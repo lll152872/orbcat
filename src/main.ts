@@ -325,6 +325,8 @@ interface McpGroupView {
 interface McpStatus {
   connected: boolean;
   error: string | null;
+  /** 当前网关地址；空串 = 未配置（没有默认值，不配就不启用） */
+  url: string;
   activeTokens: number;
   budgetTokens: number;
   groups: McpGroupView[];
@@ -1653,11 +1655,25 @@ function renderMcpView(mcp: McpStatus | null): string {
   if (!mcp) {
     return head + `<div class="mem-empty">读取 MCP 状态失败。</div>`;
   }
+
+  // 网关地址编辑器 —— MCP 网关是用户自己起的进程，没有内置默认值，
+  // 不配就不启用。这里给一个输入框：填了保存即生效，清空即禁用。
+  const urlRow = `
+    <div class="mcp-url-row">
+      <label class="mcp-url-label" for="mcp-url">网关地址</label>
+      <input class="mcp-url-input" id="mcp-url" type="text"
+        placeholder="http://127.0.0.1:3050/mcp" value="${esc(mcp.url)}" spellcheck="false">
+      <button class="set-btn" id="mcp-url-save">保存</button>
+    </div>
+    <div class="set-hint" id="mcp-url-msg" style="margin-bottom:8px">
+      ${mcp.url ? "改动保存后立即重连。清空并保存 = 禁用 MCP。" : "未配置 —— 填一个 MCP 网关地址（如 1MCP）并保存才会启用。"}
+    </div>`;
+
   if (!mcp.connected) {
     return (
       head +
-      `<div class="mem-empty">未连接到 MCP 网关${mcp.error ? `：${esc(mcp.error)}` : ""}<br>
-       检查 1MCP 网关是否在运行（默认 http://127.0.0.1:3050/mcp）。</div>
+      urlRow +
+      `<div class="mem-empty">${mcp.url ? `未连接到 ${esc(mcp.url)}${mcp.error ? `：${esc(mcp.error)}` : ""}` : "还没配网关地址。"}${mcp.url ? "<br>检查网关进程是否在运行。" : ""}</div>
        <div class="set-actions"><button class="set-btn" id="mcp-refresh">重新连接</button></div>`
     );
   }
@@ -1691,6 +1707,8 @@ function renderMcpView(mcp: McpStatus | null): string {
 
   return (
     head +
+    urlRow +
+    `<div class="set-url" style="margin-bottom:8px">已连接 ${esc(mcp.url)}</div>` +
     bar +
     `<div class="set-hint" style="margin-bottom:8px">
       这些工具**不会默认塞进模型上下文**（全量约 14k tokens）。
@@ -1709,6 +1727,27 @@ function bindMcpView(root: HTMLElement): void {
   document.getElementById("mcp-refresh")?.addEventListener("click", async () => {
     await invoke("mcp_refresh").catch((e) => pushEntry("error", `刷新失败：${e}`));
     renderBody();
+  });
+
+  // 网关地址：保存（含清空=禁用）→ Rust 写 mcp.json + 换 client + 立即试连
+  const saveUrl = async () => {
+    const input = document.getElementById("mcp-url") as HTMLInputElement | null;
+    const msg = document.getElementById("mcp-url-msg");
+    if (!input) return;
+    try {
+      if (msg) msg.textContent = "保存并连接中…";
+      await invoke("mcp_set_url", { url: input.value });
+      renderBody(); // 整页重绘 → 连接状态/组列表跟着变
+    } catch (e) {
+      if (msg) msg.textContent = `保存失败：${e}`;
+    }
+  };
+  document.getElementById("mcp-url-save")?.addEventListener("click", () => void saveUrl());
+  document.getElementById("mcp-url")?.addEventListener("keydown", (ev) => {
+    if ((ev as KeyboardEvent).key === "Enter") {
+      ev.preventDefault();
+      void saveUrl();
+    }
   });
 
   root.querySelectorAll<HTMLButtonElement>(".set-btn[data-group]").forEach((b) =>

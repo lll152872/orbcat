@@ -688,6 +688,8 @@ struct McpGroupView {
 struct McpStatus {
     connected: bool,
     error: Option<String>,
+    /// 当前网关地址（空串 = 未配置）。设置页的输入框显示它。
+    url: String,
     active_tokens: usize,
     budget_tokens: usize,
     groups: Vec<McpGroupView>,
@@ -704,6 +706,7 @@ async fn mcp_status(state: State<'_, AppState>) -> Result<McpStatus, String> {
             return Ok(McpStatus {
                 connected: false,
                 error: Some("MCP 状态查询超时（后台通信僵持中，稍后自动恢复）".into()),
+                url: String::new(),
                 active_tokens: 0,
                 budget_tokens: 0,
                 groups: Vec::new(),
@@ -713,6 +716,7 @@ async fn mcp_status(state: State<'_, AppState>) -> Result<McpStatus, String> {
     Ok(McpStatus {
         connected: reg.connected,
         error: reg.error.clone(),
+        url: reg.url(),
         active_tokens: reg.active_tokens(),
         budget_tokens: reg.budget_tokens(),
         groups: reg
@@ -734,6 +738,34 @@ async fn mcp_status(state: State<'_, AppState>) -> Result<McpStatus, String> {
 #[tauri::command]
 async fn mcp_refresh(state: State<'_, AppState>) -> Result<(), String> {
     // 与 setup 后台任务同款：锁外网络 IO，锁内落账
+    let client = state.mcp.lock().await.client_clone();
+    let snap = mcp::ToolRegistry::fetch_snapshot(&client).await;
+    state.mcp.lock().await.apply_snapshot(snap);
+    Ok(())
+}
+
+/// 设置/更换/禁用 MCP 网关地址（写 `mcp.json`，立即生效于下次拉取）。
+///
+/// `url` 传空 = 显式禁用。MCP 网关是用户自己起的进程，**没有内置默认地址**，
+/// 不配就不启用。
+#[tauri::command]
+async fn mcp_set_url(state: State<'_, AppState>, url: String) -> Result<(), String> {
+    let u = url.trim().to_string();
+    if u.is_empty() {
+        config::save_mcp_url(&state.data_dir, None)?;
+        state.mcp.lock().await.set_url("");
+        eprintln!("[float-agent] MCP 已禁用");
+        return Ok(());
+    }
+    if !u.starts_with("http://") && !u.starts_with("https://") {
+        return Err("地址必须以 http:// 或 https:// 开头".into());
+    }
+    config::save_mcp_url(&state.data_dir, Some(&u))?;
+    let mut reg = state.mcp.lock().await;
+    reg.set_url(&u);
+    drop(reg);
+    eprintln!("[float-agent] MCP 网关已设为 {u}，重新拉取工具清单");
+    // 换完顺手拉一次，用户立刻能看到成没成（网关没起来会显示连接失败）
     let client = state.mcp.lock().await.client_clone();
     let snap = mcp::ToolRegistry::fetch_snapshot(&client).await;
     state.mcp.lock().await.apply_snapshot(snap);
@@ -1046,6 +1078,7 @@ pub fn run() {
 
             // --- MCP 注册表（懒加载）---
             // 拉取在后台进行：网关没起来也不能拖慢应用启动。
+            // 没配 mcp.json 就是 None（不启用）—— 没有默认网关地址。
             let mcp_url = config::resolve_mcp_url(&data_dir);
             let registry = match &mcp_url {
                 Some(u) => {
@@ -1053,7 +1086,7 @@ pub fn run() {
                     mcp::ToolRegistry::new(u.clone())
                 }
                 None => {
-                    eprintln!("[float-agent] MCP 已在 mcp.json 中禁用");
+                    eprintln!("[float-agent] MCP 未配置（设置页里填网关地址才启用）");
                     mcp::ToolRegistry::new("")
                 }
             };
@@ -1126,6 +1159,7 @@ pub fn run() {
             session_delete,
             mcp_status,
             mcp_refresh,
+            mcp_set_url,
             mcp_load_group,
             mcp_unload_group,
             app_quit,

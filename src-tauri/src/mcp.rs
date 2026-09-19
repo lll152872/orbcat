@@ -169,6 +169,10 @@ impl McpClient {
         }
     }
 
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
     /// 走一遍 MCP 握手 + 取工具列表。
     ///
     /// 注意：1mcp 会返回 `Mcp-Session-Id`，后续请求要带上。
@@ -358,6 +362,21 @@ impl ToolRegistry {
     /// 用途：**锁外**做网络 IO —— 见 fetch_snapshot 的说明。
     pub fn client_clone(&self) -> McpClient {
         self.client.clone()
+    }
+
+    /// 当前网关地址（空串 = 未配置）
+    pub fn url(&self) -> String {
+        self.client.url().to_string()
+    }
+
+    /// 换网关地址（设置页改配置后调用）。
+    /// 换地址 = 旧 session 作废，所以顺手清掉连接态，等下次 refresh。
+    pub fn set_url(&mut self, url: &str) {
+        self.client = McpClient::new(url);
+        self.connected = false;
+        self.error = None;
+        self.groups.clear();
+        self.active.clear();
     }
 
     /// 锁外做网络 IO：拉取工具清单。**不碰 self 状态**。

@@ -293,17 +293,18 @@ fn settings_path(data_dir: &Path) -> PathBuf {
 // MCP 网关地址
 // ---------------------------------------------------------------------------
 
-/// MCP 网关的默认地址（用户的 1MCP 网关）
-pub const DEFAULT_MCP_URL: &str = "http://127.0.0.1:3050/mcp";
-
 /// 解析 MCP 网关地址。
 ///
 /// 优先级：
 ///   1. 环境变量 `FLOAT_AGENT_MCP_URL`
 ///   2. `<data_dir>/mcp.json` 的 `{"url": "...", "enabled": true}`
-///   3. [`DEFAULT_MCP_URL`]
+///   3. **没有默认值** —— 都没配就返回 `None`（MCP 不启用）
 ///
-/// 返回 `None` 表示显式禁用了 MCP（`enabled: false`）。
+/// ⚠️ 刻意不设默认地址：MCP 网关是**用户自己起的进程**，
+///    地址焊死在源码里等于替所有克隆者做主（还会在别人的机器上
+///    对着一个不存在的服务反复超时）。配置走设置页或 mcp.json。
+///
+/// 返回 `None` 表示未配置或显式禁用（`enabled: false`）。
 pub fn resolve_mcp_url(data_dir: &Path) -> Option<String> {
     if let Ok(u) = std::env::var("FLOAT_AGENT_MCP_URL") {
         if !u.trim().is_empty() {
@@ -327,7 +328,25 @@ pub fn resolve_mcp_url(data_dir: &Path) -> Option<String> {
         }
     }
 
-    Some(DEFAULT_MCP_URL.to_string())
+    None
+}
+
+/// 写入/更新/禁用 `<data_dir>/mcp.json`（设置页用）。
+///
+/// `url = Some(u)` → `{"url": u, "enabled": true}`；
+/// `url = None` → `{"enabled": false}`（显式禁用，避免下次启动
+/// 又因为别的路径解析出地址）。
+pub fn save_mcp_url(data_dir: &Path, url: Option<&str>) -> Result<(), String> {
+    let p = data_dir.join("mcp.json");
+    let v = match url {
+        Some(u) => serde_json::json!({ "url": u, "enabled": true }),
+        None => serde_json::json!({ "url": "", "enabled": false }),
+    };
+    let txt = serde_json::to_string_pretty(&v).map_err(|e| format!("序列化失败: {e}"))?;
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&p, txt).map_err(|e| format!("写入 {} 失败: {e}", p.display()))
 }
 
 pub fn load_settings(data_dir: &Path) -> AgentSettings {

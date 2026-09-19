@@ -1482,6 +1482,42 @@ body {
   color: #8b93b0;
 }
 
+/* MCP 网关地址行（设置页） */
+.mcp-url-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.mcp-url-label {
+  font-size: 11px;
+  color: #8b93b0;
+  flex: none;
+}
+
+.mcp-url-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  font-family: Consolas, Menlo, monospace;
+  color: #dfe5f5;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  padding: 5px 8px;
+  outline: none;
+}
+
+.mcp-url-input:focus {
+  border-color: #5b6ef5;
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.mcp-url-input::placeholder {
+  color: #5b637e;
+}
+
 .set-warn {
   font-size: 10px;
   color: #f0c98a;
