@@ -294,7 +294,7 @@ body {
   overflow: hidden;
 }
 
-/* 前台应用指示条：列出「用户最近在看的几个应用」 */
+/* 前台应用指示条：可翻列表（折叠 1 条 + ▾更多，展开最多 6 条） */
 .fg-ctx {
   padding: 4px 10px;
   background: rgba(120, 160, 255, 0.06);
@@ -303,6 +303,36 @@ body {
   user-select: none;
   max-height: 84px;
   overflow-y: auto;
+}
+
+.fg-ctx.fg-expanded {
+  max-height: 160px;
+}
+
+/* 「▾ 更多 N / ▴ 收起」翻牌按钮 */
+.fg-toggle {
+  display: block;
+  width: 100%;
+  margin-top: 2px;
+  padding: 1px 6px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #8b93b8;
+  font-size: 10px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.fg-toggle:hover {
+  color: #dfe3f0;
+  background: rgba(120, 160, 255, 0.14);
+}
+
+.fg-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .fg-row {

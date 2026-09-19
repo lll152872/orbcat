@@ -960,7 +960,9 @@ interface FgCtx {
 }
 
 /** 指示条最多显示几条（Rust 侧保留 6 条） */
-const FG_SHOW_MAX = 4;
+const FG_SHOW_MAX = 6;
+/** 列表是否展开：折叠时只显示第一条 + 「+N」角标，点角标翻开/收起 */
+let fgExpanded = false;
 let fgTimer: ReturnType<typeof setTimeout> | undefined;
 
 async function refreshFgCtx(loop = true): Promise<void> {
@@ -981,21 +983,30 @@ async function refreshFgCtx(loop = true): Promise<void> {
       el.innerHTML = `<div class="fg-row fg-empty">👁 还没记录到其他应用（切到 VSCode/Typora 再回来看）</div>`;
       el.style.display = "block";
     } else {
-      el.innerHTML = items
-        .map((c, i) => {
-          const where = c.file || c.dir || "";
-          const base = where
-            ? (where.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? where)
-            : "";
-          const label = base ? `${c.app} · ${base}` : c.app;
-          const tip = [c.app, c.dir && `目录 ${c.dir}`, c.file && `文件 ${c.file}`]
-            .filter(Boolean)
-            .join("\n");
-          const dot = i === 0 ? "👁" : "·";
-          return `<div class="fg-row" data-path="${esc(where)}" title="${esc(tip)}">
-            <span class="fg-eye">${dot}</span>${esc(label)}</div>`;
-        })
-        .join("");
+      const rowHtml = (c: FgCtx, i: number) => {
+        const where = c.file || c.dir || "";
+        const base = where
+          ? (where.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? where)
+          : "";
+        const label = base ? `${c.app} · ${base}` : c.app;
+        const tip = [c.app, c.dir && `目录 ${c.dir}`, c.file && `文件 ${c.file}`]
+          .filter(Boolean)
+          .join("\n");
+        const dot = i === 0 ? "👁" : "·";
+        return `<div class="fg-row" data-path="${esc(where)}" title="${esc(tip)}">
+          <span class="fg-eye">${dot}</span><span class="fg-label">${esc(label)}</span></div>`;
+      };
+      // 可翻列表：折叠态只露最近 1 条 + 「▾ N」角标；点开看全部，再点收起。
+      // 好处：默认不占面板高度（原来 4 条能把聊天区挤掉一屏），
+      //       需要回看历史时一键翻开。
+      const shown = fgExpanded ? items : items.slice(0, 1);
+      const more = items.length - shown.length;
+      el.innerHTML =
+        shown.map((c, i) => rowHtml(c, i)).join("") +
+        (items.length > 1
+          ? `<button class="fg-toggle" id="fg-toggle" title="${fgExpanded ? "收起" : "展开全部 " + items.length + " 条"}">${fgExpanded ? "▴ 收起" : `▾ 更多 ${more}`}</button>`
+          : "");
+      el.classList.toggle("fg-expanded", fgExpanded);
       el.style.display = "block";
       el.querySelectorAll<HTMLElement>(".fg-row").forEach((r) =>
         r.addEventListener("click", () => {
@@ -1003,6 +1014,12 @@ async function refreshFgCtx(loop = true): Promise<void> {
           if (p) void navigator.clipboard.writeText(p).catch(() => {});
         }),
       );
+      const tg = document.getElementById("fg-toggle");
+      tg?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        fgExpanded = !fgExpanded;
+        void refreshFgCtx(false);
+      });
     }
   } catch {
     el.innerHTML = `<div class="fg-row fg-empty">👁 上下文读取失败</div>`;
