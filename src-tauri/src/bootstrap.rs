@@ -53,6 +53,32 @@ const DIRS: [&str; 8] = [
     "skills",
 ];
 
+/// 内置技能 —— 随程序分发，初始化时释放到 `agent-data/skills/`。
+///
+/// 为什么用 `include_str!` 而不是运行时读盘：发布版没有源码目录，
+/// 技能得**编进二进制**才能跟着软件走。
+///
+/// ⚠️ 正文里的 `{{DATA_DIR}}` / `{{SKILL_DIR}}` 是占位符，写入时替换成本机绝对路径 ——
+/// 模板里写死路径，换台机器就废了。
+const BUNDLED_SKILLS: &[(&str, &str)] = &[
+    (
+        "dual-token-dashboard/SKILL.md",
+        include_str!("../../tools/dual-token-dashboard/SKILL.md"),
+    ),
+    (
+        "dual-token-dashboard/scripts/gen_dual_dashboard.py",
+        include_str!("../../tools/dual-token-dashboard/scripts/gen_dual_dashboard.py"),
+    ),
+    (
+        "dual-token-dashboard/references/adapter-schema.md",
+        include_str!("../../tools/dual-token-dashboard/references/adapter-schema.md"),
+    ),
+    (
+        "dispatch-workbuddy/SKILL.md",
+        include_str!("../../tools/dispatch-workbuddy/SKILL.md"),
+    ),
+];
+
 /// 建目录骨架 + 最小配置文件。**不碰 `models.json` 之外的任何密钥**。
 ///
 /// 返回 [`BootstrapReport`]；任何一步失败都返回 `Err`（带上具体路径），
@@ -132,7 +158,36 @@ pub fn bootstrap_agent_data(data_dir: &Path) -> Result<BootstrapReport, String> 
         created_files.push(rel.to_string());
     }
 
-    // ── 五、permissions.json 由权限模块自举，这里不碰 ────────────
+    // ── 五、内置技能（随程序分发，释放到 skills/）────────────────
+    // 这些技能**跟着程序走**：编进二进制（见 [`BUNDLED_SKILLS`]），
+    // 初始化时落地到 `agent-data/skills/`。agent-data 整体被 gitignore，
+    // 所以新克隆的人跑一次初始化就能拿到，不用手动 clone 面板。
+    //
+    // 策略与骨架文件一致：**已存在就不动**。skills/ 同时是用户和 agent
+    // 的地盘（`save_skill` 往里写），无条件覆盖会毁掉他们的改动。
+    // 代价：程序升级不会自动刷新已装好的技能 —— 要更新就删掉旧目录再初始化。
+    for (rel, tpl) in BUNDLED_SKILLS {
+        let full_rel = format!("skills/{rel}");
+        let p = data_dir.join(&full_rel);
+        if p.exists() {
+            skipped.push(full_rel);
+            continue;
+        }
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建目录 {} 失败: {e}", parent.display()))?;
+        }
+        // SKILL_DIR = 该技能自己的目录（rel 的第一段），不能写死 dual-token-dashboard
+        let skill_root = data_dir
+            .join("skills")
+            .join(rel.split('/').next().unwrap_or_default());
+        let body = render_bundled(tpl, data_dir, &skill_root);
+        std::fs::write(&p, body)
+            .map_err(|e| format!("写入 {} 失败: {e}", p.display()))?;
+        created_files.push(full_rel);
+    }
+
+    // ── 六、permissions.json 由权限模块自举，这里不碰 ────────────
     if data_dir.join("permissions.json").exists() {
         skipped.push("permissions.json".into());
     }
@@ -144,6 +199,15 @@ pub fn bootstrap_agent_data(data_dir: &Path) -> Result<BootstrapReport, String> 
         skipped,
         has_models,
     })
+}
+
+/// 把内置模板里的占位符换成本机真实路径。
+///
+/// 为什么不在模板里写死路径：那台机器是 `D:\workplace\悬浮小agent\...`，
+/// 换台机器（或换个数据目录）就全错。释放时按实际 `data_dir` 渲染才通用。
+fn render_bundled(tpl: &str, data_dir: &Path, skill_dir: &Path) -> String {
+    tpl.replace("{{DATA_DIR}}", &data_dir.display().to_string())
+        .replace("{{SKILL_DIR}}", &skill_dir.display().to_string())
 }
 
 const MEMORY_SKELETON: &str = "\
@@ -200,10 +264,18 @@ description: 一句话说清**什么场景下该用**这个技能
 - 好：`当用户要求把 Markdown 发布到 CSDN 时使用，含图片上传流程`
 - 差：`一个关于 CSDN 的技能`
 
-## 渐进式披露
+## 渐进式披露 + 关键词自动加载
 
-system prompt 里**只放清单**（名字 + description），正文不进 prompt。
-模型判断任务匹配时，自己调 `load_skill` 拿全文。
+system prompt 里**只放清单**（名字 + description），正文默认不进 prompt。
+但当用户**本轮消息命中**某个技能的触发词时，系统会把它**自动加载**进来
+（拿 description 里的引号短语 / 技能名去匹配），不用模型主动调工具。
+
+所以 description 要写清触发场景，并**把用户可能说的原话用引号列出来**：
+
+- 好：`当用户说「发给 WB」「交给 WorkBuddy」时使用`
+- 差：`一个关于分发的技能`
+
+没被自动命中的技能，模型也能自己调 `load_skill` 拿全文。
 所以技能写多长都不心疼，写清就行。
 
 ## 热加载
@@ -303,6 +375,28 @@ mod tests {
             assert!(d.join(f).is_file(), "{f} 应存在");
         }
 
+        // 内置技能：随程序分发，初始化时必须落地
+        for f in [
+            "skills/dual-token-dashboard/SKILL.md",
+            "skills/dual-token-dashboard/scripts/gen_dual_dashboard.py",
+            "skills/dual-token-dashboard/references/adapter-schema.md",
+            "skills/dispatch-workbuddy/SKILL.md",
+        ] {
+            assert!(d.join(f).is_file(), "内置技能文件 {f} 应存在");
+        }
+
+        // 占位符必须被替换成本机真实路径，不能烧死在模板里
+        let skill_md =
+            std::fs::read_to_string(d.join("skills/dual-token-dashboard/SKILL.md")).unwrap();
+        assert!(
+            !skill_md.contains("{{DATA_DIR}}") && !skill_md.contains("{{SKILL_DIR}}"),
+            "占位符应全部被替换:\n{skill_md}"
+        );
+        assert!(
+            skill_md.contains(&d.display().to_string()),
+            "应写入真实 data_dir 路径"
+        );
+
         // models.json 必须是**合法空数组**，不能是模板占位
         let txt = std::fs::read_to_string(d.join("models.json")).unwrap();
         let v: Vec<serde_json::Value> = serde_json::from_str(&txt).expect("应为合法 JSON");
@@ -334,7 +428,12 @@ mod tests {
         let r = bootstrap_agent_data(&d).expect("二次初始化应成功");
         assert!(r.created_dirs.is_empty(), "不该重复建目录");
         assert!(r.created_files.is_empty(), "不该重复写文件");
-        assert_eq!(r.skipped.len(), 14, "8 目录 + 6 文件应全跳过: {:?}", r.skipped);
+        assert_eq!(
+            r.skipped.len(),
+            18,
+            "8 目录 + 6 骨架文件 + 4 内置技能文件 应全跳过: {:?}",
+            r.skipped
+        );
 
         assert_eq!(
             std::fs::read_to_string(d.join("memory/MEMORY.md")).unwrap(),
@@ -358,6 +457,29 @@ mod tests {
 
         let r = bootstrap_agent_data(&d).expect("二次初始化应成功");
         assert!(r.has_models, "已有模型应被识别");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 展开到**任意临时目录**也成立 —— 证明内置技能不是只会写死的那一个路径。
+    #[test]
+    fn bundled_skills_expand_into_arbitrary_dir() {
+        let d = tmp("expand");
+        bootstrap_agent_data(&d).expect("初始化应成功");
+
+        let md = std::fs::read_to_string(d.join("skills/dual-token-dashboard/SKILL.md"))
+            .expect("SKILL.md 应被释放");
+        // 正文里的路径必须指向**这个**临时目录，而不是某个烧死的旧路径
+        assert!(
+            md.contains(&d.display().to_string()),
+            "释放出的 SKILL.md 应引用本次的 data_dir: {}",
+            d.display()
+        );
+        assert!(!md.contains("{{"), "不该残留占位符");
+
+        // 附带的两个文件也要在
+        assert!(d.join("skills/dual-token-dashboard/scripts/gen_dual_dashboard.py").is_file());
+        assert!(d.join("skills/dual-token-dashboard/references/adapter-schema.md").is_file());
 
         let _ = std::fs::remove_dir_all(&d);
     }

@@ -185,62 +185,16 @@ impl PermissionGate {
         &self.rules
     }
 
-    /// 判定某路径是否满足所需权限。
+    /// 判定某路径是否满足所需权限（**不带临时授权**）。
     ///
-    /// 这是**唯一**的授权入口 —— 所有文件操作（读/写/删）都必须先过这里。
+    /// 内部就是 [`PermissionGate::authorize`] 传空授权表的特例 ——
+    /// 这样"最长前缀 + Deny 特判"只有一份实现，不会两套逻辑各自演化。
+    ///
+    /// ⚠️ 新代码请优先用 `authorize`：它还会告诉你是「规则长期放行」还是
+    /// 「临时授权放行」，后者用完要 `GrantStore::consume` 扣次数。
+    /// 本签名保留是为了不惊动既有调用方。
     pub fn check(&self, path: impl AsRef<Path>, need: Access) -> Result<PathBuf, DenyReason> {
-        let raw = path.as_ref();
-
-        let canon = if raw.is_absolute() {
-            best_effort_canonicalize(raw)
-        } else {
-            // 相对路径：拼上当前工作目录再规范化
-            match std::env::current_dir() {
-                Ok(cwd) => best_effort_canonicalize(&cwd.join(raw)),
-                Err(e) => {
-                    return Err(DenyReason::BadPath {
-                        path: raw.to_path_buf(),
-                        detail: format!("无法获取工作目录: {e}"),
-                    })
-                }
-            }
-        };
-
-        if canon.as_os_str().is_empty() {
-            return Err(DenyReason::BadPath {
-                path: raw.to_path_buf(),
-                detail: "规范化后为空".into(),
-            });
-        }
-
-        // 规则已按前缀长度降序 —— 第一个命中的就是最长前缀
-        for rule in &self.rules {
-            if !path_has_prefix(&canon, &rule.prefix) {
-                continue;
-            }
-
-            // Deny 必须特判：它在枚举里排最前，若走 `>=` 比较会被误判成"权限不足"
-            if rule.access == Access::Deny {
-                return Err(DenyReason::ExplicitlyDenied {
-                    path: canon,
-                    rule_prefix: rule.prefix.clone(),
-                    rule_label: rule.label.clone(),
-                });
-            }
-
-            if rule.access >= need {
-                return Ok(canon);
-            }
-            return Err(DenyReason::InsufficientAccess {
-                path: canon,
-                rule_prefix: rule.prefix.clone(),
-                rule_label: rule.label.clone(),
-                required: need,
-                allowed: rule.access,
-            });
-        }
-
-        Err(DenyReason::NoMatchingRule { path: canon })
+        self.authorize(path, need, &[]).map(|a| a.path)
     }
 
     // -- 规则的整体替换（持久化用） ------------------------------------------
@@ -333,7 +287,7 @@ pub fn best_effort_canonicalize(path: &Path) -> PathBuf {
 }
 
 /// 剥掉 `\\?\` / `\\?\UNC\` 前缀（Windows `canonicalize` 的产物）
-fn strip_verbatim(p: PathBuf) -> PathBuf {
+pub(crate) fn strip_verbatim(p: PathBuf) -> PathBuf {
     let s = p.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         return PathBuf::from(format!(r"\\{rest}"));
@@ -507,6 +461,385 @@ pub fn save_gate(data_dir: &Path, gate: &PermissionGate) -> Result<PathBuf, Stri
     let txt = serde_json::to_string_pretty(&file).map_err(|e| format!("序列化失败: {e}"))?;
     std::fs::write(&path, txt).map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
     Ok(path)
+}
+
+// ---------------------------------------------------------------------------
+// 临时授权层（「申请权限」功能的产物）
+// ---------------------------------------------------------------------------
+//
+// 三个概念要分清：
+//   - **规则**（`Rule`）     ：用户设的长期策略，落 `permissions.json`
+//   - **授权**（`Grant`）    ：用户当场批的临时放行，**不落 permissions.json**
+//   - **档位**（`GrantTier`）：授权能活多久
+//
+// 为什么要独立一层而不是"批准后往规则里加一条"：
+//   「一次 / 一轮」如果写进规则，就会跨重启存活 —— 那这两个档位的语义当场破裂。
+//   只有「整个任务」落盘，且落在会话目录旁边，随会话一起消失（无孤儿授权）。
+
+/// 授权档位 —— **时间维度**。空间维度是 [`Grant::prefix`]，两者缺一不可。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GrantTier {
+    /// 一次：只够 **1 次**工具调用，用掉即销毁
+    Once,
+    /// 一轮：1 次 agent loop 内有效，loop 结束整批销毁
+    Turn,
+    /// 整个任务：任务会话生命周期。
+    /// 主聊天里降级为「本次 app 运行期」→ 不落盘（见 [`GrantTier::is_persistent`] 的调用方）
+    Task,
+}
+
+// ⚠️ 本段（含 `Grant` / `GrantStore` / `Allowed.grant_idx`）是「申请权限」的地基，
+//    已实现且有单测覆盖，但**工具层还没接线**（见 docs/02-PERMISSION-REQUEST.md 第 5 项）。
+//    接线后这些 allow 应当全部删掉。
+#[allow(dead_code)]
+impl GrantTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GrantTier::Once => "once",
+            GrantTier::Turn => "turn",
+            GrantTier::Task => "task",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "once" | "一次" => Some(GrantTier::Once),
+            "turn" | "一轮" => Some(GrantTier::Turn),
+            "task" | "整个任务" => Some(GrantTier::Task),
+            _ => None,
+        }
+    }
+
+    /// 这一档是否落盘。只有 `Task` 落盘，且**落在会话旁边**（`sessions/<id>.grants.json`）。
+    ///
+    /// ⚠️ 主聊天是永久会话，在它里面批 `Task` 等于变相无限期授权 ——
+    /// 所以调用方要判断会话 `kind`，主聊天时**不要**把 `Task` 写盘。
+    pub fn is_persistent(&self) -> bool {
+        matches!(self, GrantTier::Task)
+    }
+}
+
+/// 一条临时授权。
+///
+/// **禁止写进 `permissions.json`** —— 那是长期策略的地盘，
+/// 把临时授权混进去会让"一次 / 一轮"跨重启存活。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Grant {
+    /// 授权作用的路径前缀（**必须已规范化**，同 [`Rule::prefix`]）
+    pub prefix: PathBuf,
+    /// 授予的最大权限
+    pub access: Access,
+    /// 档位（时间维度）
+    pub tier: GrantTier,
+    /// 剩余可用次数。
+    /// `None` = 不限次（`Turn` / `Task` 档）；`Some(n)` = 还能用 n 次（`Once` 档，初值 1）
+    #[serde(default)]
+    pub remaining: Option<u32>,
+    /// 模型填的申请原因（展示用）
+    #[serde(default)]
+    pub reason: String,
+    /// 批准时间（epoch 毫秒，展示用）
+    #[serde(default)]
+    pub granted_at: u64,
+}
+
+#[allow(dead_code)]
+impl Grant {
+    /// 造一条「一次」授权（剩余 1 次）
+    pub fn once(prefix: impl AsRef<Path>, access: Access, reason: impl Into<String>) -> Self {
+        Self {
+            prefix: best_effort_canonicalize(prefix.as_ref()),
+            access,
+            tier: GrantTier::Once,
+            remaining: Some(1),
+            reason: reason.into(),
+            granted_at: now_ms(),
+        }
+    }
+
+    /// 造一条「一轮」/「整个任务」授权（不限次）
+    pub fn lasting(
+        prefix: impl AsRef<Path>,
+        access: Access,
+        tier: GrantTier,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            prefix: best_effort_canonicalize(prefix.as_ref()),
+            access,
+            tier,
+            remaining: None,
+            reason: reason.into(),
+            granted_at: now_ms(),
+        }
+    }
+
+    /// 是否还有剩余次数（`None` 视为无限）
+    pub fn has_left(&self) -> bool {
+        self.remaining.map(|n| n > 0).unwrap_or(true)
+    }
+}
+
+/// 当前时间（epoch 毫秒）。`perm_request` 也用它给授权/待办打时间戳。
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 临时授权表。
+///
+/// **生命周期由调用方驱动**，本结构不自带定时器：
+///   - 一次 `loop` 结束 → `clear_tier(GrantTier::Turn)`
+///   - 切换 / 删除会话 → `clear_tier(GrantTier::Task)`
+///   - 进程退出 → `Once` / `Turn` 本就在内存里，自然消失
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub struct GrantStore {
+    grants: Vec<Grant>,
+}
+
+#[allow(dead_code)]
+impl GrantStore {
+    pub fn new() -> Self {
+        Self { grants: Vec::new() }
+    }
+
+    pub fn grants(&self) -> &[Grant] {
+        &self.grants
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.grants.is_empty()
+    }
+
+    /// 加一条授权。
+    ///
+    /// 合并规则：**同前缀 + 同档位**（且都不是 `Once`）合并成一条，权限取高的。
+    /// `Once` 不合并 —— 每条 `Once` 就是一次配额，叠两条就是两次。
+    pub fn add(&mut self, grant: Grant) {
+        if grant.tier != GrantTier::Once {
+            if let Some(existing) = self
+                .grants
+                .iter_mut()
+                .find(|g| g.tier == grant.tier && g.prefix == grant.prefix)
+            {
+                if grant.access > existing.access {
+                    existing.access = grant.access;
+                }
+                if !grant.reason.is_empty() {
+                    existing.reason = grant.reason;
+                }
+                return;
+            }
+        }
+        self.grants.push(grant);
+    }
+
+    /// 整体替换（从 `*.grants.json` 加载时用）
+    pub fn replace(&mut self, grants: Vec<Grant>) {
+        self.grants = grants;
+    }
+
+    /// 命中判定（**不消费**）：返回「最长前缀且权限足够」的授权下标。
+    ///
+    /// 返回下标而不是引用 —— 调用方拿到它之后还要 `consume`，借用会打架。
+    pub fn find(&self, canon: &Path, need: Access) -> Option<usize> {
+        let mut best: Option<(usize, usize)> = None; // (下标, 前缀组件数)
+
+        for (i, g) in self.grants.iter().enumerate() {
+            if !g.has_left() || g.access < need {
+                continue;
+            }
+            if !path_has_prefix(canon, &g.prefix) {
+                continue;
+            }
+            let n = g.prefix.components().count();
+            match best {
+                Some((_, bn)) if bn >= n => {}
+                _ => best = Some((i, n)),
+            }
+        }
+
+        best.map(|(i, _)| i)
+    }
+
+    /// 消费一次。`Once` 档扣 1，扣到 0 就移出表；其余档位不动。
+    ///
+    /// 返回被消费掉的授权副本（`Once` 用尽时返回 `Some`，用于日志/审计）。
+    pub fn consume(&mut self, idx: usize) -> Option<Grant> {
+        let g = self.grants.get_mut(idx)?;
+        match g.remaining {
+            None => None,
+            Some(n) if n <= 1 => {
+                let used = g.clone();
+                self.grants.remove(idx);
+                Some(used)
+            }
+            Some(n) => {
+                g.remaining = Some(n - 1);
+                None
+            }
+        }
+    }
+
+    /// 清掉某一档的全部授权，返回清掉的条数。
+    pub fn clear_tier(&mut self, tier: GrantTier) -> usize {
+        let before = self.grants.len();
+        self.grants.retain(|g| g.tier != tier);
+        before - self.grants.len()
+    }
+
+    /// 按前缀撤销（设置界面用），可限定档位
+    pub fn revoke(&mut self, prefix: impl AsRef<Path>, tier: Option<GrantTier>) -> usize {
+        let target = best_effort_canonicalize(prefix.as_ref());
+        let before = self.grants.len();
+        self.grants
+            .retain(|g| !(g.prefix == target && tier.map(|t| t == g.tier).unwrap_or(true)));
+        before - self.grants.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 授权判定的完整结果
+// ---------------------------------------------------------------------------
+
+/// 放行结果。
+///
+/// 比裸 `PathBuf` 多一个 [`Allowed::grant_idx`]：调用方靠它区分
+/// 「规则长期放行」和「临时授权放行」，后者用完要 `GrantStore::consume` 扣次数。
+#[derive(Debug, Clone)]
+pub struct Allowed {
+    /// 规范化后的路径（**后续所有文件操作都该用这个**）
+    pub path: PathBuf,
+    /// 命中的临时授权下标；`None` = 由规则放行。
+    /// 调用方靠它决定「要不要 `GrantStore::consume` 扣次数」—— 现在还没人读，
+    /// 工具层接线后立刻会成为必读字段。
+    #[allow(dead_code)]
+    pub grant_idx: Option<usize>,
+}
+
+impl PermissionGate {
+    /// 带临时授权的判定 —— **唯一**的文件操作授权入口。
+    ///
+    /// 与 [`PermissionGate::check`] 的唯一区别是多看一层 `grants`。优先级：
+    ///
+    /// | 情况 | 结果 | 为什么 |
+    /// |---|---|---|
+    /// | 授权前缀**更长** | 授权放行 | 长的优先，与规则同一套逻辑 |
+    /// | 前缀**长度相同** | **授权 > 规则** | 否则"Deny 也能申请"这条决策形同虚设 |
+    /// | 授权前缀更短 | 规则说了算 | 所以 `D:\` 的授权**压不住** `D:\secret` 的 Deny 规则 —— 不能因为批了个上层目录就顺手解开红线 |
+    ///
+    /// 注意 `grants` 里只有**权限足够**的才参与竞争；不够的会让位给规则报错，
+    /// 这样错误信息仍能准确指向"是哪条规则不够权限"。
+    pub fn authorize(
+        &self,
+        path: impl AsRef<Path>,
+        need: Access,
+        grants: &[Grant],
+    ) -> Result<Allowed, DenyReason> {
+        let raw = path.as_ref();
+        let canon = self.canonicalize(raw)?;
+
+        // --- 候选 1：临时授权（只收下权限足够的）---
+        let mut best_grant: Option<(usize, usize)> = None; // (下标, 组件数)
+        for (i, g) in grants.iter().enumerate() {
+            if g.access < need || !path_has_prefix(&canon, &g.prefix) {
+                continue;
+            }
+            let n = g.prefix.components().count();
+            match best_grant {
+                Some((_, bn)) if bn >= n => {}
+                _ => best_grant = Some((i, n)),
+            }
+        }
+
+        // --- 候选 2：规则（取最长前缀，**不看权限够不够** —— Deny 必须能被看见）---
+        let mut best_rule: Option<(usize, usize)> = None;
+        for (i, r) in self.rules.iter().enumerate() {
+            if !path_has_prefix(&canon, &r.prefix) {
+                continue;
+            }
+            let n = r.prefix.components().count();
+            match best_rule {
+                Some((_, bn)) if bn >= n => {}
+                _ => best_rule = Some((i, n)),
+            }
+        }
+
+        // --- 比长短 ---
+        match (best_grant, best_rule) {
+            // 授权命中且不短于规则 → 授权放行（等长时"授权 > 规则"）
+            (Some((gi, gn)), Some((_, rn))) if gn >= rn => {
+                return Ok(Allowed {
+                    path: canon,
+                    grant_idx: Some(gi),
+                })
+            }
+            (Some((gi, _)), None) => {
+                return Ok(Allowed {
+                    path: canon,
+                    grant_idx: Some(gi),
+                })
+            }
+            _ => {}
+        }
+
+        // --- 规则说了算 ---
+        match best_rule {
+            Some((ri, _)) => {
+                let rule = &self.rules[ri];
+                if rule.access == Access::Deny {
+                    return Err(DenyReason::ExplicitlyDenied {
+                        path: canon,
+                        rule_prefix: rule.prefix.clone(),
+                        rule_label: rule.label.clone(),
+                    });
+                }
+                if rule.access >= need {
+                    return Ok(Allowed {
+                        path: canon,
+                        grant_idx: None,
+                    });
+                }
+                Err(DenyReason::InsufficientAccess {
+                    path: canon,
+                    rule_prefix: rule.prefix.clone(),
+                    rule_label: rule.label.clone(),
+                    required: need,
+                    allowed: rule.access,
+                })
+            }
+            None => Err(DenyReason::NoMatchingRule { path: canon }),
+        }
+    }
+
+    /// 把路径规范化成判定用的绝对形式（`authorize` 内部用，单独暴露给上层复用）
+    fn canonicalize(&self, raw: &Path) -> Result<PathBuf, DenyReason> {
+        let canon = if raw.is_absolute() {
+            best_effort_canonicalize(raw)
+        } else {
+            match std::env::current_dir() {
+                Ok(cwd) => best_effort_canonicalize(&cwd.join(raw)),
+                Err(e) => {
+                    return Err(DenyReason::BadPath {
+                        path: raw.to_path_buf(),
+                        detail: format!("无法获取工作目录: {e}"),
+                    })
+                }
+            }
+        };
+
+        if canon.as_os_str().is_empty() {
+            return Err(DenyReason::BadPath {
+                path: raw.to_path_buf(),
+                detail: "规范化后为空".into(),
+            });
+        }
+        Ok(canon)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -699,5 +1032,180 @@ mod tests {
         assert_eq!(g.rules().len(), 2);
         assert!(g.check(r"D:\x", Access::ReadWrite).is_ok());
         assert!(g.check(r"D:\no\y", Access::Read).is_err());
+    }
+
+    // ---- 临时授权层（「申请权限」）----
+
+    #[test]
+    fn grant_wins_over_deny_rule_at_same_prefix() {
+        // 决策 6 的核心：Deny 也能申请 —— 批准后**必须**能压过 Deny 规则，
+        // 否则「所有拒绝一视同仁都能申请」这条决策形同虚设。
+        let mut g = PermissionGate::new();
+        g.add_rule(r"D:\", Access::Read, "D盘");
+        g.add_rule(r"D:\private", Access::Deny, "我设的红线");
+
+        // 无授权时：显式拒绝
+        assert!(matches!(
+            g.check(r"D:\private\x.txt", Access::Read),
+            Err(DenyReason::ExplicitlyDenied { .. })
+        ));
+
+        // 同前缀授权 → 授权赢
+        let grants = vec![Grant::lasting(
+            r"D:\private",
+            Access::Read,
+            GrantTier::Turn,
+            "用户批了",
+        )];
+        let r = g.authorize(r"D:\private\x.txt", Access::Read, &grants);
+        assert!(r.is_ok(), "等长前缀时授权必须压过 Deny 规则；实际 {r:?}");
+        assert_eq!(r.unwrap().grant_idx, Some(0));
+    }
+
+    #[test]
+    fn longer_deny_rule_beats_shorter_grant() {
+        // 反向保护：批了上层目录**不能**顺手解开下层红线。
+        // 这是"授权 > 规则"唯一不该越界的地方。
+        let mut g = PermissionGate::new();
+        g.add_rule(r"D:\", Access::Read, "D盘");
+        g.add_rule(r"D:\a\secret", Access::Deny, "红线");
+
+        let grants = vec![Grant::lasting(
+            r"D:\a",
+            Access::ReadWrite,
+            GrantTier::Turn,
+            "批了 a 目录",
+        )];
+        let r = g.authorize(r"D:\a\secret\x", Access::ReadWrite, &grants);
+        assert!(
+            matches!(r, Err(DenyReason::ExplicitlyDenied { .. })),
+            "Deny 规则前缀更长时必须仍然拒绝；实际 {r:?}"
+        );
+    }
+
+    #[test]
+    fn longer_grant_beats_shorter_rule() {
+        let mut g = PermissionGate::new();
+        g.add_rule(r"D:\", Access::Read, "D盘只读");
+
+        let grants = vec![Grant::lasting(
+            r"D:\work",
+            Access::ReadWrite,
+            GrantTier::Turn,
+            "要写东西",
+        )];
+
+        let ok = g.authorize(r"D:\work\a.md", Access::ReadWrite, &grants);
+        assert!(ok.is_ok(), "授权前缀更长应放行；实际 {ok:?}");
+        assert_eq!(ok.unwrap().grant_idx, Some(0));
+
+        // 授权范围之外照旧被规则拒 —— 授权不是全局开关
+        assert!(matches!(
+            g.authorize(r"D:\other\a.md", Access::ReadWrite, &grants),
+            Err(DenyReason::InsufficientAccess { .. })
+        ));
+    }
+
+    #[test]
+    fn insufficient_grant_falls_through_to_rule() {
+        // 权限不够的授权**不参与竞争** —— 这样错误信息仍准确指向"是哪条规则不够"
+        let mut g = PermissionGate::new();
+        g.add_rule(r"D:\", Access::Read, "D盘只读");
+
+        let grants = vec![Grant::lasting(
+            r"D:\work",
+            Access::Read,
+            GrantTier::Turn,
+            "只批了读",
+        )];
+        let r = g.authorize(r"D:\work\a.md", Access::ReadWrite, &grants);
+        assert!(
+            matches!(r, Err(DenyReason::InsufficientAccess { .. })),
+            "实际 {r:?}"
+        );
+    }
+
+    #[test]
+    fn check_without_grants_is_unchanged() {
+        // 收敛到 authorize() 之后，不带授权表的行为必须与旧实现完全一致
+        let g = gate();
+        assert!(g.check(r"D:\myword\a.md", Access::ReadWrite).is_ok());
+        assert!(matches!(
+            g.check(r"D:\mycode\x.txt", Access::ReadWrite),
+            Err(DenyReason::InsufficientAccess { .. })
+        ));
+        assert!(matches!(
+            g.check(r"D:\mywordx\s.txt", Access::ReadWrite),
+            Err(DenyReason::InsufficientAccess { .. })
+        ));
+    }
+
+    #[test]
+    fn once_grant_is_consumed_and_removed() {
+        let mut store = GrantStore::new();
+        store.add(Grant::once(r"D:\work", Access::ReadWrite, "写一个文件"));
+        assert_eq!(store.grants().len(), 1);
+        assert_eq!(store.grants()[0].remaining, Some(1));
+
+        assert_eq!(
+            store.find(Path::new(r"D:\work\a.md"), Access::ReadWrite),
+            Some(0)
+        );
+        // 范围外不该命中
+        assert_eq!(store.find(Path::new(r"D:\other\a.md"), Access::ReadWrite), None);
+        // 权限不够不该命中
+        assert_eq!(store.find(Path::new(r"D:\work\a.md"), Access::Full), None);
+
+        assert!(store.consume(0).is_some(), "用尽应返回被消费的授权");
+        assert!(store.is_empty(), "用尽后应从表里移除 —— 这就是「一次」");
+    }
+
+    #[test]
+    fn clear_tier_only_removes_that_tier() {
+        let mut store = GrantStore::new();
+        store.add(Grant::once(r"D:\a", Access::Read, ""));
+        store.add(Grant::lasting(r"D:\b", Access::Read, GrantTier::Turn, ""));
+        store.add(Grant::lasting(r"D:\c", Access::Read, GrantTier::Task, ""));
+
+        assert_eq!(store.clear_tier(GrantTier::Turn), 1);
+        let tiers: Vec<GrantTier> = store.grants().iter().map(|g| g.tier).collect();
+        assert_eq!(
+            tiers,
+            vec![GrantTier::Once, GrantTier::Task],
+            "只该清掉 Turn 档，Once / Task 不受影响"
+        );
+    }
+
+    #[test]
+    fn same_prefix_non_once_grants_coalesce() {
+        let mut store = GrantStore::new();
+        store.add(Grant::lasting(r"D:\a", Access::Read, GrantTier::Turn, "第一次"));
+        store.add(Grant::lasting(r"D:\a", Access::ReadWrite, GrantTier::Turn, "第二次"));
+        assert_eq!(store.grants().len(), 1, "同前缀同档位应合并");
+        assert_eq!(store.grants()[0].access, Access::ReadWrite, "合并取权限高的");
+
+        // Once **不合并** —— 每条 Once 就是一次配额，叠两条就是两次
+        store.add(Grant::once(r"D:\b", Access::Read, ""));
+        store.add(Grant::once(r"D:\b", Access::Read, ""));
+        assert_eq!(store.grants().len(), 3);
+    }
+
+    #[test]
+    fn tier_and_grant_json_roundtrip() {
+        for t in [GrantTier::Once, GrantTier::Turn, GrantTier::Task] {
+            assert_eq!(GrantTier::parse(t.as_str()), Some(t));
+        }
+        assert!(GrantTier::Task.is_persistent(), "只有「整个任务」落盘");
+        assert!(!GrantTier::Once.is_persistent());
+        assert!(!GrantTier::Turn.is_persistent());
+
+        let g = Grant::lasting(r"D:\work", Access::ReadWrite, GrantTier::Task, "批量重命名");
+        let txt = serde_json::to_string(&g).unwrap();
+        let back: Grant = serde_json::from_str(&txt).unwrap();
+        assert_eq!(back.prefix, g.prefix);
+        assert_eq!(back.access, Access::ReadWrite);
+        assert_eq!(back.tier, GrantTier::Task);
+        assert_eq!(back.reason, "批量重命名");
+        assert_eq!(back.remaining, None, "无限次档位 remaining 为 None");
     }
 }

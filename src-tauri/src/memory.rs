@@ -289,6 +289,107 @@ impl MemoryStore {
 
         Self::rewrite_jsonl(&self.candidates_path(), &all)
     }
+
+    // -- 项目记忆（决策 5 / 16：projects/<name>/）----------------------------
+
+    fn projects_dir(&self) -> PathBuf {
+        self.root.join("projects")
+    }
+
+    /// 扫 `projects/*/source.ref`，用**最长前缀**匹配给定路径，命中则读该项目 MEMORY.md。
+    ///
+    /// 返回 `(项目名, MEMORY.md 全文)`。source 目录不存在 / MEMORY 为空 → 不返回。
+    /// 多个 source 同时前缀命中时，取**最长**那条（与文件权限同一 specificity 规则）。
+    pub fn match_project_memory(&self, paths: &[&Path]) -> Option<(String, String)> {
+        let dir = self.projects_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return None;
+        };
+
+        let norm = |p: &Path| -> PathBuf {
+            let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            crate::permission::strip_verbatim(c)
+        };
+
+        let mut best: Option<(usize, String, String)> = None; // (source_len, name, memory)
+
+        for ent in entries.flatten() {
+            if !ent.path().is_dir() {
+                continue;
+            }
+            let name = ent.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name == "README.md" {
+                continue;
+            }
+            let source_ref = ent.path().join("source.ref");
+            let Ok(src) = std::fs::read_to_string(&source_ref) else {
+                continue;
+            };
+            let src = src.trim();
+            if src.is_empty() {
+                continue;
+            }
+            let src_path = Path::new(src);
+            // 懒检测：源路径已删 → 不注入（避免给模型灌过期项目记忆）
+            if !src_path.exists() {
+                continue;
+            }
+            let src_cmp = norm(src_path);
+
+            let mem_path = ent.path().join("MEMORY.md");
+            let Ok(mem) = std::fs::read_to_string(&mem_path) else {
+                continue;
+            };
+            let mem = mem.trim().to_string();
+            if mem.is_empty() {
+                continue;
+            }
+
+            for p in paths {
+                if p.as_os_str().is_empty() {
+                    continue;
+                }
+                let pc = norm(p);
+                if pc.starts_with(&src_cmp) {
+                    let len = src_cmp.as_os_str().len();
+                    if best.as_ref().map(|(l, _, _)| len > *l).unwrap_or(true) {
+                        best = Some((len, name.clone(), mem.clone()));
+                    }
+                }
+            }
+        }
+
+        best.map(|(_, name, mem)| (name, mem))
+    }
+
+    /// 列出全部项目：`(名字, source.ref 原文, 源路径是否仍存在, MEMORY 是否非空)`
+    pub fn list_projects(&self) -> Vec<(String, String, bool, bool)> {
+        let dir = self.projects_dir();
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return out;
+        };
+        for ent in entries.flatten() {
+            if !ent.path().is_dir() {
+                continue;
+            }
+            let name = ent.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let src = std::fs::read_to_string(ent.path().join("source.ref"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let alive = !src.is_empty() && Path::new(&src).exists();
+            let has_mem = std::fs::read_to_string(ent.path().join("MEMORY.md"))
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            out.push((name, src, alive, has_mem));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +468,49 @@ mod tests {
         let a = s.propose("内容A", "model").unwrap();
         let b = s.propose("内容B", "model").unwrap();
         assert_ne!(a.id, b.id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_memory_longest_prefix_wins() {
+        let (s, dir) = fresh_store("proj");
+        let root = std::env::temp_dir().join(format!("fa_proj_src_{}", std::process::id()));
+        let deep = root.join("sub");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let mk = |name: &str, src: &Path, mem: &str| {
+            let p = dir.join("projects").join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("source.ref"), src.display().to_string()).unwrap();
+            std::fs::write(p.join("MEMORY.md"), mem).unwrap();
+        };
+        mk("outer", &root, "外层项目记忆");
+        mk("inner", &deep, "内层项目记忆");
+
+        let hit = s
+            .match_project_memory(&[&deep.join("file.txt")])
+            .expect("应命中项目记忆");
+        assert_eq!(hit.0, "inner");
+        assert!(hit.1.contains("内层项目记忆"));
+
+        let hit2 = s
+            .match_project_memory(&[&root.join("other.txt")])
+            .expect("应命中外层");
+        assert_eq!(hit2.0, "outer");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_memory_missing_source_or_empty_mem_is_skipped() {
+        let (s, dir) = fresh_store("proj_empty");
+        let p = dir.join("projects").join("ghost");
+        std::fs::create_dir_all(&p).unwrap();
+        // source.ref 指向不存在路径 → 即使 MEMORY 非空也不注入（懒检测语义）
+        std::fs::write(p.join("source.ref"), r"D:\definitely-not-here-xyz").unwrap();
+        std::fs::write(p.join("MEMORY.md"), "不该出现").unwrap();
+        assert!(s.match_project_memory(&[Path::new(r"D:\definitely-not-here-xyz\a")]).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

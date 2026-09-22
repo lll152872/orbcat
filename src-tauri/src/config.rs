@@ -22,6 +22,14 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// key 只留头尾（日志 / 前端安全展示共用）
+pub fn redact_key_str(k: &str) -> String {
+    if k.len() <= 10 {
+        return "***".into();
+    }
+    format!("{}...{}", &k[..6], &k[k.len() - 4..])
+}
+
 /// 一个模型配置（对应 models.json 里的一项）
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,11 +64,7 @@ pub struct ModelConfig {
 impl ModelConfig {
     /// 用于日志/前端的安全展示：key 只留头尾
     pub fn redacted_key(&self) -> String {
-        let k = &self.api_key;
-        if k.len() <= 10 {
-            return "***".into();
-        }
-        format!("{}...{}", &k[..6], &k[k.len() - 4..])
+        redact_key_str(&self.api_key)
     }
 
     /// **实际发出的请求头** = 用户配置的头 + 按需自动补的头。
@@ -100,6 +104,12 @@ impl ModelConfig {
         let base = self.url.trim_end_matches('/');
         format!("{base}/chat/completions")
     }
+}
+
+/// Base URL → `GET /models` 端点。用户常填 `https://host/v1`，少数只填 host。
+pub fn models_endpoint_from_base(url: &str) -> String {
+    let base = url.trim().trim_end_matches('/');
+    format!("{base}/models")
 }
 
 /// 进程级稳定的 session id。
@@ -250,6 +260,179 @@ pub fn load_models(data_dir: &Path) -> Result<Vec<ModelConfig>, String> {
     Ok(models)
 }
 
+/// 批量导入远端模型列表里的若干 id。
+///
+/// 共用 `source` 的 url / apiKey / headers；同 id **跳过**（不覆盖已配置项，
+/// 避免一次拉取把用户手工改过的能力开关冲掉）。返回 `(added, skipped)`。
+pub fn import_models_from_source(
+    data_dir: &Path,
+    source: &ModelConfig,
+    ids: &[String],
+    supports_tool_call: bool,
+    supports_images: bool,
+    // 每个模型的上下文窗口（来自 `/models` 返回，尽力而为）。
+    // 缺失的模型用 `source.max_input_tokens` 兜底。
+    context_lengths: &std::collections::HashMap<String, u64>,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut all = load_models(data_dir)?;
+    let existing: std::collections::HashSet<String> = all.iter().map(|m| m.id.clone()).collect();
+    let mut added = Vec::new();
+    let mut skipped = Vec::new();
+
+    for raw in ids {
+        let id = raw.trim();
+        if id.is_empty() {
+            continue;
+        }
+        if existing.contains(id) {
+            skipped.push(id.to_string());
+            continue;
+        }
+        let vendor = if source.vendor.trim().is_empty() {
+            "Custom".to_string()
+        } else {
+            source.vendor.trim().to_string()
+        };
+        // 优先用该模型自己上报的窗口；没有则回退来源配置的值
+        let max_input = context_lengths
+            .get(id)
+            .copied()
+            .or(source.max_input_tokens);
+        all.push(ModelConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            vendor,
+            url: source.url.clone(),
+            api_key: source.api_key.clone(),
+            supports_tool_call,
+            supports_images,
+            max_input_tokens: max_input,
+            max_output_tokens: source.max_output_tokens,
+            headers: source.headers.clone(),
+        });
+        added.push(id.to_string());
+    }
+
+    if !added.is_empty() {
+        save_models(data_dir, &all)?;
+    }
+    Ok((added, skipped))
+}
+
+/// 编辑已有模型的可变字段。`api_key` 为 None/空串时**保持原 Key**。
+pub fn update_model(
+    data_dir: &Path,
+    id: &str,
+    name: Option<String>,
+    url: Option<String>,
+    api_key: Option<String>,
+    supports_tool_call: Option<bool>,
+    supports_images: Option<bool>,
+    headers: Option<std::collections::BTreeMap<String, String>>,
+) -> Result<(), String> {
+    let mut all = load_models(data_dir)?;
+    let Some(m) = all.iter_mut().find(|x| x.id == id) else {
+        return Err(format!("找不到模型「{id}」"));
+    };
+    if let Some(n) = name {
+        let n = n.trim();
+        m.name = if n.is_empty() { id.to_string() } else { n.to_string() };
+    }
+    if let Some(u) = url {
+        let u = u.trim().trim_end_matches('/').to_string();
+        if !u.starts_with("http://") && !u.starts_with("https://") {
+            return Err("URL 必须以 http:// 或 https:// 开头".into());
+        }
+        if u.is_empty() {
+            return Err("URL 不能为空".into());
+        }
+        m.url = u;
+    }
+    if let Some(k) = api_key {
+        let k = k.trim().to_string();
+        if !k.is_empty() {
+            m.api_key = k;
+        }
+    }
+    if let Some(t) = supports_tool_call {
+        m.supports_tool_call = t;
+    }
+    if let Some(i) = supports_images {
+        m.supports_images = i;
+    }
+    if let Some(h) = headers {
+        m.headers = h;
+    }
+    save_models(data_dir, &all)?;
+    Ok(())
+}
+
+/// 重命名**接口模型 id**（发给提供商的 `model` 字段）。
+///
+/// 这和「显示名」是两回事：只改 name 不会让请求换模型。
+/// 显示名若原本等于旧 id / 为空，会顺带同步成新 id，避免界面仍像旧模型。
+pub fn rename_model(data_dir: &Path, old_id: &str, new_id: &str) -> Result<(), String> {
+    let old_id = old_id.trim();
+    let new_id = new_id.trim();
+    if old_id.is_empty() || new_id.is_empty() {
+        return Err("模型 ID 不能为空".into());
+    }
+    if old_id == new_id {
+        return Ok(());
+    }
+    let mut all = load_models(data_dir)?;
+    if all.iter().any(|m| m.id == new_id) {
+        return Err(format!("模型 ID「{new_id}」已存在，请换一个"));
+    }
+    let Some(m) = all.iter_mut().find(|x| x.id == old_id) else {
+        return Err(format!("找不到模型「{old_id}」"));
+    };
+    m.id = new_id.to_string();
+    if m.name.trim().is_empty() || m.name == old_id {
+        m.name = new_id.to_string();
+    }
+    save_models(data_dir, &all)?;
+    Ok(())
+}
+
+/// 给编辑表单用的视图：**不回传完整 apiKey**，只给「有没有 Key + 掩码」。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelEditView {
+    pub id: String,
+    pub name: String,
+    pub vendor: String,
+    pub url: String,
+    pub supports_tool_call: bool,
+    pub supports_images: bool,
+    /// 额外请求头，已格式化成 `Key: Value` 逐行文本
+    pub headers_text: String,
+    pub has_key: bool,
+    pub key_preview: String,
+}
+
+impl From<&ModelConfig> for ModelEditView {
+    fn from(m: &ModelConfig) -> Self {
+        let headers_text = m
+            .headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self {
+            id: m.id.clone(),
+            name: m.name.clone(),
+            vendor: m.vendor.clone(),
+            url: m.url.clone(),
+            supports_tool_call: m.supports_tool_call,
+            supports_images: m.supports_images,
+            headers_text,
+            has_key: !m.api_key.trim().is_empty(),
+            key_preview: redact_key_str(&m.api_key),
+        }
+    }
+}
+
 /// 按 id 找一个模型
 pub fn find_model(data_dir: &Path, id: &str) -> Result<ModelConfig, String> {
     let models = load_models(data_dir)?;
@@ -257,6 +440,23 @@ pub fn find_model(data_dir: &Path, id: &str) -> Result<ModelConfig, String> {
         .into_iter()
         .find(|m| m.id == id)
         .ok_or_else(|| format!("找不到模型「{id}」"))
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            vendor: String::new(),
+            url: String::new(),
+            api_key: String::new(),
+            supports_tool_call: false,
+            supports_images: false,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            headers: Default::default(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +473,11 @@ pub struct AgentSettings {
     /// 面板失去焦点时自动收起为悬浮球（防止一直挡屏幕）。
     /// 默认开 —— 悬浮球的本分是「用时展开、完事让路」。
     pub blur_collapse: bool,
+    /// 可选：WorkBuddy 交接文件的额外落盘目录（如 `~/.workbuddy/plans`）。
+    /// 空/未配置 = 只写 `agent-data/dispatch/workbuddy/`。
+    /// 非空时写入仍须过文件权限网关（Full），失败不阻断主交接。
+    #[serde(default)]
+    pub dispatch_wb_drop_dir: Option<String>,
 }
 
 impl Default for AgentSettings {
@@ -281,6 +486,7 @@ impl Default for AgentSettings {
             selected_model: None,
             last_session: None,
             blur_collapse: true,
+            dispatch_wb_drop_dir: None,
         }
     }
 }
@@ -387,9 +593,7 @@ mod tests {
             api_key: "sk-1234567890abcdefghij".into(),
             supports_tool_call: true,
             supports_images: false,
-            max_input_tokens: None,
-            max_output_tokens: None,
-            headers: Default::default(),
+            ..Default::default()
         };
         let r = m.redacted_key();
         assert!(r.starts_with("sk-123"));
@@ -407,9 +611,7 @@ mod tests {
             api_key: "short".into(),
             supports_tool_call: false,
             supports_images: false,
-            max_input_tokens: None,
-            max_output_tokens: None,
-            headers: Default::default(),
+            ..Default::default()
         };
         assert_eq!(m.redacted_key(), "***");
     }
@@ -425,12 +627,11 @@ mod tests {
             api_key: "k".into(),
             supports_tool_call: true,
             supports_images: false,
-            max_input_tokens: None,
-            max_output_tokens: None,
             headers: headers
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -500,9 +701,7 @@ mod tests {
             api_key: "k".into(),
             supports_tool_call: false,
             supports_images: false,
-            max_input_tokens: None,
-            max_output_tokens: None,
-            headers: Default::default(),
+            ..Default::default()
         };
         assert_eq!(
             m.chat_endpoint(),
@@ -522,10 +721,136 @@ mod tests {
             supports_images: true,
             max_input_tokens: Some(262144),
             max_output_tokens: Some(65536),
-            headers: Default::default(),
+            ..Default::default()
         };
         let v = ModelView::from(&m);
         let j = serde_json::to_string(&v).unwrap();
         assert!(!j.contains("SECRET"), "ModelView 绝不能带 apiKey: {j}");
+    }
+
+    #[test]
+    fn edit_view_masks_key_and_formats_headers() {
+        let m = ModelConfig {
+            id: "m1".into(),
+            name: "M1".into(),
+            vendor: "Custom".into(),
+            url: "https://x/v1".into(),
+            api_key: "sk-1234567890abcdefghij".into(),
+            supports_tool_call: true,
+            supports_images: false,
+            headers: [("x-foo".into(), "bar".into())].into_iter().collect(),
+            ..Default::default()
+        };
+        let v = ModelEditView::from(&m);
+        let j = serde_json::to_string(&v).unwrap();
+        assert!(!j.contains("abcdefghij"), "编辑视图不能带完整 Key: {j}");
+        assert!(v.has_key);
+        assert!(v.key_preview.starts_with("sk-123"));
+        assert_eq!(v.headers_text, "x-foo: bar");
+    }
+
+    #[test]
+    fn update_model_keeps_key_when_blank() {
+        let dir = std::env::temp_dir().join(format!("fa-edit-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let m = ModelConfig {
+            id: "keep".into(),
+            name: "Keep".into(),
+            url: "https://a/v1".into(),
+            api_key: "sk-ORIGINALKEY12345".into(),
+            supports_tool_call: true,
+            supports_images: false,
+            ..Default::default()
+        };
+        add_model(&dir, m).unwrap();
+        update_model(
+            &dir,
+            "keep",
+            Some("新名字".into()),
+            Some("https://b/v1/".into()),
+            Some("   ".into()),
+            Some(false),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        let got = find_model(&dir, "keep").unwrap();
+        assert_eq!(got.name, "新名字");
+        assert_eq!(got.url, "https://b/v1");
+        assert_eq!(got.api_key, "sk-ORIGINALKEY12345", "空 Key 必须保留原值");
+        assert!(!got.supports_tool_call);
+        assert!(got.supports_images);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_model_changes_api_id_and_keeps_distinct_display_name() {
+        let dir = std::env::temp_dir().join(format!("fa-rename-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("models.json"), "[]").unwrap();
+        add_model(
+            &dir,
+            ModelConfig {
+                id: "deepseek-v4.1-flash".into(),
+                name: "glm5.3-flash".into(),
+                url: "https://ark.example.com/v3".into(),
+                api_key: "k".into(),
+                supports_tool_call: true,
+                supports_images: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        rename_model(&dir, "deepseek-v4.1-flash", "glm-5.3-flash").unwrap();
+        let got = find_model(&dir, "glm-5.3-flash").unwrap();
+        assert_eq!(got.id, "glm-5.3-flash");
+        assert_eq!(got.name, "glm5.3-flash", "独立显示名不应被 rename 冲掉");
+        assert!(find_model(&dir, "deepseek-v4.1-flash").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_skips_existing_and_reuses_source_creds() {
+        let dir = std::env::temp_dir().join(format!("fa-import-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("models.json"), "[]").unwrap();
+        let src = ModelConfig {
+            id: "src".into(),
+            name: "Source".into(),
+            vendor: "VendorA".into(),
+            url: "https://api.vendor.com/v1".into(),
+            api_key: "sk-SOURCEKEY".into(),
+            supports_tool_call: false,
+            supports_images: false,
+            ..Default::default()
+        };
+        add_model(&dir, src.clone()).unwrap();
+        let mut ctx = std::collections::HashMap::new();
+        ctx.insert("alpha".to_string(), 262_144u64);
+        let (added, skipped) = import_models_from_source(
+            &dir,
+            &src,
+            &["alpha".into(), "src".into(), "beta".into()],
+            true,
+            true,
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(added, vec!["alpha", "beta"]);
+        assert_eq!(skipped, vec!["src"], "已存在的 id 不得覆盖");
+        let a = find_model(&dir, "alpha").unwrap();
+        assert_eq!(a.url, src.url);
+        assert_eq!(a.api_key, src.api_key);
+        assert_eq!(a.vendor, "VendorA");
+        assert!(a.supports_tool_call);
+        assert_eq!(
+            a.max_input_tokens,
+            Some(262_144),
+            "拉取到的 context_length 应写入 maxInputTokens"
+        );
+        // 没上报窗口的模型 → 回退来源配置（此处为 None）
+        let b = find_model(&dir, "beta").unwrap();
+        assert_eq!(b.max_input_tokens, None, "无 context_length 时保持来源值");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -8,11 +8,16 @@
 //! ## 布局
 //! ```text
 //!   agent-data/sessions/
-//!     current.txt        ← 当前会话 id（一行文本）
-//!     <id>.json          ← 一个会话的全部消息
+//!     current.txt          ← 当前会话 id（一行文本）
+//!     <id>.json            ← 一个会话的全部消息
+//!     <id>.grants.json     ← 该会话「整个任务」档的临时授权（无授权时不存在）
 //! ```
+//!
+//! 授权为什么放在这：**跟着会话一起生、一起死**。会话删掉 → 授权文件一并无了，
+//! 不需要额外的撤销逻辑，也不会留下孤儿授权（同「目录删了记忆自然没了」的思路）。
 //! 单会话消息数有上限（超出从头截断），避免文件无限长大。
 
+use crate::permission;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -26,14 +31,68 @@ const MAX_MESSAGES: usize = 400;
 /// 折叠后单条工具结果的展示上限（字符）
 const FOLDED_DETAIL_LIMIT: usize = 120;
 
+/// 单条助手消息保留的思考过程上限（字符）
+///
+/// 思维链有可能比正文长好几倍（长任务里一轮 CoT 几万字）。落盘只留**头部**
+/// 并加一行截断说明 —— 用户回看时想知道"它当时怎么想的"，不需要逐字复读；
+/// 而少数模型会把整篇正文重复吐在 reasoning 里，不设限会让会话文件失控。
+const REASONING_LIMIT: usize = 8 * 1024;
+
+/// 思考过程的截断说明（截断时追加在末尾）
+const REASONING_CUT_NOTE: &str = "\n\n……（思考过程过长，已截断）";
+
+/// 时间线条目单条的落盘上限（字符）。
+///
+/// 为什么不像以前那样**整组折叠成一行**（见 [`cap_steps`]）：折叠把"做了几步、
+/// 哪一步的思考对应哪个工具"全部抹平了，用户回看时只剩
+/// `[已执行：read_file、grep（共 12 次工具调用）]` —— 等于"做过的事又消失一次"
+/// （2026-09-22 用户报的第二个问题）。现在保留条目与顺序，只在**单条**上截断。
+const STEP_DETAIL_LIMIT: usize = 300;
+
+/// 单轮落盘的时间线条目数上限（超出只留最近的，前面补一条省略说明）。
+///
+/// 会话是**全量 JSON 读写**，单文件体积要控制：50 轮的 agent 跑法可能产生
+/// 150+ 条目。300 字 × 60 条 ≈ 18KB/轮，仍远低于"整篇工具输出原文"。
+const STEPS_LIMIT: usize = 60;
+
+/// 单轮落盘的链路状态条目上限（限流退避通知这类，只留最后几条）
+const STATUS_STEPS_LIMIT: usize = 8;
+
+/// 按上限截断思考过程（只截落盘，不影响内存里已展示的内容）
+fn cap_reasoning(s: &str) -> String {
+    if s.len() <= REASONING_LIMIT {
+        return s.to_string();
+    }
+    // 按 char 边界安全地截到 REASONING_LIMIT 字节以内
+    let mut cut = REASONING_LIMIT;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{}", &s[..cut], REASONING_CUT_NOTE)
+}
+
+/// 按字符数（不是字节）截断，超限时追加截断说明。
+fn cap_chars(s: &str, limit: usize) -> String {
+    if s.chars().count() <= limit {
+        return s.to_string();
+    }
+    format!("{}……（已截断）", s.chars().take(limit).collect::<String>())
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// 主会话的固定标题。主会话不可删、不参与「首条消息改名」，
 /// 名字必须一眼能认出，否则它在列表里和普通任务会话无从区分。
 const MAIN_TITLE: &str = "主聊天";
 
-/// 会话类型。整库**有且仅有一条** `Main`，其余都是 `Task`。
+/// 会话类型。整库**有且仅有一条** `Main`；`Fork` 从主会话分叉出来，其余都是 `Task`。
 pub mod kind {
     pub const MAIN: &str = "main";
     pub const TASK: &str = "task";
+    /// 从**主聊天**分叉出来的分支会话。只能由主聊天分叉（不能分叉分支/任务）。
+    pub const FORK: &str = "fork";
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +121,25 @@ pub struct StoredMessage {
     /// assistant 消息的执行步骤
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<StoredStep>,
+    /// 本轮的思考过程（思维链）。**老数据没有这个字段 → None**。
+    ///
+    /// 只存**不用** —— 不回灌给模型（见 `history.rs`）。存它是为了用户回看，
+    /// 不是为了给后续轮次当上下文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// 本轮被用户中断，`text` 是**半截**正文。
+    ///
+    /// 用独立字段而不是在 text 末尾追加"（已中断）"：后者会污染复制、
+    /// 搜索和历史回灌的字节，且一旦落盘就再也分不清哪部分是模型原话。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interrupted: bool,
+    /// 生成本条回答的模型 id（供「每天每模型」用量统计）。老数据没有 → None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// 本轮问答的 token 用量合计（含中途调工具的各轮）。
+    /// 服务端没返回 usage 时是 None —— 这种条目不进用量统计，也不显示角标。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::llm::TokenUsage>,
     pub at: u64,
 }
 
@@ -75,10 +153,28 @@ pub struct Session {
     pub created_at: u64,
     pub updated_at: u64,
     pub messages: Vec<StoredMessage>,
-    /// `main` | `task`，见 [`kind`]。老数据没有这个字段 → 默认 `task`，
+    /// `main` | `task` | `fork`，见 [`kind`]。老数据没有这个字段 → 默认 `task`，
     /// 由 [`unique_main`] 在首次加载时自愈出一条 main，无需迁移脚本。
     #[serde(default = "default_kind")]
     pub kind: String,
+    /// 分叉来源的会话 id（只有 `kind == "fork"` 时有）。
+    /// **只作审计与展示** —— 不做回流/合并/同步（分叉不是 git branch）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
+    /// 分叉点：源会话里的第几条消息（下标）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_at: Option<usize>,
+    /// **上下文摘要**（compact 产物）。覆盖 `summary_upto` 之前的所有消息。
+    ///
+    /// 为什么必须**落盘**而不是每次读取时现算：prompt cache 按 token 前缀
+    /// 逐字节比对，摘要若每轮重新生成（模型输出天然有随机性），前缀就会抖动，
+    /// 其后全部 token 按未命中价重付。落盘一次 = 写进去什么样，后面读出来就什么样。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// 摘要覆盖到第几条消息（下标，不含）。`summary_upto = n` 表示
+    /// `messages[0..n]` 已被 `summary` 概括，回灌时从 `messages[n..]` 取。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_upto: Option<usize>,
 }
 
 fn default_kind() -> String {
@@ -88,6 +184,14 @@ fn default_kind() -> String {
 impl Session {
     pub fn is_main(&self) -> bool {
         self.kind == kind::MAIN
+    }
+
+    /// 能不能被分叉 —— **只有主聊天可以**。
+    ///
+    /// 用户定案：主聊天是"关系的主线"，从它上面挑一个上下文窗口开一条新线才有意义；
+    /// 任务会话本来就是一次性的，分叉它只会制造一堆没人认领的碎片。
+    pub fn can_fork(&self) -> bool {
+        self.is_main()
     }
 }
 
@@ -120,7 +224,23 @@ fn session_file(data_dir: &Path, id: &str) -> PathBuf {
     sessions_dir(data_dir).join(format!("{id}.json"))
 }
 
-fn now_ms() -> u64 {
+/// 某会话的临时授权文件：`sessions/<id>.grants.json`
+///
+/// 与 `<id>.json` **平级**（不是子目录）—— 会话本来就是扁平存储，
+/// 不为了一个授权文件引入目录层级。
+fn grants_file(data_dir: &Path, id: &str) -> PathBuf {
+    sessions_dir(data_dir).join(format!("{id}.grants.json"))
+}
+
+/// 判断某个文件是不是授权文件（`list()` 要靠它把授权和会话分开）
+fn is_grants_file(p: &Path) -> bool {
+    p.file_name()
+        .and_then(|x| x.to_str())
+        .is_some_and(|n| n.ends_with(".grants.json"))
+}
+
+/// 当前 epoch 毫秒（会话/summary 时间戳共用口径）。
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -141,7 +261,15 @@ fn new_id() -> String {
 
 fn read_session(path: &Path) -> Option<Session> {
     let txt = std::fs::read_to_string(path).ok()?;
-    let mut s = serde_json::from_str::<Session>(&txt).ok()?;
+    let mut s = match serde_json::from_str::<Session>(&txt) {
+        Ok(s) => s,
+        Err(e) => {
+            // 静默跳过会让会话"凭空消失"，而且 `unique_main` 可能顺势把**另一条**
+            // 会话升成主会话 —— 到时候完全看不出原因。留一行痕迹。
+            eprintln!("[sessions] ⚠️ {} 解析失败，本次跳过: {e}", path.display());
+            return None;
+        }
+    };
     sanitize_legacy_images(&mut s);
     Some(s)
 }
@@ -163,6 +291,14 @@ fn write_session(data_dir: &Path, s: &Session) -> Result<(), String> {
     let path = session_file(data_dir, &s.id);
     let txt = serde_json::to_string(s).map_err(|e| format!("序列化会话失败: {e}"))?;
     std::fs::write(&path, txt).map_err(|e| format!("写会话失败: {e}"))
+}
+
+/// 落盘一个会话（对外入口）。
+///
+/// 给 compact 摘要写入用：`history::compact` 生成摘要后需要把 `summary` /
+/// `summary_upto` 写回会话文件，而底层 `write_session` 是私有的。
+pub fn save(data_dir: &Path, s: &Session) -> Result<(), String> {
+    write_session(data_dir, s)
 }
 
 /// 当前会话 id（没记录过返回 None）
@@ -194,6 +330,10 @@ pub fn new_session(data_dir: &Path) -> Session {
         updated_at: now,
         messages: Vec::new(),
         kind: kind::TASK.into(),
+        forked_from: None,
+        fork_at: None,
+        summary: None,
+        summary_upto: None,
     };
     let _ = write_session(data_dir, &s);
     set_current(data_dir, &s.id);
@@ -237,8 +377,14 @@ pub fn unique_main(data_dir: &Path) -> Session {
     let main_id = all[main_idx].id.clone();
 
     for s in all.iter_mut() {
+        // ⚠️ FORK 必须显式保留。这里原来对所有非 main 一律写成 TASK，
+        //    而 `ensure_current` **每次**都会调 `unique_main` 并写回磁盘 ——
+        //    照旧逻辑，分叉会话在下一次任何会话操作后就会被降级成普通任务会话
+        //    （"不可再分叉"的约束随之失效）。这是本项目最容易踩的一个坑。
         let want_kind = if s.id == main_id {
             kind::MAIN
+        } else if s.kind == kind::FORK {
+            kind::FORK
         } else {
             kind::TASK
         };
@@ -267,6 +413,10 @@ fn create_main(data_dir: &Path) -> Session {
         updated_at: now,
         messages: Vec::new(),
         kind: kind::MAIN.into(),
+        forked_from: None,
+        fork_at: None,
+        summary: None,
+        summary_upto: None,
     };
     let _ = write_session(data_dir, &s);
     s
@@ -296,6 +446,63 @@ pub fn load(data_dir: &Path, id: &str) -> Option<Session> {
     read_session(&session_file(data_dir, id))
 }
 
+// ---------------------------------------------------------------------------
+// 临时授权（「整个任务」档）
+// ---------------------------------------------------------------------------
+
+// ⚠️ 这三个是「申请权限」的落盘通道，已实现且有单测覆盖，
+//    但**工具层还没接线**（见 docs/02-PERMISSION-REQUEST.md 第 5 项）。
+//    接线后 allow 应全部删掉。
+#[allow(dead_code)]
+#[derive(Debug, Serialize, Deserialize)]
+struct GrantsFile {
+    #[serde(default)]
+    grants: Vec<permission::Grant>,
+}
+
+/// 读某会话的临时授权。**文件不存在 = 空表，不是错误**。
+#[allow(dead_code)]
+pub fn load_grants(data_dir: &Path, id: &str) -> Vec<permission::Grant> {
+    let path = grants_file(data_dir, id);
+    let Ok(txt) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    match serde_json::from_str::<GrantsFile>(&txt) {
+        Ok(f) => f.grants,
+        Err(e) => {
+            // 坏文件按空表处理。方向是**保守的**：空表 = 回到纯规则判定 = 更严，
+            // 不会因为文件损坏而多放行什么。
+            eprintln!(
+                "[float-agent] ⚠️ {} 解析失败（{e}），本次按「无临时授权」处理",
+                path.display()
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// 写某会话的临时授权。**空表 → 删文件**，不留空壳。
+#[allow(dead_code)]
+pub fn save_grants(data_dir: &Path, id: &str, grants: &[permission::Grant]) -> Result<(), String> {
+    let path = grants_file(data_dir, id);
+
+    if grants.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("清理 {} 失败: {e}", path.display())),
+        };
+    }
+
+    let dir = sessions_dir(data_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("建会话目录失败: {e}"))?;
+    let file = GrantsFile {
+        grants: grants.to_vec(),
+    };
+    let txt = serde_json::to_string_pretty(&file).map_err(|e| format!("序列化授权失败: {e}"))?;
+    std::fs::write(&path, txt).map_err(|e| format!("写授权失败: {e}"))
+}
+
 /// 会话列表（**主会话永远置顶**，其余按最近更新倒序）
 pub fn list(data_dir: &Path) -> Vec<SessionMeta> {
     let cur = current_id(data_dir).unwrap_or_default();
@@ -306,6 +513,11 @@ pub fn list(data_dir: &Path) -> Vec<SessionMeta> {
     for e in entries.flatten() {
         let p = e.path();
         if p.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        // `sessions/<id>.grants.json` 是临时授权，不是会话。
+        // 不跳也能活（解析 `Session` 必失败会被跳过），但那是靠"碰巧"不是靠"明确"。
+        if is_grants_file(&p) {
             continue;
         }
         let Some(s) = read_session(&p) else { continue };
@@ -354,6 +566,9 @@ pub fn delete(data_dir: &Path, id: &str) -> Result<(), String> {
         }
     }
     std::fs::remove_file(&path).map_err(|e| format!("删除失败: {e}"))?;
+    // 授权跟着会话一起走 —— 会话都没了，「整个任务」档的授权不该留成孤儿。
+    // 失败不算错（本来就可能不存在），所以忽略返回值。
+    let _ = std::fs::remove_file(grants_file(data_dir, id));
     if current_id(data_dir).as_deref() == Some(id) {
         let _ = std::fs::remove_file(current_file(data_dir));
         let _ = ensure_current(data_dir);
@@ -361,52 +576,205 @@ pub fn delete(data_dir: &Path, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 往当前会话追加一轮对话（用户消息 + 助手回答）。
+/// 从第 `upto` 条消息起**删到末尾**（含 `upto` 自己），并把结果写回磁盘。
 ///
-/// ## 工具结果在这里就折叠掉（用户 2026-09-19 定案）
-/// assistant 消息的 `steps` 体积最大（一轮 grep 可能几 KB），落盘前就压成
-/// 一行摘要。为什么放在**落盘**而不是每轮组装时折：
+/// 语义（用户 2026-09-20 要求）：在对话流里点某条消息上的「删除」，
+/// 就是「从这条开始，后面全不要了」—— 包括这条。也就是把 `messages` 截成
+/// `messages[..upto]`。这是**不可恢复**的，前端必须二次确认。
 ///
-/// - prompt cache 按 token 前缀逐字节比对，**每轮读到的历史必须字节稳定**。
-///   若在 `history.rs` 里每轮现折，折叠逻辑一改（或 `harsh` 判定随顺序变化），
-///   已发出的历史就会"变形"，其后全部 token 按未命中价重付。
-/// - 落盘一次 → 写进去什么样，后面每轮读出来就什么样，天然稳定。
-/// - 折叠是**纯函数**（只依赖 steps 本身），不依赖"现在几点"，所以不会
-///   每次读盘得到不同结果。
+/// ## 为什么不删图片文件
+/// `messages[i].images` 存的是 `agent-data/images/` 里的**路径**。同一个路径
+/// 可能被分叉会话共享，也可能是用户手动引用过的文件 —— 删消息时顺手删文件
+/// 迟早会删掉别人还在用的东西。所以这里只切会话数据，图片留在盘上（宁可留垃圾，
+/// 不删不确定归属的文件）。
 ///
-/// 代价：原文不再保留，模型只能靠重调工具拿细节。但历史本就只回灌
-/// 最近 6h ∪ 最近 10 条（见 `history.rs`），窗口外的细节本来也带不上，
-/// 丢掉不影响实际能力。**`recall_turns` 工具查的是折叠后的文本**
-/// ——这是刻意的：查历史是为了找回"聊过什么"，不是回放工具输出。
-pub fn append_turn(
-    data_dir: &Path,
-    user_text: &str,
-    images: &[String],
-    answer: &str,
-    steps: &[StoredStep],
-) -> Result<(), String> {
+/// ## 为什么不动 `updated_at`
+/// `list()` 按 `updated_at` 倒排。删几条旧消息不该让会话在列表里"跳"到最前面，
+/// 保持时间戳原样，用户的列表顺序不会被这个操作打乱。
+///
+/// 返回截断后的会话。
+pub fn truncate(data_dir: &Path, id: &str, upto: usize) -> Result<Session, String> {
+    let path = session_file(data_dir, id);
+    let mut s = read_session(&path).ok_or_else(|| format!("会话 {id} 不存在或已损坏"))?;
+    if s.messages.is_empty() {
+        return Err("这个会话还没有消息可删".into());
+    }
+    // 下标越界就夹到末尾（前端手里的下标可能因为历史截断而偏大）——
+    // 夹到末尾等于"删掉最后一条"，仍然符合"从这条起往后删"的直觉，不会误删更多。
+    let idx = upto.min(s.messages.len() - 1);
+    s.messages.truncate(idx);
+    // 摘要失效检查：`summary` 概括的是 `messages[0..summary_upto]`。
+    // 若截断落进了这个区间（idx < summary_upto），被概括的消息已被删掉一部分，
+    // 摘要不再对应任何真实内容 → 必须一并丢弃，否则回灌会带上一段"凭空捏造"的上下文。
+    if s.summary_upto.map_or(false, |u| u > idx) {
+        s.summary = None;
+        s.summary_upto = None;
+    }
+    write_session(data_dir, &s)?;
+    Ok(s)
+}
+
+/// 从**主聊天**的某条消息处分叉出一条新会话。
+///
+/// ## 语义（用户 2026-09-20 修正）
+/// **分叉的上下文 = 下一轮实际会喂给模型的那段窗口**，不是"到那条为止的全部历史"。
+/// 也就是说：把主聊天切成 `messages[..=upto]` 这个前缀，再套用 [`crate::history::pick_window`]
+/// 的同一套规则（最近 [`crate::history::WINDOW_HOURS`] 小时 ∪ 最近
+/// [`crate::history::FALLBACK_TURNS`] 条），**只把选出来的那几条复制进新会话**。
+///
+/// 为什么必须和回灌共用规则：分叉的意义是"从这里接着聊"，而接着聊时模型真正
+/// 看到的就只有那个窗口。若把 400 条历史原样搬过去，新会话一开场的上下文预算
+/// 就白占一大截，而且和"从这条消息继续"的真实视图对不上。
+///
+/// 因为最后一条必然落在最近 `FALLBACK_TURNS` 条内，**分叉点自己一定在窗口里**。
+///
+/// ## 三条硬约束
+/// - **只有主聊天能分叉**（`can_fork`）。任务会话分叉只会产出没人认领的碎片。
+/// - 分叉点必须是 **assistant 完整回复**（不是 user）：挂在 user 上时新会话
+///   末条是未回答的提问，下一轮回灌再接用户输入会拼成 user→user，轮次结构
+///   是坏的。完整一轮的边界在 assistant 之后。要防的是「模型说了半句」，
+///   不是「assistant 之后」——流式未完成的消息本来就不该给出分叉入口。
+/// - **不继承源会话的 `.grants.json`**：新 id 天然没有那个文件。授权跟着会话
+///   生死是既定约定，分叉会话要授权就得在它自己里面重新批（批了也只活在它自己
+///   的 grants 文件里，删掉分叉就一并没有）。
+///
+/// 返回新会话，并把它设为当前会话。
+pub fn fork(data_dir: &Path, src: &Session, upto: usize) -> Result<Session, String> {
+    if !src.can_fork() {
+        return Err("只有主聊天可以被分叉".into());
+    }
+    if src.messages.is_empty() {
+        return Err("主聊天还没有消息，没有可分叉的点".into());
+    }
+    // 下标越界就夹到末尾 —— 前端手里的下标可能因为 400 条截断而偏大
+    let idx = upto.min(src.messages.len() - 1);
+    if src.messages[idx].role != "assistant" {
+        return Err("分叉点必须选在一条 AI 回复上".into());
+    }
+
+    let now = now_ms();
+    // 前缀 → 套用回灌同一套窗口规则（"下一轮塞什么，分叉的上下文就是什么"）
+    let window = crate::history::pick_window(&src.messages[..=idx], now);
+    if window.is_empty() {
+        return Err("分叉点之前没有落在上下文窗口里的消息".into());
+    }
+
+    // 标题优先取分叉点前最近一条用户提问 —— 会话列表里比 assistant 正文好认
+    let head: String = src.messages[..=idx]
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.text.trim().chars().take(18).collect::<String>())
+        .unwrap_or_default();
+    let s = Session {
+        id: new_id(),
+        // 「⑂」前缀让它在会话列表里一眼能认出来
+        title: if head.is_empty() {
+            "⑂ 分支会话".into()
+        } else {
+            format!("⑂ {head}")
+        },
+        created_at: now,
+        updated_at: now,
+        messages: window,
+        kind: kind::FORK.into(),
+        forked_from: Some(src.id.clone()),
+        fork_at: Some(idx),
+        // 分叉复制的是一个"窗口"，下标与原会话不同 —— 原摘要的 summary_upto
+        // 在新会话里对不上，直接不带（新会话从头开始积累自己的摘要）。
+        summary: None,
+        summary_upto: None,
+    };
+    write_session(data_dir, &s)?;
+    set_current(data_dir, &s.id);
+    Ok(s)
+}
+
+/// 一次 run 要落盘的全部内容。
+///
+/// 参数多到不该用位置参数传（`append_turn` 当年 5 个已经够呛，加上思考过程、
+/// 插话、中断标记就要 8 个），所以聚成结构体。
+pub struct TurnRecord<'a> {
+    /// 本轮用户消息
+    pub user_text: &'a str,
+    pub images: &'a [String],
+    /// 执行中「插话」进来的用户消息（按送达顺序）
+    pub steers: &'a [crate::agent::SteeredMsg],
+    /// 助手回答（正常情况下是完整答复；`interrupted` 时是半截）
+    pub answer: &'a str,
+    pub reasoning: Option<&'a str>,
+    pub steps: &'a [StoredStep],
+    pub interrupted: bool,
+    /// 本轮用的模型 id —— 用量统计要按模型分组
+    pub model: &'a str,
+    /// 本轮问答的 token 用量合计（全 0 则落盘时不写）
+    pub usage: crate::llm::TokenUsage,
+}
+
+/// 往当前会话追加一轮完整对话（用户消息 + 插话 + 助手结果）。
+///
+/// ## 落盘顺序的取舍
+/// 插话消息统一排在**本轮用户消息之后、助手结果之前**，而不是精确插在
+/// "当时已流出的正文"之间。理由：模型自己看到的顺序在内存 `messages` 里是
+/// 精确的；落盘只需保证"用户说了什么、答案是什么、能回看"。要做到 token 级
+/// 精确就得存多个 assistant 片段，存储模型会复杂一个量级，收益却只是"回看时
+/// 位置更准"——不值。
+///
+/// ## 落盘的其它约定
+/// - 工具步骤在这里**只限长、不折叠**（见 [`cap_steps`]）：保留
+///   `reasoning / tool_call / tool_result / status / error` 的顺序，界面才能
+///   还原成交错时间线。喂给模型的那份仍走 [`fold_steps`]（`history.rs` 读时）。
+/// - `reasoning` 只留头部（[`REASONING_LIMIT`]），并加截断说明。这是**旧字段**，
+///   新数据以 `steps` 里的 `reasoning` 条目为准；保留写入是为了老前端 / 回滚安全。
+/// - `interrupted` 的中断轮**照样落盘** —— 用户要看到自己那条消息和已产出的部分。
+pub fn append_run(data_dir: &Path, rec: &TurnRecord<'_>) -> Result<(), String> {
     let mut s = ensure_current(data_dir);
     let now = now_ms();
 
     s.messages.push(StoredMessage {
         role: "user".into(),
-        text: user_text.to_string(),
-        images: images.to_vec(),
+        text: rec.user_text.to_string(),
+        images: rec.images.to_vec(),
         steps: Vec::new(),
+        reasoning: None,
+        interrupted: false,
+        model: None,
+        usage: None,
         at: now,
     });
+
+    // 插话（执行中追加的指令）—— 也是普通 user 消息
+    for m in rec.steers {
+        s.messages.push(StoredMessage {
+            role: "user".into(),
+            text: m.text.clone(),
+            images: m.images.clone(),
+            steps: Vec::new(),
+            reasoning: None,
+            interrupted: false,
+            model: None,
+            usage: None,
+            at: now,
+        });
+    }
+
     s.messages.push(StoredMessage {
         role: "assistant".into(),
-        text: answer.to_string(),
+        text: rec.answer.to_string(),
         images: Vec::new(),
-        steps: fold_steps(steps),
+        steps: cap_steps(rec.steps),
+        reasoning: rec.reasoning.filter(|r| !r.is_empty()).map(cap_reasoning),
+        interrupted: rec.interrupted,
+        // 用量与模型只落在 assistant 这条上 —— 统计的就是"每次问答花了多少"
+        model: Some(rec.model.to_string()),
+        usage: (!rec.usage.is_zero()).then_some(rec.usage),
         at: now,
     });
 
     // 标题：首次有用户消息时定下来。
     // **主会话不参与** —— 它的名字固定为「主聊天」，被首条消息劫持后就认不出来了。
     if !s.is_main() && s.title == "新会话" {
-        let t: String = user_text.trim().chars().take(24).collect();
+        let t: String = rec.user_text.trim().chars().take(24).collect();
         if !t.is_empty() {
             s.title = t;
         }
@@ -427,6 +795,51 @@ pub fn append_turn(
     write_session(data_dir, &s)
 }
 
+/// 往当前会话追加一轮对话（用户消息 + 助手回答）。
+///
+/// ## 工具结果在这里就折叠掉（用户 2026-09-19 定案）
+/// assistant 消息的 `steps` 体积最大（一轮 grep 可能几 KB），落盘前就压成
+/// 一行摘要。为什么放在**落盘**而不是每轮组装时折：
+///
+/// - prompt cache 按 token 前缀逐字节比对，**每轮读到的历史必须字节稳定**。
+///   若在 `history.rs` 里每轮现折，折叠逻辑一改（或 `harsh` 判定随顺序变化），
+///   已发出的历史就会"变形"，其后全部 token 按未命中价重付。
+/// - 落盘一次 → 写进去什么样，后面每轮读出来就什么样，天然稳定。
+/// - 折叠是**纯函数**（只依赖 steps 本身），不依赖"现在几点"，所以不会
+///   每次读盘得到不同结果。
+///
+/// 代价：原文不再保留，模型只能靠重调工具拿细节。但历史本就只回灌
+/// 最近 6h ∪ 最近 10 条（见 `history.rs`），窗口外的细节本来也带不上，
+/// 丢掉不影响实际能力。**`recall_turns` 工具查的是折叠后的文本**
+/// ——这是刻意的：查历史是为了找回"聊过什么"，不是回放工具输出。
+///
+/// ⚠️ 保留旧签名（8+ 处单测在用）。新增能力走 [`append_run`]。
+///    lib.rs 已全部改走 `append_run`，所以这个壳目前只有测试在用。
+#[allow(dead_code)]
+pub fn append_turn(
+    data_dir: &Path,
+    user_text: &str,
+    images: &[String],
+    answer: &str,
+    steps: &[StoredStep],
+) -> Result<(), String> {
+    append_run(
+        data_dir,
+        &TurnRecord {
+            user_text,
+            images,
+            steers: &[],
+            answer,
+            reasoning: None,
+            steps,
+            interrupted: false,
+            // 旧壳不记用量（usage 全 0 时不落盘），模型留空
+            model: "",
+            usage: crate::llm::TokenUsage::default(),
+        },
+    )
+}
+
 /// 把 Rust 侧 AgentStep 转成可存储的步骤
 pub fn steps_from_agent(steps: &[crate::agent::AgentStep]) -> Vec<StoredStep> {
     steps
@@ -439,11 +852,88 @@ pub fn steps_from_agent(steps: &[crate::agent::AgentStep]) -> Vec<StoredStep> {
         .collect()
 }
 
+/// 落盘前给时间线条目"限长"，**但保留条目与顺序**。
+///
+/// ## 与 [`fold_steps`] 的分工（2026-09-22 用户拍板）
+///
+/// - 喂给**模型**的历史 → [`fold_steps`]：模型不需要回放工具输出，压成一行
+///   反而省 token，且字节稳定（prompt cache 友好）。
+/// - 存给**人**看的会话 → 本函数：保留 `reasoning / tool_call / tool_result /
+///   status / error` 的原始顺序，只截断单条 `detail`。这样界面能把
+///   「思考 → 调工具 → 思考 → 调工具」还原成交错时间线。
+///
+/// 原来的做法是落盘时就折叠成一整行，结果是**回看时步骤全没了** —— 用户
+/// 感知到的"它做的事消失了"其实有第二次（第一次是错误路径整轮不落盘，见
+/// `agent.rs::RunAbort`）。
+///
+/// ## 保留了什么
+/// - 顺序：不做任何重排、不合并相邻同种条目
+/// - 种类：reasoning / tool_call / tool_result / status / error / assistant 全留
+/// - 每条的 `detail`：截到 [`STEP_DETAIL_LIMIT`]，末尾加"（已截断）"
+///
+/// ## 砍掉了什么
+/// - reasoning 的**总预算**（[`REASONING_LIMIT`]）：超了就不再落后续思考条目，
+///   防止某个模型把整篇正文重复吐进 reasoning 里把会话文件撑爆
+/// - status 条目只留最后 [`STATUS_STEPS_LIMIT`] 条（限流退避通知会刷屏）
+/// - 总条数超 [`STEPS_LIMIT`] → 只留最近的，最前面补一条 `omitted` 说明
+pub fn cap_steps(steps: &[StoredStep]) -> Vec<StoredStep> {
+    let total_status = steps.iter().filter(|s| s.kind == "status").count();
+    let drop_status = total_status.saturating_sub(STATUS_STEPS_LIMIT);
+    let mut seen_status = 0usize;
+    let mut reason_used = 0usize;
+    let mut out: Vec<StoredStep> = Vec::with_capacity(steps.len());
+
+    for s in steps {
+        if s.kind == "status" {
+            seen_status += 1;
+            if seen_status <= drop_status {
+                continue;
+            }
+        }
+        let detail = if s.kind == "reasoning" || s.kind == "thought" {
+            if reason_used >= REASONING_LIMIT {
+                // 思考预算用尽 → 后面的思考条目直接不落（正文与工具照常保留）
+                continue;
+            }
+            let left = REASONING_LIMIT - reason_used;
+            // 思考条目只受**总预算**约束，不套用单条 300 字上限 ——
+            // "它当时怎么想的"正是回看时最想看的东西。
+            let d = cap_chars(&s.detail, left);
+            reason_used += d.len();
+            d
+        } else {
+            cap_chars(&s.detail, STEP_DETAIL_LIMIT)
+        };
+        out.push(StoredStep {
+            kind: s.kind.clone(),
+            name: s.name.clone(),
+            detail,
+        });
+    }
+
+    if out.len() > STEPS_LIMIT {
+        let cut = out.len() - STEPS_LIMIT;
+        out.drain(..cut);
+        out.insert(
+            0,
+            StoredStep {
+                kind: "omitted".into(),
+                name: None,
+                detail: format!("（本轮还有 {cut} 步更早的步骤，已省略）"),
+            },
+        );
+    }
+    out
+}
+
 /// 把 assistant 消息的 steps 压成一条摘要（历史回灌用）。
 ///
 /// 输出形如 `[已执行：read_file、grep_files（共 2 次工具调用）]`。
 /// **保留原始 `kind` 字段**（`tool_call`），`detail` 换成摘要 ——
 /// 这样下游看到的是"一条 steps 记录"，不必区分折叠前后。
+///
+/// ⚠️ 用途已收窄（2026-09-22）：**只服务于"喂给模型的历史"**（`history.rs`），
+///    不再用于落盘。落盘改走 [`cap_steps`]（保留条目与顺序）。
 ///
 /// 全部非 `tool_call`（例如只有 `thought`）→ 返回空 vec：这些步骤
 /// 在历史上没有回灌价值，模型正文里已经说了它想了什么。
@@ -491,6 +981,59 @@ pub fn fold_steps(steps: &[StoredStep]) -> Vec<StoredStep> {
         name: Some(shown.first().copied().unwrap_or("?").to_string()),
         detail: line,
     }]
+}
+
+// ---------------------------------------------------------------------------
+// 用量统计
+// ---------------------------------------------------------------------------
+
+/// 一条用量记录（每条带用量的 assistant 消息一条）。
+///
+/// 不在这里按日期聚合：只有前端能拿到系统的**本地时区**，
+/// Rust 侧硬按 UTC 算「今天」会把跨零点的对话算到隔壁日期。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRecord {
+    /// 消息时间戳（epoch ms）
+    pub at: u64,
+    /// 模型 id（老数据可能为空串）
+    pub model: String,
+    /// 所属会话 id
+    pub session: String,
+    pub usage: crate::llm::TokenUsage,
+}
+
+/// 扫描**全部**会话，收集所有带 token 用量的 assistant 消息。
+///
+/// 为什么在 Rust 侧读盘：用量是跨会话的全局账，前端只看得到当前会话，
+/// 拿不到别的会话的历史。
+pub fn usage_report(data_dir: &Path) -> Vec<UsageRecord> {
+    let mut out: Vec<UsageRecord> = Vec::new();
+    for meta in list(data_dir) {
+        let Some(s) = load(data_dir, &meta.id) else {
+            continue;
+        };
+        for m in &s.messages {
+            if m.role != "assistant" {
+                continue;
+            }
+            // Option<TokenUsage> 是 Copy，这里直接拷贝出来，不用借引用
+            let Some(u) = m.usage else {
+                continue;
+            };
+            if u.is_zero() {
+                continue;
+            }
+            out.push(UsageRecord {
+                at: m.at,
+                model: m.model.clone().unwrap_or_default(),
+                session: s.id.clone(),
+                usage: u,
+            });
+        }
+    }
+    out.sort_by_key(|r| r.at);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -670,6 +1213,175 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// 分叉：只带**下一轮的上下文窗口**，且**不会被 unique_main 降级**。
+    ///
+    /// 这条回归针对一个真实存在的坑：`unique_main` 原来对所有非 main 一律写成
+    /// task，而 `ensure_current` 每次调用都会跑它 —— 分叉会话在下一次任何会话
+    /// 操作后就会变成普通任务会话。所以要断言**磁盘上**的 kind，不只是内存返回值。
+    #[test]
+    fn fork_copies_prefix_and_is_not_demoted_by_unique_main() {
+        let d = tmp("fork_survives");
+        let main = ensure_current(&d);
+        append_turn(&d, "第一问", &[], "第一答", &[]).unwrap();
+        append_turn(&d, "第二问", &[], "第二答", &[]).unwrap();
+
+        let src = load(&d, &main.id).unwrap();
+        assert_eq!(src.messages.len(), 4);
+
+        // 下标 2 = "第二问"（user）→ 不能作为分叉点；下标 3 = "第二答"（assistant）
+        let f = fork(&d, &src, 3).unwrap();
+        assert_eq!(f.kind, kind::FORK);
+        assert_eq!(f.messages.len(), 4, "4 条都在窗口里");
+        assert_eq!(f.messages.last().unwrap().text, "第二答", "分叉点自己必须在窗口里");
+        assert_eq!(f.forked_from.as_deref(), Some(main.id.as_str()));
+        assert_eq!(f.fork_at, Some(3));
+        assert!(f.title.starts_with('⑂'), "标题要能一眼认出是分支");
+        // 分叉后自动切过去
+        assert_eq!(current_id(&d).as_deref(), Some(f.id.as_str()));
+
+        // 连调两次 unique_main（模拟后续任何会话操作）
+        let _ = unique_main(&d);
+        let _ = unique_main(&d);
+        let on_disk = load(&d, &f.id).unwrap();
+        assert_eq!(on_disk.kind, kind::FORK, "❌ 分叉会话被降级成任务会话了");
+        assert!(
+            list(&d).iter().any(|m| m.id == f.id && m.kind == kind::FORK),
+            "列表里也要还是 fork"
+        );
+        // 分叉会话是可删的普通会话
+        assert!(delete(&d, &f.id).is_ok());
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// **分叉带的是"下一轮会喂给模型的窗口"，不是全部历史**（用户 2026-09-20 修正）。
+    ///
+    /// 造 30 条：前 20 条是"很久以前"（时间窗外），后 10 条是刚聊的。
+    /// 分叉点取第 29 条（assistant 回复）→ 只应带最近 10 条，老消息一条都不进。
+    #[test]
+    fn fork_takes_only_the_injected_window() {
+        let d = tmp("fork_window");
+        let main = ensure_current(&d);
+        let mut s = load(&d, &main.id).unwrap();
+        let now = now_ms();
+        for i in 0..30u64 {
+            // 前 20 条 100 小时前（时间窗外、且超出最近 10 条）
+            let at = if i < 20 { now - 100 * 3600 * 1000 } else { now - 60_000 };
+            s.messages.push(StoredMessage {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                text: format!("m{i}"),
+                images: Vec::new(),
+                steps: Vec::new(),
+                reasoning: None,
+                interrupted: false,
+                model: None,
+                usage: None,
+                at,
+            });
+        }
+        write_session(&d, &s).unwrap();
+
+        let src = load(&d, &main.id).unwrap();
+        assert_eq!(src.messages.len(), 30);
+        // 下标 29 是 assistant（奇数）= 完整轮次边界
+        let f = fork(&d, &src, 29).unwrap();
+        assert_eq!(
+            f.messages.len(),
+            10,
+            "只带最近 10 条（时间窗外的老消息不进分叉）"
+        );
+        assert_eq!(f.messages.first().unwrap().text, "m20", "窗口起点");
+        assert_eq!(f.messages.last().unwrap().text, "m29", "分叉点收尾");
+        assert!(
+            f.messages.iter().all(|m| m.text != "m0" && m.text != "m10"),
+            "窗外老消息一条都不该被复制"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 「删除这条及之后」：把 messages 截成 `[..upto]`，并**写回磁盘**（不是只改内存）。
+    #[test]
+    fn truncate_drops_this_and_everything_after() {
+        let d = tmp("truncate");
+        let main = ensure_current(&d);
+        let _ = switch(&d, &main.id);
+        for i in 0..5 {
+            append_turn(&d, &format!("q{i}"), &[], &format!("a{i}"), &[]).unwrap();
+        }
+        assert_eq!(load(&d, &main.id).unwrap().messages.len(), 10, "5 问 5 答");
+
+        // 从第 4 条（q2）起删 → 只剩 q0/a0/q1/a1
+        let s = truncate(&d, &main.id, 4).unwrap();
+        assert_eq!(s.messages.len(), 4);
+        assert_eq!(s.messages.last().unwrap().text, "a1", "保留最后一条是 a1");
+
+        // ⚠️ 必须是**落盘的**：重载后还是 4 条，否则重启就复活了
+        let back = load(&d, &main.id).unwrap();
+        assert_eq!(back.messages.len(), 4);
+        assert!(
+            back.messages.iter().all(|m| m.text != "q2" && m.text != "a4"),
+            "被删的消息一条都不该留下"
+        );
+
+        // 下标越界 → 夹到末尾，等于只删最后一条（不能误删更多）
+        let s2 = truncate(&d, &main.id, 999).unwrap();
+        assert_eq!(s2.messages.len(), 3);
+        // 删空：upto = 0
+        let s3 = truncate(&d, &main.id, 0).unwrap();
+        assert!(s3.messages.is_empty(), "upto=0 应清空整个会话");
+        assert!(truncate(&d, &main.id, 0).is_err(), "空会话再删要报错，不能静默成功");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 分叉的准入规则：只有主聊天能分叉。
+    #[test]
+    fn fork_rejects_non_main() {
+        let d = tmp("fork_reject");
+        let main = unique_main(&d);
+        let _ = switch(&d, &main.id);
+        append_turn(&d, "问", &[], "答", &[]).unwrap();
+
+        // ① 任务会话不能分叉
+        let t = new_session(&d);
+        assert!(fork(&d, &t, 0).is_err(), "任务会话不该能被分叉");
+
+        // ② 分叉出来的会话也不能再分叉（"其他的不行"）
+        //    下标 1 = assistant（问/答 之后），是唯一合法分叉点
+        let _ = switch(&d, &main.id);
+        let src = load(&d, &main.id).unwrap();
+        let f = fork(&d, &src, 1).unwrap();
+        assert!(fork(&d, &f, 1).is_err(), "分叉出来的会话不该能再分叉");
+
+        // ③ 空的主聊天没有可分叉的点
+        let empty = create_main(&d);
+        assert!(fork(&d, &empty, 0).is_err(), "没有消息就没有分叉点");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 分叉点必须落在 assistant 完整回复上（落在 user 上，新会话末条是未回答的
+    /// 提问，接着发一句会拼成 user→user）。
+    #[test]
+    fn fork_point_must_be_assistant_message_and_clamps() {
+        let d = tmp("fork_point");
+        let main = ensure_current(&d);
+        append_turn(&d, "问", &[], "答", &[]).unwrap();
+        let src = load(&d, &main.id).unwrap();
+
+        // 下标 0 = user → 拒
+        assert!(fork(&d, &src, 0).is_err(), "分叉点不能落在用户消息上");
+        // 下标 1 = assistant → 合法
+        assert!(fork(&d, &src, 1).is_ok());
+        // 越界 → 夹到末尾（末尾是 assistant）→ 同样合法
+        let _ = switch(&d, &main.id);
+        let src = load(&d, &main.id).unwrap();
+        assert!(fork(&d, &src, 999).is_ok(), "越界应夹到末尾的 assistant 后可用");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn unique_main_demotes_extra_mains() {
         let d = tmp("main_dedupe");
@@ -728,20 +1440,32 @@ mod tests {
 
     // ---------------- 落盘折叠（fold_steps）----------------
 
+    // ---------------- 落盘时间线（cap_steps）----------------
+
     #[test]
-    fn append_turn_stores_folded_steps() {
-        let d = tmp("fold_store");
+    fn append_turn_keeps_timeline_order_with_capped_details() {
+        let d = tmp("cap_store");
         let s = ensure_current(&d);
         let steps = vec![
             StoredStep {
+                kind: "reasoning".into(),
+                name: None,
+                detail: "先看结构".into(),
+            },
+            StoredStep {
                 kind: "tool_call".into(),
                 name: Some("read_file".into()),
-                detail: "x".repeat(5000),
+                detail: format!("{{\"path\":\"a.rs\",\"pad\":\"{}\"}}", "x".repeat(5000)),
             },
             StoredStep {
                 kind: "tool_result".into(),
                 name: Some("read_file".into()),
                 detail: "y".repeat(5000),
+            },
+            StoredStep {
+                kind: "reasoning".into(),
+                name: None,
+                detail: "再看调用点".into(),
             },
             StoredStep {
                 kind: "tool_call".into(),
@@ -751,22 +1475,114 @@ mod tests {
         ];
         append_turn(&d, "看看", &[], "查了", &steps).unwrap();
 
-        // 重新读盘：steps 必须已是折叠版，原文不可残留
+        // 单条 detail 必须截断，否则一个 write_file 的整篇正文就进会话文件了
         let on_disk = std::fs::read_to_string(session_file(&d, &s.id)).unwrap();
         assert!(
-            !on_disk.contains("xxxx"),
-            "原文 detail 不该落盘（单会话文件会膨胀）"
+            !on_disk.contains(&"x".repeat(600)),
+            "单条 detail 超上限必须截断（会话是全量 JSON 读写）"
         );
 
         let after = load(&d, &s.id).unwrap();
         let st = &after.messages[1].steps;
-        assert_eq!(st.len(), 1, "折叠后只留一条摘要");
-        assert!(st[0].detail.contains("read_file"), "应列出工具名");
-        assert!(st[0].detail.contains("grep_files"));
-        assert!(st[0].detail.contains("2 次"), "应报调用次数: {}", st[0].detail);
-        assert!(st[0].detail.len() <= FOLDED_DETAIL_LIMIT);
+        let kinds: Vec<&str> = st.iter().map(|s| s.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "reasoning",
+                "tool_call",
+                "tool_result",
+                "reasoning",
+                "tool_call"
+            ],
+            "落盘必须保留条目与顺序 —— 以前折成一行，回看时步骤就'消失'了"
+        );
+        assert!(
+            st[1].detail.starts_with("{\"path\":\"a.rs\""),
+            "参数头部要留着（前端靠它显示路径）: {}",
+            st[1].detail
+        );
+        assert!(st[1].detail.ends_with("（已截断）"), "截断要有说明");
+        assert_eq!(st[0].detail, "先看结构", "短条目不该被动");
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cap_steps_keeps_only_last_statuses() {
+        let mut steps: Vec<StoredStep> = (0..12)
+            .map(|i| StoredStep {
+                kind: "status".into(),
+                name: None,
+                detail: format!("限流重试 {i}"),
+            })
+            .collect();
+        steps.push(StoredStep {
+            kind: "tool_call".into(),
+            name: Some("read_file".into()),
+            detail: "{}".into(),
+        });
+
+        let out = cap_steps(&steps);
+        let statuses: Vec<&str> = out
+            .iter()
+            .filter(|s| s.kind == "status")
+            .map(|s| s.detail.as_str())
+            .collect();
+        assert_eq!(statuses.len(), STATUS_STEPS_LIMIT, "状态条目只留最后几条");
+        assert_eq!(statuses[0], "限流重试 4", "留的是**最后**几条，不是最前几条");
+        assert_eq!(out.last().unwrap().kind, "tool_call", "顺序与工具条目都不能丢");
+
+        let empty = cap_steps(&[]);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn cap_steps_marks_omitted_when_too_many() {
+        let steps: Vec<StoredStep> = (0..STEPS_LIMIT + 10)
+            .map(|i| StoredStep {
+                kind: "tool_call".into(),
+                name: Some(format!("tool{i}")),
+                detail: "{}".into(),
+            })
+            .collect();
+
+        let out = cap_steps(&steps);
+        assert_eq!(out.len(), STEPS_LIMIT + 1, "超限时补一条省略说明");
+        assert_eq!(out[0].kind, "omitted");
+        assert!(out[0].detail.contains("10 步"), "要说明省了几步: {}", out[0].detail);
+        assert_eq!(out.last().unwrap().name.as_deref(), Some("tool69"), "留最近的那批");
+
+        // 不超限时不该冒出 omitted
+        let few = cap_steps(&steps[..3]);
+        assert_eq!(few.len(), 3);
+        assert!(few.iter().all(|s| s.kind == "tool_call"));
+    }
+
+    #[test]
+    fn cap_steps_stops_reasoning_after_budget() {
+        let mut steps = vec![StoredStep {
+            kind: "reasoning".into(),
+            name: None,
+            detail: "A".repeat(REASONING_LIMIT),
+        }];
+        steps.push(StoredStep {
+            kind: "reasoning".into(),
+            name: None,
+            detail: "这段不该落盘".into(),
+        });
+        steps.push(StoredStep {
+            kind: "tool_call".into(),
+            name: Some("read_file".into()),
+            detail: "{}".into(),
+        });
+
+        let out = cap_steps(&steps);
+        assert_eq!(
+            out.iter().filter(|s| s.kind == "reasoning").count(),
+            1,
+            "思考总预算用尽后不再落思考条目（防模型把正文重复吐进 reasoning）"
+        );
+        assert_eq!(out.last().unwrap().kind, "tool_call", "工具条目不受思考预算影响");
     }
 
     #[test]
@@ -825,6 +1641,10 @@ mod tests {
                 text: format!("问{i}"),
                 images: Vec::new(),
                 steps: Vec::new(),
+                reasoning: None,
+                interrupted: false,
+                model: None,
+                usage: None,
                 at: i as u64,
             })
             .collect();
@@ -834,6 +1654,83 @@ mod tests {
         let after = load(&d, &main.id).unwrap();
         assert!(after.messages.len() <= MAX_MESSAGES, "主会话同样受 400 条上限约束");
         assert!(after.is_main(), "截断不应改变会话类型");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- 临时授权（「整个任务」档落盘）----
+
+    #[test]
+    fn grants_roundtrip_and_delete_cleans_up() {
+        let d = tmp("grants_roundtrip");
+        let s = new_session(&d);
+        assert!(load_grants(&d, &s.id).is_empty(), "没写过就该是空表，不是错误");
+
+        let gs = vec![permission::Grant::lasting(
+            r"D:\work",
+            permission::Access::ReadWrite,
+            permission::GrantTier::Task,
+            "整个任务批了写",
+        )];
+        save_grants(&d, &s.id, &gs).unwrap();
+
+        let back = load_grants(&d, &s.id);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].tier, permission::GrantTier::Task);
+        assert_eq!(back[0].access, permission::Access::ReadWrite);
+        assert_eq!(back[0].prefix, PathBuf::from(r"D:\work"));
+
+        // 授权文件不能被 list() 当成会话 —— 否则会话列表里会多出幽灵条目
+        let ids: Vec<String> = list(&d).into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![s.id.clone()], "list 必须跳过 *.grants.json；实际 {ids:?}");
+
+        // 删除会话 → 授权一起走，不留孤儿
+        delete(&d, &s.id).unwrap();
+        assert!(
+            !grants_file(&d, &s.id).exists(),
+            "会话删了，「整个任务」档的授权不该留成孤儿"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn save_empty_grants_removes_file() {
+        let d = tmp("grants_empty");
+        let s = new_session(&d);
+
+        save_grants(
+            &d,
+            &s.id,
+            &[permission::Grant::once(
+                r"D:\a",
+                permission::Access::Read,
+                "",
+            )],
+        )
+        .unwrap();
+        assert!(grants_file(&d, &s.id).exists());
+
+        // 空表 → 删文件，不留空壳
+        save_grants(&d, &s.id, &[]).unwrap();
+        assert!(!grants_file(&d, &s.id).exists(), "空表应删文件不留空壳");
+
+        // 文件本来就不存在时再存一次空表也不该报错（幂等）
+        save_grants(&d, &s.id, &[]).unwrap();
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn corrupt_grants_file_falls_back_to_empty() {
+        // 坏文件按空表处理 —— 方向必须**保守**：无授权 = 回到纯规则判定 = 更严，
+        // 绝不能因为文件损坏而多放行什么。
+        let d = tmp("grants_corrupt");
+        let s = new_session(&d);
+        std::fs::create_dir_all(sessions_dir(&d)).unwrap();
+        std::fs::write(grants_file(&d, &s.id), "{ 这不是 JSON").unwrap();
+
+        assert!(load_grants(&d, &s.id).is_empty(), "坏文件应退化为空表");
 
         let _ = std::fs::remove_dir_all(&d);
     }

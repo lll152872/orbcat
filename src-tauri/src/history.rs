@@ -26,8 +26,19 @@
 //! 但模型得先知道"有东西可查"，所以 system prompt 尾部会追加一句告知
 //! （见 `agent::build_system_prompt` 的调用方）。
 
+use crate::config::ModelConfig;
 use crate::llm::ChatMessage;
 use crate::sessions::{self, StoredMessage};
+
+/// 摘要消息的固定头（学 WorkBuddy 的 `generateSummaryHeader`）。
+///
+/// 为什么要有固定头：① 模型看到这段会明白"下面是压缩过的历史，不是用户原话"，
+/// 不会把摘要当成用户刚说的话去回应；② 逐字节固定 → prompt cache 友好。
+const SUMMARY_HEADER: &str = "Summary of the conversation so far:\n\
+The conversation is between an AI agent and a user.\n\
+Use this to get up to speed, and continue helping the user as the AI agent.\n\
+Some contents may be omitted.\n\
+（以下是本会话较早内容的压缩摘要，供你恢复上下文；不是用户刚刚说的话。）";
 
 /// 时间窗：带多少小时内的对话
 pub const WINDOW_HOURS: u64 = 6;
@@ -52,12 +63,30 @@ struct Picked {
 ///
 /// 返回的 `ChatMessage` 顺序与磁盘一致（旧 → 新），可直接插在
 /// `[system]` 之后、当前用户输入之前。
+///
+/// **compact 摘要**：若会话带 `summary` / `summary_upto`，则
+/// `messages[0..summary_upto]` 不再逐条回灌，改为在最前面插一条
+/// 摘要消息（[`SUMMARY_HEADER`] + 摘要正文）。摘要之后的区间照常按
+/// 时间窗 ∪ 轮数兜底选取。
 pub fn build_history(data_dir: &std::path::Path, session_id: &str, now_ms: u64) -> Vec<ChatMessage> {
     let Some(s) = sessions::load(data_dir, session_id) else {
         return Vec::new();
     };
-    let picked = pick(&s.messages, now_ms);
-    picked.into_iter().map(to_chat_message).collect()
+
+    // 被摘要覆盖的消息（messages[0..upto]）不再逐条回灌：
+    // 直接对**未摘要区间**套用时间窗 ∪ 轮数兜底，规则与原来一致。
+    let upto = s.summary_upto.unwrap_or(0).min(s.messages.len());
+    let picked = pick(&s.messages[upto..], now_ms);
+
+    let mut out: Vec<ChatMessage> = Vec::new();
+    // 摘要放在最前（它在语义上"概括了更早的内容"，顺序上必须在所有存活消息之前）
+    if let Some(sum) = s.summary.as_deref() {
+        if !sum.trim().is_empty() {
+            out.push(ChatMessage::system(format!("{SUMMARY_HEADER}\n\n{sum}")));
+        }
+    }
+    out.extend(picked.into_iter().map(to_chat_message));
+    out
 }
 
 /// 挑出要回灌的消息（时间窗 ∪ 轮数兜底）
@@ -89,6 +118,18 @@ fn pick(messages: &[StoredMessage], now_ms: u64) -> Vec<Picked> {
             })
         })
         .collect()
+}
+
+/// **下一轮会喂给模型的那段上下文**（就是 [`pick`] 选出来的子集，按原顺序）。
+///
+/// 单独暴露出来是给 `sessions::fork` 用的：分叉的语义是"把下一轮的上下文
+/// 窗口截出来开一条新线"，所以它必须和回灌**共用同一套规则** —— 两边各写一份
+/// 迟早会不一致（改了窗口参数只改一处，分叉出来的上下文就和真实对话不符了）。
+///
+/// 注意：传入的切片通常是某个前缀（分叉点之前的消息），选出来的最后一条
+/// 一定落在最近 [`FALLBACK_TURNS`] 条之内，所以**分叉点自己必然在里面**。
+pub fn pick_window(messages: &[StoredMessage], now_ms: u64) -> Vec<StoredMessage> {
+    pick(messages, now_ms).into_iter().map(|p| p.msg).collect()
 }
 
 /// `StoredMessage` → `ChatMessage`
@@ -264,6 +305,206 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 // ---------------------------------------------------------------------------
+// compact —— 上下文压缩（打分保原文 + 模型摘要兜底）
+// ---------------------------------------------------------------------------
+
+/// 摘要时至少保留的最近消息条数（原文，不压）。
+///
+/// 为什么必须有下界：最近几条是模型最可能直接依赖的（当前话题、刚做的决定），
+/// 把它们也压成摘要会让模型"接不上话"。保守取 6（约 3 轮问答）。
+pub const COMPACT_KEEP_RECENT: usize = 6;
+
+/// 打分时进入"原文附录"的条数上限（高分者以原文形式保留在摘要里）。
+const COMPACT_QUOTE_TOP: usize = 5;
+
+/// 触发 compact 的水位（占上下文预算的比例）。
+///
+/// 为什么低于 agent loop 的 0.75：compact 本身要发一次模型请求（摘要），
+/// 留出余量避免"刚压缩完又超"。0.6 是"有压力但还宽裕"的位置。
+pub const COMPACT_TRIGGER_RATIO: f64 = 0.6;
+
+/// 单条消息的打分：分越高越值得保留原文。
+///
+/// 学 WorkBuddy 的 `calculateItemScore`，按本项目场景裁剪：
+/// - 位置分：越新越高（`index/len * 50`）
+/// - 含错误/重要等关键词：每个 +15
+/// - 内容长：说明信息量大，`min(len/100, 20)`
+/// - 工具调用记录：+30（"做过什么"是任务连续性的关键）
+fn score_message(m: &StoredMessage, index: usize, total: usize) -> i64 {
+    let mut s = 0i64;
+    if total > 0 {
+        s += (index as i64) * 50 / total as i64;
+    }
+    if !m.steps.is_empty() {
+        s += 30;
+    }
+    let len = m.text.chars().count();
+    if len > 100 {
+        s += ((len / 100).min(20)) as i64;
+    }
+    let low = m.text.to_lowercase();
+    for k in [
+        "错误", "失败", "error", "重要", "注意", "警告", "warning",
+        "决定", "约定", "bug", "修复", "不能", "必须",
+    ] {
+        if low.contains(k) {
+            s += 15;
+        }
+    }
+    s
+}
+
+/// 把一段消息压成纯文本记录（喂给摘要模型）。
+fn render_transcript(msgs: &[&StoredMessage]) -> String {
+    let mut out = String::new();
+    for m in msgs {
+        let who = if m.role == "user" { "用户" } else { "助手" };
+        // 单条截到 2000 字：摘要看的是"发生了什么"，不需要全文
+        let text: String = m.text.chars().take(2000).collect();
+        if text.trim().is_empty() {
+            continue;
+        }
+        out.push_str(&format!("[{who}] {text}\n"));
+    }
+    out
+}
+
+/// 调模型生成摘要（失败返回 Err，调用方决定是否降级）。
+async fn generate_summary(cfg: &ModelConfig, msgs: &[&StoredMessage]) -> Result<String, String> {
+    let transcript = render_transcript(msgs);
+    if transcript.trim().is_empty() {
+        return Err("待压缩区间没有有效文本".into());
+    }
+    let prompt = format!(
+        "请把下面这段「AI 助手与用户的历史对话」压缩成一份结构化摘要，\
+供后续轮次恢复上下文使用。\n\n\
+要求：\n\
+1. 保留：用户的目标与要求、已达成的决定与约定、改过/看过哪些文件、\
+遇到的错误与解决办法、未完成的待办。\n\
+2. 省略：寒暄、重复确认、工具的原始输出全文。\n\
+3. 用简洁的中文分条列出，不要写成「用户说/助手说」这类流水话术。\n\
+4. 只输出摘要正文，不要加开场白或结尾客套。\n\n\
+--- 对话记录开始 ---\n{transcript}\n--- 对话记录结束 ---"
+    );
+
+    let messages = vec![ChatMessage::user(prompt)];
+    let out = crate::llm::chat(cfg, messages, None).await?;
+    let text = out.text();
+    if text.trim().is_empty() {
+        return Err("模型返回了空摘要".into());
+    }
+    Ok(text.trim().to_string())
+}
+
+/// compact 的结果摘要（供日志/前端提示）
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactOutcome {
+    /// 本次被摘要覆盖的消息数
+    pub summarized: usize,
+    /// 保留原文的消息数
+    pub kept: usize,
+    /// 摘要字数
+    pub summary_chars: usize,
+}
+
+/// 对会话做一次 compact：把较早的消息压成摘要写回会话文件。
+///
+/// ## 为什么必须是**持久化**而不是读取时现压
+/// prompt cache 按 token 前缀逐字节比对。摘要若每轮重新生成，模型输出的
+/// 随机性会让前缀抖动，其后全部 token 按未命中价重付 —— 每一轮都多花钱。
+/// 落盘一次 = 写进去什么样，后面读出来就什么样，天然稳定。
+///
+/// ## 流程
+/// 1. 取"未摘要区间" `messages[start..]`（`start` = 上次的 `summary_upto`）
+/// 2. 只压其中较早的部分，尾部 [`COMPACT_KEEP_RECENT`] 条保留原文
+/// 3. 对**压缩区**打分，高分者以原文附录形式附在摘要后（尽量少丢关键信息）
+/// 4. 生成摘要 + 写入 `summary` / `summary_upto` 并落盘
+pub async fn compact(
+    cfg: &ModelConfig,
+    data_dir: &std::path::Path,
+    session_id: &str,
+    keep_recent: usize,
+    force: bool,
+    now_ms: u64,
+) -> Result<CompactOutcome, String> {
+    let mut s = sessions::load(data_dir, session_id)
+        .ok_or_else(|| format!("会话 {session_id} 不存在"))?;
+
+    let start = s.summary_upto.unwrap_or(0).min(s.messages.len());
+    let pending = &s.messages[start..];
+    if pending.len() <= keep_recent {
+        return Err(format!(
+            "消息太少（{} 条），无需压缩（保留线 {} 条）",
+            pending.len(),
+            keep_recent
+        ));
+    }
+
+    // 触发水位检查（force 时跳过）
+    if !force {
+        // 用模型窗口估算：超 COMPACT_TRIGGER_RATIO 才真压
+        let window = cfg
+            .max_input_tokens
+            .map(|n| n as usize)
+            .unwrap_or(128 * 1024);
+        let budget = ((window as f64) * COMPACT_TRIGGER_RATIO) as usize;
+        let est: usize = pending
+            .iter()
+            .map(|m| crate::llm::estimate_tokens(&m.text) + 4)
+            .sum();
+        if est <= budget {
+            return Err(format!("未达压缩水位（估算 {est} ≤ {budget}），跳过"));
+        }
+    }
+
+    let split = pending.len() - keep_recent;
+    let region: Vec<&StoredMessage> = pending[..split].iter().collect();
+
+    // 打分挑出高分者 → 原文附录（尽量别把关键信息压没）
+    let total = region.len();
+    let mut scored: Vec<(usize, i64)> = region
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (i, score_message(m, i, total)))
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut top: Vec<usize> = scored
+        .iter()
+        .take(COMPACT_QUOTE_TOP)
+        .map(|(i, _)| *i)
+        .collect();
+    top.sort_unstable(); // 恢复时间顺序
+
+    let mut summary = generate_summary(cfg, &region).await?;
+    if !top.is_empty() {
+        summary.push_str("\n\n【重要历史片段（原文保留）】\n");
+        for i in top {
+            let m = region[i];
+            let who = if m.role == "user" { "用户" } else { "助手" };
+            let text: String = m.text.chars().take(300).collect();
+            summary.push_str(&format!("- [{who}] {text}\n"));
+        }
+    }
+
+    let summary_chars = summary.chars().count();
+    s.summary = Some(summary);
+    s.summary_upto = Some(start + split);
+    s.updated_at = now_ms;
+    sessions::save(data_dir, &s)?;
+
+    eprintln!(
+        "[float-agent] compact 完成：摘要 {} 条消息 → {} 字，保留原文 {} 条",
+        split, summary_chars, keep_recent
+    );
+    Ok(CompactOutcome {
+        summarized: split,
+        kept: keep_recent,
+        summary_chars,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
 
@@ -278,6 +519,10 @@ mod tests {
             text: text.into(),
             images: Vec::new(),
             steps: Vec::new(),
+            reasoning: None,
+            interrupted: false,
+            model: None,
+            usage: None,
             at,
         }
     }
@@ -313,7 +558,7 @@ mod tests {
 
         let picked = pick(&msgs, now);
         // 时间窗带 1 条（刚说的），兜底带最后 10 条
-        assert_eq!(picked.len(), 10, "应为兜底的 10 条");
+        assert_eq!(picked.len(), FALLBACK_TURNS, "应为兜底条数 FALLBACK_TURNS");
         assert_eq!(picked.last().unwrap().msg.text, "刚说的");
         // 靠兜底进来的应被标记
         assert!(picked[0].fallback, "时间窗外的应标记 fallback");
@@ -502,5 +747,130 @@ mod tests {
     fn fmt_local_epoch_zero_is_utc_plus_8() {
         // 0 ms = 1970-01-01 00:00 UTC = 1970-01-01 08:00 本地
         assert_eq!(fmt_local(0), "1970-01-01 08:00");
+    }
+
+    // ---- compact 相关 ----
+
+    #[test]
+    fn score_prefers_newer_and_error_keywords() {
+        let old = msg("user", "普通内容", 100);
+        let new = msg("user", "普通内容", 200);
+        assert!(
+            score_message(&new, 9, 10) > score_message(&old, 0, 10),
+            "越新的消息分数应更高（位置分）"
+        );
+
+        let with_err = msg("assistant", "这里报错了：连接失败", 100);
+        let plain = msg("assistant", "一切正常", 100);
+        assert!(
+            score_message(&with_err, 5, 10) > score_message(&plain, 5, 10),
+            "含错误关键词的消息应更高分"
+        );
+    }
+
+    #[test]
+    fn score_rewards_tool_usage() {
+        let mut with_tools = msg("assistant", "查了", 100);
+        with_tools.steps = vec![StoredStep {
+            kind: "tool_call".into(),
+            name: Some("read_file".into()),
+            detail: "[已执行：read_file（共 1 次工具调用）]".into(),
+        }];
+        let without = msg("assistant", "查了", 100);
+        assert!(
+            score_message(&with_tools, 5, 10) > score_message(&without, 5, 10),
+            "有工具调用记录的消息应更高分"
+        );
+    }
+
+    /// 摘要生效：`summary_upto` 之前的消息不再逐条回灌，且摘要插在最前面
+    #[test]
+    fn summary_replaces_covered_messages() {
+        let d = std::env::temp_dir().join("float_agent_history_summary");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let s = sessions::new_session(&d);
+        sessions::append_turn(&d, "第一问", &[], "第一答", &[]).unwrap();
+        sessions::append_turn(&d, "第二问", &[], "第二答", &[]).unwrap();
+
+        // 手工写回带摘要的会话：前 2 条（第一问/第一答）被摘要覆盖
+        let mut sess = sessions::load(&d, &s.id).unwrap();
+        sess.summary = Some("用户先问了第一件事，已答复。".into());
+        sess.summary_upto = Some(2);
+        sessions::save(&d, &sess).unwrap();
+
+        let msgs = build_history(&d, &s.id, now);
+        // 期望：1 条摘要（system）+ 摘要之后的消息（第二问/第二答，若在窗口内）
+        let first = serde_json::to_string(&msgs[0]).unwrap();
+        assert!(first.contains("summary") || first.contains("Summary"), "首条应是摘要: {first}");
+        assert!(first.contains("第一件事"), "摘要正文应带上: {first}");
+
+        let all = serde_json::to_string(&msgs).unwrap();
+        assert!(!all.contains("第一问"), "被摘要覆盖的消息不应再逐条出现");
+        assert!(all.contains("第二问"), "摘要之后的消息应正常回灌");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 截断落进摘要区 → 摘要必须失效（否则回灌一段对不上的上下文）
+    #[test]
+    fn truncate_inside_summary_invalidates_it() {
+        let d = std::env::temp_dir().join("float_agent_trunc_summary");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+
+        let s = sessions::new_session(&d);
+        sessions::append_turn(&d, "q1", &[], "a1", &[]).unwrap();
+        sessions::append_turn(&d, "q2", &[], "a2", &[]).unwrap();
+
+        let mut sess = sessions::load(&d, &s.id).unwrap();
+        sess.summary = Some("旧摘要".into());
+        sess.summary_upto = Some(3);
+        sessions::save(&d, &sess).unwrap();
+
+        // 截到下标 1（只剩 1 条）→ 落在摘要覆盖区 [0,3) 内 → 摘要失效
+        let after = sessions::truncate(&d, &s.id, 1).unwrap();
+        assert!(after.summary.is_none(), "截断后摘要应被清空");
+        assert!(after.summary_upto.is_none(), "summary_upto 应被清空");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 截断发生在摘要区**之后** → 摘要仍然有效
+    #[test]
+    fn truncate_after_summary_keeps_it() {
+        let d = std::env::temp_dir().join("float_agent_trunc_keep");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+
+        let s = sessions::new_session(&d);
+        sessions::append_turn(&d, "q1", &[], "a1", &[]).unwrap();
+        sessions::append_turn(&d, "q2", &[], "a2", &[]).unwrap();
+
+        let mut sess = sessions::load(&d, &s.id).unwrap();
+        sess.summary = Some("摘要".into());
+        sess.summary_upto = Some(2); // 只覆盖前 2 条
+        sessions::save(&d, &sess).unwrap();
+
+        // 截到下标 3（保留 3 条）→ 摘要区 [0,2) 完好 → 摘要保留
+        let after = sessions::truncate(&d, &s.id, 3).unwrap();
+        assert_eq!(after.summary.as_deref(), Some("摘要"), "摘要区未被触及，应保留");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn token_estimate_cjk_vs_ascii() {
+        // 4 个 ASCII 字符 ≈ 1 token；CJK 1 字 ≈ 1 token
+        assert_eq!(crate::llm::estimate_tokens("abcd"), 1);
+        assert_eq!(crate::llm::estimate_tokens("中文四个字"), 5);
+        // 空串不 panic
+        assert_eq!(crate::llm::estimate_tokens(""), 0);
     }
 }

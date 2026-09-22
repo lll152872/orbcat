@@ -128,6 +128,210 @@ pub fn catalog(data_dir: &Path) -> String {
         .join("\n")
 }
 
+/// 一次最多自动加载几个技能 —— 防止用户一句话命中一堆、prompt 膨胀。
+const MAX_AUTOLOAD: usize = 3;
+
+/// 方案 B：按用户本轮消息的关键词**自动加载**命中的技能正文。
+///
+/// 与 `catalog()`（只给一行描述、靠模型自己调 `load_skill`）互补 ——
+/// 这里在组装 prompt 时就把命中技能的**全文**塞进去，模型不必再调工具，
+/// 从根上避免「模型觉得自己懂了、跳过 load_skill」导致的技能空转。
+///
+/// 触发词来源（按信号强度）：
+/// - **技能名**（`self-rebuild` / `dual-token-dashboard`；匹配时忽略
+///   连字符、下划线、大小写）
+/// - **描述里成对引号内的短语**：「…」『…』“…”"…"‘…’
+/// - 描述里**没有引号**时，退化用标点/空白切出的短语（长度 ≥ 2、
+///   剔除虚词），且要**至少命中两个**才算数 —— 压制误触发
+///
+/// 无命中返回空串（调用方据此跳过，不往 prompt 里塞空段）。
+pub fn autoload(data_dir: &Path, message: &str) -> String {
+    let msg = message.trim();
+    if msg.is_empty() {
+        return String::new();
+    }
+    let msg_norm = msg.to_lowercase();
+    let msg_stripped = strip_seps(msg);
+
+    let mut hits: Vec<(usize, Skill, String)> = Vec::new();
+    for sk in discover(data_dir) {
+        let score = autoload_score(&sk, &msg_norm, &msg_stripped);
+        if score == 0 {
+            continue;
+        }
+        // 复用 load()：正文 + 附属文件清单，口径与模型手动 load 时一致
+        if let Ok(body) = load(data_dir, &sk.name) {
+            hits.push((score, sk, body));
+        }
+    }
+    if hits.is_empty() {
+        return String::new();
+    }
+    // 得分高者优先；同分按名字排序保证稳定
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    hits.truncate(MAX_AUTOLOAD);
+
+    let mut out = String::from(
+        "# 本轮自动加载的技能（已按用户这句话命中的关键词附上全文）\n\n\
+         ⚠️ 下列技能的正文**已经在你面前**，直接照其步骤执行，\
+         **不要再调 `load_skill`**（重复读纯属浪费）。\
+         若某个与本轮任务明显无关，忽略它即可。\n",
+    );
+    for (_, sk, body) in &hits {
+        out.push_str(&format!(
+            "\n---\n\n## 已加载技能：{}\n\n{}\n",
+            sk.name, body
+        ));
+    }
+    out
+}
+
+/// 给一个技能打分：0 = 不命中。
+fn autoload_score(sk: &Skill, msg_norm: &str, msg_stripped: &str) -> usize {
+    let mut score = 0usize;
+
+    // ① 技能名（忽略连字符/下划线/大小写）
+    let name_key = strip_seps(&sk.name);
+    if name_key.chars().count() >= 2 && msg_stripped.contains(&name_key) {
+        score += 3;
+    }
+
+    // ② 触发词
+    let quotes = quoted_phrases(&sk.description);
+    if !quotes.is_empty() {
+        for q in quotes {
+            // 一个引号里常用「 / 」并列举法（如「重新构建/更新一下」）——
+            // 整句 + 按强分隔符切出的子句都算强触发词，否则用户只说其中
+            // 一个例子时永远撞不上整句。
+            let mut cands = vec![q.clone()];
+            cands.extend(split_strong(&q));
+            for c in cands {
+                let key = c.trim().to_lowercase();
+                if key.chars().count() >= 2 && msg_norm.contains(&key) {
+                    score += 3;
+                    break; // 同一引号短语只记一次，避免刷分
+                }
+            }
+        }
+    } else {
+        // 描述没写引号样例 → 切词兜底，但要至少两个词命中才认
+        let mut weak = 0usize;
+        for seg in split_segments(&sk.description) {
+            let key = seg.to_lowercase();
+            if key.chars().count() >= 2 && !is_noise(&key) && msg_norm.contains(&key) {
+                weak += 1;
+            }
+        }
+        if weak >= 2 {
+            score += weak;
+        }
+    }
+    score
+}
+
+/// 去掉连字符/下划线/空白并转小写 —— 让 `self-rebuild`、`self_rebuild`、
+/// `self rebuild` 归一成同一个 key。
+fn strip_seps(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| *c != '-' && *c != '_' && !c.is_whitespace())
+        .collect()
+}
+
+/// 抽出成对引号内的短语：「」『』“”‘’ 以及 ASCII 的 "" 和 ''。
+/// 引号不成对时忽略其一。
+fn quoted_phrases(s: &str) -> Vec<String> {
+    const PAIRS: [(char, char); 6] = [
+        ('「', '」'),
+        ('『', '』'),
+        ('“', '”'),
+        ('‘', '’'),
+        ('"', '"'),
+        ('\'', '\''),
+    ];
+    let chars: Vec<char> = s.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some(&(_, close)) = PAIRS.iter().find(|p| p.0 == chars[i]) {
+            if let Some(j) = (i + 1..chars.len()).find(|&j| chars[j] == close) {
+                let inner: String = chars[i + 1..j].iter().collect();
+                let inner = inner.trim().to_string();
+                if !inner.is_empty() {
+                    out.push(inner);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// 按标点/空白切短语（兜底路径用）。
+fn split_segments(s: &str) -> Vec<String> {
+    s.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '、' | '，'
+                    | ','
+                    | '；'
+                    | ';'
+                    | '：'
+                    | ':'
+                    | '／'
+                    | '/'
+                    | '|'
+                    | '｜'
+                    | '。'
+                    | '！'
+                    | '!'
+                    | '？'
+                    | '?'
+                    | '…'
+                    | '（'
+                    | '）'
+                    | '('
+                    | ')'
+                    | '【'
+                    | '】'
+                    | '['
+                    | ']'
+                    | '—'
+                    | '·'
+            )
+    })
+    .map(|t| t.trim().to_string())
+    .filter(|t| !t.is_empty())
+    .collect()
+}
+
+/// 按**强分隔符**切短语（并列举法用）：`/ ／ 、 ， ; ； | ｜ 或`。
+/// 与 `split_segments` 的区别：**不按空白切** —— 保住「看看 token 用量」
+/// 这类多词短语的完整性；只拆明确表示"并列多个例子"的分隔符。
+fn split_strong(s: &str) -> Vec<String> {
+    s.split(|c: char| {
+        matches!(
+            c,
+            '/' | '／' | '、' | '，' | ',' | ';' | '；' | '|' | '｜' | '或'
+        )
+    })
+    .map(|t| t.trim().to_string())
+    .filter(|t| !t.is_empty())
+    .collect()
+}
+
+/// 兜底切词里的高频虚词 —— 命中它们不算数（否则「用户」这种词到处撞）。
+fn is_noise(p: &str) -> bool {
+    const NOISE: [&str; 12] = [
+        "用户", "使用", "触发", "当用户", "时使用", "以及", "的时候", "可以", "需要", "这个",
+        "任务", "流程",
+    ];
+    NOISE.contains(&p)
+}
+
 /// load_skill：返回 SKILL.md 全文 + 附属文件清单。
 pub fn load(data_dir: &Path, name: &str) -> Result<String, String> {
     let sk = discover(data_dir)
@@ -343,6 +547,125 @@ mod tests {
     fn catalog_empty_hint() {
         let d = tmp("empty");
         assert!(catalog(&d).contains("save_skill"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 造一个带引号触发词的技能
+    fn seed(d: &Path, name: &str, desc: &str) {
+        let sdir = d.join("skills").join(name);
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(
+            sdir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {desc}\n---\n\n# 步骤\n{name} 的正文\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn autoload_hits_quoted_trigger() {
+        let d = tmp("autoload_q");
+        seed(
+            &d,
+            "self-rebuild",
+            "重新编译时使用。触发：用户说「重新构建」「更新一下」。",
+        );
+        // 命中引号短语 → 正文进 prompt
+        let a = autoload(&d, "帮我重新构建一下");
+        assert!(a.contains("self-rebuild"), "应含技能名:\n{a}");
+        assert!(a.contains("的正文"), "应含正文:\n{a}");
+        assert!(a.contains("不要再调"), "应有『不必再 load』提示:\n{a}");
+        // 无关消息 → 不命中
+        assert!(autoload(&d, "今天天气不错").is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn autoload_hits_skill_name() {
+        let d = tmp("autoload_name");
+        seed(&d, "dual-token-dashboard", "生成看板。当用户说\"看看用量\"时使用。");
+        // 消息里直接出现技能名（含连字符）
+        let a = autoload(&d, "跑一下 dual-token-dashboard");
+        assert!(a.contains("dual-token-dashboard 的正文"), "{a}");
+        // 归一化：下划线/空格写法也能命中
+        let b = autoload(&d, "执行 dual token dashboard 谢谢");
+        assert!(b.contains("的正文"), "{b}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn autoload_splits_bundled_quoted_examples() {
+        let d = tmp("autoload_split");
+        // 真实的写法：一个引号里用「 / 」并列多个例子
+        seed(
+            &d,
+            "dispatch-workbuddy",
+            "分发时用。触发：用户说「发给 WB / 分发给 WorkBuddy / 交给 WB」「解决不了就给 WB」。",
+        );
+        // 只说其中一个例子 → 也要命中
+        assert!(autoload(&d, "把这事交给 WB 吧").contains("的正文"));
+        assert!(autoload(&d, "发给 WB").contains("的正文"));
+        assert!(autoload(&d, "解决不了就给 WB").contains("的正文"));
+        // 无关 → 不命中
+        assert!(autoload(&d, "随便聊聊天气").is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn autoload_no_quote_needs_two_weak_hits() {
+        let d = tmp("autoload_weak");
+        seed(&d, "video-analyzer", "视频分析、抽帧、转写 的时候用。");
+        // 只命中一个弱词 → 不算
+        assert!(autoload(&d, "帮我做个视频").is_empty());
+        // 命中两个弱词 → 算
+        let a = autoload(&d, "视频分析一下顺便转写");
+        assert!(a.contains("video-analyzer 的正文"), "{a}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 🔴 真实数据冒烟 —— 用仓库真实的 `agent-data/skills`（含内置三技能）
+    /// 验证自动加载命中。手动跑：
+    /// ```text
+    /// cargo test --lib real_autoload -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "依赖本机真实 agent-data/skills"]
+    fn real_autoload_smoke() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-data");
+        let cases = [
+            ("帮我重新构建一下 float-agent", "self-rebuild"),
+            // dual-token-dashboard：多种说法都要中
+            ("看看 token 用量", "dual-token-dashboard"),
+            ("算一下花了多少 token", "dual-token-dashboard"),
+            ("打开 token 看板", "dual-token-dashboard"),
+            // dispatch-workbuddy：多种说法都要中
+            ("这个太复杂了，交给 WB 吧", "dispatch-workbuddy"),
+            ("甩给 WB 算了", "dispatch-workbuddy"),
+            ("让 WorkBuddy 做吧", "dispatch-workbuddy"),
+            ("升级到 WorkBuddy", "dispatch-workbuddy"),
+        ];
+        for (msg, expect) in cases {
+            let out = autoload(&dir, msg);
+            let hit = out
+                .lines()
+                .find(|l| l.starts_with("## 已加载技能："))
+                .unwrap_or("(无命中)");
+            println!("「{msg}」 → {hit}");
+            assert!(out.contains(expect), "「{msg}」应命中 {expect}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn autoload_empty_and_caps_count() {
+        let d = tmp("autoload_cap");
+        assert!(autoload(&d, "").is_empty());
+        assert!(autoload(&d, "   ").is_empty());
+        // 造 4 个都会被同一条消息命中的技能 → 最多注入 MAX_AUTOLOAD 个
+        for n in ["aaa-one", "bbb-two", "ccc-three", "ddd-four"] {
+            seed(&d, n, "触发：用户说「万能咒语」。");
+        }
+        let a = autoload(&d, "来一段万能咒语");
+        let count = a.matches("## 已加载技能：").count();
+        assert_eq!(count, MAX_AUTOLOAD, "应封顶 {MAX_AUTOLOAD} 个:\n{a}");
         let _ = std::fs::remove_dir_all(&d);
     }
 }
