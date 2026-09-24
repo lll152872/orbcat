@@ -143,6 +143,10 @@ pub struct ModelView {
     pub url: String,
     pub supports_tool_call: bool,
     pub supports_images: bool,
+    pub max_input_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    /// 是否已配置 Key（本地/Ollama 可无 Key）
+    pub has_key: bool,
 }
 
 impl From<&ModelConfig> for ModelView {
@@ -158,6 +162,9 @@ impl From<&ModelConfig> for ModelView {
             url: m.url.clone(),
             supports_tool_call: m.supports_tool_call,
             supports_images: m.supports_images,
+            max_input_tokens: m.max_input_tokens,
+            max_output_tokens: m.max_output_tokens,
+            has_key: !m.api_key.trim().is_empty(),
         }
     }
 }
@@ -212,27 +219,68 @@ pub fn save_models(data_dir: &Path, models: &[ModelConfig]) -> Result<PathBuf, S
     Ok(path)
 }
 
-/// 新增（或按 id 覆盖）一个模型
-pub fn add_model(data_dir: &Path, m: ModelConfig) -> Result<(), String> {
-    if m.id.trim().is_empty() || m.url.trim().is_empty() {
-        return Err("模型 id 和 url 不能为空".into());
+/// 规范化 Base URL：去空白、去尾斜杠；缺 scheme 时补 `https://`（`localhost`/`127.0.0.1` 补 `http://`）。
+pub fn normalize_base_url(raw: &str) -> Result<String, String> {
+    let u = raw.trim().trim_end_matches('/').to_string();
+    if u.is_empty() {
+        return Err("URL 不能为空".into());
     }
+    let with_scheme = if u.starts_with("http://") || u.starts_with("https://") {
+        u
+    } else if u.starts_with("localhost")
+        || u.starts_with("127.0.0.1")
+        || u.starts_with("0.0.0.0")
+        || u.starts_with("[::1]")
+    {
+        format!("http://{u}")
+    } else {
+        format!("https://{u}")
+    };
+    if !with_scheme.starts_with("http://") && !with_scheme.starts_with("https://") {
+        return Err("URL 必须以 http:// 或 https:// 开头".into());
+    }
+    Ok(with_scheme)
+}
+
+/// 新增或按 **显示名** 覆盖一个模型。
+///
+/// - **显示名 `name` 是唯一键**（官方 DeepSeek 与火山可以同时存在，都调 `deepseek-v4.1-flash`）
+/// - **接口 `id` 允许重复**，只是 request 的 `model` 字段
+/// - 同名 = 更新这一条；异名 = 新增一条（哪怕接口 id 相同）
+/// - API Key 允许为空（Ollama / 本地网关）
+pub fn add_model(data_dir: &Path, m: ModelConfig) -> Result<(), String> {
+    let mut m = m;
+    let key = if m.name.trim().is_empty() {
+        m.id.trim().to_string()
+    } else {
+        m.name.trim().to_string()
+    };
+    if key.is_empty() {
+        return Err("显示名不能为空".into());
+    }
+    if m.id.trim().is_empty() {
+        m.id = key.clone();
+    }
+    if m.url.trim().is_empty() {
+        return Err("URL 不能为空".into());
+    }
+    m.name = key;
     let mut all = load_models(data_dir)?;
-    match all.iter_mut().find(|x| x.id == m.id) {
-        Some(existing) => *existing = m, // 同 id 覆盖
+    match all.iter_mut().find(|x| x.name == m.name) {
+        Some(existing) => *existing = m,
         None => all.push(m),
     }
     save_models(data_dir, &all)?;
     Ok(())
 }
 
-/// 删除一个模型；返回被删的 id（供调用方检查是否是当前选中项）
-pub fn remove_model(data_dir: &Path, id: &str) -> Result<(), String> {
+/// 删除一个模型（按显示名）
+pub fn remove_model(data_dir: &Path, name: &str) -> Result<(), String> {
     let mut all = load_models(data_dir)?;
     let before = all.len();
-    all.retain(|x| x.id != id);
+    all.retain(|x| x.name != name);
     if all.len() == before {
-        return Err(format!("找不到模型「{id}」"));
+        return Err(format!("找不到模型「{name}」"));
     }
     save_models(data_dir, &all)?;
     Ok(())
@@ -262,20 +310,18 @@ pub fn load_models(data_dir: &Path) -> Result<Vec<ModelConfig>, String> {
 
 /// 批量导入远端模型列表里的若干 id。
 ///
-/// 共用 `source` 的 url / apiKey / headers；同 id **跳过**（不覆盖已配置项，
-/// 避免一次拉取把用户手工改过的能力开关冲掉）。返回 `(added, skipped)`。
+/// 共用 `source` 的 url / apiKey / headers。**显示名冲突时跳过**（不覆盖）。
+/// 返回 `(added, skipped)`。
 pub fn import_models_from_source(
     data_dir: &Path,
     source: &ModelConfig,
     ids: &[String],
     supports_tool_call: bool,
     supports_images: bool,
-    // 每个模型的上下文窗口（来自 `/models` 返回，尽力而为）。
-    // 缺失的模型用 `source.max_input_tokens` 兜底。
     context_lengths: &std::collections::HashMap<String, u64>,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let mut all = load_models(data_dir)?;
-    let existing: std::collections::HashSet<String> = all.iter().map(|m| m.id.clone()).collect();
+    let existing: std::collections::HashSet<String> = all.iter().map(|m| m.name.clone()).collect();
     let mut added = Vec::new();
     let mut skipped = Vec::new();
 
@@ -284,6 +330,7 @@ pub fn import_models_from_source(
         if id.is_empty() {
             continue;
         }
+        // 显示名默认 = 接口 id；已占用则跳过（要两条同接口 id 请手动改显示名）
         if existing.contains(id) {
             skipped.push(id.to_string());
             continue;
@@ -293,11 +340,7 @@ pub fn import_models_from_source(
         } else {
             source.vendor.trim().to_string()
         };
-        // 优先用该模型自己上报的窗口；没有则回退来源配置的值
-        let max_input = context_lengths
-            .get(id)
-            .copied()
-            .or(source.max_input_tokens);
+        let max_input = context_lengths.get(id).copied().or(source.max_input_tokens);
         all.push(ModelConfig {
             id: id.to_string(),
             name: id.to_string(),
@@ -319,36 +362,48 @@ pub fn import_models_from_source(
     Ok((added, skipped))
 }
 
-/// 编辑已有模型的可变字段。`api_key` 为 None/空串时**保持原 Key**。
+/// 编辑已有模型（按 **显示名** 定位）。
+/// - `api_key` 为 None/空串时**保持原 Key**；`clear_key: true` 清空
+/// - `new_id`：只改发给提供商的 `model` 字段（**允许与别的条目相同**）
+/// - `name`：改显示名（唯一）
+/// - `max_*` 为 `Some(None)` 清空；`None` 不动
 pub fn update_model(
     data_dir: &Path,
-    id: &str,
+    name_key: &str,
     name: Option<String>,
     url: Option<String>,
     api_key: Option<String>,
+    clear_key: bool,
     supports_tool_call: Option<bool>,
     supports_images: Option<bool>,
     headers: Option<std::collections::BTreeMap<String, String>>,
+    max_input_tokens: Option<Option<u64>>,
+    max_output_tokens: Option<Option<u64>>,
+    api_model_id: Option<String>,
 ) -> Result<(), String> {
     let mut all = load_models(data_dir)?;
-    let Some(m) = all.iter_mut().find(|x| x.id == id) else {
-        return Err(format!("找不到模型「{id}」"));
+    let Some(idx) = all.iter().position(|x| x.name == name_key) else {
+        return Err(format!("找不到模型「{name_key}」"));
     };
     if let Some(n) = name {
         let n = n.trim();
-        m.name = if n.is_empty() { id.to_string() } else { n.to_string() };
+        let n = if n.is_empty() {
+            name_key.to_string()
+        } else {
+            n.to_string()
+        };
+        if n != all[idx].name && all.iter().any(|x| x.name == n) {
+            return Err(format!("显示名「{n}」已存在，请换一个"));
+        }
+        all[idx].name = n;
     }
+    let m = &mut all[idx];
     if let Some(u) = url {
-        let u = u.trim().trim_end_matches('/').to_string();
-        if !u.starts_with("http://") && !u.starts_with("https://") {
-            return Err("URL 必须以 http:// 或 https:// 开头".into());
-        }
-        if u.is_empty() {
-            return Err("URL 不能为空".into());
-        }
-        m.url = u;
+        m.url = normalize_base_url(&u)?;
     }
-    if let Some(k) = api_key {
+    if clear_key {
+        m.api_key = String::new();
+    } else if let Some(k) = api_key {
         let k = k.trim().to_string();
         if !k.is_empty() {
             m.api_key = k;
@@ -363,34 +418,40 @@ pub fn update_model(
     if let Some(h) = headers {
         m.headers = h;
     }
+    if let Some(v) = max_input_tokens {
+        m.max_input_tokens = v;
+    }
+    if let Some(v) = max_output_tokens {
+        m.max_output_tokens = v;
+    }
+    if let Some(mid) = api_model_id {
+        let mid = mid.trim();
+        if !mid.is_empty() {
+            m.id = mid.to_string();
+        }
+    }
     save_models(data_dir, &all)?;
     Ok(())
 }
 
-/// 重命名**接口模型 id**（发给提供商的 `model` 字段）。
-///
-/// 这和「显示名」是两回事：只改 name 不会让请求换模型。
-/// 显示名若原本等于旧 id / 为空，会顺带同步成新 id，避免界面仍像旧模型。
-pub fn rename_model(data_dir: &Path, old_id: &str, new_id: &str) -> Result<(), String> {
-    let old_id = old_id.trim();
-    let new_id = new_id.trim();
-    if old_id.is_empty() || new_id.is_empty() {
-        return Err("模型 ID 不能为空".into());
+/// 重命名**显示名**（唯一键）。接口 `id` 不动。
+pub fn rename_model(data_dir: &Path, old_name: &str, new_name: &str) -> Result<(), String> {
+    let old_name = old_name.trim();
+    let new_name = new_name.trim();
+    if old_name.is_empty() || new_name.is_empty() {
+        return Err("显示名不能为空".into());
     }
-    if old_id == new_id {
+    if old_name == new_name {
         return Ok(());
     }
     let mut all = load_models(data_dir)?;
-    if all.iter().any(|m| m.id == new_id) {
-        return Err(format!("模型 ID「{new_id}」已存在，请换一个"));
+    if all.iter().any(|m| m.name == new_name) {
+        return Err(format!("显示名「{new_name}」已存在，请换一个"));
     }
-    let Some(m) = all.iter_mut().find(|x| x.id == old_id) else {
-        return Err(format!("找不到模型「{old_id}」"));
+    let Some(m) = all.iter_mut().find(|x| x.name == old_name) else {
+        return Err(format!("找不到模型「{old_name}」"));
     };
-    m.id = new_id.to_string();
-    if m.name.trim().is_empty() || m.name == old_id {
-        m.name = new_id.to_string();
-    }
+    m.name = new_name.to_string();
     save_models(data_dir, &all)?;
     Ok(())
 }
@@ -409,6 +470,8 @@ pub struct ModelEditView {
     pub headers_text: String,
     pub has_key: bool,
     pub key_preview: String,
+    pub max_input_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
 }
 
 impl From<&ModelConfig> for ModelEditView {
@@ -429,17 +492,19 @@ impl From<&ModelConfig> for ModelEditView {
             headers_text,
             has_key: !m.api_key.trim().is_empty(),
             key_preview: redact_key_str(&m.api_key),
+            max_input_tokens: m.max_input_tokens,
+            max_output_tokens: m.max_output_tokens,
         }
     }
 }
 
-/// 按 id 找一个模型
-pub fn find_model(data_dir: &Path, id: &str) -> Result<ModelConfig, String> {
+/// 按 **显示名** 找模型（显示名唯一；接口 id 可重复）
+pub fn find_model(data_dir: &Path, name: &str) -> Result<ModelConfig, String> {
     let models = load_models(data_dir)?;
     models
         .into_iter()
-        .find(|m| m.id == id)
-        .ok_or_else(|| format!("找不到模型「{id}」"))
+        .find(|m| m.name == name || (m.name.is_empty() && m.id == name))
+        .ok_or_else(|| format!("找不到模型「{name}」"))
 }
 
 impl Default for ModelConfig {
@@ -478,6 +543,14 @@ pub struct AgentSettings {
     /// 非空时写入仍须过文件权限网关（Full），失败不阻断主交接。
     #[serde(default)]
     pub dispatch_wb_drop_dir: Option<String>,
+    /// 快答模式：不发工具列表，system prompt 只带人格段（见
+    /// `agent::build_quick_system_prompt`）。托盘菜单手动切换 —— 不做自动
+    /// 启发式，误判（该带工具没带）比省那点 token 严重得多。
+    #[serde(default)]
+    pub quick_mode: bool,
+    /// 当前激活的项目 id（pmem.projects）。`None` = 主对话（无项目记忆）。
+    #[serde(default)]
+    pub active_project_id: Option<i64>,
 }
 
 impl Default for AgentSettings {
@@ -487,6 +560,8 @@ impl Default for AgentSettings {
             last_session: None,
             blur_collapse: true,
             dispatch_wb_drop_dir: None,
+            quick_mode: false,
+            active_project_id: None,
         }
     }
 }
@@ -496,63 +571,134 @@ fn settings_path(data_dir: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// MCP 网关地址
+// MCP 服务器列表（可单独添加多个）
 // ---------------------------------------------------------------------------
 
-/// 解析 MCP 网关地址。
-///
-/// 优先级：
-///   1. 环境变量 `FLOAT_AGENT_MCP_URL`
-///   2. `<data_dir>/mcp.json` 的 `{"url": "...", "enabled": true}`
-///   3. **没有默认值** —— 都没配就返回 `None`（MCP 不启用）
-///
-/// ⚠️ 刻意不设默认地址：MCP 网关是**用户自己起的进程**，
-///    地址焊死在源码里等于替所有克隆者做主（还会在别人的机器上
-///    对着一个不存在的服务反复超时）。配置走设置页或 mcp.json。
-///
-/// 返回 `None` 表示未配置或显式禁用（`enabled: false`）。
-pub fn resolve_mcp_url(data_dir: &Path) -> Option<String> {
-    if let Ok(u) = std::env::var("FLOAT_AGENT_MCP_URL") {
-        if !u.trim().is_empty() {
-            return Some(u);
-        }
-    }
-
-    let p = data_dir.join("mcp.json");
-    if p.exists() {
-        if let Ok(txt) = std::fs::read_to_string(&p) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                if v.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
-                    return None;
-                }
-                if let Some(u) = v.get("url").and_then(serde_json::Value::as_str) {
-                    if !u.trim().is_empty() {
-                        return Some(u.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    None
+/// 一条 MCP 服务器配置（Streamable HTTP）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerCfg {
+    /// 稳定 id（展示/路由用），用户可改
+    pub id: String,
+    pub url: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 展示名（可空，空则用 id）
+    #[serde(default)]
+    pub label: String,
 }
 
-/// 写入/更新/禁用 `<data_dir>/mcp.json`（设置页用）。
+fn default_true() -> bool {
+    true
+}
+
+/// `<data_dir>/mcp.json` 的多 server 格式。
 ///
-/// `url = Some(u)` → `{"url": u, "enabled": true}`；
-/// `url = None` → `{"enabled": false}`（显式禁用，避免下次启动
-/// 又因为别的路径解析出地址）。
-pub fn save_mcp_url(data_dir: &Path, url: Option<&str>) -> Result<(), String> {
-    let p = data_dir.join("mcp.json");
-    let v = match url {
-        Some(u) => serde_json::json!({ "url": u, "enabled": true }),
-        None => serde_json::json!({ "url": "", "enabled": false }),
+/// 兼容旧的 `{"url","enabled"}` 单网关写法 —— 读入时自动升成单元素列表。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpFile {
+    #[serde(default)]
+    pub servers: Vec<McpServerCfg>,
+}
+
+fn mcp_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("mcp.json")
+}
+
+/// 读 MCP 服务器列表（只返回 enabled 的，供连接用；管理界面用 [`load_mcp_servers`]）。
+pub fn resolve_mcp_servers(data_dir: &Path) -> Vec<McpServerCfg> {
+    load_mcp_servers(data_dir)
+        .into_iter()
+        .filter(|s| s.enabled && !s.url.trim().is_empty())
+        .collect()
+}
+
+/// 读全部 MCP 服务器（含禁用），设置页用。
+///
+/// 环境变量 `FLOAT_AGENT_MCP_URL` 若存在，会在列表最前插入一条临时启用项
+/// （不落盘）——保持旧调试入口可用。
+pub fn load_mcp_servers(data_dir: &Path) -> Vec<McpServerCfg> {
+    let mut list = Vec::new();
+
+    if let Ok(u) = std::env::var("FLOAT_AGENT_MCP_URL") {
+        let u = u.trim().to_string();
+        if !u.is_empty() {
+            list.push(McpServerCfg {
+                id: "env".into(),
+                url: u,
+                enabled: true,
+                label: "环境变量 FLOAT_AGENT_MCP_URL".into(),
+            });
+        }
+    }
+
+    let p = mcp_path(data_dir);
+    if !p.exists() {
+        return list;
+    }
+    let Ok(txt) = std::fs::read_to_string(&p) else {
+        return list;
     };
-    let txt = serde_json::to_string_pretty(&v).map_err(|e| format!("序列化失败: {e}"))?;
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return list;
+    };
+
+    // 新格式：{"servers":[...]}
+    if let Ok(f) = serde_json::from_value::<McpFile>(v.clone()) {
+        if !f.servers.is_empty() {
+            list.extend(f.servers);
+            return list;
+        }
+    }
+    // 旧格式：{"url":"...","enabled":true}
+    if let Some(u) = v.get("url").and_then(serde_json::Value::as_str) {
+        let enabled = v.get("enabled").and_then(serde_json::Value::as_bool) != Some(false);
+        if !u.trim().is_empty() {
+            list.push(McpServerCfg {
+                id: "default".into(),
+                url: u.trim().to_string(),
+                enabled,
+                label: "默认网关".into(),
+            });
+        }
+    }
+    list
+}
+
+/// 整表写回 `mcp.json`（多 server）。
+pub fn save_mcp_servers(data_dir: &Path, servers: &[McpServerCfg]) -> Result<(), String> {
+    let p = mcp_path(data_dir);
+    let file = McpFile {
+        servers: servers.to_vec(),
+    };
+    let txt = serde_json::to_string_pretty(&file).map_err(|e| format!("序列化失败: {e}"))?;
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).ok();
     }
     std::fs::write(&p, txt).map_err(|e| format!("写入 {} 失败: {e}", p.display()))
+}
+
+/// 兼容旧接口：解析「主」网关地址（第一个启用的）。
+pub fn resolve_mcp_url(data_dir: &Path) -> Option<String> {
+    resolve_mcp_servers(data_dir)
+        .into_iter()
+        .next()
+        .map(|s| s.url)
+}
+
+/// 兼容旧接口：设置单条 URL（覆盖成仅此一条）。
+pub fn save_mcp_url(data_dir: &Path, url: Option<&str>) -> Result<(), String> {
+    let servers = match url {
+        Some(u) if !u.trim().is_empty() => vec![McpServerCfg {
+            id: "default".into(),
+            url: u.trim().to_string(),
+            enabled: true,
+            label: "默认网关".into(),
+        }],
+        _ => Vec::new(),
+    };
+    save_mcp_servers(data_dir, &servers)
 }
 
 pub fn load_settings(data_dir: &Path) -> AgentSettings {
@@ -590,15 +736,15 @@ mod tests {
             name: "x".into(),
             vendor: "".into(),
             url: "https://example.com/v1".into(),
-            api_key: "sk-1234567890abcdefghij".into(),
+            api_key: "sk-TESTKEY0001abcdef".into(),
             supports_tool_call: true,
             supports_images: false,
             ..Default::default()
         };
         let r = m.redacted_key();
-        assert!(r.starts_with("sk-123"));
-        assert!(r.ends_with("ghij"));
-        assert!(!r.contains("4567890abcdef"));
+        assert!(r.starts_with("sk-TE"));
+        assert!(r.ends_with("cdef"));
+        assert!(!r.contains("sk-TESTKEY0001abcdef"));
     }
 
     #[test]
@@ -735,7 +881,7 @@ mod tests {
             name: "M1".into(),
             vendor: "Custom".into(),
             url: "https://x/v1".into(),
-            api_key: "sk-1234567890abcdefghij".into(),
+            api_key: "sk-TESTKEY0001abcdef".into(),
             supports_tool_call: true,
             supports_images: false,
             headers: [("x-foo".into(), "bar".into())].into_iter().collect(),
@@ -743,9 +889,9 @@ mod tests {
         };
         let v = ModelEditView::from(&m);
         let j = serde_json::to_string(&v).unwrap();
-        assert!(!j.contains("abcdefghij"), "编辑视图不能带完整 Key: {j}");
+        assert!(!j.contains("sk-TESTKEY0001abcdef"), "编辑视图不能带完整 Key: {j}");
         assert!(v.has_key);
-        assert!(v.key_preview.starts_with("sk-123"));
+        assert!(v.key_preview.starts_with("sk-TE"));
         assert_eq!(v.headers_text, "x-foo: bar");
     }
 
@@ -765,17 +911,22 @@ mod tests {
         add_model(&dir, m).unwrap();
         update_model(
             &dir,
-            "keep",
+            "Keep",
             Some("新名字".into()),
             Some("https://b/v1/".into()),
             Some("   ".into()),
+            false,
             Some(false),
             Some(true),
             None,
+            None,
+            None,
+            Some("glm-5.3-flash".into()),
         )
         .unwrap();
-        let got = find_model(&dir, "keep").unwrap();
+        let got = find_model(&dir, "新名字").unwrap();
         assert_eq!(got.name, "新名字");
+        assert_eq!(got.id, "glm-5.3-flash");
         assert_eq!(got.url, "https://b/v1");
         assert_eq!(got.api_key, "sk-ORIGINALKEY12345", "空 Key 必须保留原值");
         assert!(!got.supports_tool_call);
@@ -784,7 +935,25 @@ mod tests {
     }
 
     #[test]
-    fn rename_model_changes_api_id_and_keeps_distinct_display_name() {
+    fn same_api_id_different_display_name_both_allowed() {
+        let dir = std::env::temp_dir().join(format!("fa-dupid-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("models.json"), "[]").unwrap();
+        let mk = |name: &str, url: &str| ModelConfig {
+            id: "deepseek-v4.1-flash".into(),
+            name: name.into(),
+            url: url.into(),
+            api_key: "sk-x1234567890".into(),
+            ..Default::default()
+        };
+        add_model(&dir, mk("dpsk官方", "https://api.deepseek.com/v1")).unwrap();
+        add_model(&dir, mk("火山", "https://ark.cn-beijing.volces.com/api/v3")).unwrap();
+        assert_eq!(load_models(&dir).unwrap().len(), 2, "同接口 id 不同显示名应共存");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_model_changes_display_name_only() {
         let dir = std::env::temp_dir().join(format!("fa-rename-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("models.json"), "[]").unwrap();
@@ -801,11 +970,14 @@ mod tests {
             },
         )
         .unwrap();
-        rename_model(&dir, "deepseek-v4.1-flash", "glm-5.3-flash").unwrap();
+        rename_model(&dir, "glm5.3-flash", "glm-5.3-flash").unwrap();
         let got = find_model(&dir, "glm-5.3-flash").unwrap();
-        assert_eq!(got.id, "glm-5.3-flash");
-        assert_eq!(got.name, "glm5.3-flash", "独立显示名不应被 rename 冲掉");
-        assert!(find_model(&dir, "deepseek-v4.1-flash").is_err());
+        assert_eq!(got.name, "glm-5.3-flash");
+        assert_eq!(
+            got.id, "deepseek-v4.1-flash",
+            "接口 model 不应被改显示名冲掉"
+        );
+        assert!(find_model(&dir, "glm5.3-flash").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -815,7 +987,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("models.json"), "[]").unwrap();
         let src = ModelConfig {
-            id: "src".into(),
+            id: "src-model".into(),
             name: "Source".into(),
             vendor: "VendorA".into(),
             url: "https://api.vendor.com/v1".into(),
@@ -830,14 +1002,14 @@ mod tests {
         let (added, skipped) = import_models_from_source(
             &dir,
             &src,
-            &["alpha".into(), "src".into(), "beta".into()],
+            &["alpha".into(), "Source".into(), "beta".into()],
             true,
             true,
             &ctx,
         )
         .unwrap();
         assert_eq!(added, vec!["alpha", "beta"]);
-        assert_eq!(skipped, vec!["src"], "已存在的 id 不得覆盖");
+        assert_eq!(skipped, vec!["Source"], "已存在的显示名不得覆盖");
         let a = find_model(&dir, "alpha").unwrap();
         assert_eq!(a.url, src.url);
         assert_eq!(a.api_key, src.api_key);

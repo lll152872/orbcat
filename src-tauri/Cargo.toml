@@ -34,6 +34,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util"] }
 futures-util = "0.3"
 glob = "0.3"
+# 项目/会话索引库（仿 WorkBuddy：SQLite 只管索引，长期记忆仍写 md）
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # --- 截图 / 图片 ---
 # 截图走 Win32 原生 API（见 capture.rs），不引入重型截图库；

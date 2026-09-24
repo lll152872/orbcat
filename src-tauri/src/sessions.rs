@@ -133,6 +133,11 @@ pub struct StoredMessage {
     /// 搜索和历史回灌的字节，且一旦落盘就再也分不清哪部分是模型原话。
     #[serde(default, skip_serializing_if = "is_false")]
     pub interrupted: bool,
+    /// 执行中插话的 id。有值时 UI **不在对话流铺气泡**，
+    /// 而是在 assistant.steps 的 `kind=steer` 时间线里按位置画（真实交错）。
+    /// 历史回灌仍按 user 角色进模型上下文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_id: Option<String>,
     /// 生成本条回答的模型 id（供「每天每模型」用量统计）。老数据没有 → None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -550,6 +555,20 @@ pub fn switch(data_dir: &Path, id: &str) -> Result<Session, String> {
     Ok(s)
 }
 
+/// 改会话标题（主聊天标题固定，不可改）
+pub fn set_title(data_dir: &Path, id: &str, title: &str) -> Result<(), String> {
+    let mut s = load(data_dir, id).ok_or_else(|| format!("会话 {id} 不存在"))?;
+    if s.is_main() {
+        return Err("主聊天标题固定，不能改".into());
+    }
+    let t = title.trim();
+    if t.is_empty() {
+        return Err("标题不能为空".into());
+    }
+    s.title = t.to_string();
+    write_session(data_dir, &s)
+}
+
 /// 删除一个会话。
 ///
 /// **主会话拒绝删除** —— 它「永久且不可删」是主副结构的前提，
@@ -738,12 +757,14 @@ pub fn append_run(data_dir: &Path, rec: &TurnRecord<'_>) -> Result<(), String> {
         steps: Vec::new(),
         reasoning: None,
         interrupted: false,
+        steer_id: None,
         model: None,
         usage: None,
         at: now,
     });
 
-    // 插话（执行中追加的指令）—— 也是普通 user 消息
+    // 插话（执行中追加的指令）—— 仍是 user 消息（历史回灌要按角色），
+    // 但带 steer_id：UI 不单独铺气泡，改画在 steps 时间线里（与真实进度交错）。
     for m in rec.steers {
         s.messages.push(StoredMessage {
             role: "user".into(),
@@ -752,6 +773,7 @@ pub fn append_run(data_dir: &Path, rec: &TurnRecord<'_>) -> Result<(), String> {
             steps: Vec::new(),
             reasoning: None,
             interrupted: false,
+            steer_id: Some(m.id.clone()),
             model: None,
             usage: None,
             at: now,
@@ -760,11 +782,12 @@ pub fn append_run(data_dir: &Path, rec: &TurnRecord<'_>) -> Result<(), String> {
 
     s.messages.push(StoredMessage {
         role: "assistant".into(),
-        text: rec.answer.to_string(),
+        text: strip_step_folds(rec.answer),
         images: Vec::new(),
         steps: cap_steps(rec.steps),
         reasoning: rec.reasoning.filter(|r| !r.is_empty()).map(cap_reasoning),
         interrupted: rec.interrupted,
+        steer_id: None,
         // 用量与模型只落在 assistant 这条上 —— 统计的就是"每次问答花了多少"
         model: Some(rec.model.to_string()),
         usage: (!rec.usage.is_zero()).then_some(rec.usage),
@@ -841,6 +864,81 @@ pub fn append_turn(
 }
 
 /// 把 Rust 侧 AgentStep 转成可存储的步骤
+/// 剥掉正文里混入的「工具轨迹 / 思考摘要」尾巴。
+///
+/// 根因（2026-09-24）：`history::fold_steps_to_line` 把 steps 拼进发给模型的
+/// assistant 文本后，部分模型（商汤等）会把 `«steps…»` / `调用 …` / `·think …`
+/// / 旧版 `[思考] …` 回显进 `answer`。落盘前剥掉，界面才不会把思考画成正文。
+pub fn strip_step_folds(text: &str) -> String {
+    let t = text;
+    let mut cut = t.len();
+    let markers = [
+        "\n«steps\n",
+        "\n«steps",
+        "\n[思考] ",
+        "\n[状态] ",
+        "\n[中间正文] ",
+        "\n[已执行",
+        "\n·think ",
+        "\n·status ",
+        "\n·text ",
+        "\n调用 ",
+        "\n  参数: ",
+    ];
+    for m in markers {
+        if let Some(i) = t.find(m) {
+            // 前面要有像样的正文，避免把「一上来就是工具」的合法内容砍掉
+            if i > 0 && i < cut {
+                cut = i;
+            }
+        }
+    }
+    let mut out = t[..cut].trim_end().to_string();
+    // 整段就是轨迹（没有任何正文）→ 空串
+    if out.is_empty() && cut < t.len() {
+        return String::new();
+    }
+    // 若正文里还嵌着完整轨迹块，再整块删掉
+    while let (Some(a), Some(b)) = (out.find("«steps\n"), out.find("\n»")) {
+        if b > a {
+            out.replace_range(a..=b.min(out.len() - 1), "");
+        } else {
+            break;
+        }
+    }
+    out.trim_end().to_string()
+}
+
+#[cfg(test)]
+mod strip_folds_tests {
+    use super::strip_step_folds;
+
+    #[test]
+    fn strips_legacy_think_tail() {
+        let t = "直接说：不是论文术语。\n[思考] 用户在问临床故事…";
+        assert_eq!(strip_step_folds(t), "直接说：不是论文术语。");
+    }
+
+    #[test]
+    fn strips_tool_log_tail() {
+        let t = "回答正文\n调用 read_file\n  参数: {\"path\": \"x\"}\nread_file 返回:\n130|\n·think 用户在问";
+        assert_eq!(strip_step_folds(t), "回答正文");
+    }
+
+    #[test]
+    fn strips_steps_block() {
+        let t = "正文\n«steps\n调用 read_file\n  参数: {}\n»\n";
+        assert!(strip_step_folds(t).starts_with("正文"));
+        assert!(!strip_step_folds(t).contains("«steps"));
+    }
+
+    #[test]
+    fn keeps_clean_answer() {
+        let t = "# 标题\n\n这是一段正常回答。";
+        assert_eq!(strip_step_folds(t), t);
+    }
+}
+
 pub fn steps_from_agent(steps: &[crate::agent::AgentStep]) -> Vec<StoredStep> {
     steps
         .iter()
@@ -854,12 +952,12 @@ pub fn steps_from_agent(steps: &[crate::agent::AgentStep]) -> Vec<StoredStep> {
 
 /// 落盘前给时间线条目"限长"，**但保留条目与顺序**。
 ///
-/// ## 与 [`fold_steps`] 的分工（2026-09-22 用户拍板）
+/// ## 与 `history::fold_steps_to_line` 的分工（2026-09-23 更新）
 ///
-/// - 喂给**模型**的历史 → [`fold_steps`]：模型不需要回放工具输出，压成一行
-///   反而省 token，且字节稳定（prompt cache 友好）。
-/// - 存给**人**看的会话 → 本函数：保留 `reasoning / tool_call / tool_result /
-///   status / error` 的原始顺序，只截断单条 `detail`。这样界面能把
+/// - 喂给**模型**的历史 → `history::fold_steps_to_line`：近 K 条 steps **原文/截断**
+///   （含 tool_result），更旧折一行摘要。**不要**再把 tool_result 压成一行。
+/// - 存给**人**看的会话 → 本函数 [`cap_steps`]：保留 `reasoning / tool_call /
+///   tool_result / status / error` 的原始顺序，只截断单条 `detail`。这样界面能把
 ///   「思考 → 调工具 → 思考 → 调工具」还原成交错时间线。
 ///
 /// 原来的做法是落盘时就折叠成一整行，结果是**回看时步骤全没了** —— 用户
@@ -901,6 +999,9 @@ pub fn cap_steps(steps: &[StoredStep]) -> Vec<StoredStep> {
             let d = cap_chars(&s.detail, left);
             reason_used += d.len();
             d
+        } else if s.kind == "text" || s.kind == "stream" {
+            // 多轮流式正文按轮收进时间线 —— 回看要比 tool 参数更长一点
+            cap_chars(&s.detail, 2000)
         } else {
             cap_chars(&s.detail, STEP_DETAIL_LIMIT)
         };
@@ -1274,6 +1375,7 @@ mod tests {
                 steps: Vec::new(),
                 reasoning: None,
                 interrupted: false,
+                steer_id: None,
                 model: None,
                 usage: None,
                 at,
@@ -1643,6 +1745,7 @@ mod tests {
                 steps: Vec::new(),
                 reasoning: None,
                 interrupted: false,
+                steer_id: None,
                 model: None,
                 usage: None,
                 at: i as u64,

@@ -260,13 +260,19 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
       state.messages.push({
         role: "assistant",
         text: state.chatReply,
-        steps: [],
+        steps: [
+          { kind: "tool_call", name: "read_file", detail: '{"path":"a.md"}' },
+          { kind: "tool_result", name: "read_file", detail: "FILE_BODY_MARKER\n" + "x".repeat(300) },
+        ],
         at: now + 1,
         model: state.selectedModel ?? "mock-1",
       });
       return {
         answer: state.chatReply,
-        steps: [],
+        steps: [
+          { kind: "tool_call", name: "read_file", detail: '{"path":"a.md"}' },
+          { kind: "tool_result", name: "read_file", detail: "FILE_BODY_MARKER\n" + "x".repeat(300) },
+        ],
         iterations: 1,
         interrupted: false,
         usage: { prompt: 1, completion: 2, total: 3 },

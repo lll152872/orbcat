@@ -31,6 +31,20 @@ pub fn is_data_url(s: &str) -> bool {
     s.starts_with("data:")
 }
 
+/// 路径看起来是图片文件吗（按扩展名；不读内容）。
+/// `view_image` / `read_file` 分流用。
+pub fn is_image_path(path: &Path) -> bool {
+    matches!(
+        path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default()
+            .as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
+    )
+}
+
 /// 解析 data URL → (mime, 原始字节)
 pub fn parse_data_url(u: &str) -> Option<(String, Vec<u8>)> {
     let rest = u.strip_prefix("data:")?;

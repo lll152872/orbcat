@@ -41,6 +41,17 @@ interface ModelView {
   url: string;
   supportsToolCall: boolean;
   supportsImages: boolean;
+  maxInputTokens?: number | null;
+  maxOutputTokens?: number | null;
+  hasKey?: boolean;
+}
+
+/** pmem.projects 一行（SQLite 索引；记忆正文在 projects/<名>/MEMORY.md） */
+interface ProjectRow {
+  id: number;
+  name: string;
+  rootPath: string;
+  createdAt: string;
 }
 
 /** 远端 GET /models 返回的一项 */
@@ -64,6 +75,29 @@ interface ModelEditView {
   headersText: string;
   hasKey: boolean;
   keyPreview: string;
+  maxInputTokens?: number | null;
+  maxOutputTokens?: number | null;
+}
+
+/** 添加/编辑表单的会话内状态（re-render 时保住输入，错误也能回填） */
+interface ModelFormState {
+  /** null = 新建；否则为正在编辑的旧 id */
+  editId: string | null;
+  name: string;
+  id: string;
+  url: string;
+  /** 明文 Key（仅内存；不落日志） */
+  apiKey: string;
+  clearKey: boolean;
+  tool: boolean;
+  img: boolean;
+  headersText: string;
+  maxIn: string;
+  maxOut: string;
+  /** 内联错误（不进聊天、不丢表单） */
+  error?: string;
+  /** 预设 key，用于填 URL */
+  preset: string;
 }
 
 /** 设置页「拉取模型列表」的会话内状态（re-render 时要保住） */
@@ -178,6 +212,10 @@ interface PendingPerm {
 interface ChatEntry {
   role: "user" | "assistant" | "error" | "system" | "running";
   text: string;
+  /** 插话：插到 running 气泡之前，不要永远垫底 */
+  insertBeforeRunning?: boolean;
+  /** 轮数/上下文降级后可点「继续」 */
+  continueRun?: boolean;
   /**
    * 时间线：这一步"想了什么 / 做了什么"，**按发生顺序**排列。
    *
@@ -238,6 +276,10 @@ interface TokenUsage {
   completion: number;
   /** 思维链 token（部分模型单独给） */
   reasoning?: number;
+  /** 缓存命中（读）token */
+  cacheHit?: number;
+  /** 缓存写入 token */
+  cacheWrite?: number;
   total: number;
 }
 
@@ -250,6 +292,8 @@ interface StoredMsg {
   reasoning?: string;
   /** 本轮被中断（text 是半截） */
   interrupted?: boolean;
+  /** 插话 id —— UI 不铺气泡，画在 steps 时间线（真实交错） */
+  steerId?: string;
   /** 生成本条回答的模型 id（用量统计用）。老数据没有 */
   model?: string;
   /** 本轮问答的 token 用量合计。老数据 / 服务端没给 usage → 无此字段 */
@@ -280,6 +324,8 @@ interface SessionMeta {
   current: boolean;
   /** 主会话固定在列表置顶且不可删；fork 是分叉出来的会话，其余都是任务会话 */
   kind: "main" | "task" | "fork";
+  /** 已挂靠的项目名（右键挂靠后显示） */
+  projectName?: string | null;
 }
 
 interface SessionState {
@@ -328,10 +374,43 @@ function capAppend(cur: string | undefined, chunk: string, limit: number): strin
   return s.length <= limit ? s : `${s.slice(0, limit)}\n…（显示已截断）`;
 }
 
+/** 剥掉正文里混入的工具轨迹/思考尾巴（老数据 + 模型回显兜底，与后端 strip_step_folds 对齐） */
+function stripStepFolds(text: string): string {
+  if (!text) return text;
+  const markers = [
+    "\n«steps\n",
+    "\n«steps",
+    "\n[思考] ",
+    "\n[状态] ",
+    "\n[中间正文] ",
+    "\n[已执行",
+    "\n·think ",
+    "\n·status ",
+    "\n·text ",
+    "\n调用 ",
+    "\n  参数: ",
+  ];
+  let cut = text.length;
+  for (const m of markers) {
+    const i = text.indexOf(m);
+    if (i > 0 && i < cut) cut = i;
+  }
+  let out = text.slice(0, cut).trimEnd();
+  // 整块删掉嵌在中间的 «steps … »
+  out = out.replace(/«steps\n[\s\S]*?\n»/g, "").trimEnd();
+  return out;
+}
+
 /** 把磁盘上的会话消息转成面板的 entries */
 function sessionToEntries(s: Session): ChatEntry[] {
   const out: ChatEntry[] = [];
   s.messages.forEach((m, idx) => {
+    // 插话：历史回灌仍按 user 进模型，但 UI **不铺气泡** ——
+    // 它已作为 `kind=steer` 画在后续 assistant 的 steps 时间线里（真实交错）。
+    // 老数据没有 steerId → 仍当普通用户消息显示。
+    if (m.steerId) {
+      return;
+    }
     // ⚠️ 有 reasoning / items / interrupted 也要留 —— 否则「被中断 / 出错，
     //    只有思考或只有一条错误」的那轮会整条消失，用户看不到"停在这儿了"
     if (
@@ -345,7 +424,7 @@ function sessionToEntries(s: Session): ChatEntry[] {
     }
     out.push({
       role: m.role,
-      text: m.text,
+      text: stripStepFolds(m.text),
       // 磁盘上的 steps 就是时间线（后端保序落盘），直接当条目用
       items: m.steps,
       images: m.images,
@@ -397,7 +476,7 @@ function ensureSessionLoaded(): Promise<void> {
   return sessionLoaded;
 }
 
-/** 开新会话（旧会话留在「历史」里） */
+/** 开新会话 → 挂到**当前激活项目**（主对话则不绑） */
 async function newSession(): Promise<void> {
   if (busy) return;
   try {
@@ -405,6 +484,14 @@ async function newSession(): Promise<void> {
     currentSessionId = s.id;
     entries = [];
     await refreshSessionList();
+    // 只绑**这一条新会话**，不动其它
+    if (activeProjectId != null) {
+      await invoke("pmem_bind_session", {
+        sessionId: s.id,
+        projectId: activeProjectId,
+      }).catch(() => {});
+      await refreshSessionProjectTags();
+    }
     view = "chat";
     renderBody();
   } catch (e) {
@@ -412,6 +499,7 @@ async function newSession(): Promise<void> {
   }
 }
 
+/** 进入会话：顶栏项目跟着会话走（主聊天 → 主对话） */
 async function switchSession(id: string): Promise<void> {
   if (busy) return;
   try {
@@ -419,6 +507,16 @@ async function switchSession(id: string): Promise<void> {
     currentSessionId = s.id;
     entries = sessionToEntries(s);
     await refreshSessionList();
+    await loadProjects();
+    await refreshSessionProjectTags();
+    const meta = sessionList.find((x) => x.id === id);
+    // 主聊天永不挂项目 → 记忆回主对话
+    const wantPid =
+      meta?.kind === "main"
+        ? null
+        : (projects.find((p) => p.name === meta?.projectName)?.id ?? null);
+    activeProjectId = wantPid;
+    await invoke("pmem_set_active", { id: wantPid }).catch(() => {});
     view = "chat";
     renderBody();
   } catch (e) {
@@ -465,6 +563,71 @@ function installForkHandlers(): void {
     const upto = Number(btn.dataset.upto);
     if (!Number.isFinite(upto) || upto < 0) return;
     void forkSession(upto);
+  });
+}
+
+/**
+ * 面板内多字段输入（替代 window.prompt 的系统白框）。
+ * 返回 `null` = 取消；否则为各字段值。
+ */
+function askFields(
+  title: string,
+  fields: { key: string; label: string; placeholder?: string; value?: string }[],
+  okLabel = "确定",
+): Promise<Record<string, string> | null> {
+  return new Promise((resolve) => {
+    const mask = document.createElement("div");
+    mask.className = "confirm-mask";
+    const inputs = fields
+      .map(
+        (f, i) =>
+          `<label class="ask-field"><span>${esc(f.label)}</span>
+           <input data-k="${esc(f.key)}"${i === 0 ? " data-autofocus='1'" : ""}
+             placeholder="${esc(f.placeholder ?? "")}" value="${esc(f.value ?? "")}" /></label>`,
+      )
+      .join("");
+    mask.innerHTML = `
+      <div class="confirm-card">
+        <div class="confirm-title">${esc(title)}</div>
+        <div class="ask-fields">${inputs}</div>
+        <div class="confirm-actions">
+          <button type="button" class="set-btn" data-k="no">取消</button>
+          <button type="button" class="set-btn add" data-k="yes">${esc(okLabel)}</button>
+        </div>
+      </div>`;
+    (document.querySelector(".panel") ?? app).appendChild(mask);
+    mask.querySelector<HTMLInputElement>("input[data-autofocus='1']")?.focus();
+
+    let done = false;
+    const collect = (): Record<string, string> => {
+      const out: Record<string, string> = {};
+      mask.querySelectorAll<HTMLInputElement>("input[data-k]").forEach((el) => {
+        out[el.dataset.k!] = el.value.trim();
+      });
+      return out;
+    };
+    const close = (v: Record<string, string> | null): void => {
+      if (done) return;
+      done = true;
+      mask.remove();
+      resolve(v);
+    };
+    mask.addEventListener("click", (e) => {
+      const t = e.target as HTMLElement;
+      if (t === mask) {
+        close(null);
+        return;
+      }
+      const b = t.closest<HTMLElement>("[data-k]");
+      if (!b) return;
+      if (b.dataset.k === "no") close(null);
+      if (b.dataset.k === "yes") close(collect());
+    });
+    mask.addEventListener("keydown", (e) => {
+      const ke = e as KeyboardEvent;
+      if (ke.key === "Escape") close(null);
+      if (ke.key === "Enter") close(collect());
+    });
   });
 }
 
@@ -684,9 +847,13 @@ async function resendPrompt(text: string, imgs: string[]): Promise<void> {
     );
     if (run.interrupted) {
       const reason = run.stopReason && run.stopReason !== "已停止" ? run.stopReason : "";
+      const canContinue = reason.includes("轮数上限") || reason.includes("上下文");
       pushEntry(
         "system",
         reason ? `⚠️ ${reason}` : "⏹ 已停止，本轮已产出的内容保留在上面",
+        undefined,
+        undefined,
+        canContinue ? { continueRun: true } : undefined,
       );
     }
   } catch (e) {
@@ -718,16 +885,33 @@ function installRegenHandlers(): void {
 async function deleteSession(id: string): Promise<void> {
   if (busy) return;
   try {
+    const meta = sessionList.find((s) => s.id === id);
+    const proj = meta?.projectName ?? null;
+    const sibs = sessionList.filter((s) => s.projectName === proj && s.id !== id);
     await invoke("session_delete", { id });
-    await refreshSessionList();
-    // 删的可能是当前会话 → 后端已自动切到别的，这里重新对齐
+    // 若删的是当前会话，后端会切到别的 → 重新对齐
     const st = await invoke<SessionState>("session_state");
     currentSessionId = st.session.id;
     sessionList = st.list;
     entries = sessionToEntries(st.session);
+    if (proj && sibs.length === 0) {
+      const clear = await askConfirm(
+        "清空项目记忆",
+        `「${proj}」下已无其它会话。\n是否清空项目记忆 MEMORY.md？（项目保留）`,
+        "清空记忆",
+        true,
+      );
+      if (clear) {
+        await invoke("pmem_clear_memory", { name: proj }).catch(() => {});
+        showToast(`已清空「${proj}」项目记忆`, "ok");
+      }
+    }
+    await refreshSessionList();
+    await refreshSessionProjectTags();
     renderBody();
+    showToast("已删除会话", "ok", 2000);
   } catch (e) {
-    pushEntry("error", `删除会话失败：${e}`);
+    showToast(`删除失败：${e}`, "error");
   }
 }
 
@@ -749,56 +933,71 @@ function fmtTime(ms: number): string {
 }
 
 /** 会话页：**上方主聊天（唯一、不可删）**，下方任务会话列表 */
+/** 会话页：按**项目**分组；📁 标签独立、不被标题省略吃掉 */
 function renderSessionsView(): string {
-  const main = sessionList.find((s) => s.kind === "main");
-  const tasks = sessionList.filter((s) => s.kind !== "main");
+  const projTag = (name?: string | null): string =>
+    name ? `<span class="sess-proj" title="项目：${esc(name)}">📁 ${esc(name)}</span>` : "";
 
-  // 主聊天卡片：无删除按钮，标题固定
-  const mainHtml = main
-    ? `
-      <button class="sess-main${main.current ? " cur" : ""}" data-id="${esc(main.id)}" title="切回主聊天">
-        <span class="sess-main-icon">👤</span>
-        <span class="sess-main-text">
-          <b>主聊天</b>
-          <i>${fmtTime(main.updatedAt)} · ${main.count} 条 · 永久保留</i>
-        </span>
-        ${main.current ? '<span class="sess-main-cur">当前</span>' : '<span class="set-entry-arrow">›</span>'}
-      </button>`
-    : "";
-
-  const taskRows =
-    tasks.length === 0
-      ? `<div class="mem-empty">还没有任务会话。点右上「＋」开一个，或直接把活丢给它。</div>`
-      : tasks
-          .map(
-            (s) => `
-      <div class="sess-item${s.current ? " cur" : ""}">
+  const itemRow = (s: SessionMeta): string => `
+      <div class="sess-item${s.current ? " cur" : ""}" data-id="${esc(s.id)}" title="右键挂靠到项目">
         <button class="sess-open" data-id="${esc(s.id)}" title="切换到该会话">
-          <span class="sess-title">${esc(s.title)}<span class="sess-fork-tag"${
-            s.kind === "fork" ? "" : " hidden"
-          }>分支</span>${s.current ? " · 当前" : ""}</span>
+          <span class="sess-title-row">
+            <span class="sess-title">${esc(s.title || "（无标题）")}</span>
+            ${s.kind === "fork" ? '<span class="sess-fork-tag">分支</span>' : ""}
+            ${projTag(s.projectName)}
+            ${s.current ? '<span class="sess-cur-tag">当前</span>' : ""}
+          </span>
           <span class="sess-meta">${fmtTime(s.updatedAt)} · ${s.count} 条</span>
         </button>
-        <button class="sess-del" data-id="${esc(s.id)}" title="删除该会话">✕</button>
-      </div>`,
-          )
-          .join("");
+        ${s.kind === "main" ? "" : `<button class="sess-del" data-id="${esc(s.id)}" title="删除该会话">✕</button>`}
+      </div>`;
+
+  const groups = new Map<string | null, SessionMeta[]>();
+  for (const s of sessionList) {
+    // 主聊天永远进「主对话」组
+    const k = s.kind === "main" ? null : (s.projectName ?? null);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k)!.push(s);
+  }
+  const activeName =
+    activeProjectId == null
+      ? null
+      : (projects.find((p) => p.id === activeProjectId)?.name ?? null);
+  const keys = [...groups.keys()].sort((a, b) => {
+    if (a === activeName) return -1;
+    if (b === activeName) return 1;
+    if (a === null) return -1;
+    if (b === null) return 1;
+    return (a ?? "").localeCompare(b ?? "");
+  });
+
+  const sections = keys
+    .map((k) => {
+      const list = groups.get(k)!;
+      const head =
+        k === null
+          ? `主对话 / 未挂靠 · ${list.length}`
+          : `📁 ${esc(k)} · ${list.length}${k === activeName ? " · 当前项目" : ""}`;
+      const rows = list.map(itemRow).join("");
+      const sepAttrs =
+        k === null
+          ? ""
+          : ` data-pname="${esc(k)}" data-pid="${projects.find((p) => p.name === k)?.id ?? ""}"`;
+      return `
+    <div class="sess-sep"${sepAttrs}>${head}</div>
+    <div class="sess-group${k === activeName ? " cur-proj" : ""}">${rows}</div>`;
+    })
+    .join("");
 
   return `
     <div class="mem-head">会话<button class="mem-back" id="sess-new">＋ 新建</button></div>
     <div class="set-hint" style="margin-bottom:8px">
-      对话自动存到 <code>agent-data/sessions/</code>。主聊天永久保留，任务会话与分支都可删。<br>
-      分叉：主聊天里任意一条<b>AI 回复</b>右侧的点 <b>⑂</b> —— 只带「下一次会喂给模型的
-      上下文窗口」（最近 6 小时 ∪ 最近 10 条），不是全部历史。
+      <b>按项目分组</b> · 右键会话挂靠/改挂靠 · 点一条进入对话
     </div>
-    ${mainHtml}
+    ${sections || '<div class="mem-empty">还没有会话。</div>'}
     <div style="margin:8px 0">
-      <button class="set-btn" id="sess-compact" title="把较早的对话压成摘要（落盘），减小后续每轮的上下文占用。摘要会替代被压缩的原文。">
-        压缩上下文（compact）
-      </button>
-    </div>
-    <div class="sess-sep">任务会话 ${tasks.length} 个</div>
-    ${taskRows}`;
+      <button class="set-btn" id="sess-compact">压缩上下文（compact）</button>
+    </div>`;
 }
 
 function bindSessionsView(root: HTMLElement): void {
@@ -816,6 +1015,249 @@ function bindSessionsView(root: HTMLElement): void {
   );
   document.getElementById("sess-new")?.addEventListener("click", () => void newSession());
   document.getElementById("sess-compact")?.addEventListener("click", () => void compactCurrent());
+
+  // 右键会话 → 挂靠到项目（session 之上是项目记忆）
+  installSessionBindHandler(root);
+}
+
+/** 「＋」菜单：新建会话 / 新建项目（原「项+」并入） */
+function showNewMenu(x: number, y: number): void {
+  document.getElementById("new-ctx")?.remove();
+  const menu = document.createElement("div");
+  menu.id = "new-ctx";
+  menu.className = "ctx-menu";
+  menu.innerHTML = `
+    <div class="ctx-item" data-act="sess">新建会话</div>
+    <div class="ctx-item" data-act="proj">新建项目…</div>`;
+  menu.style.left = `${Math.min(x, window.innerWidth - 160)}px`;
+  menu.style.top = `${Math.min(y, window.innerHeight - 100)}px`;
+  document.body.appendChild(menu);
+  const close = (): void => menu.remove();
+  menu.addEventListener("click", async (e) => {
+    const t = (e.target as HTMLElement).closest<HTMLElement>(".ctx-item");
+    if (!t) return;
+    close();
+    if (t.dataset.act === "sess") {
+      void newSession();
+      return;
+    }
+    const got = await askFields(
+      "新建项目",
+      [
+        { key: "name", label: "项目名", placeholder: "M3FM / 论文精读" },
+        { key: "root", label: "绑定工作目录（可空）", placeholder: "D:\\myword\\文章\\论文" },
+      ],
+      "创建并切换",
+    );
+    if (!got?.name) return;
+    try {
+      const p = await invoke<ProjectRow>("pmem_create", {
+        name: got.name,
+        rootPath: got.root || null,
+      });
+      await loadProjects();
+      activeProjectId = p.id;
+      await invoke("pmem_set_active", { id: p.id }).catch(() => {});
+      await newSession(); // 新会话会绑到 p.id
+      await refreshSessionProjectTags();
+      showToast(`已创建「${p.name}」并打开新会话`, "ok");
+    } catch (err) {
+      showToast(`创建项目失败：${err}`, "error");
+    }
+    renderBody();
+  });
+  window.addEventListener("click", close, { once: true });
+}
+
+/** 会话右键：挂靠 / 重命名会话 / 删除（打开用左键） */
+function showSessionBindMenu(x: number, y: number, sid: string, kind: string): void {
+  document.getElementById("sess-ctx")?.remove();
+  const menu = document.createElement("div");
+  menu.id = "sess-ctx";
+  menu.className = "ctx-menu";
+  const binds = [
+    `<div class="ctx-item" data-act="bind" data-pid="">主对话（不挂项目）</div>`,
+    ...projects.map(
+      (p) => `<div class="ctx-item" data-act="bind" data-pid="${p.id}">📁 ${esc(p.name)}</div>`,
+    ),
+  ].join("");
+  menu.innerHTML = `
+    <div class="ctx-title">挂靠到项目</div>
+    ${binds}
+    <div class="ctx-sep"></div>
+    <div class="ctx-item" data-act="rename">重命名会话</div>
+    ${kind === "main" ? "" : '<div class="ctx-item danger" data-act="del">删除会话</div>'}
+  `;
+  menu.style.left = `${Math.min(x, window.innerWidth - 190)}px`;
+  menu.style.top = `${Math.min(y, window.innerHeight - 280)}px`;
+  document.body.appendChild(menu);
+  const close = (): void => menu.remove();
+  menu.addEventListener("click", async (e) => {
+    const t = (e.target as HTMLElement).closest<HTMLElement>(".ctx-item");
+    if (!t) return;
+    const act = t.dataset.act;
+
+    if (act === "rename") {
+      close();
+      const meta = sessionList.find((s) => s.id === sid);
+      const got = await askFields(
+        "重命名会话",
+        [{ key: "title", label: "标题", value: meta?.title ?? "" }],
+        "保存",
+      );
+      if (!got?.title) return;
+      // 用 session_set_title；后端若无则回退 truncate 不可 —— 需已有命令
+      try {
+        await invoke("session_set_title", { id: sid, title: got.title });
+        await refreshSessionList();
+        renderBody();
+        showToast("已重命名", "ok", 2000);
+      } catch (err) {
+        showToast(`重命名失败：${err}`, "error");
+      }
+      return;
+    }
+
+    if (act === "del") {
+      close();
+      const meta = sessionList.find((s) => s.id === sid);
+      const proj = meta?.projectName ?? null;
+      const sibs = sessionList.filter((s) => s.projectName === proj && s.id !== sid);
+      const ok = await askConfirm("删除会话", `确定删除「${meta?.title ?? sid}」？`, "删除");
+      if (!ok) return;
+      try {
+        await invoke("session_delete", { id: sid });
+        // 最后一条才问清不清项目记忆
+        if (proj && sibs.length === 0) {
+          const clear = await askConfirm(
+            "清空项目记忆",
+            `「${proj}」下已无其它会话。\n是否清空项目记忆 MEMORY.md？（项目本身保留）`,
+            "清空记忆",
+            true,
+          );
+          if (clear) {
+            await invoke("pmem_clear_memory", { name: proj }).catch(() => {});
+            showToast(`已清空「${proj}」项目记忆`, "ok");
+          }
+        }
+        await refreshSessionList();
+        await refreshSessionProjectTags();
+        renderBody();
+        showToast("已删除会话", "ok", 2000);
+      } catch (err) {
+        showToast(`删除失败：${err}`, "error");
+      }
+      return;
+    }
+
+    if (act === "bind") {
+      // 主聊天不允许挂靠
+      if (kind === "main") {
+        close();
+        showToast("主聊天不能挂靠项目", "info");
+        return;
+      }
+      const pid = t.dataset.pid === "" ? null : Number(t.dataset.pid);
+      try {
+        await invoke("pmem_bind_session", { sessionId: sid, projectId: pid });
+        await refreshSessionProjectTags();
+        renderBody();
+        showToast(
+          pid == null
+            ? "已解除挂靠"
+            : `已挂靠到「${projects.find((p) => p.id === pid)?.name ?? pid}」`,
+          "ok",
+          2500,
+        );
+      } catch (err) {
+        showToast(`挂靠失败：${err}`, "error");
+      }
+      close();
+    }
+  });
+  window.addEventListener("click", close, { once: true });
+}
+
+/** 拉 session→项目名 映射；顺带把误绑到项目上的主聊天解绑 */
+async function refreshSessionProjectTags(): Promise<void> {
+  try {
+    const map = await invoke<Record<string, string | null>>("pmem_session_map");
+    for (const s of sessionList) {
+      s.projectName = map[s.id] ?? null;
+    }
+    // 主聊天永不挂项目 —— 清历史脏数据
+    for (const s of sessionList) {
+      if (s.kind === "main" && s.projectName) {
+        await invoke("pmem_bind_session", { sessionId: s.id, projectId: null }).catch(() => {});
+        s.projectName = null;
+      }
+    }
+  } catch {
+    /* 库未建时静默 */
+  }
+}
+
+function installSessionBindHandler(root: HTMLElement): void {
+  // 会话行右键
+  root.addEventListener("contextmenu", (e) => {
+    const item = (e.target as HTMLElement).closest<HTMLElement>(".sess-item");
+    if (!item) return;
+    e.preventDefault();
+    const sid = item.dataset.id ?? "";
+    if (!sid) return;
+    const meta = sessionList.find((s) => s.id === sid);
+    const kind = meta?.kind ?? "task";
+    void loadProjects()
+      .then(() => refreshSessionProjectTags())
+      .then(() => {
+        showSessionBindMenu(e.clientX, e.clientY, sid, kind);
+      });
+    return;
+  });
+  // 项目组标题右键 → 重命名项目
+  root.addEventListener("contextmenu", (e) => {
+    const sep = (e.target as HTMLElement).closest<HTMLElement>(".sess-sep[data-pname]");
+    if (!sep) return;
+    e.preventDefault();
+    const pname = sep.dataset.pname ?? "";
+    const pid = Number(sep.dataset.pid ?? 0);
+    if (!pname || !pid) return;
+    document.getElementById("sess-ctx")?.remove();
+    const menu = document.createElement("div");
+    menu.id = "sess-ctx";
+    menu.className = "ctx-menu";
+    menu.innerHTML = `
+      <div class="ctx-title">📁 ${esc(pname)}</div>
+      <div class="ctx-item" data-act="rename-proj">重命名项目</div>`;
+    menu.style.left = `${Math.min(e.clientX, window.innerWidth - 180)}px`;
+    menu.style.top = `${Math.min(e.clientY, window.innerHeight - 80)}px`;
+    document.body.appendChild(menu);
+    const close = (): void => menu.remove();
+    menu.addEventListener("click", async (ev) => {
+      const t = (ev.target as HTMLElement).closest<HTMLElement>(".ctx-item");
+      if (!t) return;
+      close();
+      const got = await askFields(
+        "重命名项目",
+        [{ key: "name", label: "项目名", value: pname }],
+        "保存",
+      );
+      if (!got?.name || got.name === pname) return;
+      try {
+        await invoke("pmem_rename", { id: pid, name: got.name });
+        await loadProjects();
+        if (activeProjectId === pid) {
+          // 名字变了，active 不变
+        }
+        await refreshSessionProjectTags();
+        renderBody();
+        showToast("项目已重命名", "ok", 2000);
+      } catch (err) {
+        showToast(`重命名失败：${err}`, "error");
+      }
+    });
+    window.addEventListener("click", close, { once: true });
+  });
 }
 
 /**
@@ -907,9 +1349,17 @@ interface McpStatus {
   error: string | null;
   /** 当前网关地址；空串 = 未配置（没有默认值，不配就不启用） */
   url: string;
+  /** 活跃工具 schema 的粗略 token 估算（仅展示，无加载上限） */
   activeTokens: number;
-  budgetTokens: number;
   groups: McpGroupView[];
+}
+
+/** 一条 MCP server 配置（对应 Rust `config::McpServerCfg`，camelCase 序列化） */
+interface McpServerCfg {
+  id: string;
+  url: string;
+  enabled: boolean;
+  label: string;
 }
 
 // ---------------- 状态 ----------------
@@ -971,12 +1421,33 @@ const app = document.getElementById("app")!;
 
 let models: ModelView[] = [];
 let selectedModel: string | null = null;
+/** 项目索引（pmem.sqlite）；activeProjectId=null = 主对话 */
+let projects: ProjectRow[] = [];
+let activeProjectId: number | null = null;
 let entries: ChatEntry[] = [];
 
 /** 远端模型列表拉取结果（设置 › 模型） */
 let remoteFetch: RemoteFetchState | null = null;
-/** 正在编辑的模型 id；null = 新增模式 */
-let modelEditId: string | null = null;
+/** 添加/编辑表单状态（统一一张表，不再拆「拉取 / 手动」） */
+let modelForm: ModelFormState = emptyModelForm();
+let modelSearch = "";
+
+function emptyModelForm(): ModelFormState {
+  return {
+    editId: null,
+    name: "",
+    id: "",
+    url: "",
+    apiKey: "",
+    clearKey: false,
+    tool: true,
+    img: true,
+    headersText: "",
+    maxIn: "",
+    maxOut: "",
+    preset: "custom",
+  };
+}
 
 /** 待发送的图片（data URL） */
 let pendingImages: string[] = [];
@@ -1374,6 +1845,14 @@ function renderTimeline(items: AgentStep[] | undefined, live: boolean): string {
 
   const body = items.map((s, i) => renderItem(s, live, i)).join("");
   if (!body) return "";
+  // 跑完（历史）：包进默认折叠的「过程」，中间细节不再抢最终答案；
+  // 中途（live）保持摊开 —— 用户要盯着进度。
+  if (!live) {
+    return `<details class="run-process" data-open-key="proc-${esc((items[0]?.detail ?? "").slice(0, 12))}-${items.length}">
+      <summary>过程 · ${items.length} 步</summary>
+      <div class="run-timeline tl-hist">${body}</div>
+    </details>`;
+  }
   return `<div class="run-timeline${live ? "" : " tl-hist"}">${body}</div>`;
 }
 
@@ -1385,7 +1864,7 @@ function renderItem(s: AgentStep, live: boolean, idx = -1): string {
   switch (s.kind) {
     case "reasoning":
       if (!s.detail.trim()) return "";
-      return `<details class="run-reason tl-reason"${di}${live ? " open" : ""}>
+      return `<details class="run-reason tl-reason"${di}${live ? " open" : ""} data-open-key="r-${esc(s.name || "")}-${idx}">
         <summary>💭 思考过程<span class="run-reason-len">（${s.detail.length} 字）</span></summary>
         <pre class="run-reason-pre">${esc(s.detail)}</pre>
       </details>`;
@@ -1396,10 +1875,19 @@ function renderItem(s: AgentStep, live: boolean, idx = -1): string {
       }</div>`;
 
     case "tool_result": {
-      const preview = (s.detail || "").split("\n")[0].slice(0, 70);
-      return `<div class="tl-line"${di}>✅ <code>${esc(s.name || "?")}</code> 返回 <i>${esc(
-        preview,
-      )}</i></div>`;
+      const full = s.detail || "";
+      const preview = full.split("\n")[0].slice(0, 70);
+      const truncated = full.length > 200;
+      const bodyFull = full.length > 8 * 1024 ? full.slice(0, 8 * 1024) + "\n…[截断]" : full;
+      if (!truncated) {
+        return `<div class="tl-line"${di}>✅ <code>${esc(s.name || "?")}</code> 返回 <i>${esc(
+          preview,
+        )}</i></div>`;
+      }
+      return `<details class="tl-tool-res"${di}${live ? "" : ""} data-open-key="tr-${esc(s.name || "")}-${idx}">
+        <summary>✅ <code>${esc(s.name || "?")}</code> 返回 <i>${esc(preview)}</i></summary>
+        <pre class="tl-tool-pre">${esc(bodyFull)}</pre>
+      </details>`;
     }
 
     case "tool_error":
@@ -1413,6 +1901,17 @@ function renderItem(s: AgentStep, live: boolean, idx = -1): string {
       return `<div class="tl-line tl-status"${di}>${s.kind === "omitted" ? "" : "⏳ "}${esc(
         s.detail,
       )}</div>`;
+
+    case "steer":
+      return `<div class="tl-steer"${di}>💬 插话${s.name ? ` <i>${esc(s.name)}</i>` : ""}：${esc(
+        s.detail,
+      )}</div>`;
+
+    case "text":
+    case "stream":
+      return `<div class="tl-text"${di}>${
+        s.name ? `<span class="tl-text-tag">${esc(s.name)}</span>` : ""
+      }${esc(s.detail).replace(/\n/g, "<br>")}</div>`;
 
     // 最终答案的正文另有渲染（`e.text` → markdown），这里跳过免得重复
     case "assistant":
@@ -1471,7 +1970,7 @@ function renderThumb(src: string, idx: number, removable: boolean): string {
 
 /** 权限申请卡永远挂在消息流**最后** —— 它是"此刻要你拍板"的东西 */
 function renderMessages(): string {
-  return renderMessagesInner() + renderPermCards();
+  return renderMessagesInner() + `<div class="perm-cards">${renderPermCards()}</div>`;
 }
 
 /**
@@ -1485,7 +1984,36 @@ function renderMessages(): string {
  * 直接把字符串塞进 innerHTML 的话，卡片渲染出来了但按钮是死的。
  */
 function paintMessages(el: HTMLElement): void {
+  // 重绘前收集用户/系统已展开的 details，重建后写回 —— 否则权限卡刷新、
+  // 记忆提示等整块 innerHTML 会把展开状态冲掉（「展开一下马上没了」）。
+  const openKeys = new Set<string>();
+  el.querySelectorAll<HTMLDetailsElement>("details[open]").forEach((d) => {
+    const key = d.dataset.openKey ?? d.dataset.i ?? d.querySelector("summary")?.textContent?.slice(0, 24) ?? "";
+    if (key) openKeys.add(key);
+  });
   el.innerHTML = renderMessages();
+  el.querySelectorAll<HTMLDetailsElement>("details").forEach((d) => {
+    const key = d.dataset.openKey ?? d.dataset.i ?? d.querySelector("summary")?.textContent?.slice(0, 24) ?? "";
+    if (key && openKeys.has(key)) {
+      d.open = true;
+      d.dataset.userOpen = "1";
+    }
+    // 记录用户手动展开（E5/E7）
+    d.addEventListener("toggle", () => {
+      if (d.open) d.dataset.userOpen = "1";
+      else delete d.dataset.userOpen;
+    });
+  });
+  el.querySelectorAll<HTMLButtonElement>("button[data-continue]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const ta = document.querySelector<HTMLTextAreaElement>("#prompt-input");
+      if (ta) {
+        ta.value = "继续";
+        draftInput = "继续";
+      }
+      void send();
+    });
+  });
   bindPermButtons(el);
 }
 
@@ -1612,7 +2140,13 @@ function scheduleRunPaint(): void {
     const b = document.getElementById("panel-body");
     if (!b) return;
     const atBottom = b.scrollHeight - b.scrollTop - b.clientHeight < 60;
+    // 用户主动展开过过程块 → 禁止误滚走（E7）
+    const userExpanded = b.querySelector("details[data-user-open='1']");
     patchRunning(b);
+    if (userExpanded) {
+      // 重建后按 data-open-key 恢复；若仍展开，别滚
+      return;
+    }
     // 用户没往上翻时才自动跟到底部
     if (atBottom) b.scrollTop = b.scrollHeight;
   });
@@ -1735,7 +2269,7 @@ function renderMessagesInner(): string {
           <div class="run-stream${e.streamDiscarded ? " discarded" : ""}"${
             streamText ? "" : " hidden"
           }>${esc(streamText).replace(/\n/g, "<br>")}</div>
-          <div class="run-note"${e.streamDiscarded ? "" : " hidden"}>（模型中途决定调用工具，上面这段不是最终答复）</div>
+          <div class="run-note"${e.streamDiscarded ? "" : " hidden"}>已改调工具 · 仍可看</div>
         </div>`;
       }
 
@@ -1772,7 +2306,9 @@ function renderMessagesInner(): string {
         e.role === "assistant" && e.usage
           ? `<span class="tok-badge" title="输入 ${e.usage.prompt} · 输出 ${
               e.usage.completion
-            }${e.usage.reasoning ? ` · 思考 ${e.usage.reasoning}` : ""} tokens${
+            }${e.usage.reasoning ? ` · 思考 ${e.usage.reasoning}` : ""}${
+              e.usage.cacheHit ? ` · 缓存命中 ${e.usage.cacheHit}` : ""
+            }${e.usage.cacheWrite ? ` · 缓存写入 ${e.usage.cacheWrite}` : ""} tokens${
               e.model ? ` · ${esc(e.model)}` : ""
             }">${fmtTokens(e.usage.total)} tok</span>`
           : "";
@@ -1781,6 +2317,11 @@ function renderMessagesInner(): string {
         ${imgs}
         ${reason}
         ${body ? `<div class="msg-body${isMd ? " md" : ""}">${body}</div>` : ""}
+        ${
+          e.continueRun
+            ? `<div class="perm-actions" style="margin-top:6px"><button type="button" class="perm-btn ok" data-continue="1">继续</button></div>`
+            : ""
+        }
         ${
           e.text || e.storedIdx !== undefined
             ? `<div class="msg-foot">${tokBadge}${renderForkBtn(e)}${renderRegenBtn(e)}${renderDelBtn(e)}${
@@ -1865,7 +2406,13 @@ const PERM_RISK_LABEL: Record<string, string> = {
 
 function renderPermCards(): string {
   return pendingPerms
-    .map((p) => (p.kind === "command" ? renderCommandPermCard(p) : renderFilePermCard(p)))
+    .map((p) =>
+      p.kind === "command"
+        ? renderCommandPermCard(p)
+        : p.kind === "mcp"
+          ? renderMcpPermCard(p)
+          : renderFilePermCard(p),
+    )
     .join("");
 }
 
@@ -1933,6 +2480,23 @@ function renderFilePermCard(p: PendingPerm): string {
 }
 
 /** 命令级申请卡（指纹维度）：显示原文 + 归一化（实际执行什么）+ 三种批准粒度 */
+function renderMcpPermCard(p: PendingPerm): string {
+  return `
+  <div class="perm-card perm-card-cmd perm-risk-${esc(p.risk || "medium")}" data-perm="${esc(p.id)}">
+    <div class="perm-title">🔌 调用 MCP 工具</div>
+    <div class="perm-cmd">${esc(p.command)}</div>
+    ${p.normalized ? `<div class="perm-hint">参数：${esc(p.normalized)}</div>` : ""}
+    <div class="perm-hint">默认每次询问。选「总是允许」后同工具不再弹卡（可在设置 › MCP 撤销）。</div>
+    <div class="perm-actions">
+      <button type="button" class="perm-btn ok" data-act="approve">允许一次</button>
+      <button type="button" class="perm-btn ok" data-act="always" title="永久允许该工具，跨会话、重启后仍生效">总是允许</button>
+      <button type="button" class="perm-btn no" data-act="deny">拒绝</button>
+      <button type="button" class="perm-btn why" data-act="deny-why" title="拒绝并说明理由">拒绝并说明</button>
+    </div>
+    <div class="perm-hint">Enter 允许一次 · Esc 拒绝 · Shift+Enter 总是允许</div>
+  </div>`;
+}
+
 function renderCommandPermCard(p: PendingPerm): string {
   const deadline = p.createdAt + p.timeoutMs;
   const rest = Math.max(0, deadline - Date.now());
@@ -1986,13 +2550,22 @@ function renderCommandPermCard(p: PendingPerm): string {
   </div>`;
 }
 
-/** 只重绘消息区（卡片跟着消息流一起重绘） */
+/** 权限卡局部刷新：只动卡片区，不整页 paintMessages（保 details.open，降重绘） */
 function refreshPermCards(): void {
   if (view !== "chat") return;
   const b = document.getElementById("panel-body");
   if (!b) return;
-  paintMessages(b);
-  scrollToBottom();
+  const host = b.querySelector<HTMLElement>(".perm-cards");
+  if (host) {
+    host.innerHTML = renderPermCards();
+    bindPermButtons(host);
+  } else {
+    // 老布局：卡片区可能嵌在消息流里 —— 兜底整绘
+    paintMessages(b);
+  }
+  // 权限卡出现/消失时若用户在底部，跟一下；否则别抢滚动
+  const atBottom = b.scrollHeight - b.scrollTop - b.clientHeight < 60;
+  if (atBottom) b.scrollTop = b.scrollHeight;
 }
 
 /** 提交用户的决定。失败不吞 —— 明确报出来，否则用户以为点了没反应 */
@@ -2001,7 +2574,20 @@ async function decidePerm(id: string, act: string, reason = ""): Promise<void> {
     // reason 只在拒绝时有意义（批准时后端会忽略），原样回给模型当"为什么不行"
     await invoke("perm_request_decide", { id, decision: act, reason });
   } catch (e) {
+    const msg = String(e);
+    // 已被处理 / 超时作废：卡片留着也没意义，安静移除即可
+    if (msg.includes("不存在或已处理") || msg.includes("已失效")) {
+      pendingPerms = pendingPerms.filter((x) => x.id !== id);
+      void refreshPendingApprovals();
+      refreshPermCards();
+      return;
+    }
+    // 其它失败：**保留卡片**并恢复按钮，否则用户点失败后没法重试，
+    // 后端还在阻塞等决定 —— 表现就是「卡死」。
     pushEntry("error", `权限申请处理失败：${e}`);
+    const card = document.querySelector<HTMLElement>(`.perm-card[data-perm="${id}"]`);
+    card?.querySelectorAll<HTMLButtonElement>(".perm-btn").forEach((b) => (b.disabled = false));
+    return;
   }
   denyReasonFor = null;
   // 乐观移除：不等 perm-resolved 事件回来 —— 它会因为重绘时序晚到，
@@ -2128,13 +2714,28 @@ function renderPanel(): void {
   const opts = models
     .map(
       (m) =>
-        `<option value="${esc(m.id)}"${m.id === selectedModel ? " selected" : ""}>${esc(
+        `<option value="${esc(m.name)}"${m.name === selectedModel ? " selected" : ""}>${esc(
           m.name,
         )}${m.vendor && m.vendor !== "Custom" ? ` · ${esc(m.vendor)}` : ""}${
           m.supportsImages ? " 🖼" : ""
         }${m.supportsToolCall ? " 🔧" : ""}</option>`,
     )
     .join("");
+
+  // 主对话 / 项目（新建走独立「项+」，select 只显示真实项目，永远选中当前）
+  const projOpts = [
+    `<option value=""${activeProjectId == null ? " selected" : ""}>主对话</option>`,
+    ...projects.map(
+      (p) =>
+        `<option value="${p.id}"${p.id === activeProjectId ? " selected" : ""}>📁 ${esc(
+          p.name,
+        )}</option>`,
+    ),
+  ].join("");
+  const projTitle =
+    activeProjectId == null
+      ? "主对话"
+      : (projects.find((p) => p.id === activeProjectId)?.name ?? "主对话");
 
   app.innerHTML = `
     <div class="panel">
@@ -2148,8 +2749,11 @@ function renderPanel(): void {
         <select id="model-select" ${models.length ? "" : "disabled"}>
           ${opts || '<option>（没有可用模型）</option>'}
         </select>
+        <select id="project-select" title="当前：${esc(projTitle)} · 切项目看该项目会话">
+          ${projOpts}
+        </select>
         <button class="mini-btn" id="btn-grab" title="截取当前屏幕">截</button>
-        <button class="mini-btn" id="btn-new" title="新建任务会话">＋</button>
+        <button class="mini-btn" id="btn-new" title="新建会话 / 项目">＋</button>
         <button class="mini-btn" id="btn-sess" title="会话（主聊天 / 任务）">史</button>
       </div>
 
@@ -2181,7 +2785,10 @@ function renderPanel(): void {
   // 「测」「忆」的工具栏入口已删（与设置页重复）：
   //   测试连通性 → 设置 › 模型（每个模型一行一颗）
   //   记忆审批   → 设置入口页「🧠 记忆」
-  document.getElementById("btn-new")!.addEventListener("click", () => void newSession());
+  document.getElementById("btn-new")!.addEventListener("click", (e) => {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    showNewMenu(r.left, r.bottom + 4);
+  });
   document.getElementById("btn-sess")!.addEventListener("click", () => void switchView("sessions"));
 
   // 当前会话标题挂到「史」按钮的 tooltip 上，一眼知道在哪个会话里
@@ -2200,6 +2807,22 @@ function renderPanel(): void {
     await invoke("set_selected_model", { id: selectedModel }).catch((e) =>
       pushEntry("error", `保存模型选择失败：${e}`),
     );
+  });
+
+  // 顶栏项目：只切换；新建入口在「＋」菜单里（与新建会话合并）
+  const psel = document.getElementById("project-select") as HTMLSelectElement | null;
+  psel?.addEventListener("change", async () => {
+    const id = psel.value === "" ? null : Number(psel.value);
+    activeProjectId = id;
+    try {
+      await invoke("pmem_set_active", { id });
+      // 只切记忆上下文，不改任何会话的挂靠
+      await refreshSessionProjectTags();
+    } catch (e) {
+      showToast(`切换项目失败：${e}`, "error");
+    }
+    view = "sessions";
+    renderBody();
   });
 
   const input = document.getElementById("input") as HTMLTextAreaElement;
@@ -2372,6 +2995,12 @@ function renderBody(): void {
       if (view !== "sessions") return;
       b.innerHTML = renderSessionsView();
       bindSessionsView(b);
+      void refreshSessionProjectTags().then(() => {
+        if (view === "sessions") {
+          b.innerHTML = renderSessionsView();
+          bindSessionsView(b);
+        }
+      });
     });
     return;
   }
@@ -2473,16 +3102,20 @@ function renderBody(): void {
   if (view === "mcp") {
     const keep = b.scrollTop;
     b.innerHTML = `<div class="mem-loading">加载中…</div>`;
-    void invoke<McpStatus>("mcp_status")
-      .then((st) => {
+    void Promise.all([
+      invoke<McpStatus>("mcp_status").catch(() => null),
+      invoke<McpServerCfg[]>("mcp_servers_list").catch(() => [] as McpServerCfg[]),
+      invoke<string[]>("mcp_grants_list").catch(() => [] as string[]),
+    ])
+      .then(([st, servers, grants]) => {
         if (view !== "mcp") return;
-        b.innerHTML = renderMcpView(st);
+        b.innerHTML = renderMcpView(st, servers ?? [], grants ?? []);
         b.scrollTop = keep;
         bindMcpView(b);
       })
       .catch(() => {
         if (view !== "mcp") return;
-        b.innerHTML = renderMcpView(null);
+        b.innerHTML = renderMcpView(null, [], []);
         b.scrollTop = keep;
         bindMcpView(b);
       });
@@ -2739,7 +3372,13 @@ function bindMemButtons(root: HTMLElement): void {
 
 async function switchView(v: View): Promise<void> {
   // 再点同一个非 chat 视图 → 退回对话（toggle 手感）
-  view = v === view && v !== "chat" ? "chat" : v;
+  const next = v === view && v !== "chat" ? "chat" : v;
+  // 离开模型页时丢掉表单草稿，避免下次进来卡在「编辑模式 + 空字段」
+  if (view === "models" && next !== "models") {
+    modelForm = emptyModelForm();
+    remoteFetch = null;
+  }
+  view = next;
   renderBody();
 }
 
@@ -2961,449 +3600,380 @@ function bindSearchView(_root: HTMLElement): void {
 }
 
 // ---------------- 设置 › 模型 ----------------
-
 function renderModelsView(): string {
-  const rows = models
+  const q = (modelSearch || "").trim().toLowerCase();
+  const filtered = q
+    ? models.filter(
+        (m) =>
+          m.id.toLowerCase().includes(q) ||
+          m.name.toLowerCase().includes(q) ||
+          m.url.toLowerCase().includes(q),
+      )
+    : models;
+
+  const rows = filtered
     .map((m) => {
-      const cur = m.id === selectedModel;
+      const cur = m.name === selectedModel;
+      const ctx = m.maxInputTokens ? ` · ${Math.round(m.maxInputTokens / 1000)}k` : "";
       return `
-      <div class="set-row${cur ? " cur" : ""}" data-id="${esc(m.id)}">
+      <div class="set-row${cur ? " cur" : ""}" data-id="${esc(m.name)}">
         <div class="set-name">${esc(m.name)}${cur ? ' <span class="set-cur">当前</span>' : ""}</div>
         <div class="set-url">${
-          m.name !== m.id ? `<span class="set-id">接口 model=${esc(m.id)}</span> · ` : ""
-        }${esc(m.url)} · ${m.supportsImages ? "🖼" : ""}${
+          m.name !== m.id ? `<span class="set-id">model=${esc(m.id)}</span> · ` : ""
+        }${esc(m.url)}${ctx} · ${m.hasKey === false ? "🔓无Key " : ""}${m.supportsImages ? "🖼" : ""}${
         m.supportsToolCall ? "🔧" : ""
       }</div>
         <div class="set-actions">
-          ${cur ? "" : `<button class="set-btn use" data-id="${esc(m.id)}">使用</button>`}
-          <button class="set-btn edit" data-id="${esc(m.id)}">改</button>
-          <button class="set-btn test" data-id="${esc(m.id)}">测</button>
-          <button class="set-btn del" data-id="${esc(m.id)}">删</button>
+          ${cur ? "" : `<button class="set-btn use" data-id="${esc(m.name)}">使用</button>`}
+          <button class="set-btn edit" data-id="${esc(m.name)}">改</button>
+          <button class="set-btn test" data-id="${esc(m.name)}">测</button>
+          <button class="set-btn del" data-id="${esc(m.name)}">删</button>
         </div>
         <div class="set-test-msg" hidden></div>
       </div>`;
     })
     .join("");
 
-  const rf = remoteFetch;
-  const src = rf?.source ?? "custom";
-  const isCustom = src === "custom";
-  const isPreset = src.startsWith("preset:");
-  const isFromModel = src.startsWith("model:");
-  const presetKey = isPreset ? src.slice("preset:".length) : "";
-  const modelId = isFromModel ? src.slice("model:".length) : "";
-  const preset = isPreset ? providerPreset(presetKey) : undefined;
-  const fromModel = isFromModel ? models.find((m) => m.id === modelId) : undefined;
+  const f = modelForm;
+  const editing = f.editId !== null;
+  const presetOpts = [
+    `<option value="custom"${f.preset === "custom" ? " selected" : ""}>自定义</option>`,
+    ...PROVIDER_PRESETS.map(
+      (p) =>
+        `<option value="${esc(p.key)}"${f.preset === p.key ? " selected" : ""}>${esc(p.name)} · ${esc(
+          shortHost(p.url),
+        )}</option>`,
+    ),
+  ].join("");
 
-  const presetOpts = PROVIDER_PRESETS.map(
-    (p) =>
-      `<option value="preset:${p.key}"${presetKey === p.key ? " selected" : ""}>${esc(
-        p.name,
-      )} · ${esc(shortHost(p.url))}</option>`,
-  ).join("");
-
-  const modelOpts = models
-    .map(
-      (m) =>
-        `<option value="model:${esc(m.id)}"${modelId === m.id ? " selected" : ""}>${esc(
-          m.name || m.id,
-        )} · ${esc(shortHost(m.url))}</option>`,
-    )
-    .join("");
-
-  /** 实际会请求的提供商端点（展示用） */
-  let endpointHint = "";
-  let urlDisabled = !isCustom;
-  let keyDisabled = !isCustom;
-  let urlValue = "";
-  let keyValue = "";
-  let headersValue = "";
-  let headersDisabled = !isCustom;
-
-  if (isCustom) {
-    urlValue = rf?.sourceUrl ?? "";
-    keyValue = rf?.apiKey ?? "";
-    headersValue = rf?.headersText ?? "";
-    endpointHint = urlValue
-      ? `将请求提供商接口：<code>${esc(modelsEndpointPreview(urlValue))}</code>`
-      : "填提供商的 OpenAI 兼容 Base URL，将请求 <code>{Base URL}/models</code>";
-  } else if (isPreset && preset) {
-    urlValue = preset.url;
-    endpointHint = `提供商 <b>${esc(preset.name)}</b> · 将请求 <code>${esc(
-      modelsEndpointPreview(preset.url),
-    )}</code>（只需填 Key）`;
-  } else if (isFromModel && fromModel) {
-    urlValue = fromModel.url;
-    endpointHint = `用已配置「${esc(fromModel.name || fromModel.id)}」的提供商凭据 · 将请求 <code>${esc(
-      modelsEndpointPreview(fromModel.url),
-    )}</code>`;
-  } else if (isFromModel) {
-    endpointHint = "找不到该已配置模型，请重新选择";
-  }
-
-  const remoteRows =
-    rf && rf.items.length > 0
-      ? rf.items
-          .map((it) => {
-            const already = rf.localIds.has(it.id);
-            const on = rf.checked.has(it.id);
-            return `
-      <label class="remote-row${already ? " already" : ""}">
-        <input type="checkbox" class="remote-pick" data-id="${esc(it.id)}"${on ? " checked" : ""} />
-        <span class="remote-id">${esc(it.id)}</span>
-        <span class="remote-meta">${already ? "已配置" : it.ownedBy ? esc(it.ownedBy) : ""}</span>
-      </label>`;
-          })
-          .join("")
-      : "";
-
-  const remoteErr = rf?.error ? `<div class="set-test-msg bad">${esc(rf.error)}</div>` : "";
-
-  const checkedCount = rf ? [...rf.checked].filter((id) => !rf.localIds.has(id)).length : 0;
-
-  const providerLabel = rf?.lastEndpoint
-    ? `<div class="set-hint">上次拉取自：<code>${esc(rf.lastEndpoint)}</code> · 共 ${
-        rf.items.length
-      } 个模型</div>`
+  // 「从提供商获取模型 ID」的弹出列表
+  const picker = remoteFetch
+    ? `
+    <div class="id-picker">
+      <div class="id-picker-head">
+        <span>从 <code>${esc(remoteFetch.lastEndpoint ?? remoteFetch.sourceUrl)}</code> 选择模型 ID</span>
+        <button type="button" class="set-btn" id="picker-close">关闭</button>
+      </div>
+      ${remoteFetch.error ? `<div class="form-err">${esc(remoteFetch.error)}</div>` : ""}
+      <div class="id-picker-list">
+        ${
+          remoteFetch.items.length === 0
+            ? '<div class="mem-empty">没有返回模型。</div>'
+            : remoteFetch.items
+                .map((it) => {
+                  const already = remoteFetch!.localIds.has(it.id);
+                  return `<button type="button" class="id-pick${already ? " already" : ""}" data-id="${esc(
+                    it.id,
+                  )}" data-ctx="${it.contextLength ?? ""}">
+                    <span class="remote-id">${esc(it.id)}</span>
+                    <span class="remote-meta">${already ? "已配置" : it.ownedBy ? esc(it.ownedBy) : ""}</span>
+                  </button>`;
+                })
+                .join("")
+        }
+      </div>
+      <div class="remote-actions">
+        <button type="button" class="set-btn add" id="picker-batch">批量导入未配置的全部</button>
+        <div class="set-hint">点一行 = 填入上方「接口模型 ID」；批量导入会共用当前 URL / Key。</div>
+      </div>
+    </div>`
     : "";
-
-  const ed = modelEditId;
-  const editing = ed !== null;
 
   return `
     ${subHeader("模型")}
-    <div class="set-list">${rows || '<div class="mem-empty">还没有模型。</div>'}</div>
-
-    <div class="mem-head">📡 从提供商拉取模型列表</div>
-    <div class="set-form">
-      <select id="rf-source">
-        <option value="custom"${isCustom ? " selected" : ""}>自定义 Base URL + Key</option>
-        <optgroup label="常见提供商">${presetOpts}</optgroup>
-        ${
-          models.length
-            ? `<optgroup label="已配置模型的提供商">${modelOpts}</optgroup>`
-            : ""
-        }
-      </select>
-      <div class="set-hint">${endpointHint}</div>
-      <input id="rf-url" placeholder="提供商 Base URL（含 /v1 等路径）"
-        value="${esc(urlValue)}"${urlDisabled ? " disabled" : ""} />
-      <input id="rf-key" type="password" placeholder="${
-        isFromModel ? "使用已保存的 Key，无需填写" : "提供商 API Key"
-      }" value="${esc(keyValue)}"${keyDisabled ? " disabled" : ""} />
-      <textarea id="rf-headers" rows="2"
-        placeholder="额外请求头（可选，每行一个 Key: Value）"${headersDisabled ? " disabled" : ""}>${esc(
-          headersValue,
-        )}</textarea>
-      <label class="set-check"><input type="checkbox" id="rf-tool"${
-        rf?.tool === false ? "" : " checked"
-      } /> 导入时勾选「支持工具调用」</label>
-      <label class="set-check"><input type="checkbox" id="rf-img"${
-        rf?.img === false ? "" : " checked"
-      } /> 导入时勾选「支持图片」</label>
-      <button class="set-btn add" id="rf-go">拉取提供商模型列表</button>
-      ${remoteErr}
-      ${providerLabel}
-      ${
-        remoteRows
-          ? `<div class="remote-list">${remoteRows}</div>
-             <div class="remote-actions">
-               <button class="set-btn" id="rf-all">全选未配置</button>
-               <button class="set-btn" id="rf-none">清空</button>
-               <button class="set-btn add" id="rf-import" ${checkedCount ? "" : "disabled"}>
-                 导入选中 ${checkedCount} 个
-               </button>
-             </div>
-             <div class="set-hint">导入的模型会共用上面这家提供商的 URL / Key / 请求头。</div>`
-          : ""
-      }
+    <div class="set-form" style="margin-bottom:8px">
+      <input id="model-search" placeholder="筛选名称 / ID / URL" value="${esc(modelSearch)}" />
     </div>
+    <div class="set-list">${rows || '<div class="mem-empty">还没有模型。点下方表单添加。</div>'}</div>
 
-    <div class="mem-head">${editing ? "✏️ 编辑模型" : "➕ 手动添加模型"}</div>
-    <div class="set-form">
+    <div class="mem-head">${editing ? "✏️ 编辑模型" : "➕ 添加模型"}</div>
+    <div class="set-form" id="model-form">
+      ${f.error ? `<div class="form-err">${esc(f.error)}</div>` : ""}
       ${
         editing
-          ? `<div class="set-hint">
-               正在编辑 <code>${esc(ed)}</code><br>
-               <b>显示名</b>只改界面；<b>接口模型 ID</b>才会发给提供商（request 的 <code>model</code> 字段）。<br>
-               <span id="f-key-hint">Key 留空则保持不变</span>
-             </div>
-             <input id="f-name" placeholder="显示名（仅界面，可任意）" value="" />
-             <input id="f-id" value="${esc(ed)}" placeholder="接口模型 ID（发给提供商的 model）" />`
-          : `<input id="f-name" placeholder="显示名（仅界面，可留空）" value="" />
-             <input id="f-id" placeholder="接口模型 ID（发给提供商的 model 字段）" />
-             <div class="set-hint">显示名和接口 ID 可以不同：改显示名不影响请求；要换真正调用的模型请改接口 ID。</div>`
+          ? `<div class="set-hint">正在编辑 <code>${esc(f.editId!)}</code> · <b>接口模型 ID</b> 才会发给提供商（request 的 <code>model</code>）</div>`
+          : ""
       }
-      <input id="f-url" placeholder="提供商 Base URL，如 https://token.sensenova.cn/v1" />
-      <input id="f-key" type="password" placeholder="${
-        editing ? "API Key（留空则保持原 Key）" : "API Key（只存本地 agent-data/models.json）"
-      }" />
-      <label class="set-check"><input type="checkbox" id="f-tool" checked /> 支持工具调用</label>
-      <label class="set-check"><input type="checkbox" id="f-img" checked /> 支持图片</label>
-      <textarea id="f-headers" rows="3"
-        placeholder="额外请求头（可选，每行一个 Key: Value）&#10;例：x-opencode-session: 你的会话id"></textarea>
-      <div class="set-hint">
-        有些网关在标准协议外要求自定义头。<br>
-        <code>opencode.ai/zen</code> 会自动补 <code>x-opencode-session</code>，不用手填。
+      <select id="f-preset">
+        ${presetOpts}
+      </select>
+      <label class="fld"><span>Base URL</span>
+        <input id="f-url" placeholder="提供商 Base URL（含 /v1 等）" value="${esc(f.url)}" />
+      </label>
+      <label class="fld"><span>API Key</span>
+        <input id="f-key" type="password" placeholder="${
+          editing
+            ? f.clearKey
+              ? "保存后将清空 Key"
+              : "留空保持原 Key"
+            : "本地 / Ollama 可留空"
+        }" value="${esc(f.clearKey ? "" : f.apiKey)}" />
+      </label>
+      ${
+        editing
+          ? `<label class="set-check"><input type="checkbox" id="f-clear-key"${
+              f.clearKey ? " checked" : ""
+            } /> 清空 Key（不需要鉴权的本地模型）</label>`
+          : ""
+      }
+      <div class="form-row-2">
+        <label class="fld grow"><span>接口模型 ID（发给提供商的 model）</span>
+          <input id="f-id" placeholder="deepseek-v4.1-flash" value="${esc(f.id)}" />
+        </label>
+        <button type="button" class="set-btn fetch-id" id="f-fetch-ids" title="GET ${esc(
+          f.url.trim() ? modelsEndpointPreview(f.url.trim()) : "{Base URL}/models",
+        )}">获取 ID</button>
       </div>
+      <label class="fld"><span>显示名（可空，默认同 ID）</span>
+        <input id="f-name" placeholder="火山agent" value="${esc(f.name)}" />
+      </label>
+      <div class="form-row-2 even">
+        <label class="fld"><span>上下文窗口</span>
+          <input id="f-max-in" placeholder="128000" value="${esc(f.maxIn)}" inputmode="numeric" />
+        </label>
+        <label class="fld"><span>最大输出</span>
+          <input id="f-max-out" placeholder="8192" value="${esc(f.maxOut)}" inputmode="numeric" />
+        </label>
+      </div>
+      <div class="form-row-2 even">
+        <label class="set-check"><input type="checkbox" id="f-tool"${f.tool ? " checked" : ""} /> 工具调用</label>
+        <label class="set-check"><input type="checkbox" id="f-img"${f.img ? " checked" : ""} /> 图片</label>
+      </div>
+      <details class="adv-box"${f.headersText ? " open" : ""}>
+        <summary>额外请求头（可选）</summary>
+        <textarea id="f-headers" rows="3" placeholder="每行一个 Key: Value">${esc(f.headersText)}</textarea>
+        <div class="set-hint">OpenCode Zen 的 <code>x-opencode-session</code> 会自动补，不用手填。</div>
+      </details>
       <div class="set-form-row">
         <button class="set-btn add" id="f-add">${editing ? "保存修改" : "添加"}</button>
-        ${
-          editing
-            ? `<button class="set-btn" id="f-cancel-edit">取消编辑</button>`
-            : ""
-        }
+        ${editing ? `<button class="set-btn" id="f-cancel-edit">取消</button>` : ""}
       </div>
-      <div class="set-hint">⚠️ Key 只保存在本地 agent-data/models.json（已 gitignore），不会进仓库。</div>
+      <div class="set-hint">Key 只存本地 <code>agent-data/models.json</code>（已 gitignore）。本地模型可不填 Key。</div>
+      ${picker}
     </div>`;
 }
 
-function bindModelsView(root: HTMLElement): void {
-  document.getElementById("sub-back")?.addEventListener("click", () => void switchView("settings"));
+/** 把当前 DOM 表单读进 modelForm（保存 / 重绘前都要调，避免丢输入） */
+function readModelForm(): void {
+  const f = modelForm;
+  const val = (sel: string): string => {
+    const el = document.querySelector(sel) as HTMLInputElement | HTMLTextAreaElement | null;
+    return el?.value ?? "";
+  };
+  const chk = (sel: string, dflt: boolean): boolean => {
+    const el = document.querySelector(sel) as HTMLInputElement | null;
+    return el ? el.checked : dflt;
+  };
+  f.name = val("#f-name");
+  f.id = val("#f-id");
+  f.url = val("#f-url");
+  f.apiKey = val("#f-key");
+  f.clearKey = chk("#f-clear-key", f.clearKey);
+  f.tool = chk("#f-tool", f.tool);
+  f.img = chk("#f-img", f.img);
+  f.headersText = val("#f-headers");
+  f.maxIn = val("#f-max-in");
+  f.maxOut = val("#f-max-out");
+  const ps = document.getElementById("f-preset") as HTMLSelectElement | null;
+  if (ps) f.preset = ps.value || "custom";
+}
 
-  // —— 远端拉取：来源切换（提供商预设 / 已配置模型 / 自定义） ——
-  const sourceSel = document.getElementById("rf-source") as HTMLSelectElement | null;
-  sourceSel?.addEventListener("change", () => {
-    const source = sourceSel.value || "custom";
-    const prev = remoteFetch;
-    const next: RemoteFetchState = {
-      items: prev?.items ?? [],
-      source,
-      sourceUrl: prev?.sourceUrl ?? "",
-      apiKey: prev?.apiKey ?? "",
-      headersText: prev?.headersText ?? "",
-      tool: prev?.tool ?? true,
-      img: prev?.img ?? true,
-      localIds: new Set(models.map((m) => m.id)),
-      checked: prev?.checked ?? new Set(),
-      lastEndpoint: prev?.lastEndpoint,
-      error: undefined,
-    };
-    // 预设时把 URL 写进 state，方便失败重试
-    if (source.startsWith("preset:")) {
-      const p = providerPreset(source.slice("preset:".length));
-      if (p) next.sourceUrl = p.url;
+function setModelFormError(msg: string | undefined): void {
+  modelForm.error = msg;
+  renderBody();
+}
+
+/** token 数：支持 `128000` / `128k` / `1m`（1m=1000k=1000000） */
+function parseTok(v: string): number | null {
+  const t = v.trim().toLowerCase();
+  if (!t) return null;
+  const m = /^(\d+(?:\.\d+)?)([km]?)$/.exec(t);
+  if (!m) {
+    throw new Error(`「${v}」不是合法 token 数（可用 128000 / 128k / 1m）`);
+  }
+  const n = Number(m[1]);
+  const unit = m[2];
+  const mul = unit === "m" ? 1000_000 : unit === "k" ? 1000 : 1;
+  const out = Math.round(n * mul);
+  if (!Number.isFinite(out) || out < 0) {
+    throw new Error(`「${v}」不是合法 token 数`);
+  }
+  return out;
+}
+
+function bindModelsView(root: HTMLElement): void {
+  document.getElementById("sub-back")?.addEventListener("click", () => {
+    readModelForm();
+    void switchView("settings");
+  });
+
+  document.getElementById("model-search")?.addEventListener("input", (e) => {
+    modelSearch = (e.target as HTMLInputElement).value;
+    readModelForm();
+    renderBody();
+    const s = document.getElementById("model-search") as HTMLInputElement | null;
+    if (s) {
+      s.focus();
+      s.setSelectionRange(s.value.length, s.value.length);
     }
-    if (source.startsWith("model:")) {
-      const m = models.find((x) => x.id === source.slice("model:".length));
-      if (m) next.sourceUrl = m.url;
-    }
-    remoteFetch = next;
+  });
+
+  // —— 预设切换：只填 URL ——
+  document.getElementById("f-preset")?.addEventListener("change", (e) => {
+    readModelForm();
+    const key = (e.target as HTMLSelectElement).value;
+    modelForm.preset = key;
+    const p = providerPreset(key);
+    if (p) modelForm.url = p.url;
+    modelForm.error = undefined;
     renderBody();
   });
 
-  // —— 远端拉取：执行 ——
-  document.getElementById("rf-go")?.addEventListener("click", async () => {
-    const source = sourceSel?.value || "custom";
-    const urlEl = document.getElementById("rf-url") as HTMLInputElement;
-    const keyEl = document.getElementById("rf-key") as HTMLInputElement;
-    const hsEl = document.getElementById("rf-headers") as HTMLTextAreaElement;
-    const toolEl = document.getElementById("rf-tool") as HTMLInputElement;
-    const imgEl = document.getElementById("rf-img") as HTMLInputElement;
-
-    const tool = toolEl?.checked ?? true;
-    const img = imgEl?.checked ?? true;
-    const url = urlEl?.value.trim() ?? "";
-    const key = keyEl?.value.trim() ?? "";
-    const headersText = hsEl?.value ?? "";
-
-    const isFromModel = source.startsWith("model:");
-    const isPreset = source.startsWith("preset:");
-    let sourceUrl = url;
-    if (isPreset) {
-      const p = providerPreset(source.slice("preset:".length));
-      sourceUrl = p?.url ?? url;
-    } else if (isFromModel) {
-      const m = models.find((x) => x.id === source.slice("model:".length));
-      sourceUrl = m?.url ?? "";
+  // —— 从提供商获取模型 ID（填表辅助，不是另一套流程） ——
+  document.getElementById("f-fetch-ids")?.addEventListener("click", async () => {
+    readModelForm();
+    const f = modelForm;
+    const url = f.url.trim();
+    const key = f.apiKey.trim();
+    if (!url) {
+      setModelFormError("先填 Base URL，再获取模型 ID");
+      return;
     }
-
-    // 先把表单存进 state，避免失败后 re-render 丢输入
-    remoteFetch = {
-      items: remoteFetch?.items ?? [],
-      source,
-      sourceUrl,
-      apiKey: key,
-      headersText,
-      tool,
-      img,
-      error: undefined,
-      localIds: new Set(models.map((m) => m.id)),
-      checked: remoteFetch?.checked ?? new Set(),
-      lastEndpoint: remoteFetch?.lastEndpoint,
-    };
-
-    const btn = document.getElementById("rf-go") as HTMLButtonElement | null;
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = "拉取中…";
-    }
-
+    // 本地网关允许无 Key；远程建议有 Key（没有也先试一次）
     try {
-      let list: RemoteModelInfo[];
-      let endpoint: string;
-      if (isFromModel) {
-        const id = source.slice("model:".length);
-        const m = models.find((x) => x.id === id);
-        if (!m) throw new Error("找不到该已配置模型");
-        endpoint = modelsEndpointPreview(m.url);
-        list = await invoke<RemoteModelInfo[]>("models_fetch_remote_using", { id });
-      } else {
-        if (!sourceUrl || !key) {
-          throw new Error(
-            isPreset
-              ? "请填写该提供商的 API Key"
-              : "自定义拉取时 Base URL 和 API Key 都必填",
-          );
-        }
-        endpoint = modelsEndpointPreview(sourceUrl);
-        list = await invoke<RemoteModelInfo[]>("models_fetch_remote", {
-          url: sourceUrl,
-          apiKey: key,
-          headers: headersText.trim() ? headersText : null,
-        });
-      }
+      const list = await invoke<RemoteModelInfo[]>("models_fetch_remote", {
+        url,
+        apiKey: key,
+        headers: f.headersText.trim() ? f.headersText : null,
+      });
       const localIds = new Set(models.map((m) => m.id));
-      // 默认勾选尚未配置的模型
-      const checked = new Set(list.filter((x) => !localIds.has(x.id)).map((x) => x.id));
       remoteFetch = {
         items: list,
-        source,
-        sourceUrl,
+        source: "custom",
+        sourceUrl: url,
         apiKey: key,
-        headersText,
-        tool,
-        img,
+        headersText: f.headersText,
+        tool: f.tool,
+        img: f.img,
         localIds,
-        checked,
-        lastEndpoint: endpoint,
+        checked: new Set(),
+        lastEndpoint: modelsEndpointPreview(url),
         error: undefined,
       };
-      showToast(`提供商返回 ${list.length} 个模型`, "ok");
+      f.error = undefined;
+      if (list.length === 0) {
+        f.error = "提供商返回 0 个模型（接口可能不支持 /models）";
+      }
     } catch (e) {
       remoteFetch = {
-        ...remoteFetch,
         items: [],
-        error: String(e),
-      };
-      showToast(`拉取失败：${e}`, "error");
-    } finally {
-      renderBody();
-    }
-  });
-
-  // —— 远端列表勾选 ——
-  root.querySelectorAll<HTMLInputElement>(".remote-pick").forEach((cb) => {
-    cb.addEventListener("change", () => {
-      const rf = remoteFetch;
-      if (!rf) return;
-      const id = cb.dataset.id!;
-      if (cb.checked) rf.checked.add(id);
-      else rf.checked.delete(id);
-      // 只更新按钮文案，避免整页重绘打断勾选
-      const btn = document.getElementById("rf-import");
-      if (btn) {
-        const n = [...rf.checked].filter((x) => !rf.localIds.has(x)).length;
-        btn.textContent = `导入选中 ${n} 个`;
-        (btn as HTMLButtonElement).disabled = n === 0;
-      }
-    });
-  });
-
-  document.getElementById("rf-all")?.addEventListener("click", () => {
-    const rf = remoteFetch;
-    if (!rf) return;
-    rf.checked = new Set(rf.items.filter((x) => !rf.localIds.has(x.id)).map((x) => x.id));
-    renderBody();
-  });
-
-  document.getElementById("rf-none")?.addEventListener("click", () => {
-    const rf = remoteFetch;
-    if (!rf) return;
-    rf.checked = new Set();
-    renderBody();
-  });
-
-  document.getElementById("rf-import")?.addEventListener("click", async () => {
-    const rf = remoteFetch;
-    if (!rf) return;
-    const ids = [...rf.checked].filter((id) => !rf.localIds.has(id));
-    if (ids.length === 0) return;
-
-    const btn = document.getElementById("rf-import") as HTMLButtonElement | null;
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = "导入中…";
-    }
-
-    try {
-      const tool = rf.tool;
-      const img = rf.img;
-      const isFromModel = rf.source.startsWith("model:");
-      let result: { added: string[]; skipped: string[] };
-
-      // 从拉取结果里抽出「id → 上下文窗口」，让后端导入时自动填 maxInputTokens。
-      // 网关不返回该字段时这里是空对象，模型仍需手填 —— 不影响导入本身。
-      const contextLengths: Record<string, number> = {};
-      for (const it of rf.items) {
-        if (typeof it.contextLength === "number" && it.contextLength > 0) {
-          contextLengths[it.id] = it.contextLength;
-        }
-      }
-
-      if (isFromModel) {
-        result = await invoke("models_import_remote", {
-          ids,
-          sourceId: rf.source.slice("model:".length),
-          url: null,
-          apiKey: null,
-          headers: null,
-          supportsToolCall: tool,
-          supportsImages: img,
-          contextLengths,
-        });
-      } else {
-        if (!rf.sourceUrl || !rf.apiKey) {
-          throw new Error("缺少提供商 URL 或 API Key，无法导入");
-        }
-        result = await invoke("models_import_remote", {
-          ids,
-          sourceId: null,
-          url: rf.sourceUrl,
-          apiKey: rf.apiKey,
-          headers: rf.headersText.trim() ? rf.headersText : null,
-          supportsToolCall: tool,
-          supportsImages: img,
-          contextLengths,
-        });
-      }
-
-      await loadModels();
-      remoteFetch = {
-        ...rf,
+        source: "custom",
+        sourceUrl: url,
+        apiKey: key,
+        headersText: f.headersText,
+        tool: f.tool,
+        img: f.img,
         localIds: new Set(models.map((m) => m.id)),
         checked: new Set(),
-        error: undefined,
+        error: String(e),
       };
-      const msg =
-        result.added.length > 0
-          ? `已从该提供商导入 ${result.added.length} 个模型` +
-            (result.skipped.length ? `（跳过已存在 ${result.skipped.length} 个）` : "")
-          : `没有新增（${result.skipped.length} 个都已配置）`;
-      showToast(msg, "ok");
-    } catch (e) {
-      showToast(`导入失败：${e}`, "error");
-    } finally {
-      renderBody();
+      f.error = undefined;
     }
+    renderBody();
   });
 
-  // —— 已有模型操作 ——
+  document.getElementById("picker-close")?.addEventListener("click", () => {
+    readModelForm();
+    remoteFetch = null;
+    renderBody();
+  });
+
+  root.querySelectorAll<HTMLButtonElement>(".id-pick").forEach((b) =>
+    b.addEventListener("click", async () => {
+      readModelForm();
+      const id = b.dataset.id ?? "";
+      const ctx = Number(b.dataset.ctx || 0);
+      remoteFetch = null;
+      // 已配置 → 直接进编辑（选中的就是这个 ID）
+      if (models.some((m) => m.id === id)) {
+        try {
+          const ev = await invoke<ModelEditView>("models_get_edit", { id });
+          modelForm = {
+            editId: id,
+            name: ev.name && ev.name !== id ? ev.name : "",
+            id: ev.id,
+            url: ev.url,
+            apiKey: "",
+            clearKey: false,
+            tool: ev.supportsToolCall,
+            img: ev.supportsImages,
+            headersText: ev.headersText,
+            maxIn: ev.maxInputTokens != null ? String(ev.maxInputTokens) : "",
+            maxOut: ev.maxOutputTokens != null ? String(ev.maxOutputTokens) : "",
+            preset: "custom",
+            error: undefined,
+          };
+          renderBody();
+          showToast(`「${id}」已在列表中，已进入编辑`, "info", 2500);
+        } catch (e) {
+          showToast(`读取失败：${e}`, "error");
+        }
+        return;
+      }
+      modelForm.id = id;
+      if (ctx > 0) modelForm.maxIn = String(ctx);
+      modelForm.error = undefined;
+      renderBody();
+      showToast(`已填入模型 ID：${id}`, "ok", 2500);
+    }),
+  );
+
+  document.getElementById("picker-batch")?.addEventListener("click", async () => {
+    readModelForm();
+    const rf = remoteFetch;
+    const f = modelForm;
+    if (!rf) return;
+    const ids = rf.items.map((x) => x.id).filter((id) => !rf.localIds.has(id));
+    if (ids.length === 0) {
+      showToast("没有可导入的模型（都已配置）", "info");
+      return;
+    }
+    const contextLengths: Record<string, number> = {};
+    for (const it of rf.items) {
+      if (typeof it.contextLength === "number" && it.contextLength > 0) {
+        contextLengths[it.id] = it.contextLength;
+      }
+    }
+    try {
+      const result = await invoke<{ added: string[]; skipped: string[] }>("models_import_remote", {
+        ids,
+        sourceId: null,
+        url: f.url,
+        apiKey: f.apiKey || null,
+        headers: f.headersText.trim() ? f.headersText : null,
+        supportsToolCall: f.tool,
+        supportsImages: f.img,
+        contextLengths,
+      });
+      await loadModels();
+      remoteFetch = null;
+      showToast(
+        `已导入 ${result.added.length} 个` +
+          (result.skipped.length ? `（跳过 ${result.skipped.length}）` : ""),
+        "ok",
+      );
+    } catch (e) {
+      showToast(`批量导入失败：${e}`, "error");
+    }
+    renderBody();
+  });
+
+  // —— 列表操作 ——
   root.querySelectorAll<HTMLButtonElement>(".set-btn.use").forEach((b) =>
     b.addEventListener("click", async () => {
       selectedModel = b.dataset.id!;
       await invoke("set_selected_model", { id: selectedModel }).catch((e) =>
-        pushEntry("error", `保存失败：${e}`),
+        showToast(`保存失败：${e}`, "error"),
       );
       renderBody();
     }),
@@ -3412,10 +3982,13 @@ function bindModelsView(root: HTMLElement): void {
   root.querySelectorAll<HTMLButtonElement>(".set-btn.del").forEach((b) =>
     b.addEventListener("click", async () => {
       const id = b.dataset.id!;
-      await invoke("models_remove", { id }).catch((e) => pushEntry("error", `删除失败：${e}`));
-      if (modelEditId === id) modelEditId = null;
+      const ok = await askConfirm("删除模型", `确定删除「${id}」？`, "删除");
+      if (!ok) return;
+      await invoke("models_remove", { id }).catch((e) => showToast(`删除失败：${e}`, "error"));
+      if (modelForm.editId === id) modelForm = emptyModelForm();
       await loadModels();
       renderBody();
+      showToast(`已删除 ${id}`, "ok", 2500);
     }),
   );
 
@@ -3424,45 +3997,42 @@ function bindModelsView(root: HTMLElement): void {
       const id = b.dataset.id!;
       try {
         const ev = await invoke<ModelEditView>("models_get_edit", { id });
-        modelEditId = id;
-        // 把回填值塞进表单（render 之后再填，保证 DOM 已存在）
-        renderBody();
-        const setVal = (sel: string, v: string): void => {
-          const el = document.querySelector(sel) as
-            | HTMLInputElement
-            | HTMLTextAreaElement
-            | null;
-          if (el) el.value = v;
+        modelForm = {
+          editId: id,
+          name: ev.name && ev.name !== id ? ev.name : "",
+          id: ev.id,
+          url: ev.url,
+          apiKey: "",
+          clearKey: false,
+          tool: ev.supportsToolCall,
+          img: ev.supportsImages,
+          headersText: ev.headersText,
+          maxIn: ev.maxInputTokens != null ? String(ev.maxInputTokens) : "",
+          maxOut: ev.maxOutputTokens != null ? String(ev.maxOutputTokens) : "",
+          preset: "custom",
+          error: undefined,
         };
-        setVal("#f-name", ev.name ?? "");
-        setVal("#f-id", ev.id);
-        setVal("#f-url", ev.url);
-        setVal("#f-key", "");
-        setVal("#f-headers", ev.headersText);
-        const tool = document.getElementById("f-tool") as HTMLInputElement | null;
-        const img = document.getElementById("f-img") as HTMLInputElement | null;
-        if (tool) tool.checked = ev.supportsToolCall;
-        if (img) img.checked = ev.supportsImages;
-        const hint = document.getElementById("f-key-hint");
+        remoteFetch = null;
+        renderBody();
+        const hint = document.getElementById("f-key") as HTMLInputElement | null;
         if (hint && ev.hasKey) {
-          hint.textContent = `Key ${ev.keyPreview}（留空则保持不变）`;
+          hint.placeholder = `Key ${ev.keyPreview}（留空保持不变）`;
         }
       } catch (e) {
-        pushEntry("error", `读取模型配置失败：${e}`);
+        showToast(`读取模型配置失败：${e}`, "error");
       }
     }),
   );
 
   document.getElementById("f-cancel-edit")?.addEventListener("click", () => {
-    modelEditId = null;
+    modelForm = emptyModelForm();
+    remoteFetch = null;
     renderBody();
   });
 
   root.querySelectorAll<HTMLButtonElement>(".set-btn.test").forEach((b) =>
     b.addEventListener("click", async () => {
       const id = b.dataset.id!;
-      // 结果写在**这一行自己**里 + 一条浮动提示。
-      // 绝不 pushEntry —— 那会把整个设置页重绘成聊天记录（用户 2026-09-20 反馈）。
       const row = [...root.querySelectorAll<HTMLElement>(".set-row")].find(
         (r) => r.dataset.id === id,
       );
@@ -3479,7 +4049,6 @@ function bindModelsView(root: HTMLElement): void {
       const oldLabel = b.textContent;
       b.textContent = "测…";
       say(`正在测试 ${id} …`, "run");
-      showToast(`正在测试 ${id} …`, "info", 2000);
 
       try {
         const reply = await invoke<string>("test_model", { id });
@@ -3495,68 +4064,98 @@ function bindModelsView(root: HTMLElement): void {
     }),
   );
 
+  // —— 保存（添加 / 编辑同一入口） ——
+  // 唯一键 = 显示名；接口 model（f.id）允许重复（官方/火山可同 model）
   document.getElementById("f-add")?.addEventListener("click", async () => {
-    const idInput = document.getElementById("f-id") as HTMLInputElement;
-    const name = (document.getElementById("f-name") as HTMLInputElement).value.trim();
-    const formId = idInput.value.trim();
-    const url = (document.getElementById("f-url") as HTMLInputElement).value.trim();
-    const key = (document.getElementById("f-key") as HTMLInputElement).value.trim();
-    const tool = (document.getElementById("f-tool") as HTMLInputElement).checked;
-    const img = (document.getElementById("f-img") as HTMLInputElement).checked;
-    const headers = (document.getElementById("f-headers") as HTMLTextAreaElement).value;
+    readModelForm();
+    const f = modelForm;
+    const editing = f.editId !== null;
+    const newId = f.id.trim();
+    const url = f.url.trim();
+    const name = f.name.trim();
+    const key = f.apiKey.trim();
+    const display = name || newId;
 
-    const editing = modelEditId !== null;
-    const newId = formId;
+    const fail = (m: string): void => {
+      f.error = m;
+      renderBody();
+    };
 
-    if (!newId || !url) {
-      pushEntry("error", "接口模型 ID / URL 不能为空");
-      return;
+    if (!newId) return fail("接口模型 ID 不能为空（点「获取 ID」可从提供商选）");
+    if (!url) return fail("Base URL 不能为空");
+    if (/\s/.test(newId)) return fail("接口模型 ID 不能含空格");
+    if (!display) return fail("显示名不能为空");
+
+    let maxIn: number | null;
+    let maxOut: number | null;
+    try {
+      maxIn = parseTok(f.maxIn);
+      maxOut = parseTok(f.maxOut);
+    } catch (e) {
+      return fail(String(e instanceof Error ? e.message : e));
     }
-    if (!editing && !key) {
-      pushEntry("error", "新建模型时 API Key 不能为空");
-      return;
-    }
+
+    const headers = f.headersText.trim() ? f.headersText : null;
 
     try {
       if (editing) {
         await invoke("models_edit", {
-          id: modelEditId,
-          newId: newId !== modelEditId ? newId : null,
-          name: name || null,
+          id: f.editId,
+          newId, // 接口 model 可与其它条目相同
+          name: display,
           url,
           apiKey: key || null,
-          supportsToolCall: tool,
-          supportsImages: img,
-          headers: headers.trim() ? headers : null,
+          clearKey: f.clearKey,
+          supportsToolCall: f.tool,
+          supportsImages: f.img,
+          headers,
+          maxInputTokens: maxIn,
+          maxOutputTokens: maxOut,
         });
-        const label =
-          newId !== modelEditId
-            ? `已更新：显示名=${name || newId}，接口 model=${newId}`
-            : `已更新 ${name || newId}`;
-        showToast(label, "ok");
-        if (selectedModel === modelEditId && newId !== modelEditId) {
-          selectedModel = newId;
-        }
-        modelEditId = null;
+        showToast(`已保存 ${display}`, "ok");
+        if (selectedModel === f.editId) selectedModel = display;
+        modelForm = emptyModelForm();
       } else {
-        await invoke("models_add", {
+        await invokeModelsAdd({
           id: newId,
-          name: name || newId,
+          name: display,
           url,
           apiKey: key,
-          supportsToolCall: tool,
-          supportsImages: img,
-          headers: headers.trim() ? headers : null,
+          supportsToolCall: f.tool,
+          supportsImages: f.img,
+          headers,
+          maxInputTokens: maxIn,
+          maxOutputTokens: maxOut,
+          overwrite: true,
         });
-        selectedModel = newId;
-        await invoke("set_selected_model", { id: newId }).catch(() => {});
+        selectedModel = display;
+        await invoke("set_selected_model", { id: display }).catch(() => {});
+        modelForm = emptyModelForm();
+        showToast(`已保存 ${display}`, "ok");
       }
       await loadModels();
+      remoteFetch = null;
       renderBody();
     } catch (e) {
-      pushEntry("error", editing ? `修改失败：${e}` : `添加失败：${e}`);
+      fail(`保存失败：${e}`);
     }
   });
+}
+
+/** models_add 的参数打包（含 overwrite） */
+async function invokeModelsAdd(args: {
+  id: string;
+  name: string;
+  url: string;
+  apiKey: string;
+  supportsToolCall: boolean;
+  supportsImages: boolean;
+  headers: string | null;
+  maxInputTokens: number | null;
+  maxOutputTokens: number | null;
+  overwrite: boolean;
+}): Promise<string> {
+  return await invoke<string>("models_add", args);
 }
 
 // ---------------- 设置 › 文件权限 ----------------
@@ -3851,76 +4450,128 @@ function bindCmdPolicyView(_root: HTMLElement): void {
 
 // ---------------- 设置 › MCP ----------------
 
-function renderMcpView(mcp: McpStatus | null): string {
+function renderMcpView(
+  mcp: McpStatus | null,
+  servers: McpServerCfg[],
+  grants: string[],
+): string {
   const head = subHeader("MCP 外部工具");
 
-  if (!mcp) {
-    return head + `<div class="mem-empty">读取 MCP 状态失败。</div>`;
-  }
-
-  // 网关地址编辑器 —— MCP 网关是用户自己起的进程，没有内置默认值，
-  // 不配就不启用。这里给一个输入框：填了保存即生效，清空即禁用。
-  const urlRow = `
-    <div class="mcp-url-row">
-      <label class="mcp-url-label" for="mcp-url">网关地址</label>
-      <input class="mcp-url-input" id="mcp-url" type="text"
-        placeholder="http://127.0.0.1:3050/mcp" value="${esc(mcp.url)}" spellcheck="false">
-      <button class="set-btn" id="mcp-url-save">保存</button>
-    </div>
-    <div class="set-hint" id="mcp-url-msg" style="margin-bottom:8px">
-      ${mcp.url ? "改动保存后立即重连。清空并保存 = 禁用 MCP。" : "未配置 —— 填一个 MCP 网关地址（如 1MCP）并保存才会启用。"}
-    </div>`;
-
-  if (!mcp.connected) {
-    return (
-      head +
-      urlRow +
-      `<div class="mem-empty">${mcp.url ? `未连接到 ${esc(mcp.url)}${mcp.error ? `：${esc(mcp.error)}` : ""}` : "还没配网关地址。"}${mcp.url ? "<br>检查网关进程是否在运行。" : ""}</div>
-       <div class="set-actions"><button class="set-btn" id="mcp-refresh">重新连接</button></div>`
-    );
-  }
-
-  const pct = Math.min(100, Math.round((mcp.activeTokens / mcp.budgetTokens) * 100));
-  const bar = `
-    <div class="mcp-budget">
-      <div class="mcp-budget-bar"><i style="width:${pct}%"></i></div>
-      <span>已加载工具占用 ~${mcp.activeTokens} / ${mcp.budgetTokens} tokens</span>
-    </div>`;
-
-  const rows = mcp.groups
-    .map(
-      (g) => `
-      <div class="set-row${g.active ? " cur" : ""}">
-        <div class="set-name">${esc(g.name)}${
-        g.active ? ' <span class="set-cur">已加载</span>' : ""
-      }${g.hasDestructive ? ' <span class="set-warn">含危险操作</span>' : ""}</div>
-        <div class="set-url">${esc(g.summary)}</div>
-        <div class="set-url">${g.toolCount} 个工具 · 约 ${g.tokens} tokens</div>
+  // ---- 多 server 列表（增删启用） ----
+  const serverRows =
+    servers.length === 0
+      ? `<div class="mem-empty">还没有配置任何 MCP server。下面填一行再点「添加」。</div>`
+      : servers
+          .map(
+            (s, i) => `
+      <div class="set-row mcp-srv-row" data-idx="${i}">
+        <div class="set-name">
+          <label class="mcp-en"><input type="checkbox" class="mcp-en-cb" data-idx="${i}" ${
+            s.enabled ? "checked" : ""
+          }> 启用</label>
+          <code class="mcp-srv-id">${esc(s.id)}</code>
+          <span class="set-cur">${esc(s.label || s.id)}</span>
+        </div>
+        <div class="set-url"><code>${esc(s.url)}</code></div>
         <div class="set-actions">
-          ${
-            g.active
-              ? `<button class="set-btn unload" data-group="${esc(g.name)}">卸载</button>`
-              : `<button class="set-btn use" data-group="${esc(g.name)}">加载</button>`
-          }
+          <button class="set-btn mcp-srv-del" data-idx="${i}">删除</button>
         </div>
       </div>`,
-    )
-    .join("");
+          )
+          .join("");
 
-  return (
-    head +
-    urlRow +
-    `<div class="set-url" style="margin-bottom:8px">已连接 ${esc(mcp.url)}</div>` +
-    bar +
-    `<div class="set-hint" style="margin-bottom:8px">
-      这些工具**不会默认塞进模型上下文**（全量约 14k tokens）。
-      模型会按需自己加载；你也可以在这里手动加载/卸载。
-     </div>
-     <div class="set-actions" style="margin-bottom:10px">
-       <button class="set-btn" id="mcp-refresh">重新拉取工具清单</button>
-     </div>` +
-    `<div class="set-list">${rows}</div>`
-  );
+  const serverBlock = `
+    <div class="mem-head">🔗 MCP Server 列表</div>
+    <div class="set-hint" style="margin-bottom:8px">
+      可单独添加多个 server（Streamable HTTP）。未启用的保存后不会连接。
+    </div>
+    <div class="set-list" id="mcp-srv-list">${serverRows}</div>
+    <div class="mem-head">➕ 添加一行</div>
+    <div class="set-form mcp-add-form">
+      <input id="mcp-new-id" placeholder="id（如 github）" spellcheck="false">
+      <input id="mcp-new-label" placeholder="显示名（可空）" spellcheck="false">
+      <input id="mcp-new-url" placeholder="http://127.0.0.1:3050/mcp" spellcheck="false">
+      <button class="set-btn add" id="mcp-srv-add">添加</button>
+    </div>
+    <div class="set-actions" style="margin-top:8px">
+      <button class="set-btn ok" id="mcp-srv-save">保存并重连</button>
+      <button class="set-btn" id="mcp-refresh">重新拉取工具清单</button>
+    </div>
+    <div class="set-hint" id="mcp-srv-msg"></div>`;
+
+  // ---- 连接状态 + 工具组 ----
+  let statusBlock = "";
+  if (!mcp) {
+    statusBlock = `<div class="mem-empty">读取 MCP 状态失败。</div>`;
+  } else if (!mcp.connected) {
+    statusBlock = `<div class="mem-empty">${
+      mcp.url
+        ? `未连接到 ${esc(mcp.url)}${mcp.error ? `：${esc(mcp.error)}` : ""}`
+        : "还没配可用的 server。"
+    }${mcp.url ? "<br>检查 MCP 进程是否在运行。" : ""}</div>`;
+  } else {
+    const bar = `
+      <div class="mcp-budget">
+        <span>已加载工具占用 ~${mcp.activeTokens} tokens</span>
+      </div>`;
+    const rows = mcp.groups
+      .map(
+        (g) => `
+        <div class="set-row${g.active ? " cur" : ""}">
+          <div class="set-name">${esc(g.name)}${
+          g.active ? ' <span class="set-cur">已加载</span>' : ""
+        }${g.hasDestructive ? ' <span class="set-warn">含危险操作</span>' : ""}</div>
+          <div class="set-url">${esc(g.summary)}</div>
+          <div class="set-url">${g.toolCount} 个工具 · 约 ${g.tokens} tokens</div>
+          <div class="set-actions">
+            ${
+              g.active
+                ? `<button class="set-btn unload" data-group="${esc(g.name)}">卸载</button>`
+                : `<button class="set-btn use" data-group="${esc(g.name)}">加载</button>`
+            }
+          </div>
+        </div>`,
+      )
+      .join("");
+    statusBlock =
+      `<div class="set-url" style="margin-bottom:8px">已连接 ${esc(mcp.url)}</div>` +
+      bar +
+      `<div class="set-hint" style="margin-bottom:8px">
+        这些工具**不会默认塞进模型上下文**（全量约 14k tokens）。
+        模型会按需自己加载；你也可以在这里手动加载/卸载。
+       </div>` +
+      `<div class="set-list">${rows}</div>`;
+  }
+
+  // ---- T3：永久授权（总是允许） ----
+  const grantRows =
+    grants.length === 0
+      ? `<div class="mem-empty">当前没有「总是允许」的 MCP 工具。点 MCP 权限卡的「总是允许」（或 Shift+Enter）即写入 <code>mcp_grants.json</code>。</div>`
+      : grants
+          .map(
+            (t) => `
+      <div class="set-row">
+        <div class="set-name"><code>${esc(t)}</code></div>
+        <button class="set-btn mcp-grant-revoke" data-tool="${esc(t)}">撤销</button>
+      </div>`,
+          )
+          .join("");
+
+  const grantsBlock = `
+    <div class="mem-head">🔓 总是允许 ${grants.length}</div>
+    ${
+      grants.length
+        ? `<div class="set-actions" style="margin-bottom:6px">
+             <button class="set-btn" id="mcp-grant-clear">全部撤销</button>
+           </div>`
+        : ""
+    }
+    ${grantRows}
+    <div class="set-hint" style="margin-top:6px">
+      落盘 <code>mcp_grants.json</code>，跨会话、重启后仍生效。要收回就在这里撤销。
+    </div>`;
+
+  return head + serverBlock + statusBlock + grantsBlock;
 }
 
 function bindMcpView(root: HTMLElement): void {
@@ -3931,27 +4582,89 @@ function bindMcpView(root: HTMLElement): void {
     renderBody();
   });
 
-  // 网关地址：保存（含清空=禁用）→ Rust 写 mcp.json + 换 client + 立即试连
-  const saveUrl = async () => {
-    const input = document.getElementById("mcp-url") as HTMLInputElement | null;
-    const msg = document.getElementById("mcp-url-msg");
-    if (!input) return;
+  // ---- server 列表：从 DOM 收集当前编辑态 ----
+  const collectServers = (): McpServerCfg[] => {
+    const rows = root.querySelectorAll<HTMLElement>(".mcp-srv-row");
+    return Array.from(rows).map((row) => {
+      const i = Number(row.dataset.idx ?? "0");
+      const cb = row.querySelector<HTMLInputElement>(".mcp-en-cb");
+      const idEl = row.querySelector<HTMLElement>(".mcp-srv-id");
+      const urlEl = row.querySelector<HTMLElement>(".set-url code");
+      // label 从展示名取（set-cur），删掉可能的空白
+      const labelEl = row.querySelector<HTMLElement>(".set-cur");
+      return {
+        id: idEl?.textContent?.trim() || `s${i + 1}`,
+        url: urlEl?.textContent?.trim() || "",
+        enabled: !!cb?.checked,
+        label: labelEl?.textContent?.trim() || "",
+      };
+    });
+  };
+
+  // 删除一行 → 直接从 DOM 移除并重绘（未保存前只动 UI）
+  root.querySelectorAll<HTMLButtonElement>(".mcp-srv-del").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const row = btn.closest(".mcp-srv-row");
+      row?.remove();
+    });
+  });
+
+  // 添加一行：先插进列表（内存/DOM），点「保存并重连」才落盘
+  document.getElementById("mcp-srv-add")?.addEventListener("click", () => {
+    const id = (document.getElementById("mcp-new-id") as HTMLInputElement | null)?.value.trim() ?? "";
+    const label =
+      (document.getElementById("mcp-new-label") as HTMLInputElement | null)?.value.trim() ?? "";
+    const url = (document.getElementById("mcp-new-url") as HTMLInputElement | null)?.value.trim() ?? "";
+    const msg = document.getElementById("mcp-srv-msg");
+    if (!url) {
+      if (msg) msg.textContent = "URL 不能为空";
+      return;
+    }
+    if (!(url.startsWith("http://") || url.startsWith("https://"))) {
+      if (msg) msg.textContent = "MCP 地址必须是 http/https URL";
+      return;
+    }
+    const list = document.getElementById("mcp-srv-list");
+    if (!list) return;
+    // 空列表提示先清掉
+    if (list.querySelector(".mem-empty")) list.innerHTML = "";
+    const idx = list.querySelectorAll(".mcp-srv-row").length;
+    const row = document.createElement("div");
+    row.className = "set-row mcp-srv-row";
+    row.dataset.idx = String(idx);
+    row.innerHTML = `
+      <div class="set-name">
+        <label class="mcp-en"><input type="checkbox" class="mcp-en-cb" data-idx="${idx}" checked> 启用</label>
+        <code class="mcp-srv-id">${esc(id || `s${idx + 1}`)}</code>
+        <span class="set-cur">${esc(label || id || `s${idx + 1}`)}</span>
+      </div>
+      <div class="set-url"><code>${esc(url)}</code></div>
+      <div class="set-actions">
+        <button class="set-btn mcp-srv-del" data-idx="${idx}">删除</button>
+      </div>`;
+    row.querySelector(".mcp-srv-del")?.addEventListener("click", () => row.remove());
+    list.appendChild(row);
+    // 清空添加表单
+    for (const fid of ["mcp-new-id", "mcp-new-label", "mcp-new-url"]) {
+      const el = document.getElementById(fid) as HTMLInputElement | null;
+      if (el) el.value = "";
+    }
+    if (msg) msg.textContent = "已加入列表，点「保存并重连」生效";
+  });
+
+  // 保存并重连
+  document.getElementById("mcp-srv-save")?.addEventListener("click", async () => {
+    const msg = document.getElementById("mcp-srv-msg");
     try {
       if (msg) msg.textContent = "保存并连接中…";
-      await invoke("mcp_set_url", { url: input.value });
-      renderBody(); // 整页重绘 → 连接状态/组列表跟着变
+      await invoke("mcp_servers_save", { servers: collectServers() });
+      renderBody();
     } catch (e) {
       if (msg) msg.textContent = `保存失败：${e}`;
     }
-  };
-  document.getElementById("mcp-url-save")?.addEventListener("click", () => void saveUrl());
-  document.getElementById("mcp-url")?.addEventListener("keydown", (ev) => {
-    if ((ev as KeyboardEvent).key === "Enter") {
-      ev.preventDefault();
-      void saveUrl();
-    }
   });
 
+  // 工具组加载/卸载（沿用）
   root.querySelectorAll<HTMLButtonElement>(".set-btn[data-group]").forEach((b) =>
     b.addEventListener("click", async () => {
       const name = b.dataset.group!;
@@ -3964,6 +4677,31 @@ function bindMcpView(root: HTMLElement): void {
       renderBody();
     }),
   );
+
+  // ---- 永久授权撤销 ----
+  root.querySelectorAll<HTMLButtonElement>(".mcp-grant-revoke").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const tool = btn.dataset.tool ?? "";
+      if (!tool) return;
+      try {
+        const n = await invoke<number>("mcp_grant_revoke", { tool });
+        showToast(n > 0 ? "已撤销这条总是允许" : "这条授权已经不存在了", "ok");
+        renderBody();
+      } catch (e) {
+        showToast(`撤销失败：${e}`, "error");
+      }
+    });
+  });
+
+  document.getElementById("mcp-grant-clear")?.addEventListener("click", async () => {
+    try {
+      const n = await invoke<number>("mcp_grants_clear");
+      showToast(n > 0 ? `已撤销全部 ${n} 条总是允许` : "本来就没有总是允许", "ok");
+      renderBody();
+    } catch (e) {
+      showToast(`撤销失败：${e}`, "error");
+    }
+  });
 }
 
 // ---------------- 设置 › Token 用量 ----------------
@@ -4157,7 +4895,18 @@ function pushEntry(
     return;
   }
 
-  entries.push({ role, text, items, images, ...extra });
+  const entry: ChatEntry = { role, text, items, images, ...extra };
+  // 插话插到 running 之前（用户说话时的进度位置），不要永远垫底
+  if (extra?.insertBeforeRunning) {
+    const ri = entries.findIndex((x) => x.role === "running");
+    if (ri >= 0) {
+      entries.splice(ri, 0, entry);
+    } else {
+      entries.push(entry);
+    }
+  } else {
+    entries.push(entry);
+  }
   const b = document.getElementById("panel-body");
   if (b) {
     paintMessages(b);
@@ -4205,6 +4954,16 @@ async function refreshPendingApprovals(): Promise<void> {
 
 // ---------------- 实时进度 ----------------
 
+/** 把当前 streamText 收进 items 时间线（按轮分段），再清空 stream 区 */
+function archiveStreamToItems(last: ChatEntry, tag?: string): void {
+  const t = (last.streamText ?? "").trim();
+  if (!t) return;
+  last.items = last.items ?? [];
+  last.items.push({ kind: "text", name: tag ?? null, detail: t });
+  last.streamText = undefined;
+  last.streamDiscarded = false;
+}
+
 /**
  * 接收 Rust 侧推上来的 agent 进度事件。
  *
@@ -4232,13 +4991,10 @@ function installProgressListener(): void {
     switch (p.kind) {
       case "thinking":
         if (p.iteration) last.text = `正在思考…（第 ${p.iteration} 轮）`;
-        // 正文按轮清 —— 新一轮的正文确实是新的
-        last.streamText = undefined;
+        // 上一轮流式正文收进时间线（保留可看），再开新轮。
+        // ⚠️ 不能只「不清空」——那会把多轮正文 capAppend 成一坨（用户 2026-09-23 截图）。
+        archiveStreamToItems(last);
         last.streamDiscarded = false;
-        // 时间线**不清空**：用户要看的是整段推演（"前面为什么绕"）。
-        // 但**思考要另起一段** —— 关掉开关，下一个思考增量会新开一个条目，
-        // 于是多轮各自成块、并各自跟在自己触发的工具调用前面。
-        // 空轮不留空条目：开了开关但不喂增量就不会产生条目。
         last.reasonOpen = false;
         break;
 
@@ -4272,6 +5028,11 @@ function installProgressListener(): void {
 
       case "discardStream":
         last.streamDiscarded = true;
+        // 这段不是最终答复，但用户要能看 → 收进时间线，stream 区留给下一轮
+        // （工具改调 / 断流重试共用）。reasonOpen 收掉，避免新 reasoning 续进半截
+        archiveStreamToItems(last, p.reason ? p.reason : "已改调工具");
+        last.streamDiscarded = false;
+        last.reasonOpen = false;
         break;
 
       default: {
@@ -4480,6 +5241,17 @@ async function loadModels(): Promise<void> {
   }
 }
 
+async function loadProjects(): Promise<void> {
+  try {
+    projects = await invoke<ProjectRow[]>("pmem_list");
+    const act = await invoke<ProjectRow | null>("pmem_get_active");
+    activeProjectId = act?.id ?? null;
+  } catch {
+    projects = [];
+    activeProjectId = null;
+  }
+}
+
 async function send(): Promise<void> {
   // 忙碌中 → 走「插话」通道（排队），而不是静默吞掉用户打的字
   if (busy) {
@@ -4541,9 +5313,13 @@ async function send(): Promise<void> {
     if (run.interrupted) {
       // 区分「用户主动停止」与「轮数/上下文降级」：后者 stopReason 会说明原因
       const reason = run.stopReason && run.stopReason !== "已停止" ? run.stopReason : "";
+      const canContinue = reason.includes("轮数上限") || reason.includes("上下文");
       pushEntry(
         "system",
         reason ? `⚠️ ${reason}` : "⏹ 已停止，本轮已产出的内容保留在上面",
+        undefined,
+        undefined,
+        canContinue ? { continueRun: true } : undefined,
       );
     }
     // 没来得及送达的插话 → 塞回输入框。用户打的字不该因为"停得太快"白打。
@@ -4634,11 +5410,13 @@ async function sendSteer(): Promise<void> {
     draftInput = "";
     pendingImages = [];
     renderPreview();
-    // 立刻上屏一条「排队中」的气泡：用户需要看到自己的话被收下了
+    // 立刻上屏一条「排队中」的气泡：插到 running **之前**，不要永远垫底
     pushEntry("user", text || "（仅图片）", undefined, imgs, {
       queued: true,
       steerId: ack.id,
       steerQueuePos: ack.queued,
+      // force insert-before-running handled in pushEntry via extra
+      insertBeforeRunning: true,
     });
   } catch (e) {
     // 多半是当前轮刚好结束了（或队列满）→ 把文本塞回输入框，别弄丢
@@ -4763,6 +5541,9 @@ async function applyMode(next: Mode): Promise<void> {
     panelOpenedAt = Date.now();
     await ensureSessionLoaded(); // 会话从磁盘恢复（只做一次）
     await loadModels();
+    await loadProjects();
+    // ⚠️ 不要 bindCurrentSession —— 切/开面板改挂靠是主聊天被塞进 redis 的根因
+    await refreshSessionProjectTags();
     renderPanel();
   } else if (next === "menu") {
     renderMenu();
@@ -4956,6 +5737,11 @@ function boot(): void {
       const top = pendingPerms[0];
       if (e.key === "Enter") {
         e.preventDefault();
+        // MCP 卡：Shift+Enter =「总是允许」（跨会话持久），不是「本轮不再问」
+        if (top.kind === "mcp" && e.shiftKey) {
+          void decidePerm(top.id, "always");
+          return;
+        }
         const mute = e.shiftKey;
         if (mute) permMuteThisTurn = true;
         void decidePerm(top.id, mute ? "deny" : "approve");

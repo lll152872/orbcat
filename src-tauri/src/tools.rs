@@ -61,7 +61,8 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         ToolSpec::new(
             "read_file",
             "读取一个文本文件的内容。返回带行号的文本。仅在确定路径存在时使用；\
-             若不确定路径，先用 glob_files 或 list_dir 查找。受文件权限网关管辖。",
+             若不确定路径，先用 glob_files 或 list_dir 查找。受文件权限网关管辖。\
+             **不要**用来读图片 —— 图片请用 view_image。",
             json!({
                 "type": "object",
                 "properties": {
@@ -74,11 +75,14 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "list_dir",
-            "列出目录下的条目（文件与子目录），含大小与是否为目录。受文件权限网关管辖。",
+            "列出目录下的条目（文件与子目录），含大小与是否为目录。\
+             **优先于** run_command 跑 Get-ChildItem。可选 recursive 递归。受文件权限网关管辖。",
             json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "目录的绝对路径" }
+                    "path": { "type": "string", "description": "目录的绝对路径" },
+                    "recursive": { "type": "boolean", "description": "是否递归列出（默认 false）" },
+                    "depth": { "type": "integer", "description": "递归最大深度（默认 2，最大 4）" }
                 },
                 "required": ["path"]
             }),
@@ -97,14 +101,16 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "grep_files",
-            "在指定目录下递归搜索包含某段文本的文件，返回 文件:行号:内容。\
-             用于定位某个符号或字符串在哪里定义/使用。受文件权限网关管辖。",
+            "在指定目录下递归搜索子串文本，返回 文件:行号:内容。\
+             **优先于** run_command 跑 Select-String/findstr。受文件权限网关管辖。",
             json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "要搜索的文本（子串匹配）" },
+                    "pattern": { "type": "string", "description": "要搜索的文本（子串匹配，大小写敏感）" },
                     "path": { "type": "string", "description": "搜索根目录（绝对路径）" },
-                    "ext": { "type": "string", "description": "只搜这些扩展名，如 'rs,md'（可选）" }
+                    "ext": { "type": "string", "description": "只搜这些扩展名，如 'rs,md'（可选）" },
+                    "regex": { "type": "boolean", "description": "未启用；传 true 会报错。只用子串 pattern" },
+                    "context": { "type": "integer", "description": "命中行前后各显示几行（默认 0，最大 3）" }
                 },
                 "required": ["pattern", "path"]
             }),
@@ -156,9 +162,96 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
             }),
         ),
         ToolSpec::new(
+            "move_file",
+            "移动或重命名文件/目录（相当于 Rename/Move）。**优先于** `run_command` 跑 Move-Item/Rename-Item。\
+             需对**源路径与目标父目录**均有 readwrite。目标已存在时默认拒绝，除非 overwrite=true（会先备份目标文件）。受文件权限网关管辖。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "src": { "type": "string", "description": "源路径（绝对）" },
+                    "dst": { "type": "string", "description": "目标路径（绝对）" },
+                    "overwrite": { "type": "boolean", "description": "目标已存在时是否覆盖（默认 false）" }
+                },
+                "required": ["src", "dst"]
+            }),
+        ),
+        ToolSpec::new(
+            "copy_file",
+            "复制文件（目录请自行 glob/list 后多次 copy）。**优先于** `run_command` 跑 Copy-Item。\
+             源需 read、目标需 readwrite。目标已存在时默认拒绝，除非 overwrite=true。受文件权限网关管辖。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "src": { "type": "string", "description": "源文件路径（绝对）" },
+                    "dst": { "type": "string", "description": "目标路径（绝对）" },
+                    "overwrite": { "type": "boolean", "description": "目标已存在时是否覆盖（默认 false）" }
+                },
+                "required": ["src", "dst"]
+            }),
+        ),
+        ToolSpec::new(
+            "mkdir",
+            "创建目录（含缺失的父目录）。**优先于** `run_command` 跑 New-Item。受文件权限网关管辖（需 readwrite）。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "要创建的目录绝对路径" }
+                },
+                "required": ["path"]
+            }),
+        ),
+        ToolSpec::new(
+            "file_info",
+            "查看路径元信息：是否存在、是否目录、大小、修改时间。**优先于** PowerShell Get-Item。受文件权限网关管辖（需 read）。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "绝对路径" }
+                },
+                "required": ["path"]
+            }),
+        ),
+        ToolSpec::new(
+            "append_file",
+            "向文本文件末尾追加内容（文件不存在则创建）。**优先于** Add-Content / `>>`。\
+             写入前若文件已存在会自动备份。受文件权限网关管辖（需 readwrite）。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "文件绝对路径" },
+                    "content": { "type": "string", "description": "要追加的文本（不会自动加换行，请自带）" }
+                },
+                "required": ["path", "content"]
+            }),
+        ),
+        ToolSpec::new(
+            "git",
+            "Git **只读**查询：status / diff / log / show / branch（-v 含 sha）。\
+             **优先于** `run_command` 跑 git —— 只读子命令不进命令确认卡。\
+             写操作（add/commit/push/checkout/reset 等）**不可用**，请用 `run_command` 并接受命令策略。\
+             cwd 默认为 path 所在仓库根，或显式传 repo。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "subcommand": {
+                        "type": "string",
+                        "enum": ["status", "diff", "log", "show", "branch"],
+                        "description": "只读子命令"
+                    },
+                    "repo": { "type": "string", "description": "仓库工作目录绝对路径（默认 agent 数据目录）" },
+                    "args": { "type": "string", "description": "附加参数串，如 '-n 20' 或 'HEAD~3..HEAD'（可选）" }
+                },
+                "required": ["subcommand"]
+            }),
+        ),
+        ToolSpec::new(
             "run_command",
             "在用户机器上执行一条 **PowerShell** 命令并返回输出（stdout/stderr/退出码）。\
-             **受命令权限策略管辖**：只读命令（git status / ls / rg 等）直接放行；\
+             **硬规则：读/搜/列文件禁止用本工具**（禁止 Get-Content / Select-String / findstr / Get-ChildItem 查文件）—— \
+             必须用 read_file / grep_files / glob_files / list_dir。\
+             复制/移动/建目录用 copy_file / move_file / mkdir；git 只读用 `git` 工具。\
+             仅当需要跑编译器、包管理器、自定义程序或无对应内置工具时才用本工具。\
+             **受命令权限策略管辖**：只读命令（ls / rg 等）直接放行；\
              危险命令（递归删除 / 格式化 / 关机 / 改注册表等）被**硬性阻断**（不可申请）；\
              其余命令会让你弹出确认卡片让用户当场拍板 —— 被拒就照用户给的理由调整，\
              不要原样重试。\
@@ -191,6 +284,22 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
              或者你需要了解用户正在看什么时调用。\
              图片会在下一条消息里附上，你届时就能看到。",
             json!({ "type": "object", "properties": {}, "required": [] }),
+        ),
+        ToolSpec::new(
+            "view_image",
+            "查看一张**图片文件**的内容（png/jpg/webp/gif/bmp）。\
+             当用户给你图片路径、你用 glob/list_dir 找到截图或图片、\
+             或需要「看看这张图里是什么」时调用。\
+             **不要**用 read_file 读图片（那是文本工具，只会得到乱码）。\
+             画面会在下一条消息里附上，多模态模型下一轮就能看到；\
+             纯文本模型看不到画面，会明确告诉你。PDF 等文档请用 skills 处理。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "图片文件的绝对路径" }
+                },
+                "required": ["path"]
+            }),
         ),
         ToolSpec::new(
             "foreground_context",
@@ -340,7 +449,7 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
                     "tier": {
                         "type": "string",
                         "enum": ["once", "turn", "task"],
-                        "description": "有效期：once 只够这一次工具调用 / turn 本轮对话内有效 / task 整个任务期间有效。拿不准就选 once"
+                        "description": "有效期：once 只够这一次工具调用 / turn 本轮对话内有效 / task 整个任务期间有效（推荐 task，减少连环弹卡）"
                     },
                     "reason": {
                         "type": "string",
@@ -351,6 +460,26 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
             }),
         ),
     ]
+}
+
+/// `fetch_url` —— 拉网页正文（Markdown 子集）。始终可用（不依赖搜索 key）。
+pub fn fetch_url_spec() -> ToolSpec {
+    ToolSpec::new(
+        "fetch_url",
+        "抓取一个 http/https 网页并抽取可读正文（Markdown 子集：标题/段落/链接/列表/代码）。\
+         用于读文档、博客、公告等**静态**页面。\
+         **不**用于：需要点击/登录/JS 渲染的页面（改用 playwright MCP 组）；\
+         也不是搜索 —— 不知道 URL 时先 `web_search`。\
+         URL 会直接请求目标站点。结果会截断到约 1 万字。",
+        json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "要抓取的 http/https 地址" },
+                "max_chars": { "type": "integer", "description": "正文最多几字（200–50000，默认 10000）" }
+            },
+            "required": ["url"]
+        }),
+    )
 }
 
 /// `web_search` —— 仅在搜索已配置时进入 tool_specs
@@ -381,6 +510,7 @@ pub fn web_search_spec() -> ToolSpec {
 /// 所以它必须只做拼接、不产生副作用（早先用 Box::leak 会反复泄漏）。
 pub fn tool_specs(mcp: Option<&crate::mcp::ToolRegistry>, web_search_ready: bool) -> Vec<ToolSpec> {
     let mut specs = builtin_specs();
+    specs.push(fetch_url_spec());
     if web_search_ready {
         specs.push(web_search_spec());
     }
@@ -523,7 +653,8 @@ fn deny_message(e: &DenyReason, need: Access) -> String {
          → 如果你确实需要访问它，可以调用 `request_access` 向用户申请权限（需用户当场批准）：\n\
          - path：要访问的路径。**尽量填最窄的够用范围** —— 填得越宽用户越可能拒绝或收窄；\n\
          - access：\"{need}\"（就是你这次需要的权限）；\n\
-         - tier：once（只够这一次工具调用）/ turn（本轮对话内有效）/ task（整个任务期间有效）；\n\
+         - tier：**推荐 task**（整个任务期间有效）；turn=本轮；once=仅这一次。\
+             **不要对同一父目录下多个文件用 once 连环申请** —— 请申请公共父目录 + task。\n\
          - reason：一句话说明你要做什么、为什么需要，用户是靠它判断批不批的。\n\
          用户拒绝或超时后**不要原样重复申请同一个路径** —— 那只会打扰用户。\n\
          如果用户的拒绝带了理由，请**按理由调整**（换更窄的路径 / 换做法）后再考虑申请。",
@@ -545,10 +676,18 @@ pub async fn execute(
         "write_file" => write_file(args, ctx),
         "edit_file" => edit_file(args, ctx),
         "delete_file" => delete_file(args, ctx),
+        "move_file" => move_file(args, ctx),
+        "copy_file" => copy_file(args, ctx),
+        "mkdir" => mkdir(args, ctx),
+        "file_info" => file_info(args, ctx),
+        "append_file" => append_file(args, ctx),
+        "git" => git_tool(args, ctx),
         "run_command" => run_command(args, ctx).await,
         "web_search" => web_search(args, ctx).await,
+        "fetch_url" => fetch_url(args, ctx).await,
         "request_access" => request_access(args, ctx).await,
         "capture_screen" => capture_screen(ctx.data_dir),
+        "view_image" => view_image(args, ctx),
         "foreground_context" => {
             let out = match crate::context::cached().or_else(crate::context::current) {
                 Some(c) => c.summary(),
@@ -597,8 +736,8 @@ pub async fn execute(
         other => {
             // MCP 工具：mcp__<server>__<tool>
             if let Some((_server, tool)) = crate::mcp::parse_mcp_tool_name(other) {
+                // 先查是否已加载 —— 未加载的组不该弹权限卡（用户批了也执行不了）
                 let reg = ctx.mcp.lock().await;
-                // 确认这个工具确实在已加载的组里（防止模型调用未加载的工具）
                 let loaded = reg
                     .active_tools()
                     .iter()
@@ -609,6 +748,25 @@ pub async fn execute(
                          再用 load_tool_group 加载对应组。"
                     ));
                 }
+                drop(reg);
+
+                // Cline 式：默认问；「总是允许」写 mcp_grants.json 后免问
+                let allowed = crate::mcp::is_mcp_tool_allowed(ctx.data_dir, other);
+                if !allowed {
+                    let verdict = ctx
+                        .perm
+                        .ask_mcp_tool(other.to_string(), crate::agent::summarize_args_pub(&args.to_string()), ctx.session_id)
+                        .await?;
+                    if !verdict.is_approved() {
+                        return Ok(ToolOutput::text(verdict.to_model_message()));
+                    }
+                    // ApproveFull = 总是允许 → 落盘
+                    if matches!(verdict.decision, crate::perm_request::Decision::ApproveFull) {
+                        crate::mcp::allow_mcp_tool(ctx.data_dir, other)?;
+                    }
+                }
+
+                let reg = ctx.mcp.lock().await;
                 let msg = reg.call_tool(&tool_with_server(other), args).await?;
                 return Ok(ToolOutput::text(msg));
             }
@@ -695,12 +853,26 @@ fn recall_turns(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
 // ---------------------------------------------------------------------------
 
 /// 提交长期记忆候选。不直接写 MEMORY.md —— 要等用户审批。
+/// 提交长期记忆。
+/// - **主对话**（无激活项目）→ 全局 pending 审批
+/// - **已切到项目** → 直接追加 `projects/<名>/MEMORY.md`（跳脱主对话）
 fn remember(args: &Value, data_dir: &Path) -> Result<ToolOutput, String> {
     let content = get_str(args, "content")?;
+    let settings = crate::config::load_settings(data_dir);
+    if let Some(pid) = settings.active_project_id {
+        let projects = crate::pmem::list_projects(data_dir)?;
+        if let Some(p) = projects.into_iter().find(|x| x.id == pid) {
+            crate::pmem::append_project_memory(data_dir, &p.name, &content, "model")?;
+            return Ok(ToolOutput::text(format!(
+                "已写入项目「{}」的记忆（projects/{}/MEMORY.md），跨会话有效。",
+                p.name, p.name
+            )));
+        }
+    }
     let store = crate::memory::MemoryStore::new(data_dir);
     let c = store.propose(&content, "model")?;
     Ok(ToolOutput::text(format!(
-        "已提交记忆候选（id: {}），等用户在面板里确认后才会进入长期记忆。",
+        "已提交全局记忆候选（id: {}），等用户在面板里确认后才会进入长期记忆。",
         c.id
     )))
 }
@@ -783,7 +955,7 @@ fn dispatch_task(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> 
 }
 
 // ---------------------------------------------------------------------------
-// capture_screen
+// capture_screen / view_image
 // ---------------------------------------------------------------------------
 
 /// 截取当前主屏幕。图片**存盘后把路径**随 `ToolOutput.image` 返回，
@@ -806,6 +978,45 @@ fn capture_screen(data_dir: &Path) -> Result<ToolOutput, String> {
     })
 }
 
+/// 查看一张图片文件。路径经权限网关后，把**文件路径**随 `ToolOutput.image` 带出，
+/// 由 agent loop 按模型能力转 base64 / 占位 —— 与 `capture_screen` 同一条递送链路。
+fn view_image(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
+    let raw = get_str(args, "path")?;
+    let safe = authorize(ctx, &raw, Access::Read)?;
+
+    if safe.is_dir() {
+        return Err(format!("{} 是目录，不是图片。请给出具体图片文件路径。", safe.display()));
+    }
+    if !crate::images::is_image_path(&safe) {
+        return Err(format!(
+            "{} 不是图片文件（支持 png/jpg/jpeg/webp/gif/bmp）。\n\
+             文本请用 read_file；PDF 等文档请用 skills 处理。",
+            safe.display()
+        ));
+    }
+
+    let meta = std::fs::metadata(&safe).map_err(|e| format!("读取失败: {e}"))?;
+    if meta.len() == 0 {
+        return Err(format!("{} 是空文件。", safe.display()));
+    }
+
+    // 尺寸尽力而为：image crate 未编译的格式（webp/gif…）拿不到就跳过，
+    // 不影响递送 —— to_data_url 只读字节。
+    let dim = image::image_dimensions(&safe)
+        .ok()
+        .map(|(w, h)| format!("{w}x{h}"))
+        .unwrap_or_else(|| "未知尺寸".into());
+
+    let path = safe.to_string_lossy().into_owned();
+    Ok(ToolOutput {
+        text: format!(
+            "已读取图片（{dim}，{:.1} KB），画面内容附在下一条消息里。\n路径：{path}",
+            meta.len() as f64 / 1024.0
+        ),
+        image: Some(path),
+    })
+}
+
 fn get_str(args: &Value, key: &str) -> Result<String, String> {
     args.get(key)
         .and_then(Value::as_str)
@@ -824,6 +1035,13 @@ fn read_file(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     if safe_path.is_dir() {
         return Err(format!(
             "{} 是一个目录，请用 list_dir",
+            safe_path.display()
+        ));
+    }
+    // 图片走 view_image：read_file 是文本工具，对图片只会吐乱码
+    if crate::images::is_image_path(&safe_path) {
+        return Err(format!(
+            "{} 是图片文件，请改用 view_image 查看画面内容（read_file 只能读文本）。",
             safe_path.display()
         ));
     }
@@ -877,28 +1095,72 @@ fn list_dir(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
         return Err(format!("{} 不是目录", safe_path.display()));
     }
 
+    let recursive = args
+        .get("recursive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let depth = args
+        .get("depth")
+        .and_then(Value::as_u64)
+        .unwrap_or(2)
+        .clamp(1, 4) as usize;
+
     let mut dirs: Vec<String> = Vec::new();
     let mut files: Vec<(String, u64)> = Vec::new();
 
-    let entries = std::fs::read_dir(&safe_path).map_err(|e| format!("读目录失败: {e}"))?;
-    let mut count = 0usize;
-    for e in entries.flatten() {
-        if count >= MAX_LIST_ENTRIES {
-            break;
-        }
-        count += 1;
-        let name = e.file_name().to_string_lossy().to_string();
-        match e.metadata() {
-            Ok(md) if md.is_dir() => dirs.push(name),
-            Ok(md) => files.push((name, md.len())),
-            Err(_) => files.push((name, 0)),
+    fn walk_list(
+        root: &Path,
+        prefix: &str,
+        depth_left: usize,
+        recursive: bool,
+        dirs: &mut Vec<String>,
+        files: &mut Vec<(String, u64)>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for e in entries.flatten() {
+            if dirs.len() + files.len() >= MAX_LIST_ENTRIES {
+                return;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            let label = format!("{prefix}{name}");
+            match e.metadata() {
+                Ok(md) if md.is_dir() => {
+                    dirs.push(label.clone());
+                    if recursive && depth_left > 0 {
+                        walk_list(
+                            &e.path(),
+                            &format!("{label}/"),
+                            depth_left - 1,
+                            recursive,
+                            dirs,
+                            files,
+                        );
+                    }
+                }
+                Ok(md) => files.push((label, md.len())),
+                Err(_) => files.push((label, 0)),
+            }
         }
     }
+
+    walk_list(
+        &safe_path,
+        "",
+        depth,
+        recursive,
+        &mut dirs,
+        &mut files,
+    );
 
     dirs.sort();
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut out = format!("{}\n", safe_path.display());
+    if recursive {
+        out.push_str(&format!("（递归 depth≤{depth}）\n"));
+    }
     out.push_str(&format!("目录 {} 个：\n", dirs.len()));
     for d in &dirs {
         out.push_str(&format!("  [DIR]  {d}\n"));
@@ -907,7 +1169,7 @@ fn list_dir(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     for (f, sz) in &files {
         out.push_str(&format!("  {:>9}B  {f}\n", sz));
     }
-    if count >= MAX_LIST_ENTRIES {
+    if dirs.len() + files.len() >= MAX_LIST_ENTRIES {
         out.push_str(&format!("\n… [已截断，最多列 {MAX_LIST_ENTRIES} 项]\n"));
     }
 
@@ -979,6 +1241,21 @@ fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     let needle = get_str(args, "pattern")?;
     let raw = get_str(args, "path")?;
     let roots = authorize(ctx, &raw, Access::Read)?;
+    // 不支持正则（本项目不引 regex crate）。schema/描述只承诺子串匹配。
+    let use_regex = args
+        .get("regex")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if use_regex {
+        return Err(
+            "grep_files 只支持子串匹配（regex=true 未启用）。请用普通 pattern，或 run_command + rg".into(),
+        );
+    }
+    let context = args
+        .get("context")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(3) as usize;
 
     let exts: Vec<String> = args
         .get("ext")
@@ -1030,7 +1307,19 @@ fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
             }
             if line.contains(&needle) {
                 let trimmed: String = line.trim().chars().take(200).collect();
-                hits.push(format!("{}:{}: {}", safe.display(), i + 1, trimmed));
+                if context > 0 {
+                    let all: Vec<&str> = content.lines().collect();
+                    let idx = i;
+                    let start = idx.saturating_sub(context);
+                    let end = (idx + context + 1).min(all.len());
+                    for j in start..end {
+                        let mark = if j == idx { ">" } else { " " };
+                        let ctx_line: String = all[j].trim().chars().take(120).collect();
+                        hits.push(format!("{}:{}: {mark} {}", safe.display(), j + 1, ctx_line));
+                    }
+                } else {
+                    hits.push(format!("{}:{}: {}", safe.display(), i + 1, trimmed));
+                }
             }
         }
     });
@@ -1183,6 +1472,276 @@ fn edit_file(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
         "已编辑 {}（替换 {replaced} 处，体积变化 {delta:+} 字节）{note}",
         safe_path.display()
     )))
+}
+
+// ---------------------------------------------------------------------------
+// move / copy / mkdir / file_info / append / git
+// ---------------------------------------------------------------------------
+
+fn move_file(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
+    let src_raw = get_str(args, "src")?;
+    let dst_raw = get_str(args, "dst")?;
+    let overwrite = args
+        .get("overwrite")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let src = authorize(ctx, &src_raw, Access::ReadWrite)?;
+    let dst = authorize(ctx, &dst_raw, Access::ReadWrite)?;
+
+    if !src.exists() {
+        return Err(format!("源不存在：{}", src.display()));
+    }
+    if dst.exists() {
+        if !overwrite {
+            return Err(format!(
+                "目标已存在：{}。确认要覆盖请带 overwrite=true。",
+                dst.display()
+            ));
+        }
+        if dst.is_file() {
+            let _ = backup_file(ctx.data_dir, &dst)?;
+        }
+        if dst.is_dir() && !dst.read_dir().map(|mut d| d.next().is_none()).unwrap_or(false) {
+            return Err(format!(
+                "目标是非空目录：{}。请换目标路径或自行清理。",
+                dst.display()
+            ));
+        }
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("建目标父目录失败: {e}"))?;
+    }
+
+    let same = src == dst;
+    if same {
+        return Ok(ToolOutput::text("源与目标相同，未移动。"));
+    }
+
+    match std::fs::rename(&src, &dst) {
+        Ok(()) => {}
+        Err(e) => {
+            // 跨盘 rename 可能失败 → 文件退回 copy+delete
+            if src.is_file() {
+                if std::fs::copy(&src, &dst).is_ok() {
+                    let _ = std::fs::remove_file(&src);
+                } else {
+                    return Err(format!("移动失败: {e}"));
+                }
+            } else {
+                return Err(format!("移动失败: {e}"));
+            }
+        }
+    }
+
+    Ok(ToolOutput::text(format!(
+        "已移动\n  {} → {}",
+        src.display(),
+        dst.display()
+    )))
+}
+
+fn copy_file(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
+    let src_raw = get_str(args, "src")?;
+    let dst_raw = get_str(args, "dst")?;
+    let overwrite = args
+        .get("overwrite")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let src = authorize(ctx, &src_raw, Access::Read)?;
+    let dst = authorize(ctx, &dst_raw, Access::ReadWrite)?;
+
+    if !src.is_file() {
+        return Err(format!(
+            "源不是文件：{}。目录请 glob/list 后对每个文件调用 copy_file。",
+            src.display()
+        ));
+    }
+    if dst.exists() && !overwrite {
+        return Err(format!(
+            "目标已存在：{}。确认要覆盖请带 overwrite=true。",
+            dst.display()
+        ));
+    }
+    if dst.is_file() && overwrite {
+        let _ = backup_file(ctx.data_dir, &dst)?;
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("建目标父目录失败: {e}"))?;
+    }
+
+    let n = std::fs::copy(&src, &dst).map_err(|e| format!("复制失败: {e}"))?;
+    Ok(ToolOutput::text(format!(
+        "已复制 {} → {}（{n} 字节）",
+        src.display(),
+        dst.display()
+    )))
+}
+
+fn mkdir(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
+    let raw = get_str(args, "path")?;
+    let safe = authorize(ctx, &raw, Access::ReadWrite)?;
+    if safe.exists() {
+        if safe.is_dir() {
+            return Ok(ToolOutput::text(format!("目录已存在：{}", safe.display())));
+        }
+        return Err(format!("路径已存在且是文件：{}", safe.display()));
+    }
+    std::fs::create_dir_all(&safe).map_err(|e| format!("建目录失败: {e}"))?;
+    Ok(ToolOutput::text(format!("已创建目录 {}", safe.display())))
+}
+
+fn file_info(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
+    let raw = get_str(args, "path")?;
+    let safe = authorize(ctx, &raw, Access::Read)?;
+
+    if !safe.exists() {
+        return Ok(ToolOutput::text(format!("不存在：{}", safe.display())));
+    }
+    let md = safe.metadata().map_err(|e| format!("读元信息失败: {e}"))?;
+    let is_dir = md.is_dir();
+    let len = md.len();
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    Ok(ToolOutput::text(format!(
+        "path: {}\nexists: true\nis_dir: {}\nsize: {} bytes\nmtime_unix: {}",
+        safe.display(),
+        is_dir,
+        len,
+        mtime
+    )))
+}
+
+fn append_file(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
+    let raw = get_str(args, "path")?;
+    let content = get_str(args, "content")?;
+    let safe = authorize(ctx, &raw, Access::ReadWrite)?;
+
+    if safe.is_dir() {
+        return Err(format!("{} 是目录，不能 append", safe.display()));
+    }
+    if safe.exists() {
+        let _ = backup_file(ctx.data_dir, &safe)?;
+    }
+    if let Some(parent) = safe.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("建父目录失败: {e}"))?;
+    }
+
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&safe)
+        .map_err(|e| format!("打开文件失败: {e}"))?;
+    f.write_all(content.as_bytes())
+        .map_err(|e| format!("追加失败: {e}"))?;
+
+    Ok(ToolOutput::text(format!(
+        "已追加 {} 字节到 {}",
+        content.len(),
+        safe.display()
+    )))
+}
+
+/// Git 只读查询。写子命令明确拒绝，避免静默绕过 `command_policy`。
+fn git_tool(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
+    let sub = get_str(args, "subcommand")?;
+    let allowed = ["status", "diff", "log", "show", "branch"];
+    if !allowed.contains(&sub.as_str()) {
+        return Err(format!(
+            "git 只读子命令仅限 {allowed:?}。写操作（add/commit/push 等）请用 run_command 并接受命令策略。"
+        ));
+    }
+
+    let repo_raw = args
+        .get("repo")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| ctx.data_dir.to_string_lossy().into_owned());
+    let repo = authorize(ctx, &repo_raw, Access::Read)?;
+
+    let extra = args
+        .get("args")
+        .and_then(Value::as_str)
+        .map(|s| s.split_whitespace().map(|x| x.to_string()).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg(&sub).current_dir(&repo);
+
+    // 只读白名单：拒绝一切可能写工作区/输出到文件/调外部 diff 的 flag。
+    // 自由 args 无法用「黑名单」保证只读，这里用**前缀/子串危险特征**收紧。
+    for a in &extra {
+        let lower = a.to_ascii_lowercase();
+        let dangerous = matches!(
+            lower.as_str(),
+            "-m"
+                | "--amend"
+                | "--force"
+                | "-f"
+                | "--hard"
+                | "--cached"
+                | "-d"
+                | "-D"
+                | "--delete"
+                | "--move"
+                | "-M"
+                | "--set-upstream-to"
+                | "--edit-description"
+                | "-e"
+                | "--ext-diff"
+                | "--no-index"
+                | "--exit-code"
+                | "--output"
+        ) || lower.starts_with("--output=")
+            || lower.starts_with("--ext-diff")
+            || lower.starts_with("-o")
+            || lower.starts_with("--exec=")
+            // branch 的 -m/-d 等短选项夹在字母里也拒
+            || (sub == "branch" && (lower == "-d" || lower == "-D" || lower == "-m" || lower == "-M"));
+        if dangerous {
+            return Err(format!(
+                "git {sub} 的附加参数 `{a}` 可能产生写操作或外部副作用，已拒绝。只读查询请用更简单参数。"
+            ));
+        }
+        cmd.arg(a);
+    }
+    // branch 只允许 -v/-vv 列表；其余 branch 形态不透传
+    if sub == "branch" {
+        if extra.iter().any(|x| {
+            let l = x.to_ascii_lowercase();
+            !(l == "-v" || l == "-vv" || l.starts_with("--list") || l == "--contains" || l.starts_with("--contains="))
+        }) {
+            return Err("git branch 仅支持只读列出（-v/--list）。改名/删除请用 run_command。".into());
+        }
+        if !extra.iter().any(|x| x == "-v" || x == "-vv") {
+            cmd.arg("-v");
+        }
+    }
+
+    let out = cmd
+        .output()
+        .map_err(|e| format!("启动 git 失败（是否安装了 git？）: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let mut body = if !stdout.is_empty() { stdout } else { stderr };
+    const GIT_LIMIT: usize = 32 * 1024;
+    if body.chars().count() > GIT_LIMIT {
+        // 按字符截断，避免 UTF-8 边界 panic
+        body = body.chars().take(GIT_LIMIT).collect();
+        body.push_str("\n… [输出已截断]");
+    }
+    if !out.status.success() {
+        return Err(format!("git {sub} 退出码 {:?}\n{body}", out.status.code()));
+    }
+    Ok(ToolOutput::text(format!("$ git {sub} {}\n{body}", extra.join(" "))))
 }
 
 fn collect_files_limited(root: &Path, out: &mut Vec<PathBuf>, limit: usize) {
@@ -1373,11 +1932,10 @@ async fn request_access(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, S
         }
     }
 
-    // ---- 校验 3：这条申请**刚被拒过** → 直接打回，不再弹卡打扰用户 ----
+    // ---- 校验 3：这条申请**刚被拒过**（含同 parent/更宽 access）→ 打回 ----
     //
-    // 这就是「防骚扰」的落点：不是把路径禁言，而是**同一个请求不重复放卡**。
-    // 模型凭理由换成更窄的路径时那是一条新记录，会正常弹卡 —— 那正是"按用户的意思调整"。
-    // 判定按 (会话, 规范路径, 权限) 精确匹配，所以"窄一点再试"不会被误拦。
+    // 2026-09-23：同目录连续写曾连环弹卡。现在同 parent + 同/更宽 access 也拦，
+    // 并提示模型**申请父目录 + task**（而不是单文件 once）。
     if let Some(m) = ctx.perm.find_denied(ctx.session_id, &canon, access) {
         let why = if m.reason.is_empty() {
             "（用户上次没有说明理由）".to_string()
@@ -1385,12 +1943,13 @@ async fn request_access(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, S
             format!("用户上次给的理由：{}", m.reason)
         };
         return Ok(ToolOutput::text(format!(
-            "{} 的这条申请（{}）刚刚已经被拒绝过了，**不会再弹第二次卡**，\n\
+            "{} 的这条申请（{}）刚刚已经被拒绝过了（或落在已拒范围 {} 内），**不会再弹第二次卡**，\n\
              请不要原样重复申请。\n{}\n\n\
-             请按这个理由换个做法：换一条更窄的路径、或者改用别的方案；\
-             实在做不了就如实告诉用户。",
+             若确需继续：请按理由换更窄路径、换做法；\
+             或一次性申请**公共父目录 + tier=task**（不要单文件/once 连环申请）。",
             canon.display(),
             access.as_str(),
+            m.prefix.display(),
             why
         )));
     }
@@ -1445,6 +2004,18 @@ async fn request_access(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, S
 
 // ---------------------------------------------------------------------------
 // run_command
+
+/// `fetch_url` 执行体：GET → 剥壳 → Markdown 子集 → 截断
+async fn fetch_url(args: &Value, _ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
+    let url = get_str(args, "url")?;
+    let max = args
+        .get("max_chars")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(crate::fetch::DEFAULT_MAX_CHARS);
+    let text = crate::fetch::fetch_and_extract(&url, max).await?;
+    Ok(ToolOutput::text(text))
+}
 
 /// `web_search` 执行体：读 search.json → 调 provider API
 async fn web_search(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
@@ -1798,9 +2369,11 @@ mod tests {
     fn specs_include_loaded_mcp_tools_only() {
         let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
         let before = tool_specs(Some(&mcp.try_lock().unwrap()), false).len();
-        assert_eq!(before, builtin_specs().len(), "初始不应带 MCP 工具");
+        // 初始：内置 + fetch_url（无 MCP）
+        assert_eq!(before, builtin_specs().len() + 1, "初始 = 内置 + fetch_url");
+        assert!(tool_specs(None, false).iter().any(|s| s.name == "fetch_url"));
         let with = tool_specs(Some(&mcp.try_lock().unwrap()), true).len();
-        assert_eq!(with, builtin_specs().len() + 1, "配置搜索后应多 web_search");
+        assert_eq!(with, builtin_specs().len() + 2, "应有 fetch_url + web_search");
         assert!(tool_specs(None, false).iter().all(|s| s.name != "web_search"));
         assert!(tool_specs(None, true).iter().any(|s| s.name == "web_search"));
     }
@@ -1987,6 +2560,16 @@ mod tests {
         let names: Vec<String> = builtin_specs().into_iter().map(|s| s.name).collect();
         assert!(names.contains(&"edit_file".to_string()), "缺 edit_file");
         assert!(names.contains(&"delete_file".to_string()), "缺 delete_file");
+    }
+
+    #[test]
+    fn view_image_is_in_builtin_specs_and_is_image_path() {
+        let names: Vec<String> = builtin_specs().into_iter().map(|s| s.name).collect();
+        assert!(names.contains(&"view_image".to_string()), "缺 view_image");
+        assert!(crate::images::is_image_path(std::path::Path::new("a/b.PNG")));
+        assert!(crate::images::is_image_path(std::path::Path::new("x.jpeg")));
+        assert!(!crate::images::is_image_path(std::path::Path::new("a.pdf")));
+        assert!(!crate::images::is_image_path(std::path::Path::new("a.txt")));
     }
 
     #[test]
@@ -2193,6 +2776,87 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("request_access") || err.contains("full") || err.contains("权限"), "{}", err);
         assert!(target.exists(), "被拒时不得动文件");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn move_copy_mkdir_file_info_append_work() {
+        let tmp = fresh_tmp("fs_extra");
+        let gate = gate_for(&tmp);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &tmp, mcp);
+
+        let sub = tmp.join("sub");
+        let out = execute("mkdir", &json!({ "path": sub.to_string_lossy() }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.text.contains("已创建") || out.text.contains("已存在"), "{}", out.text);
+        assert!(sub.is_dir());
+
+        let log = tmp.join("sub/log.txt");
+        execute(
+            "append_file",
+            &json!({ "path": log.to_string_lossy(), "content": "hello\n" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        execute(
+            "append_file",
+            &json!({ "path": log.to_string_lossy(), "content": "world\n" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "hello\nworld\n");
+
+        let out = execute("file_info", &json!({ "path": log.to_string_lossy() }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.text.contains("exists: true"), "{}", out.text);
+        assert!(out.text.contains("is_dir: false"), "{}", out.text);
+
+        let cp = tmp.join("sub/log-copy.txt");
+        let out = execute(
+            "copy_file",
+            &json!({ "src": log.to_string_lossy(), "dst": cp.to_string_lossy() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(out.text.contains("已复制"), "{}", out.text);
+        assert_eq!(std::fs::read_to_string(&cp).unwrap(), "hello\nworld\n");
+
+        let mv = tmp.join("sub/log-moved.txt");
+        let out = execute(
+            "move_file",
+            &json!({ "src": cp.to_string_lossy(), "dst": mv.to_string_lossy() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(out.text.contains("已移动"), "{}", out.text);
+        assert!(!cp.exists());
+        assert!(mv.exists());
+
+        let err = execute(
+            "copy_file",
+            &json!({ "src": mv.to_string_lossy(), "dst": log.to_string_lossy() }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("已存在"), "{}", err);
+
+        let err = execute(
+            "git",
+            &json!({ "subcommand": "commit", "repo": tmp.to_string_lossy() }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("只读") || err.contains("run_command"), "{}", err);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

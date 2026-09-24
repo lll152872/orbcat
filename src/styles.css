@@ -1721,6 +1721,263 @@ body {
   background: rgba(255, 255, 255, 0.04);
 }
 
+#project-select {
+  max-width: 110px;
+  min-width: 72px;
+  flex: 0 1 auto;
+}
+
+/* 会话右键「挂靠到项目」 */
+.ctx-menu {
+  position: fixed;
+  z-index: 4000;
+  min-width: 160px;
+  background: #1c1f2e;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  font-size: 12px;
+  color: #dfe3f0;
+}
+
+.ctx-title {
+  padding: 4px 8px 6px;
+  font-size: 10.5px;
+  color: #8a93b8;
+}
+
+.ctx-item {
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.ctx-item:hover {
+  background: rgba(120, 137, 255, 0.22);
+}
+
+.ctx-item.danger {
+  color: #ff8e8e;
+}
+
+.ctx-item.danger:hover {
+  background: rgba(255, 80, 80, 0.18);
+}
+
+.ctx-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* 会话行：标题可截断，📁 固定不截断 */
+.sess-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  width: 100%;
+}
+
+.sess-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sess-proj {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: rgba(255, 200, 60, 0.12);
+  color: #f0d080;
+  white-space: nowrap;
+}
+
+.sess-cur-tag {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: #8fd0ff;
+  white-space: nowrap;
+}
+
+.sess-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.sess-group.cur-proj {
+  border-left: 2px solid rgba(120, 137, 255, 0.45);
+  padding-left: 6px;
+}
+
+/* 表单字段：小标签 + 输入，和面板深色一致（不要系统白框） */
+.fld {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.fld > span {
+  font-size: 10.5px;
+  color: #8a93b8;
+  letter-spacing: 0.02em;
+}
+
+.fld.grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.fld input {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 7px;
+  color: #e8eaf2;
+  padding: 7px 9px;
+  font-size: 12px;
+  outline: none;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.fld input:focus {
+  border-color: rgba(120, 137, 255, 0.55);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+button.fetch-id {
+  align-self: flex-end;
+  margin-bottom: 1px;
+  white-space: nowrap;
+}
+
+.ask-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 10px 0 4px;
+}
+
+.ask-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: #aab4dd;
+}
+
+.ask-field input {
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 7px;
+  color: #e8eaf2;
+  padding: 7px 9px;
+  font-size: 12px;
+  outline: none;
+}
+
+.ask-field input:focus {
+  border-color: rgba(120, 137, 255, 0.55);
+}
+
+.form-err {
+  background: rgba(255, 90, 90, 0.12);
+  border: 1px solid rgba(255, 90, 90, 0.35);
+  color: #ffb4b4;
+  border-radius: 7px;
+  padding: 7px 9px;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.form-row-2 {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.form-row-2.even {
+  grid-template-columns: 1fr 1fr;
+}
+
+.adv-box {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 7px;
+  padding: 6px 8px;
+}
+
+.adv-box summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  color: #aab4dd;
+  user-select: none;
+}
+
+.id-picker {
+  margin-top: 8px;
+  border: 1px solid rgba(120, 137, 255, 0.35);
+  border-radius: 8px;
+  padding: 8px;
+  background: rgba(40, 48, 90, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.id-picker-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: #c6d0f5;
+}
+
+.id-picker-list {
+  max-height: 180px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.id-pick {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  color: #e8eaf2;
+  padding: 6px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.id-pick:hover {
+  border-color: rgba(120, 137, 255, 0.5);
+}
+
+.id-pick.already {
+  opacity: 0.55;
+}
+
+.id-pick .remote-meta {
+  font-size: 11px;
+  color: #8a93b8;
+}
+
 .set-form input[type="text"],
 .set-form input[type="password"],
 .set-form input:not([type]) {
@@ -1890,6 +2147,34 @@ body {
 
 .mcp-url-input::placeholder {
   color: #5b637e;
+}
+
+/* 多 server 列表 */
+.mcp-srv-row .mcp-en {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.mcp-srv-row .mcp-en-cb {
+  margin: 0;
+  cursor: pointer;
+}
+.mcp-srv-row .mcp-srv-id {
+  margin-right: 6px;
+}
+.mcp-add-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.mcp-add-form input {
+  flex: 1 1 120px;
+  min-width: 100px;
 }
 
 .set-warn {
@@ -2208,17 +2493,77 @@ body {
   overflow-wrap: anywhere;
 }
 
-/* 模型中途改主意去调工具了 → 这段作废，淡化掉 */
+/* 模型中途改调工具：弱化标记，但**不要删除线处死**——中间正文仍可看 */
 .run-stream.discarded {
-  opacity: 0.45;
-  text-decoration: line-through;
-  text-decoration-color: rgba(255, 255, 255, 0.3);
+  opacity: 0.72;
 }
 
 .run-note {
   font-size: 10.5px;
   color: #7c85a3;
   margin-top: 5px;
+}
+
+/* 跑完折叠的「过程」 */
+details.run-process {
+  margin-top: 8px;
+  border: 1px solid rgba(140, 150, 180, 0.22);
+  border-radius: 8px;
+  padding: 4px 8px;
+}
+details.run-process > summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: 11.5px;
+  color: #9aa3c0;
+}
+details.tl-tool-res {
+  margin-top: 4px;
+  font-size: 11.5px;
+}
+details.tl-tool-res > summary {
+  cursor: pointer;
+  user-select: none;
+}
+.tl-tool-pre {
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11px;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 6px;
+}
+
+/* 过程里的插话 */
+.tl-steer {
+  margin: 6px 0;
+  padding: 6px 8px;
+  border-left: 2px solid #d8b25a;
+  background: rgba(216, 178, 90, 0.08);
+  font-size: 12px;
+  color: #e8eaf2;
+}
+
+/* 多轮流式正文：按轮收进时间线，不要糊成一坨 */
+.tl-text {
+  margin: 6px 0;
+  padding: 6px 8px;
+  border-left: 2px solid rgba(140, 150, 180, 0.45);
+  background: rgba(140, 150, 180, 0.08);
+  font-size: 12px;
+  line-height: 1.6;
+  color: #e8eaf2;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tl-text-tag {
+  display: inline-block;
+  margin-right: 6px;
+  font-size: 10.5px;
+  color: #9aa3c0;
 }
 
 /* 思维链折叠块 */

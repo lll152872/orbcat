@@ -149,28 +149,27 @@ fn to_chat_message(p: Picked) -> ChatMessage {
         ));
     }
 
-    // 工具调用结果：**落盘时就已折叠**（见 `sessions::append_turn`），
-    // 这里直接拼，不再加工 —— 每轮读到的历史必须字节稳定，
-    // 任何"读取时加工"都会让 prompt cache 前缀失效。
+    // 工具步骤回灌（2026-09-23 修正）：
     //
-    // 唯一的例外是**存量老数据**：折叠机制上线前落盘的 steps 是原文
-    // （一条 detail 可能几 KB）。这些消息在本机读出来仍是原文，
-    // 会对缓存不友好。但老数据的折叠结果一旦写回磁盘就定死，
-    // 反而会被"重折一次"改掉 —— 所以这里**读时兜底折叠**，
-    // 只对明显是原文的（detail 很长）动手，且不写回磁盘：
-    // 老消息会随 400 条上限自然淘汰，不影响新数据的稳定性。
-    let steps = if is_legacy_unfolded(&m.steps) {
-        crate::sessions::fold_steps(&m.steps)
-    } else {
-        m.steps.clone()
-    };
-
-    let folded = fold_steps_to_line(&steps);
+    // 落盘已走 `sessions::cap_steps`（**保序多条**，含 tool_result），不再是
+    // 一行摘要。这里直接交给 [`fold_steps_to_line`]：
+    // - 已折叠老格式（1 条 `[已执行…`）→ 原样返回
+    // - 结构化多条 steps → **近 K 条原文/截断**（含 tool_result），更旧折一行
+    //
+    // ⚠️ 不要再 `sessions::fold_steps` 预折叠：那会把 tool_result 全部丢掉，
+    // 模型下一轮「失忆」重跑 Get-Content（STATUS 2026-09-22 根因）。
+    //
+    // 每轮读到的历史对**同一会话前缀**保持稳定（fold 规则只依赖 steps 本身），
+    // 有利于 prompt cache；不要在读取路径引入时间戳/随机量。
+    let folded = fold_steps_to_line(&m.steps);
     if !folded.is_empty() {
         if !text.is_empty() {
             text.push('\n');
         }
+        // 明确圈出轨迹块：降低模型把工具日志续写进正文的概率
+        text.push_str("«steps\n");
         text.push_str(&folded);
+        text.push_str("\n»");
     }
 
     match m.role.as_str() {
@@ -179,32 +178,117 @@ fn to_chat_message(p: Picked) -> ChatMessage {
     }
 }
 
-/// 判断这组 steps 是否是**折叠前**的存量数据。
+/// 是否「旧折叠格式」：只有一条 `tool_call`，且 `detail` 以 `[已执行` 开头。
 ///
-/// 折叠后的记录形状固定：只有 1 条，`kind == "tool_call"`，且 `detail`
-/// 以 `[已执行` 开头。除此之外都是原文（多条记录、或含 `tool_result`、
-/// 或 detail 是真实输出）。
-///
-/// 依赖 [`crate::sessions::fold_steps`] 的**幂等性**：折叠结果再过一遍
-/// 折不出别的样子，所以这个判定不会把新数据误判成老数据。
-fn is_legacy_unfolded(steps: &[sessions::StoredStep]) -> bool {
-    if steps.is_empty() {
+/// 新数据是 `cap_steps` 保序多条（含 tool_result），**不是** legacy。
+/// 仅用于识别历史里真正被旧 `fold_steps` 压成一行的记录。
+fn is_already_folded_line(steps: &[sessions::StoredStep]) -> bool {
+    if steps.len() != 1 {
         return false;
     }
-    if steps.len() != 1 {
-        return true;
-    }
     let s = &steps[0];
-    s.kind != "tool_call" || !s.detail.trim_start().starts_with("[已执行")
+    s.kind == "tool_call" && s.detail.trim_start().starts_with("[已执行")
 }
 
-/// 已折叠的 steps → 拼进历史文本的那一行
+/// 已折叠的 steps → 拼进历史文本的那一行（保留近期原文/截断，更旧折一行）
+///
+/// **为什么必须保留近期 tool_result**（2026-09-23 用户点名）：
+/// 早先实现只 `find` 首条 `tool_call` detail，`tool_result` 全部丢弃 ——
+/// 跨轮/插话后模型「失忆」，只能重跑 `Get-Content`/`Select-String` 打转。
+/// 现在与 `sessions::cap_steps` 对齐：**落盘给模型看的也不是一行摘要**。
 fn fold_steps_to_line(steps: &[sessions::StoredStep]) -> String {
-    steps
-        .iter()
-        .find(|s| s.kind == "tool_call")
-        .map(|s| s.detail.clone())
-        .unwrap_or_default()
+    const KEEP_RECENT_STEPS: usize = 12;
+    const TOOL_RESULT_LIMIT: usize = 4 * 1024; // 按**字符**计，防 UTF-8 边界 panic
+
+    if steps.is_empty() {
+        return String::new();
+    }
+
+    // 旧折叠格式：单条 tool_call 且以 [已执行 开头 → 原样返回
+    if is_already_folded_line(steps) {
+        return steps[0].detail.clone();
+    }
+
+    let n = steps.len();
+    let split = n.saturating_sub(KEEP_RECENT_STEPS);
+    let mut parts: Vec<String> = Vec::new();
+
+    if split > 0 {
+        let older = &steps[..split];
+        let calls = older.iter().filter(|s| s.kind == "tool_call").count();
+        let results = older.iter().filter(|s| s.kind == "tool_result").count();
+        let last_name = older
+            .iter()
+            .rev()
+            .find(|s| s.kind == "tool_call" || s.kind == "tool_result")
+            .and_then(|s| s.name.as_ref())
+            .map(|s| s.as_str())
+            .unwrap_or("?");
+        parts.push(format!(
+            "[已执行：更早 steps 已折叠 tool_call×{calls} tool_result×{results}；最后: {last_name}]"
+        ));
+    }
+
+    for s in &steps[split..] {
+        match s.kind.as_str() {
+            "tool_call" => {
+                let args: String = s.detail.chars().take(120).collect();
+                parts.push(format!("调用 {}", s.name.as_deref().unwrap_or("?")));
+                if !args.is_empty() {
+                    parts.push(format!("  参数: {args}"));
+                }
+            }
+            "tool_result" => {
+                let mut d = s.detail.clone();
+                if d.chars().count() > TOOL_RESULT_LIMIT {
+                    // 按字符截断，避免 String::truncate 在 UTF-8 边界 panic
+                    let cut: String = d.chars().take(TOOL_RESULT_LIMIT).collect();
+                    d = cut;
+                    d.push_str("…[截断]");
+                }
+                parts.push(format!(
+                    "{} 返回:\n{}",
+                    s.name.as_deref().unwrap_or("?"),
+                    d
+                ));
+            }
+            "tool_error" | "error" => {
+                parts.push(format!(
+                    "{} {}: {}",
+                    if s.kind == "error" { "错误" } else { "工具失败" },
+                    s.name.as_deref().unwrap_or(""),
+                    s.detail
+                ));
+            }
+            "reasoning" => {
+                // 思考已单独有 reasoning 字段；这里只留极短摘要，避免与 reason_total 重复
+                // ⚠️ 前缀刻意不用「[思考]」这种会被模型当成正文续写的格式（2026-09-24
+                //    用户截图：商汤把 fold 尾巴回显进 answer.text）。改用轨迹块标记。
+                let head: String = s.detail.trim().chars().take(80).collect();
+                if !head.is_empty() {
+                    parts.push(format!("·think {head}"));
+                }
+            }
+            "status" | "omitted" => {
+                let t: String = s.detail.chars().take(120).collect();
+                if !t.is_empty() {
+                    parts.push(format!("·status {t}"));
+                }
+            }
+            // 多轮流式正文（按轮收进时间线的中间话）
+            "text" | "stream" => {
+                let t: String = s.detail.trim().chars().take(200).collect();
+                if !t.is_empty() {
+                    parts.push(format!("·text {t}"));
+                }
+            }
+            // 插话已作为独立 user 消息落盘回灌；steps 里只服务 UI 时间线，这里跳过防重复
+            "steer" => {}
+            _ => {}
+        }
+    }
+
+    parts.join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +605,7 @@ mod tests {
             steps: Vec::new(),
             reasoning: None,
             interrupted: false,
+            steer_id: None,
             model: None,
             usage: None,
             at,
@@ -593,7 +678,7 @@ mod tests {
             name: Some("read_file".into()),
             detail: "[已执行：read_file、grep_files（共 2 次工具调用）]".into(),
         }];
-        assert!(!is_legacy_unfolded(&m.steps), "这形状就是折叠版");
+        assert!(is_already_folded_line(&m.steps), "这形状就是折叠版");
 
         let cm = to_chat_message(Picked { msg: m, fallback: false });
         let json = serde_json::to_string(&cm).unwrap();
@@ -603,31 +688,77 @@ mod tests {
         );
     }
 
-    /// 存量老数据（折叠机制上线前的原文 steps）读时兜底折叠
+    /// P0：结构化 steps 的 tool_result 必须进下一轮（不再被 fold 成一行）
     #[test]
-    fn legacy_unfolded_steps_are_folded_on_read() {
+    fn structured_steps_keep_recent_tool_results() {
         let mut m = msg("assistant", "查了", 100);
         m.steps = vec![
             StoredStep {
                 kind: "tool_call".into(),
                 name: Some("read_file".into()),
-                detail: "x".repeat(5000),
+                detail: r#"{"path":"D:\\a.md"}"#.into(),
             },
             StoredStep {
                 kind: "tool_result".into(),
                 name: Some("read_file".into()),
-                detail: "y".repeat(5000),
+                detail: "FILE_BODY_MARKER\nline2".into(),
             },
             StoredStep {
                 kind: "tool_call".into(),
                 name: Some("grep_files".into()),
-                detail: "z".repeat(5000),
+                detail: r#"{"pattern":"TODO"}"#.into(),
+            },
+            StoredStep {
+                kind: "tool_result".into(),
+                name: Some("grep_files".into()),
+                detail: "TODO_HIT_MARKER".into(),
             },
         ];
         let cm = to_chat_message(Picked { msg: m, fallback: false });
         let json = serde_json::to_string(&cm).unwrap();
-        assert!(json.contains("2 次工具调用"), "老数据应被兜底折叠: {json}");
-        assert!(!json.contains("xxxx"), "原文不该出现在回灌内容里");
+        assert!(
+            json.contains("FILE_BODY_MARKER"),
+            "近条 tool_result 必须回灌: {json}"
+        );
+        assert!(
+            json.contains("TODO_HIT_MARKER"),
+            "近条 tool_result 必须回灌: {json}"
+        );
+        assert!(
+            !json.contains("2 次工具调用"),
+            "不应再被压成一行摘要: {json}"
+        );
+    }
+
+    /// 更旧的 steps 折成一行摘要，近条仍保留
+    #[test]
+    fn older_steps_fold_to_summary_line() {
+        let mut steps = Vec::new();
+        for i in 0..20 {
+            steps.push(StoredStep {
+                kind: "tool_call".into(),
+                name: Some(format!("t{i}")),
+                detail: format!("call-{i}"),
+            });
+            steps.push(StoredStep {
+                kind: "tool_result".into(),
+                name: Some(format!("t{i}")),
+                detail: format!("RESULT_{i}_MARKER"),
+            });
+        }
+        let line = fold_steps_to_line(&steps);
+        assert!(
+            line.contains("更早 steps 已折叠"),
+            "超 K 条应有折叠摘要: {line}"
+        );
+        assert!(
+            line.contains("RESULT_19_MARKER") || line.contains("RESULT_18_MARKER"),
+            "近条结果应保留: {line}"
+        );
+        assert!(
+            !line.contains("RESULT_0_MARKER"),
+            "很旧的结果应被折叠掉: {line}"
+        );
     }
 
     /// 只有 thought、没有工具调用的 steps → 不产生折叠行

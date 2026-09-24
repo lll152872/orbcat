@@ -42,11 +42,6 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// 建立会话超时
 const INIT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// 活跃工具集的 token 预算。
-///
-/// 防止模型无脑 `load_tool_group` 把所有组都装进来 —— 那样等于退回"全量注入"。
-const ACTIVE_BUDGET_TOKENS: usize = 10_000;
-
 /// 粗略 token 估算：JSON 字符数 / 3.5
 fn est_tokens(s: &str) -> usize {
     s.len() / 3 + s.len() / 10 // ≈ /3.33，比除法简单
@@ -106,14 +101,16 @@ impl McpTool {
     }
 }
 
-/// 一个工具组（= 一个 MCP server）
+/// 一个工具组（= 一个 MCP server 上的一簇工具）
 #[derive(Debug, Clone)]
 pub struct McpGroup {
-    /// 组名，如 `ssh`
+    /// 组名，如 `ssh` / `github`
     pub name: String,
+    /// 来自哪条 server 配置（call 时按它路由）
+    pub server_id: String,
     /// 一句话概括这个组是干嘛的（供模型决策）
     pub summary: String,
-    /// 组内工具
+    /// 组内工具（`name` = 该 server 上的原始工具名）
     pub tools: Vec<McpTool>,
     /// 该 server 是否可用（连不上时为 false）
     pub available: bool,
@@ -337,20 +334,27 @@ impl McpClient {
 // ---------------------------------------------------------------------------
 
 pub struct ToolRegistry {
-    client: McpClient,
+    /// 每条启用的 server 一个 client；key = server id
+    clients: std::collections::HashMap<String, McpClient>,
     /// 全部分组（含未加载的）
     groups: Vec<McpGroup>,
     /// 已加载进活跃集的组名
     active: HashSet<String>,
-    /// 上次拉取是否成功
+    /// 至少一条 server 拉取成功
     pub connected: bool,
     pub error: Option<String>,
 }
 
 impl ToolRegistry {
+    /// 单 URL（兼容旧调用 / 测试）
     pub fn new(url: impl Into<String>) -> Self {
+        let url = url.into();
+        let mut clients = std::collections::HashMap::new();
+        if !url.trim().is_empty() {
+            clients.insert("default".into(), McpClient::new(url));
+        }
         Self {
-            client: McpClient::new(url),
+            clients,
             groups: Vec::new(),
             active: HashSet::new(),
             connected: false,
@@ -358,46 +362,129 @@ impl ToolRegistry {
         }
     }
 
-    /// 克隆一份 client（reqwest::Client 内部是 Arc，克隆廉价）。
-    /// 用途：**锁外**做网络 IO —— 见 fetch_snapshot 的说明。
+    /// 按 server 列表建注册表。空列表 = MCP 不启用。
+    pub fn with_servers(servers: &[crate::config::McpServerCfg]) -> Self {
+        let mut clients = std::collections::HashMap::new();
+        for s in servers {
+            if s.enabled && !s.url.trim().is_empty() {
+                clients.insert(s.id.clone(), McpClient::new(s.url.clone()));
+            }
+        }
+        Self {
+            clients,
+            groups: Vec::new(),
+            active: HashSet::new(),
+            connected: false,
+            error: None,
+        }
+    }
+
+    /// 克隆全部 client（锁外网络 IO 用）。
+    pub fn clients_clone(&self) -> Vec<(String, McpClient)> {
+        self.clients
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// 兼容旧接口：第一个 client
     pub fn client_clone(&self) -> McpClient {
-        self.client.clone()
+        self.clients
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| McpClient::new(""))
     }
 
-    /// 当前网关地址（空串 = 未配置）
+    /// 概况：`id=url` 列表（设置页展示用）
+    pub fn server_urls(&self) -> Vec<(String, String)> {
+        self.clients
+            .iter()
+            .map(|(k, v)| (k.clone(), v.url().to_string()))
+            .collect()
+    }
+
+    /// 兼容旧接口：第一个 URL
     pub fn url(&self) -> String {
-        self.client.url().to_string()
+        self.clients
+            .values()
+            .next()
+            .map(|c| c.url().to_string())
+            .unwrap_or_default()
     }
 
-    /// 换网关地址（设置页改配置后调用）。
-    /// 换地址 = 旧 session 作废，所以顺手清掉连接态，等下次 refresh。
-    pub fn set_url(&mut self, url: &str) {
-        self.client = McpClient::new(url);
+    /// 整表替换 servers（设置页改完配置后调用）。
+    pub fn set_servers(&mut self, servers: &[crate::config::McpServerCfg]) {
+        self.clients.clear();
+        for s in servers {
+            if s.enabled && !s.url.trim().is_empty() {
+                self.clients.insert(s.id.clone(), McpClient::new(s.url.clone()));
+            }
+        }
         self.connected = false;
         self.error = None;
         self.groups.clear();
         self.active.clear();
     }
 
-    /// 锁外做网络 IO：拉取工具清单。**不碰 self 状态**。
-    ///
-    /// 为什么拆出来：refresh 持锁做网络 IO 时（网关僵持最长 ~40s），
-    /// mcp_status / 工具列表 / load_tool_group 全部在锁上排队，
-    /// 表现就是「点开设置卡半天」。正确姿势：锁外 fetch，锁内只做内存落账。
+    /// 兼容旧接口：换单 URL
+    pub fn set_url(&mut self, url: &str) {
+        self.set_servers(&[crate::config::McpServerCfg {
+            id: "default".into(),
+            url: url.to_string(),
+            enabled: !url.trim().is_empty(),
+            label: String::new(),
+        }]);
+    }
+
+    /// 锁外做网络 IO：拉取**全部** server 的工具清单。**不碰 self 状态**。
     pub async fn fetch_snapshot(
+        clients: &[(String, McpClient)],
+    ) -> Result<(Option<String>, Vec<(String, Vec<McpTool>)>), String> {
+        if clients.is_empty() {
+            return Err("没有已启用的 MCP server".into());
+        }
+        let mut all = Vec::new();
+        let mut errs: Vec<String> = Vec::new();
+        let mut any_ok = false;
+        for (sid, client) in clients {
+            match client.fetch_tools().await {
+                Ok((_, tools)) => {
+                    any_ok = true;
+                    all.push((sid.clone(), tools));
+                }
+                Err(e) => errs.push(format!("{sid}: {e}")),
+            }
+        }
+        if !any_ok {
+            return Err(if errs.is_empty() {
+                "全部 MCP server 拉取失败".into()
+            } else {
+                errs.join("; ")
+            });
+        }
+        Ok((None, all))
+    }
+
+    /// 兼容旧接口：单 client snapshot
+    pub async fn fetch_snapshot_one(
         client: &McpClient,
     ) -> Result<(Option<String>, Vec<McpTool>), String> {
         client.fetch_tools().await
     }
 
-    /// 锁内落账：把 fetch_snapshot 的结果写进注册表（纯内存，微秒级）。
+    /// 锁内落账。
     pub fn apply_snapshot(
         &mut self,
-        res: Result<(Option<String>, Vec<McpTool>), String>,
+        res: Result<(Option<String>, Vec<(String, Vec<McpTool>)>), String>,
     ) {
         match res {
-            Ok((_, tools)) => {
-                let groups = Self::group_tools(tools);
+            Ok((_, per_server)) => {
+                let mut groups = Vec::new();
+                for (sid, tools) in per_server {
+                    groups.extend(Self::group_tools_for(&sid, tools));
+                }
+                groups.sort_by(|a, b| b.tools.len().cmp(&a.tools.len()).then(a.name.cmp(&b.name)));
                 eprintln!(
                     "[float-agent] MCP 工具已加载：{} 个组 / {} 个工具",
                     groups.len(),
@@ -417,45 +504,78 @@ impl ToolRegistry {
         }
     }
 
-    /// 从网关拉取全部工具并按 server 分组。
-    /// 失败不致命 —— 应用照常运行，只是没有 MCP 工具。
-    ///
-    /// ⚠️ 持锁调用方注意：本方法内部做网络 IO。后台刷新请改用
-    /// `fetch_snapshot`（锁外）+ `apply_snapshot`（锁内）的组合。
+    /// 兼容旧接口：单 client 落账
+    pub fn apply_snapshot_one(&mut self, res: Result<(Option<String>, Vec<McpTool>), String>) {
+        match res {
+            Ok((_, tools)) => {
+                let sid = self
+                    .clients
+                    .keys()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "default".into());
+                self.apply_snapshot(Ok((None, vec![(sid, tools)])));
+            }
+            Err(e) => self.apply_snapshot(Err(e)),
+        }
+    }
+
+    /// 从全部 server 拉取。失败不致命。
     pub async fn refresh(&mut self) {
-        let res = Self::fetch_snapshot(&self.client).await;
+        let clients = self.clients_clone();
+        let res = Self::fetch_snapshot(&clients).await;
         self.apply_snapshot(res);
     }
 
-    /// 按 `_1mcp_` 切分组名
-    fn group_tools(tools: Vec<McpTool>) -> Vec<McpGroup> {
+    /// 把一个 server 上的工具切成组。
+    ///
+    /// - 工具名带 `_1mcp_`（1MCP 网关）→ 按前缀拆成多组
+    /// - 否则整包一组，组名 = server id
+    fn group_tools_for(server_id: &str, tools: Vec<McpTool>) -> Vec<McpGroup> {
+        let gateway_style = tools.iter().any(|t| t.name.contains("_1mcp_"));
+        if !gateway_style {
+            let summary = summarize(server_id, &tools);
+            return vec![McpGroup {
+                name: server_id.to_string(),
+                server_id: server_id.to_string(),
+                summary,
+                tools,
+                available: true,
+            }];
+        }
+
         let mut map: Vec<(String, Vec<McpTool>)> = Vec::new();
         for t in tools {
-            let server = match t.name.split_once("_1mcp_") {
+            let gname = match t.name.split_once("_1mcp_") {
                 Some((s, _)) => s.to_string(),
                 None => "(standalone)".to_string(),
             };
-            match map.iter_mut().find(|(k, _)| *k == server) {
+            match map.iter_mut().find(|(k, _)| *k == gname) {
                 Some((_, v)) => v.push(t),
-                None => map.push((server, vec![t])),
+                None => map.push((gname, vec![t])),
             }
         }
 
-        let mut groups: Vec<McpGroup> = map
-            .into_iter()
+        map.into_iter()
             .map(|(name, tools)| {
                 let summary = summarize(&name, &tools);
                 McpGroup {
                     name,
+                    server_id: server_id.to_string(),
                     summary,
                     tools,
                     available: true,
                 }
             })
-            .collect();
+            .collect()
+    }
 
-        // 工具多的排前面（通常也更常用）
-        groups.sort_by(|a, b| b.tools.len().cmp(&a.tools.len()));
+    /// 兼容旧测试/调用
+    fn group_tools(tools: Vec<McpTool>) -> Vec<McpGroup> {
+        let groups = Self::group_tools_for("default", tools);
+        // 工具多的排前面；同名按组名稳定序（大小相同保持确定性）
+        let mut groups = groups;
+        groups.sort_by(|a, b| b.tools.len().cmp(&a.tools.len()).then(a.name.cmp(&b.name)));
         groups
     }
 
@@ -484,7 +604,7 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// 活跃集的 token 估算
+    /// 活跃集的 token 估算（仅展示用，不再做加载拦截）
     pub fn active_tokens(&self) -> usize {
         self.groups
             .iter()
@@ -493,13 +613,54 @@ impl ToolRegistry {
             .sum()
     }
 
-    pub fn budget_tokens(&self) -> usize {
-        ACTIVE_BUDGET_TOKENS
+    /// 调用一个 MCP 工具（原始工具名，如 `ssh_1mcp_run-command`）。
+    /// 按组上的 `server_id` 路由到对应 client。
+    pub async fn call_tool(&self, raw_name: &str, args: &Value) -> Result<String, String> {
+        let sid = self
+            .groups
+            .iter()
+            .find(|g| g.tools.iter().any(|t| t.name == raw_name))
+            .map(|g| g.server_id.clone());
+        let client = match sid {
+            Some(id) => self.clients.get(&id),
+            None => self.clients.values().next(),
+        };
+        let Some(client) = client else {
+            return Err("没有可用的 MCP server".into());
+        };
+        client.call_tool(raw_name, args).await
     }
 
-    /// 调用一个 MCP 工具（原始工具名，如 `ssh_1mcp_run-command`）
-    pub async fn call_tool(&self, raw_name: &str, args: &Value) -> Result<String, String> {
-        self.client.call_tool(raw_name, args).await
+    /// 按完整名 `mcp__<group>__<tool>` 调用。
+    pub async fn call_tool_full(&self, full: &str, args: &Value) -> Result<String, String> {
+        let raw = self.raw_name_of(full)?;
+        self.call_tool(&raw, args).await
+    }
+
+    /// `mcp__ssh__run-command` → 该 server 上的原始名（可能是 `ssh_1mcp_run-command` 或 `run-command`）
+    pub fn raw_name_of(&self, full: &str) -> Result<String, String> {
+        let (group, tool) = crate::mcp::parse_mcp_tool_name(full)
+            .ok_or_else(|| format!("非法 MCP 工具名：{full}"))?;
+        let g = self
+            .groups
+            .iter()
+            .find(|g| g.name == group)
+            .ok_or_else(|| format!("未知工具组：{group}"))?;
+        // 1mcp 网关：raw = <group>_1mcp_<tool>；独立 server：raw = <tool> 或组内唯一后缀匹配
+        if let Some(t) = g.tools.iter().find(|t| t.name == format!("{group}_1mcp_{tool}")) {
+            return Ok(t.name.clone());
+        }
+        if let Some(t) = g.tools.iter().find(|t| t.name == tool) {
+            return Ok(t.name.clone());
+        }
+        if let Some(t) = g
+            .tools
+            .iter()
+            .find(|t| t.name.ends_with(&format!("_{tool}")) || t.name.ends_with(tool.as_str()))
+        {
+            return Ok(t.name.clone());
+        }
+        Err(format!("组「{group}」里没有工具「{tool}」"))
     }
 
     /// 按组内工具的原始名反查它属于哪个组（用于校验是否已加载）
@@ -528,20 +689,6 @@ impl ToolRegistry {
         }
 
         let cost = g.total_tokens();
-        let now = self.active_tokens();
-        if now + cost > ACTIVE_BUDGET_TOKENS {
-            return Err(format!(
-                "加载「{name}」需要约 {cost} tokens，但当前活跃工具已占 {now}，\
-                 超出预算 {ACTIVE_BUDGET_TOKENS}。请先用 unload_tool_group 卸载暂时不用的组。\
-                 当前已加载：{}",
-                if self.active.is_empty() {
-                    "（无）".to_string()
-                } else {
-                    self.active_groups().join(", ")
-                }
-            ));
-        }
-
         // 工具名清单（让模型知道现在能调什么，但不重复 schema）
         let names: Vec<String> = g.tools.iter().map(|t| mcp_tool_full_name(&g.name, &t.name)).collect();
 
@@ -588,13 +735,10 @@ impl ToolRegistry {
                 g.summary
             ));
         }
-        out.push_str(&format!(
-            "\n当前活跃工具占用约 {} / {} tokens。\n\
-             用 load_tool_group 加载需要的组，用 unload_tool_group 卸载。\
-             一次只加载当前任务真正需要的组。",
-            self.active_tokens(),
-            ACTIVE_BUDGET_TOKENS
-        ));
+        out.push_str(
+            "\n用 load_tool_group 加载需要的组，用 unload_tool_group 卸载暂时不用的组。\n\
+             只加载当前任务真正需要的组，避免上下文被工具 schema 撑爆。",
+        );
         out
     }
 }
@@ -604,8 +748,6 @@ impl ToolRegistry {
 // ---------------------------------------------------------------------------
 
 /// 暴露给模型的完整工具名：`mcp__<server>__<tool>`
-///
-/// 加前缀是为了和内置工具（read_file 等）隔离，避免重名冲突。
 pub fn mcp_tool_full_name(server: &str, tool: &str) -> String {
     format!("mcp__{server}__{tool}")
 }
@@ -615,6 +757,87 @@ pub fn parse_mcp_tool_name(full: &str) -> Option<(String, String)> {
     let rest = full.strip_prefix("mcp__")?;
     let (server, tool) = rest.split_once("__")?;
     Some((server.to_string(), tool.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// MCP 工具「总是允许」（Cline 式，独立于 command_grants）
+// ---------------------------------------------------------------------------
+
+/// `<data_dir>/mcp_grants.json` 的形状。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpGrantsFile {
+    /// 已永久允许的**完整工具名**（`mcp__ssh__run-command` 这种）
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+}
+
+fn mcp_grants_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("mcp_grants.json")
+}
+
+/// 读「总是允许」名单。坏文件退空表。
+pub fn load_mcp_grants(data_dir: &std::path::Path) -> Vec<String> {
+    let p = mcp_grants_path(data_dir);
+    let Ok(txt) = std::fs::read_to_string(&p) else {
+        return Vec::new();
+    };
+    match serde_json::from_str::<McpGrantsFile>(&txt) {
+        Ok(f) => f.allowed_tools,
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 写「总是允许」名单。空表 = 删文件。已去重、排序稳定。
+pub fn save_mcp_grants(data_dir: &std::path::Path, tools: &[String]) -> Result<(), String> {
+    let p = mcp_grants_path(data_dir);
+    let mut v: Vec<String> = tools.to_vec();
+    v.sort();
+    v.dedup();
+    if v.is_empty() {
+        if p.exists() {
+            std::fs::remove_file(&p).map_err(|e| format!("删除 {} 失败: {e}", p.display()))?;
+        }
+        return Ok(());
+    }
+    let file = McpGrantsFile {
+        allowed_tools: v,
+    };
+    let txt = serde_json::to_string_pretty(&file).map_err(|e| format!("序列化失败: {e}"))?;
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&p, txt).map_err(|e| format!("写入 {} 失败: {e}", p.display()))
+}
+
+/// 把一个工具名加进「总是允许」并落盘。
+pub fn allow_mcp_tool(data_dir: &std::path::Path, full_name: &str) -> Result<(), String> {
+    let mut list = load_mcp_grants(data_dir);
+    if !list.iter().any(|t| t == full_name) {
+        list.push(full_name.to_string());
+    }
+    save_mcp_grants(data_dir, &list)
+}
+
+/// 从「总是允许」移除一个工具。
+pub fn revoke_mcp_tool(data_dir: &std::path::Path, full_name: &str) -> Result<usize, String> {
+    let mut list = load_mcp_grants(data_dir);
+    let before = list.len();
+    list.retain(|t| t != full_name);
+    save_mcp_grants(data_dir, &list)?;
+    Ok(before - list.len())
+}
+
+/// 清空全部 MCP 永久授权。
+pub fn clear_mcp_grants(data_dir: &std::path::Path) -> Result<usize, String> {
+    let n = load_mcp_grants(data_dir).len();
+    save_mcp_grants(data_dir, &[])?;
+    Ok(n)
+}
+
+/// 该工具是否已「总是允许」
+pub fn is_mcp_tool_allowed(data_dir: &std::path::Path, full_name: &str) -> bool {
+    load_mcp_grants(data_dir).iter().any(|t| t == full_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -682,11 +905,12 @@ mod tests {
     }
 
     #[test]
-    fn budget_guard_blocks_overload() {
+    fn load_has_no_token_budget() {
         let mut reg = ToolRegistry::new("http://127.0.0.1:1/mcp");
-        // 造两个组，各自都很大
+        // 两个大组：预算时代第二组会被拦；现在应都能装下
         let big = |n: &str, cnt: usize| McpGroup {
             name: n.into(),
+            server_id: "default".into(),
             summary: "x".into(),
             tools: (0..cnt)
                 .map(|i| McpTool {
@@ -701,15 +925,12 @@ mod tests {
         reg.groups = vec![big("g1", 10), big("g2", 10)];
         reg.connected = true;
 
-        // 第一个能装下
         reg.load("g1").expect("第一组应该能加载");
-        // 第二个应该被预算挡住
-        let err = reg.load("g2").unwrap_err();
-        assert!(err.contains("超出预算"), "应被预算拦住: {err}");
+        reg.load("g2").expect("第二组也应能加载（预算已删除）");
+        assert!(reg.is_active("g1") && reg.is_active("g2"));
 
-        // 卸载后可加载
         reg.unload("g1").unwrap();
-        reg.load("g2").expect("卸载后应能加载");
+        assert!(!reg.is_active("g1"));
     }
 
     #[test]

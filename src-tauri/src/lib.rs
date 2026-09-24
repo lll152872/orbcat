@@ -9,6 +9,7 @@ mod command_policy;
 mod config;
 mod context;
 mod dispatch;
+mod fetch;
 mod history;
 mod images;
 mod llm;
@@ -16,6 +17,7 @@ mod mcp;
 mod memory;
 mod perm_request;
 mod permission;
+mod pmem;
 mod sessions;
 mod shell;
 mod skills;
@@ -410,6 +412,22 @@ fn perm_cmd_grants_clear(state: State<'_, AppState>) -> Result<usize, String> {
     Ok(state.perm.clear_cmd_all())
 }
 
+/// MCP「总是允许」名单
+#[tauri::command]
+fn mcp_grants_list(state: State<'_, AppState>) -> Vec<String> {
+    mcp::load_mcp_grants(&state.data_dir)
+}
+
+#[tauri::command]
+fn mcp_grant_revoke(state: State<'_, AppState>, tool: String) -> Result<usize, String> {
+    mcp::revoke_mcp_tool(&state.data_dir, &tool)
+}
+
+#[tauri::command]
+fn mcp_grants_clear(state: State<'_, AppState>) -> Result<usize, String> {
+    mcp::clear_mcp_grants(&state.data_dir)
+}
+
 /// 覆盖保存命令策略（设置页编辑白名单 / 硬阻断列表）。
 /// 入参去空白、去空行、去重后整体写入 `command_policy.json`。
 #[tauri::command]
@@ -553,55 +571,66 @@ fn parse_headers(text: &str) -> Result<std::collections::BTreeMap<String, String
     Ok(map)
 }
 
-/// 新增（或覆盖）一个模型。**apiKey 只落本地文件**（agent-data/models.json，
-/// 已在 .gitignore），不进日志、不回传前端。
+/// 新增（或按 **显示名** 覆盖）一个模型。
 ///
-/// `api_key` 为空时：若 id 已存在则**保持原 Key**（编辑场景）；新建则报错。
+/// - **显示名唯一**；**接口 model（`id`）允许重复**（官方 / 火山可同时调 `deepseek-v4.1-flash`）
+/// - 同显示名 = 更新这一条；不再因为接口 id 相同而拦截
+/// - Key 可空（Ollama / 本地）
 #[tauri::command]
 fn models_add(
     state: State<'_, AppState>,
     id: String,
     name: String,
     url: String,
-    api_key: String,
+    api_key: Option<String>,
     supports_tool_call: bool,
     supports_images: bool,
     headers: Option<String>,
+    max_input_tokens: Option<u64>,
+    max_output_tokens: Option<u64>,
+    overwrite: Option<bool>,
 ) -> Result<String, String> {
+    let _ = overwrite; // 同显示名即更新，不再需要「覆盖」确认
     let id = id.trim().to_string();
+    let display = if name.trim().is_empty() {
+        id.clone()
+    } else {
+        name.trim().to_string()
+    };
+    if display.is_empty() {
+        return Err("显示名不能为空".into());
+    }
     if id.is_empty() {
-        return Err("模型 id 不能为空".into());
+        return Err("接口模型 ID 不能为空".into());
     }
-    let url = url.trim().trim_end_matches('/').to_string();
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err("URL 必须以 http:// 或 https:// 开头".into());
-    }
+    let url = config::normalize_base_url(&url)?;
 
-    let existing = config::find_model(&state.data_dir, &id).ok();
-    let key_in = api_key.trim().to_string();
-    let kept_key = existing
-        .as_ref()
-        .map(|m| m.api_key.clone())
-        .filter(|k| !k.trim().is_empty());
-    let vendor = existing_vendor_or_custom(&existing);
-    let max_in = existing.as_ref().and_then(|m| m.max_input_tokens);
-    let max_out = existing.as_ref().and_then(|m| m.max_output_tokens);
+    // 按显示名找旧配置（保留 vendor / max / key 兜底）
+    let existing = config::find_model(&state.data_dir, &display).ok();
 
+    let key_in = api_key.unwrap_or_default().trim().to_string();
     let api_key = if key_in.is_empty() {
-        kept_key.ok_or_else(|| "API key 不能为空".to_string())?
+        existing
+            .as_ref()
+            .map(|m| m.api_key.clone())
+            .unwrap_or_default()
     } else {
         key_in
     };
 
-    // 额外请求头：表单给了就用表单的；没给则**保留原有配置**（避免编辑模型时把已有的头冲掉）
+    let vendor = existing_vendor_or_custom(&existing);
+    let max_in = max_input_tokens.or_else(|| existing.as_ref().and_then(|m| m.max_input_tokens));
+    let max_out =
+        max_output_tokens.or_else(|| existing.as_ref().and_then(|m| m.max_output_tokens));
+
     let extra_headers = match headers {
         Some(t) => parse_headers(&t)?,
         None => existing.as_ref().map(|m| m.headers.clone()).unwrap_or_default(),
     };
 
     let m = config::ModelConfig {
-        id: id.clone(),
-        name: if name.trim().is_empty() { id.clone() } else { name.trim().to_string() },
+        id,
+        name: display.clone(),
         vendor,
         url,
         api_key,
@@ -613,8 +642,8 @@ fn models_add(
     };
 
     config::add_model(&state.data_dir, m)?;
-    eprintln!("[float-agent] 已添加/覆盖模型 {id}");
-    Ok(id)
+    eprintln!("[float-agent] 已保存模型（显示名={display}）");
+    Ok(display)
 }
 
 fn existing_vendor_or_custom(existing: &Option<config::ModelConfig>) -> String {
@@ -624,13 +653,11 @@ fn existing_vendor_or_custom(existing: &Option<config::ModelConfig>) -> String {
     }
 }
 
-/// 编辑已有模型。
+/// 编辑已有模型（按 **显示名** 定位）。
 ///
-/// **显示名** 与 **接口模型 id** 是两个字段：
-/// - `name`：只影响界面展示
-/// - `new_id`：发给提供商的 `model` 字段；改了才会换模型
-///
-/// `apiKey` 空 = 保持原 Key；`headers` null = 保持原头。
+/// - `name`：显示名（唯一键）
+/// - `new_id`：发给提供商的 `model` 字段，**允许与别的条目相同**
+/// - `apiKey` 空 = 保持原 Key；`clear_key` = 清空
 #[tauri::command]
 fn models_edit(
     state: State<'_, AppState>,
@@ -639,53 +666,61 @@ fn models_edit(
     name: Option<String>,
     url: Option<String>,
     api_key: Option<String>,
+    clear_key: Option<bool>,
     supports_tool_call: Option<bool>,
     supports_images: Option<bool>,
     headers: Option<String>,
+    max_input_tokens: Option<u64>,
+    max_output_tokens: Option<u64>,
 ) -> Result<(), String> {
-    let old_id = id.trim().to_string();
+    let key = id.trim().to_string();
     let extra_headers = match headers {
         Some(t) => Some(parse_headers(&t)?),
         None => None,
     };
 
-    let trimmed_new = new_id
+    // 显示名变更（唯一）；接口 id 单独改、不查重
+    let new_name = name
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let rename_to = trimmed_new.filter(|n| n != &old_id);
+    let rename_to = new_name.filter(|n| n != &key);
 
-    if let Some(nid) = &rename_to {
-        config::rename_model(&state.data_dir, &old_id, nid)?;
+    if let Some(nn) = &rename_to {
+        config::rename_model(&state.data_dir, &key, nn)?;
     }
 
-    let target = rename_to.clone().unwrap_or_else(|| old_id.clone());
+    let target = rename_to.clone().unwrap_or_else(|| key.clone());
     config::update_model(
         &state.data_dir,
         &target,
-        name,
+        None,
         url,
         api_key,
+        clear_key.unwrap_or(false),
         supports_tool_call,
         supports_images,
         extra_headers,
+        Some(max_input_tokens),
+        Some(max_output_tokens),
+        new_id.filter(|s| !s.trim().is_empty()),
     )?;
 
-    // 当前选中项跟着 id 走，否则改完 id 会选空
-    if let Some(nid) = &rename_to {
+    if let Some(nn) = &rename_to {
         let mut s = config::load_settings(&state.data_dir);
-        if s.selected_model.as_deref() == Some(old_id.as_str()) {
-            s.selected_model = Some(nid.clone());
+        if s.selected_model.as_deref() == Some(key.as_str()) {
+            s.selected_model = Some(nn.clone());
             config::save_settings(&state.data_dir, &s)?;
         }
     }
 
     eprintln!(
-        "[float-agent] 已编辑模型 {old_id}{}",
+        "[float-agent] 已编辑模型（显示名 {}{}）",
+        key,
         rename_to
             .as_ref()
-            .map(|n| format!(" → model id={n}"))
+            .map(|n| format!(" → {n}"))
             .unwrap_or_default()
     );
     Ok(())
@@ -717,6 +752,7 @@ async fn models_fetch_remote(
         }
         _ => Vec::new(),
     };
+    // Key 可空：Ollama / 本地网关不需要鉴权（预设下 Key 输入框必须可写，前端负责）
     eprintln!("[float-agent] 拉取模型列表 @ {}", config::models_endpoint_from_base(&url));
     llm::fetch_models_list(&url, &api_key, &hs).await
 }
@@ -1207,8 +1243,8 @@ struct McpStatus {
     error: Option<String>,
     /// 当前网关地址（空串 = 未配置）。设置页的输入框显示它。
     url: String,
+    /// 活跃工具 schema 的粗略 token 估算（仅展示）
     active_tokens: usize,
-    budget_tokens: usize,
     groups: Vec<McpGroupView>,
 }
 
@@ -1225,7 +1261,6 @@ async fn mcp_status(state: State<'_, AppState>) -> Result<McpStatus, String> {
                 error: Some("MCP 状态查询超时（后台通信僵持中，稍后自动恢复）".into()),
                 url: String::new(),
                 active_tokens: 0,
-                budget_tokens: 0,
                 groups: Vec::new(),
             })
         }
@@ -1235,7 +1270,6 @@ async fn mcp_status(state: State<'_, AppState>) -> Result<McpStatus, String> {
         error: reg.error.clone(),
         url: reg.url(),
         active_tokens: reg.active_tokens(),
-        budget_tokens: reg.budget_tokens(),
         groups: reg
             .groups()
             .iter()
@@ -1251,40 +1285,68 @@ async fn mcp_status(state: State<'_, AppState>) -> Result<McpStatus, String> {
     })
 }
 
-/// 手动重新拉取 MCP 工具清单（网关刚起来时用得上）
+/// 手动重新拉取全部 MCP server 的工具清单
 #[tauri::command]
 async fn mcp_refresh(state: State<'_, AppState>) -> Result<(), String> {
-    // 与 setup 后台任务同款：锁外网络 IO，锁内落账
-    let client = state.mcp.lock().await.client_clone();
-    let snap = mcp::ToolRegistry::fetch_snapshot(&client).await;
+    let clients = state.mcp.lock().await.clients_clone();
+    let snap = mcp::ToolRegistry::fetch_snapshot(&clients).await;
     state.mcp.lock().await.apply_snapshot(snap);
     Ok(())
 }
 
-/// 设置/更换/禁用 MCP 网关地址（写 `mcp.json`，立即生效于下次拉取）。
-///
-/// `url` 传空 = 显式禁用。MCP 网关是用户自己起的进程，**没有内置默认地址**，
-/// 不配就不启用。
+/// 读取全部 MCP server 配置（含禁用）
+#[tauri::command]
+fn mcp_servers_list(state: State<'_, AppState>) -> Vec<config::McpServerCfg> {
+    config::load_mcp_servers(&state.data_dir)
+}
+
+/// 整表保存 MCP server 配置并立即重连
+#[tauri::command]
+async fn mcp_servers_save(
+    state: State<'_, AppState>,
+    servers: Vec<config::McpServerCfg>,
+) -> Result<(), String> {
+    // 规整：id 空则生成；url 去空白
+    let mut cleaned: Vec<config::McpServerCfg> = Vec::new();
+    for (i, mut s) in servers.into_iter().enumerate() {
+        s.url = s.url.trim().to_string();
+        if s.id.trim().is_empty() {
+            s.id = format!("s{}", i + 1);
+        }
+        if s.label.trim().is_empty() {
+            s.label = s.id.clone();
+        }
+        cleaned.push(s);
+    }
+    config::save_mcp_servers(&state.data_dir, &cleaned)?;
+    {
+        let mut reg = state.mcp.lock().await;
+        reg.set_servers(&cleaned);
+    }
+    let clients = state.mcp.lock().await.clients_clone();
+    let snap = mcp::ToolRegistry::fetch_snapshot(&clients).await;
+    state.mcp.lock().await.apply_snapshot(snap);
+    Ok(())
+}
+
+/// 设置/更换/禁用 MCP 网关地址（兼容旧单 URL 入口）。
 #[tauri::command]
 async fn mcp_set_url(state: State<'_, AppState>, url: String) -> Result<(), String> {
     let u = url.trim().to_string();
     if u.is_empty() {
         config::save_mcp_url(&state.data_dir, None)?;
         state.mcp.lock().await.set_url("");
-        eprintln!("[float-agent] MCP 已禁用");
         return Ok(());
     }
-    if !u.starts_with("http://") && !u.starts_with("https://") {
-        return Err("地址必须以 http:// 或 https:// 开头".into());
+    if !(u.starts_with("http://") || u.starts_with("https://")) {
+        return Err("MCP 地址必须是 http/https URL".into());
     }
     config::save_mcp_url(&state.data_dir, Some(&u))?;
     let mut reg = state.mcp.lock().await;
     reg.set_url(&u);
     drop(reg);
-    eprintln!("[float-agent] MCP 网关已设为 {u}，重新拉取工具清单");
-    // 换完顺手拉一次，用户立刻能看到成没成（网关没起来会显示连接失败）
-    let client = state.mcp.lock().await.client_clone();
-    let snap = mcp::ToolRegistry::fetch_snapshot(&client).await;
+    let clients = state.mcp.lock().await.clients_clone();
+    let snap = mcp::ToolRegistry::fetch_snapshot(&clients).await;
     state.mcp.lock().await.apply_snapshot(snap);
     Ok(())
 }
@@ -1480,7 +1542,7 @@ fn persist_run(
     if !run.interrupted {
         if let Err(e) = app.memory.append_daily(
             input,
-            &run.answer,
+            &sessions::strip_step_folds(&run.answer),
             run.steps.iter().filter(|s| s.kind == "tool_call").count(),
         ) {
             eprintln!("[float-agent] 写日记失败: {e}");
@@ -1518,8 +1580,13 @@ static CHAT_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 
 /// 前端「停止」按钮：请求中断当前对话轮
 #[tauri::command]
-fn chat_cancel() {
+fn chat_cancel(state: State<'_, AppState>) {
     CHAT_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+    // 权限申请是**阻塞**在 ask* 上的：只置 cancel 标志叫不醒它，
+    // 用户会看到「点了停止还一直转」。一并作废所有待办，立刻放行 agent loop。
+    state
+        .perm
+        .cancel_all("用户已停止本轮，此申请作废（不是对请求本身的拒绝）。");
     eprintln!("[float-agent] 收到停止请求");
 }
 
@@ -1747,10 +1814,13 @@ fn perm_request_decide(
     reason: Option<String>,
 ) -> Result<(), String> {
     let d = perm_request::Decision::parse(&decision).ok_or_else(|| {
-        format!("未知的决定：{decision}（只能是 approve / narrow / prefix / full / deny）")
+        format!("未知的决定：{decision}（只能是 approve / narrow / prefix / full / always / deny）")
     })?;
-    // 命令级申请 id 以 `pc` 打头（文件级是 `pr`）—— 按前缀路由到各自通道。
-    if id.starts_with("pc") {
+    // id 前缀路由：`pr*` = 文件级（pending），`pc*` / `pm*` = 命令 / MCP 级（pending_cmds）。
+    // ⚠️ `pm*` 必须走 decide_command —— 它登记在 pending_cmds 里；
+    //    早先只认 `pc` 打头，MCP 申请被误送进 decide() 后报「不存在或已处理」，
+    //    前端还把卡片删了，agent 一直阻塞到 3 分钟超时（用户看到的就是卡死）。
+    if id.starts_with("pc") || id.starts_with("pm") {
         state.perm.decide_command(&id, d, reason.unwrap_or_default())
     } else {
         state.perm.decide(&id, d, reason.unwrap_or_default())
@@ -1822,6 +1892,116 @@ fn mem_reject(state: State<'_, AppState>, id: String) -> Result<(), String> {
 #[tauri::command]
 fn mem_propose(state: State<'_, AppState>, content: String) -> Result<memory::Candidate, String> {
     state.memory.propose(&content, "user")
+}
+
+// ---------------------------------------------------------------------------
+// Tauri 命令 —— 项目索引（仿 WB：SQLite 索引 + md 记忆）
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn pmem_list(state: State<'_, AppState>) -> Result<Vec<pmem::ProjectRow>, String> {
+    pmem::list_projects(&state.data_dir)
+}
+
+#[tauri::command]
+fn pmem_create(
+    state: State<'_, AppState>,
+    name: String,
+    root_path: Option<String>,
+) -> Result<pmem::ProjectRow, String> {
+    pmem::create_project(&state.data_dir, &name, root_path.as_deref().unwrap_or(""))
+}
+
+#[tauri::command]
+fn pmem_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    pmem::delete_project(&state.data_dir, id)?;
+    // 删的是当前激活项目 → 回到主对话
+    let mut s = config::load_settings(&state.data_dir);
+    if s.active_project_id == Some(id) {
+        s.active_project_id = None;
+        config::save_settings(&state.data_dir, &s)?;
+    }
+    Ok(())
+}
+
+/// 切换项目：`id` 为 `null` = 主对话（无项目记忆）
+#[tauri::command]
+fn pmem_set_active(state: State<'_, AppState>, id: Option<i64>) -> Result<(), String> {
+    if let Some(pid) = id {
+        let all = pmem::list_projects(&state.data_dir)?;
+        if !all.iter().any(|p| p.id == pid) {
+            return Err(format!("找不到项目 id={pid}"));
+        }
+    }
+    let mut s = config::load_settings(&state.data_dir);
+    s.active_project_id = id;
+    config::save_settings(&state.data_dir, &s)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn pmem_get_active(state: State<'_, AppState>) -> Result<Option<pmem::ProjectRow>, String> {
+    let s = config::load_settings(&state.data_dir);
+    let Some(pid) = s.active_project_id else {
+        return Ok(None);
+    };
+    let all = pmem::list_projects(&state.data_dir)?;
+    Ok(all.into_iter().find(|p| p.id == pid))
+}
+
+/// 往**当前激活项目**的 MEMORY.md 追加一条（项目记忆不走全局 pending）
+#[tauri::command]
+fn pmem_remember(state: State<'_, AppState>, content: String) -> Result<String, String> {
+    let s = config::load_settings(&state.data_dir);
+    let Some(pid) = s.active_project_id else {
+        return Err("当前是主对话，没有激活项目".into());
+    };
+    let all = pmem::list_projects(&state.data_dir)?;
+    let p = all
+        .into_iter()
+        .find(|x| x.id == pid)
+        .ok_or_else(|| "激活项目已不存在".to_string())?;
+    pmem::append_project_memory(&state.data_dir, &p.name, &content, "user")?;
+    Ok(p.name)
+}
+
+/// 把会话绑到项目（null = 主对话）
+#[tauri::command]
+fn pmem_bind_session(
+    state: State<'_, AppState>,
+    session_id: String,
+    project_id: Option<i64>,
+) -> Result<(), String> {
+    pmem::bind_session(&state.data_dir, &session_id, project_id)
+}
+
+/// session_id → 项目名（null = 主对话）
+#[tauri::command]
+fn pmem_session_map(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, Option<String>>, String> {
+    pmem::session_map(&state.data_dir)
+}
+
+#[tauri::command]
+fn pmem_rename(state: State<'_, AppState>, id: i64, name: String) -> Result<(), String> {
+    pmem::rename_project(&state.data_dir, id, &name)
+}
+
+/// 清空项目 MEMORY.md（项目保留）
+#[tauri::command]
+fn pmem_clear_memory(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    pmem::clear_project_memory(&state.data_dir, &name)
+}
+
+/// 改会话标题
+#[tauri::command]
+fn session_set_title(
+    state: State<'_, AppState>,
+    id: String,
+    title: String,
+) -> Result<(), String> {
+    sessions::set_title(&state.data_dir, &id, &title)
 }
 
 /// 截取当前主屏幕，返回 `data:image/jpeg;base64,...`（供前端预览 + 随消息发送）
@@ -1943,30 +2123,27 @@ pub fn run() {
                 config::models_json_path(&data_dir).display()
             );
 
-            // --- MCP 注册表（懒加载）---
-            // 拉取在后台进行：网关没起来也不能拖慢应用启动。
-            // 没配 mcp.json 就是 None（不启用）—— 没有默认网关地址。
-            let mcp_url = config::resolve_mcp_url(&data_dir);
-            let registry = match &mcp_url {
-                Some(u) => {
-                    eprintln!("[float-agent] MCP 网关: {u}（后台拉取工具清单中…）");
-                    mcp::ToolRegistry::new(u.clone())
-                }
-                None => {
-                    eprintln!("[float-agent] MCP 未配置（设置页里填网关地址才启用）");
-                    mcp::ToolRegistry::new("")
-                }
+            // --- MCP 注册表（多 server，懒加载）---
+            // 拉取在后台进行：server 没起来也不能拖慢应用启动。
+            let servers = config::resolve_mcp_servers(&data_dir);
+            let registry = if servers.is_empty() {
+                eprintln!("[float-agent] MCP 未配置（设置页可添加多个 server）");
+                mcp::ToolRegistry::new("")
+            } else {
+                eprintln!(
+                    "[float-agent] MCP servers: {}（后台拉取工具清单中…）",
+                    servers.len()
+                );
+                mcp::ToolRegistry::with_servers(&servers)
             };
 
             let shared = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
-            if mcp_url.is_some() {
+            if !servers.is_empty() {
                 let bg = shared.clone();
                 tauri::async_runtime::spawn(async move {
-                    // 锁外做网络 IO（网关僵持时最长 ~40s），锁内只落内存账。
-                    // 之前持锁 refresh 会把 mcp_status/工具列表全部堵在锁上
-                    // —— 表现就是「点开设置，加载中卡半天」。
-                    let client = bg.lock().await.client_clone();
-                    let snap = mcp::ToolRegistry::fetch_snapshot(&client).await;
+                    // 锁外做网络 IO，锁内只落内存账。
+                    let clients = bg.lock().await.clients_clone();
+                    let snap = mcp::ToolRegistry::fetch_snapshot(&clients).await;
                     bg.lock().await.apply_snapshot(snap);
                 });
             }
@@ -2044,6 +2221,9 @@ pub fn run() {
             perm_cmd_grants_list,
             perm_cmd_grant_revoke,
             perm_cmd_grants_clear,
+            mcp_grants_list,
+            mcp_grant_revoke,
+            mcp_grants_clear,
             perm_cmd_policy_set,
             perm_cmd_test,
             perm_cmd_audit_tail,
@@ -2068,6 +2248,16 @@ pub fn run() {
             mem_approve,
             mem_reject,
             mem_propose,
+            pmem_list,
+            pmem_create,
+            pmem_delete,
+            pmem_set_active,
+            pmem_get_active,
+            pmem_remember,
+            pmem_bind_session,
+            pmem_session_map,
+            pmem_rename,
+            pmem_clear_memory,
             mem_read,
             mem_files,
             mem_projects,
@@ -2093,6 +2283,7 @@ pub fn run() {
             session_new,
             session_switch,
             session_delete,
+            session_set_title,
             session_compact,
             session_fork,
             session_truncate,
@@ -2100,6 +2291,8 @@ pub fn run() {
             mcp_status,
             mcp_refresh,
             mcp_set_url,
+            mcp_servers_list,
+            mcp_servers_save,
             mcp_load_group,
             mcp_unload_group,
             app_quit,

@@ -70,6 +70,18 @@ const BUNDLED_SKILLS: &[(&str, &str)] = &[
         include_str!("../../tools/dual-token-dashboard/scripts/gen_dual_dashboard.py"),
     ),
     (
+        "dual-token-dashboard/panel/index.html",
+        include_str!("../../tools/dual-token-dashboard/panel/index.html"),
+    ),
+    (
+        "dual-token-dashboard/panel/panel.css",
+        include_str!("../../tools/dual-token-dashboard/panel/panel.css"),
+    ),
+    (
+        "dual-token-dashboard/panel/panel.js",
+        include_str!("../../tools/dual-token-dashboard/panel/panel.js"),
+    ),
+    (
         "dual-token-dashboard/references/adapter-schema.md",
         include_str!("../../tools/dual-token-dashboard/references/adapter-schema.md"),
     ),
@@ -379,6 +391,9 @@ mod tests {
         for f in [
             "skills/dual-token-dashboard/SKILL.md",
             "skills/dual-token-dashboard/scripts/gen_dual_dashboard.py",
+            "skills/dual-token-dashboard/panel/index.html",
+            "skills/dual-token-dashboard/panel/panel.css",
+            "skills/dual-token-dashboard/panel/panel.js",
             "skills/dual-token-dashboard/references/adapter-schema.md",
             "skills/dispatch-workbuddy/SKILL.md",
         ] {
@@ -430,8 +445,8 @@ mod tests {
         assert!(r.created_files.is_empty(), "不该重复写文件");
         assert_eq!(
             r.skipped.len(),
-            18,
-            "8 目录 + 6 骨架文件 + 4 内置技能文件 应全跳过: {:?}",
+            21,
+            "8 目录 + 6 骨架文件 + 7 内置技能文件 应全跳过: {:?}",
             r.skipped
         );
 
@@ -479,6 +494,9 @@ mod tests {
 
         // 附带的两个文件也要在
         assert!(d.join("skills/dual-token-dashboard/scripts/gen_dual_dashboard.py").is_file());
+        assert!(d.join("skills/dual-token-dashboard/panel/index.html").is_file());
+        assert!(d.join("skills/dual-token-dashboard/panel/panel.css").is_file());
+        assert!(d.join("skills/dual-token-dashboard/panel/panel.js").is_file());
         assert!(d.join("skills/dual-token-dashboard/references/adapter-schema.md").is_file());
 
         let _ = std::fs::remove_dir_all(&d);

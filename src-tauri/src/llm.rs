@@ -186,6 +186,13 @@ pub struct TokenUsage {
     /// 思维链 token（部分模型单独给；不给就是 None）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<u32>,
+    /// 缓存命中（读缓存）token —— DeepSeek `prompt_cache_hit_tokens` /
+    /// OpenAI `prompt_tokens_details.cached_tokens` / Claude `cache_read_input_tokens`
+    #[serde(default)]
+    pub cache_hit: u32,
+    /// 缓存写入 token —— Claude `cache_creation_input_tokens` 等
+    #[serde(default)]
+    pub cache_write: u32,
     /// 总计。厂商没给时按 prompt + completion 补
     #[serde(default)]
     pub total: u32,
@@ -202,6 +209,8 @@ impl TokenUsage {
         self.prompt += o.prompt;
         self.completion += o.completion;
         self.total += o.total;
+        self.cache_hit += o.cache_hit;
+        self.cache_write += o.cache_write;
         if let Some(r) = o.reasoning {
             self.reasoning = Some(self.reasoning.unwrap_or(0) + r);
         }
@@ -221,6 +230,14 @@ struct RawUsage {
     input_tokens: Option<u32>,
     #[serde(default)]
     output_tokens: Option<u32>,
+    /// DeepSeek 风格顶层缓存命中
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u32>,
+    /// Claude 风格顶层缓存读/写
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
     #[serde(default)]
     prompt_tokens_details: Option<RawUsageDetails>,
     #[serde(default)]
@@ -231,6 +248,16 @@ struct RawUsage {
 struct RawUsageDetails {
     #[serde(default)]
     reasoning_tokens: Option<u32>,
+    /// OpenAI 风格缓存命中
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+    /// 另一些网关的缓存写入别名
+    #[serde(default)]
+    cache_write_tokens: Option<u32>,
+    #[serde(default)]
+    cached_creation_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_tokens: Option<u32>,
 }
 
 impl RawUsage {
@@ -251,10 +278,24 @@ impl RawUsage {
                     .as_ref()
                     .and_then(|d| d.reasoning_tokens)
             });
+        let ptd = self.prompt_tokens_details.as_ref();
+        let cache_hit = self
+            .prompt_cache_hit_tokens
+            .or(self.cache_read_input_tokens)
+            .or_else(|| ptd.and_then(|d| d.cached_tokens))
+            .unwrap_or(0);
+        let cache_write = self
+            .cache_creation_input_tokens
+            .or_else(|| ptd.and_then(|d| d.cache_write_tokens))
+            .or_else(|| ptd.and_then(|d| d.cached_creation_tokens))
+            .or_else(|| ptd.and_then(|d| d.cache_creation_tokens))
+            .unwrap_or(0);
         Some(TokenUsage {
             prompt,
             completion,
             reasoning,
+            cache_hit,
+            cache_write,
             total,
         })
     }
@@ -351,13 +392,13 @@ pub async fn chat(
     for attempt in 1..=MAX_RETRIES {
         match chat_once(cfg, messages.clone(), tools.clone()).await {
             Ok(out) => return Ok(out),
-            Err(ChatError::Retryable(status, msg)) => {
+            Err(ChatError::Retryable(reason, msg)) => {
                 last_err = msg;
                 if attempt == MAX_RETRIES {
                     break;
                 }
                 eprintln!(
-                    "[float-agent] {status} 限流/临时故障，{:?} 后重试（第 {attempt}/{MAX_RETRIES} 次）",
+                    "[float-agent] {reason} 临时故障，{:?} 后重试（第 {attempt}/{MAX_RETRIES} 次）",
                     backoff
                 );
                 tokio::time::sleep(backoff).await;
@@ -378,8 +419,11 @@ pub async fn chat(
 /// 区分可重试与不可重试的错误
 #[derive(Debug)]
 enum ChatError {
-    /// (HTTP 状态码, 原始信息)
-    Retryable(u16, String),
+    /// (原因标签, 原始信息) —— 标签进状态文案，如 "HTTP 429" / "流中断"
+    ///
+    /// 流式读到一半 `error decoding response body` 这类**传输层**故障也走这里：
+    /// 它既不是 429，也不是请求写错，整轮直接判死太粗暴（2026-09-24 用户实撞）。
+    Retryable(String, String),
     Fatal(String),
 }
 
@@ -462,6 +506,12 @@ struct DeltaFunction {
 /// 流式增量回调：`(正文增量, 思维链增量)`
 pub type DeltaFn = dyn Fn(Option<String>, Option<String>) + Send + Sync;
 
+/// 流式重试前调用：上一尝试已推送的半截正文应作废（reason 给前端归档标签）。
+///
+/// 为什么要：断流重试会从头发第二遍，不作废就会把两截拼成重复/错乱正文。
+/// 与工具调用的 `DiscardStream` 同语义 —— **只作废正文**，reasoning 保留。
+pub type DiscardFn = dyn Fn(String) + Send + Sync;
+
 /// 请求链路状态回调 `(文案, 是否值得留在时间线上)`。
 /// 用来区分「模型在思考」和「HTTP 还没首字节」—— 后者以前是纯黑盒。
 ///
@@ -504,7 +554,7 @@ fn classify_http_error(code: u16, body: &str, msg: String) -> ChatError {
         ));
     }
     if is_retryable(code) {
-        ChatError::Retryable(code, msg)
+        ChatError::Retryable(format!("HTTP {code}"), msg)
     } else {
         ChatError::Fatal(msg)
     }
@@ -519,6 +569,14 @@ fn reqwest_err_chain(e: &reqwest::Error) -> String {
         src = s.source();
     }
     parts.join(" ← ")
+}
+
+/// 流式 chunk 读失败 → **可重试**（不是 429，也不是请求写错）。
+///
+/// 典型：`error decoding response body`（代理/网关掐流、解压坏包）、连接被复位。
+/// 以前包成 Fatal，用户表现为「长回复经常一有就红、从不重试」。
+fn stream_read_fail(err_chain: String) -> ChatError {
+    ChatError::Retryable("流中断".into(), format!("读取流失败: {err_chain}"))
 }
 
 /// 等到取消标志置位（配合 `tokio::select!` 做可中断的网络等待）。
@@ -543,6 +601,8 @@ async fn chat_stream_once(
     on_delta: &DeltaFn,
     on_status: &StatusFn,
     cancel: &std::sync::atomic::AtomicBool,
+    // 本次尝试是否已推送正文增量（重试前决定要不要 `on_discard`）
+    emitted: &std::sync::atomic::AtomicBool,
 ) -> Result<ChatOutcome, ChatError> {
     use futures_util::StreamExt;
     use std::sync::atomic::Ordering;
@@ -630,7 +690,7 @@ async fn chat_stream_once(
         if cancel.load(Ordering::Relaxed) {
             return Err(ChatError::Fatal("已停止".into()));
         }
-        let bytes = chunk.map_err(|e| ChatError::Fatal(format!("读取流失败: {e}")))?;
+        let bytes = chunk.map_err(|e| stream_read_fail(reqwest_err_chain(&e)))?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
 
         // 按行处理，最后一行可能不完整 → 留在 buf 里
@@ -676,6 +736,7 @@ async fn chat_stream_once(
             // 正文增量
             if let Some(c) = d.content.filter(|s| !s.is_empty()) {
                 content.push_str(&c);
+                emitted.store(true, Ordering::Relaxed);
                 on_delta(Some(c), None);
             }
 
@@ -744,41 +805,57 @@ async fn chat_stream_once(
 }
 
 /// 流式 chat（带限流退避重试）
+///
+/// `on_discard`：重试前若上一尝试已吐过正文，先作废那半截，避免与新一发拼接。
 pub async fn chat_stream(
     cfg: &ModelConfig,
     messages: Vec<ChatMessage>,
     tools: Option<Vec<Value>>,
     on_delta: &DeltaFn,
     on_status: &StatusFn,
+    on_discard: &DiscardFn,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<ChatOutcome, String> {
     let mut backoff = FIRST_BACKOFF;
     let mut last_err = String::new();
+    // 本次尝试是否已推送正文增量 —— 决定重试前要不要 on_discard
+    let emitted = std::sync::atomic::AtomicBool::new(false);
 
     for attempt in 1..=MAX_RETRIES {
         // 取消后不再重试（否则用户点了停止，退避完又发一轮）
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("已停止".into());
         }
-        match chat_stream_once(cfg, messages.clone(), tools.clone(), on_delta, on_status, cancel)
-            .await
+        emitted.store(false, std::sync::atomic::Ordering::Relaxed);
+        match chat_stream_once(
+            cfg,
+            messages.clone(),
+            tools.clone(),
+            on_delta,
+            on_status,
+            cancel,
+            &emitted,
+        )
+        .await
         {
             Ok(out) => return Ok(out),
-            Err(ChatError::Retryable(status, msg)) => {
+            Err(ChatError::Retryable(reason, msg)) => {
                 last_err = msg;
                 if attempt == MAX_RETRIES {
                     break;
                 }
+                // 上一发已经吐了半截正文 → 作废，否则重试会拼接出重复内容
+                if emitted.load(std::sync::atomic::Ordering::Relaxed) {
+                    on_discard(format!("{reason}，已丢弃半截输出后重试"));
+                }
                 let wait = format!("{:?}", backoff);
                 eprintln!(
-                    "[float-agent] {status} 限流/临时故障，{wait} 后重试（第 {attempt}/{MAX_RETRIES} 次）"
+                    "[float-agent] {reason} 临时故障，{wait} 后重试（第 {attempt}/{MAX_RETRIES} 次）"
                 );
                 // 静默退避是「一直思考、界面无动静」的主因之一 —— 必须告诉用户在等什么
-                // 这个**值得**进时间线：撞限流时用户最想看"它在等什么、重试到第几次"
+                // 这个**值得**进时间线：撞限流/断流时用户最想看"它在等什么、重试到第几次"
                 on_status(
-                    format!(
-                        "接口限流/临时故障（HTTP {status}），{wait} 后自动重试（第 {attempt}/{MAX_RETRIES} 次）…"
-                    ),
+                    format!("{reason}，{wait} 后自动重试（第 {attempt}/{MAX_RETRIES} 次）…"),
                     true,
                 );
                 tokio::time::sleep(backoff).await;
@@ -1249,11 +1326,29 @@ mod tests {
         assert!(!is_quota_exhausted(429, transient), "限流不等于配额耗尽");
         assert!(matches!(
             classify_http_error(429, transient, "HTTP 429".into()),
-            ChatError::Retryable(429, _)
+            ChatError::Retryable(reason, _) if reason.contains("429")
         ));
 
         // 别误判：200 里的 "quota exceeded" 字样不该被当错误分类（状态码先卡住）
         assert!(!is_quota_exhausted(200, "quota exceeded"));
+    }
+
+    #[test]
+    fn stream_decode_error_is_retryable_not_fatal() {
+        // 用户实撞：火山 glm 流式读到一半 `error decoding response body`
+        // 以前包成 Fatal → 整轮直接红、从不重试
+        let e = stream_read_fail("error decoding response body".into());
+        match e {
+            ChatError::Retryable(reason, msg) => {
+                assert!(reason.contains("流中断"), "标签要能看出是断流: {reason}");
+                assert!(msg.contains("读取流失败"), "原始错误要保留: {msg}");
+                assert!(msg.contains("error decoding response body"));
+            }
+            other => panic!("流读失败必须可重试，实际 {other:?}"),
+        }
+
+        // 对照：已停止 / 配额耗尽 仍然是 Fatal，不能被误重试
+        assert!(matches!(ChatError::Fatal("已停止".into()), ChatError::Fatal(_)));
     }
 
     #[test]
@@ -1320,21 +1415,55 @@ mod tests {
         let mut a = TokenUsage {
             prompt: 1,
             completion: 2,
-            reasoning: None,
-            total: 3,
+            reasoning: Some(3),
+            cache_hit: 4,
+            cache_write: 5,
+            total: 6,
         };
         a.add(&TokenUsage {
             prompt: 10,
             completion: 20,
-            reasoning: Some(5),
-            total: 30,
+            reasoning: Some(30),
+            cache_hit: 40,
+            cache_write: 50,
+            total: 60,
         });
-        assert_eq!((a.prompt, a.completion, a.total), (11, 22, 33));
-        assert_eq!(a.reasoning, Some(5));
+        assert_eq!(a.prompt, 11);
+        assert_eq!(a.completion, 22);
+        assert_eq!(a.reasoning, Some(33));
+        assert_eq!(a.cache_hit, 44);
+        assert_eq!(a.cache_write, 55);
+        assert_eq!(a.total, 66);
     }
 
-    /// GET /models 响应解析：OpenAI 标准形态 + 几种网关变体
     #[test]
+    fn raw_usage_parses_cache_fields() {
+        // DeepSeek 顶层
+        let ds: RawUsage = serde_json::from_str(
+            r#"{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_cache_hit_tokens":60}"#,
+        )
+        .unwrap();
+        let u = ds.to_usage().unwrap();
+        assert_eq!(u.cache_hit, 60);
+        assert_eq!(u.cache_write, 0);
+
+        // OpenAI details.cached_tokens
+        let oai: RawUsage = serde_json::from_str(
+            r#"{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_tokens_details":{"cached_tokens":40}}"#,
+        )
+        .unwrap();
+        assert_eq!(oai.to_usage().unwrap().cache_hit, 40);
+
+        // Claude 顶层 cache_read / cache_creation
+        let cl: RawUsage = serde_json::from_str(
+            r#"{"input_tokens":100,"output_tokens":10,"total_tokens":110,"cache_read_input_tokens":70,"cache_creation_input_tokens":15}"#,
+        )
+        .unwrap();
+        let cu = cl.to_usage().unwrap();
+        assert_eq!(cu.cache_hit, 70);
+        assert_eq!(cu.cache_write, 15);
+    }
+
     fn parse_models_openai_standard() {
         let v: Value = serde_json::from_str(
             r#"{"object":"list","data":[

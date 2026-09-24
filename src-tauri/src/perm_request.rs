@@ -32,6 +32,12 @@ use std::time::Duration;
 /// 为什么不默认批准：用户不在电脑前时，模型不该因为"没人回"就拿到权限。
 pub const REQUEST_TIMEOUT_MS: u64 = 3 * 60 * 1000;
 
+/// 这条拒绝是「用户停止本轮」造成的系统作废，不是对申请本身的否决。
+/// 这种情况不写防骚扰 memo。
+fn is_system_cancel(reason: &str) -> bool {
+    reason.contains("已停止本轮")
+}
+
 // ---------------------------------------------------------------------------
 // 决定
 // ---------------------------------------------------------------------------
@@ -62,7 +68,9 @@ impl Decision {
             "deny" | "no" | "拒绝" => Some(Decision::Deny),
             // 命令授权粒度的两个按钮
             "prefix" | "approve-prefix" | "记住命令名" => Some(Decision::ApprovePrefix),
-            "full" | "approve-full" | "记住完整命令" => Some(Decision::ApproveFull),
+            "full" | "approve-full" | "记住完整命令" | "always" | "总是允许" => {
+                Some(Decision::ApproveFull)
+            }
             _ => None,
         }
     }
@@ -131,8 +139,7 @@ impl Verdict {
             Decision::ApprovePrefix => "用户已批准，并**记住了这类命令**（可执行名+首个子命令）。\
                  现在直接重试原来那条命令即可。"
                 .to_string(),
-            Decision::ApproveFull => "用户已批准，并**记住了这条完整命令**。\
-                 现在直接重试原来那条命令即可。"
+            Decision::ApproveFull => "用户已批准，并**总是允许**（跨会话持久，可在设置撤销）。现在可以执行。"
                 .to_string(),
         }
     }
@@ -265,9 +272,16 @@ pub struct PendingCmd {
 
 impl PendingCmd {
     pub fn view(&self) -> PendingView {
+        // `pm*` = MCP 工具申请，`pc*` = 命令申请。kind 必须从 id 推出来 ——
+        // pending_views() 会重新 view()，只在 emit 前改本地副本会在补拉时丢掉。
+        let kind = if self.id.starts_with("pm") {
+            "mcp"
+        } else {
+            "command"
+        };
         PendingView {
             id: self.id.clone(),
-            kind: "command".into(),
+            kind: kind.into(),
             // 文件级字段留空
             path: String::new(),
             access: String::new(),
@@ -396,12 +410,35 @@ impl PermHub {
         });
     }
 
-    /// 这条申请是不是**刚被拒过**（同会话 + 同路径 + 同权限）。
-    /// 命中就不弹卡，直接把上次的理由回给模型。
+    /// 这条申请是不是**刚被拒过**。
+    ///
+    /// 2026-09-23 放宽（B2/B3）：同会话下满足下列任一即视为刚拒过，**不再弹卡**：
+    /// - 路径精确相同
+    /// - 本次路径落在**已拒前缀之下**（拒了目录就别再为目录下每个文件弹）
+    /// - 与已拒路径**同一父目录**（拒了 `a.md` 就别再为 `b.md` 弹）
+    /// 且所需 access 不比已拒的更宽（Full ⊇ ReadWrite ⊇ Read）。
+    ///
+    /// 模型改成**上层目录**（B2 要求的「申请父目录 + task」）仍会正常弹卡。
     pub fn find_denied(&self, session_id: &str, prefix: &Path, access: Access) -> Option<DeniedMemo> {
         let v = self.denied.lock().ok()?;
         v.iter()
-            .find(|m| m.session_id == session_id && m.prefix == prefix && m.access == access)
+            .filter(|m| m.session_id == session_id)
+            .filter(|m| {
+                let under = prefix.starts_with(&m.prefix);
+                let sibling = m.prefix.parent().is_some()
+                    && prefix.parent().is_some()
+                    && m.prefix.parent() == prefix.parent();
+                let same_or_covered = m.prefix == prefix || under || sibling;
+                let access_covered = match (m.access, access) {
+                    (Access::Full, _) => true,
+                    (Access::ReadWrite, Access::Read | Access::ReadWrite) => true,
+                    (Access::Read, Access::Read) => true,
+                    (Access::Deny, _) => false,
+                    _ => false,
+                };
+                same_or_covered && access_covered
+            })
+            .max_by_key(|m| m.prefix.as_os_str().len())
             .cloned()
     }
 
@@ -569,7 +606,9 @@ impl PermHub {
         }
     }
 
-    /// 用户对一条**命令**申请的决定（唤醒 `ask_command()`）。
+    /// 用户对一条**命令**申请的决定（唤醒 `ask_command()` / `ask_mcp_tool()`）。
+    ///
+    /// MCP 工具申请的 id 是 `pm*`，和命令申请 `pc*` 同住 `pending_cmds`。
     pub fn decide_command(&self, id: &str, decision: Decision, reason: String) -> Result<(), String> {
         let taken = {
             let mut map = self
@@ -585,6 +624,38 @@ impl PermHub {
                 .map_err(|_| "命令申请已失效（等待方已超时离开）".to_string()),
             None => Err(format!("命令申请 {id} 不存在或已处理")),
         }
+    }
+
+    /// 作废全部待办（用户点「停止」时用）—— 唤醒所有阻塞中的 `ask*`。
+    ///
+    /// 为什么不干等 3 分钟超时：`ask*` 挂着 agent loop，取消标志在工具层检查不到，
+    /// 不把 oneshot 发出去，这一轮就永远停在权限卡上（用户看到的就是卡死）。
+    ///
+    /// 理由里带「已停止本轮」标记：`ask*` 靠它区分「用户拒绝」与「用户取消」，
+    /// 取消**不写**防骚扰 memo，否则同路径下次申请会被误打回。
+    pub fn cancel_all(&self, reason: &str) -> usize {
+        let mut n = 0usize;
+        if let Ok(mut map) = self.pending.lock() {
+            for (_, p) in map.drain() {
+                let _ = p.tx.send(Verdict {
+                    decision: Decision::Deny,
+                    reason: reason.to_string(),
+                });
+                self.emit_resolved(&p.id, Decision::Deny);
+                n += 1;
+            }
+        }
+        if let Ok(mut map) = self.pending_cmds.lock() {
+            for (_, p) in map.drain() {
+                let _ = p.tx.send(Verdict {
+                    decision: Decision::Deny,
+                    reason: reason.to_string(),
+                });
+                self.emit_resolved(&p.id, Decision::Deny);
+                n += 1;
+            }
+        }
+        n
     }
 
     /// 登记一条申请并**阻塞等待**用户决定（超时 → [`Decision::Timeout`]）。
@@ -646,7 +717,8 @@ impl PermHub {
         // 被拒的记一笔 —— 模型下次原样再申请时直接打回，不再打扰用户。
         // 这就是「防骚扰」的落点：不是禁言路径，而是**同一请求不重复弹卡**，
         // 模型仍可凭理由改成更窄/不同的申请（那是另一条 memo，会正常弹卡）。
-        if !verdict.is_approved() {
+        // 用户点「停止」导致的作废**不记** —— 那不是对申请本身的拒绝。
+        if !verdict.is_approved() && !is_system_cancel(&verdict.reason) {
             self.note_denied(session_id, &asked_path, access, &verdict.reason);
         }
 
@@ -710,10 +782,67 @@ impl PermHub {
         }
 
         // 被拒的记一笔 —— 同一命令原样再申请时直接打回，不再弹卡
-        if !verdict.is_approved() {
+        if !verdict.is_approved() && !is_system_cancel(&verdict.reason) {
             self.note_denied_cmd(session_id, &fp_for_memo, &verdict.reason);
         }
 
+        self.emit_resolved(&id, verdict.decision);
+        Ok(verdict)
+    }
+
+    /// 登记一条 **MCP 工具**申请并阻塞等用户决定。
+    ///
+    /// Cline 式档位：`Approve` = 允许这一次；`ApproveFull` = **总是允许**
+    /// （调用方落 `mcp_grants.json`）。默认问，不搞 destructive 自动放行。
+    pub async fn ask_mcp_tool(
+        &self,
+        tool: String,
+        args_preview: String,
+        session_id: &str,
+    ) -> Result<Verdict, String> {
+        let id = format!("pm{}", self.seq.fetch_add(1, Ordering::Relaxed) + 1);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let timeout_ms = REQUEST_TIMEOUT_MS;
+
+        let fp_for_memo = tool.clone();
+        let req = PendingCmd {
+            id: id.clone(),
+            command: tool,
+            normalized: args_preview,
+            risk: Risk::Medium,
+            head_fp: String::new(),
+            full_fp: fp_for_memo.clone(),
+            reason: "调用 MCP 外部工具".into(),
+            session_id: session_id.to_string(),
+            created_at: permission::now_ms(),
+            timeout_ms,
+            tx,
+        };
+        let view = req.view();
+        // kind 已由 PendingCmd::view() 按 `pm*` 前缀推出
+        debug_assert_eq!(view.kind, "mcp");
+
+        {
+            let mut map = self
+                .pending_cmds
+                .lock()
+                .map_err(|e| format!("命令待办表锁失败: {e}"))?;
+            map.insert(id.clone(), req);
+        }
+        self.emit_request(&view);
+
+        let verdict = match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(_)) => Verdict::bare(Decision::Deny),
+            Err(_) => Verdict::bare(Decision::Timeout),
+        };
+
+        if let Ok(mut map) = self.pending_cmds.lock() {
+            map.remove(&id);
+        }
+        if !verdict.is_approved() && !is_system_cancel(&verdict.reason) {
+            self.note_denied_cmd(session_id, &fp_for_memo, &verdict.reason);
+        }
         self.emit_resolved(&id, verdict.decision);
         Ok(verdict)
     }
@@ -886,9 +1015,9 @@ mod tests {
     }
 
     #[test]
-    fn denied_memo_blocks_exact_repeat_only() {
-        // 防骚扰的核心：**同路径同权限**再申请直接打回；
-        // 换成更窄的路径（正是"按理由调整"）不拦。
+    fn denied_memo_blocks_repeat_siblings_and_children() {
+        // B2/B3 防骚扰：同路径 / 同父目录兄弟 / 已拒前缀之下，同或更宽 access
+        // 再申请直接打回；换**上层目录**（申请父目录 + task）才允许重新弹卡。
         let hub = PermHub::new();
         assert!(hub
             .find_denied("s1", Path::new(r"D:\report"), Access::ReadWrite)
@@ -901,18 +1030,36 @@ mod tests {
             .expect("同路径同权限应命中");
         assert_eq!(hit.reason, "有合同");
 
-        // 更窄的路径 → 不命中，允许重新申请
+        // 已拒前缀之下（拒了目录就别再为 a.md 连环弹）
+        assert!(
+            hub.find_denied("s1", Path::new(r"D:\report\a.md"), Access::ReadWrite)
+                .is_some(),
+            "已拒前缀之下的文件应命中"
+        );
+        // 同父目录兄弟（拒了 a.md 后 b.md 也不该再弹）
+        assert!(
+            hub.find_denied("s1", Path::new(r"D:\report\b.md"), Access::ReadWrite)
+                .is_some(),
+            "同父目录兄弟应命中"
+        );
+        // 权限更宽 → 不命中（用户只拒了 ReadWrite，要 Full 得重新问）
         assert!(hub
-            .find_denied("s1", Path::new(r"D:\report\a.md"), Access::ReadWrite)
-            .is_none());
-        // 权限不同 → 不命中
-        assert!(hub
-            .find_denied("s1", Path::new(r"D:\report"), Access::Read)
+            .find_denied("s1", Path::new(r"D:\report"), Access::Full)
             .is_none());
         // 换个会话 → 不命中（上个任务拒过的不该管到这个任务）
         assert!(hub
             .find_denied("s2", Path::new(r"D:\report"), Access::ReadWrite)
             .is_none());
+
+        // 拒了子文件后，申请**上层目录**仍可弹卡（B2 引导改申请父目录 + task）
+        let hub2 = PermHub::new();
+        hub2.note_denied("s1", Path::new(r"D:\report\a.md"), Access::ReadWrite, "别碰 a");
+        assert!(hub2
+            .find_denied("s1", Path::new(r"D:\report"), Access::ReadWrite)
+            .is_none());
+        assert!(hub2
+            .find_denied("s1", Path::new(r"D:\report\b.md"), Access::ReadWrite)
+            .is_some());
 
         hub.clear_denied();
         assert!(hub
@@ -1098,5 +1245,72 @@ mod tests {
         let hub = PermHub::new();
         // 没有这条待办 → 报错而不是静默成功
         assert!(hub.decide("pr999", Decision::Approve, String::new()).is_err());
+    }
+
+    /// 回归：MCP 申请 id 是 `pm*`，必须能被 decide_command 唤醒。
+    /// 早先 lib.rs 只把 `pc*` 路由到 decide_command，`pm*` 掉进 decide() 后
+    /// 报「不存在或已处理」，agent 卡满 3 分钟超时。
+    #[tokio::test]
+    async fn decide_command_accepts_pm_ids() {
+        let hub = std::sync::Arc::new(PermHub::new());
+        let h2 = hub.clone();
+        let waiter = tokio::spawn(async move {
+            h2.ask_mcp_tool(
+                "mcp__windows-mcp__DisplayInventory".into(),
+                "（无参数）".into(),
+                "s1",
+            )
+            .await
+        });
+
+        for _ in 0..100 {
+            if !hub.pending_views().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let views = hub.pending_views();
+        assert_eq!(views.len(), 1);
+        let id = views[0].id.clone();
+        assert!(id.starts_with("pm"), "MCP 申请 id 应以 pm 打头，实际 {id}");
+        assert_eq!(views[0].kind, "mcp");
+
+        hub.decide_command(&id, Decision::Approve, String::new())
+            .expect("pm* 应走 decide_command，而不是报不存在");
+        let got = waiter.await.unwrap().unwrap();
+        assert!(got.is_approved());
+        assert!(hub.pending_views().is_empty());
+    }
+
+    /// 回归：用户点「停止」要能立刻叫醒阻塞中的 ask*，且不写防骚扰 memo。
+    #[tokio::test]
+    async fn cancel_all_wakes_waiters_without_memo() {
+        let hub = std::sync::Arc::new(PermHub::new());
+        let h2 = hub.clone();
+        let waiter = tokio::spawn(async move {
+            h2.ask_mcp_tool("mcp__ssh__run-command".into(), "ls".into(), "s1")
+                .await
+        });
+
+        for _ in 0..100 {
+            if !hub.pending_views().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(hub.pending_views().len(), 1);
+
+        let n = hub.cancel_all("用户已停止本轮，此申请作废（不是对请求本身的拒绝）。");
+        assert_eq!(n, 1);
+
+        let got = tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("cancel_all 应立刻唤醒，而不是等 3 分钟超时")
+            .unwrap()
+            .unwrap();
+        assert!(!got.is_approved());
+        assert!(hub.pending_views().is_empty());
+        // 取消不是拒绝 —— 不该留下会误伤下次申请的 memo
+        assert!(hub.find_denied_cmd("s1", "mcp__ssh__run-command").is_none());
     }
 }

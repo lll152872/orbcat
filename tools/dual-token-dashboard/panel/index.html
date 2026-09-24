@@ -1,0 +1,133 @@
+<!-- AI生成 -->
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Token 用量驾驶舱</title>
+  <link rel="stylesheet" href="panel.css" />
+</head>
+<body>
+<p data-aigc-mark="1" style="margin:0 0 8px;font-size:10px;line-height:1.3;color:#6b6560;font-weight:400;">AI生成</p>
+
+  <div id="app" class="app">
+    <header class="top">
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <div>
+          <h1>Token 用量驾驶舱</h1>
+          <p class="sub" id="gen-stamp">—</p>
+        </div>
+      </div>
+      <div class="top-controls">
+        <div class="seg" id="source-seg" role="tablist" aria-label="数据源"></div>
+        <div class="seg" id="window-seg" role="group" aria-label="时间窗">
+          <button type="button" data-win="1">1 天</button>
+          <button type="button" data-win="3">3 天</button>
+          <button type="button" data-win="7" class="on">7 天</button>
+          <button type="button" data-win="30">30 天</button>
+          <button type="button" data-win="custom">自定义</button>
+        </div>
+        <button type="button" id="theme-btn" class="ghost">深色</button>
+      </div>
+    </header>
+
+    <section class="custom-range hidden" id="custom-range">
+      <label>从 <input type="date" id="c-start" /></label>
+      <label>到 <input type="date" id="c-end" /></label>
+      <button type="button" id="c-apply" class="ghost">应用</button>
+    </section>
+
+    <section class="kpi-strip" id="kpi-strip"></section>
+
+    <section class="grid">
+      <article class="card span-7">
+        <header class="card-h">
+          <h2>活跃节奏</h2>
+          <span class="hint">按日 · 颜色深浅 = 当日 token（对数）</span>
+        </header>
+        <div class="cal" id="cal"></div>
+        <header class="card-h sub-h">
+          <h3>时段分布</h3>
+          <span class="hint">0–24 时 · 堆叠模型占比</span>
+        </header>
+        <canvas id="hour-chart" width="720" height="180" aria-label="时段分布"></canvas>
+      </article>
+
+      <article class="card span-5">
+        <header class="card-h">
+          <h2>模型构成</h2>
+          <span class="hint">窗口内合计</span>
+        </header>
+        <canvas id="model-chart" width="360" height="200" aria-label="模型构成"></canvas>
+        <div class="model-list" id="model-list"></div>
+      </article>
+
+      <article class="card span-12">
+        <header class="card-h">
+          <h2>会话轨道</h2>
+          <span class="hint">点一条看请求明细</span>
+        </header>
+        <div class="session-rail" id="session-rail"></div>
+      </article>
+    </section>
+
+    <aside class="drawer hidden" id="drawer" aria-hidden="true">
+      <header class="drawer-h">
+        <div>
+          <h2 id="drawer-title">请求明细</h2>
+          <p class="sub" id="drawer-sub"></p>
+        </div>
+        <button type="button" id="drawer-close" class="ghost">关闭</button>
+      </header>
+      <canvas id="scatter" width="520" height="160" aria-label="请求散点"></canvas>
+      <div class="table-wrap">
+        <table class="req-table" id="req-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>模型</th>
+              <th>输入</th>
+              <th>输出</th>
+              <th>缓存</th>
+              <th>合计</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </aside>
+    <div class="scrim hidden" id="scrim"></div>
+  </div>
+
+  <!-- 数据由生成脚本注入；预览时用内置样例 -->
+  <script id="payload" type="application/json">
+  {
+    "genMs": 0,
+    "gen": "预览样例",
+    "order": ["wb", "local"],
+    "sources": {
+      "wb": {
+        "key": "wb",
+        "name": "WorkBuddy",
+        "genMs": 0,
+        "gen": "",
+        "ws": ["工作区"],
+        "models": ["claude-opus-5", "glm-5.3", "deepseek-v4-pro", "qwen3"],
+        "sess": []
+      },
+      "local": {
+        "key": "local",
+        "name": "小 agent",
+        "genMs": 0,
+        "gen": "",
+        "ws": ["float-agent"],
+        "models": ["glm-5.2"],
+        "sess": []
+      }
+    }
+  }
+  </script>
+  <script src="panel.js"></script>
+</body>
+</html>

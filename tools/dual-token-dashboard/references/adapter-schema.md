@@ -45,6 +45,14 @@ sess = {
 | total | `rawUsage.total_tokens` | `usage.total` | **必须有**，无则跳过该条 |
 | input | `rawUsage.prompt_tokens` | `usage.prompt` | 0 |
 | output | `rawUsage.completion_tokens` | `usage.completion` | 0 |
+| cache_hit | `rawUsage.prompt_cache_hit_tokens` / `prompt_tokens_details.cached_tokens` | `usage.cacheHit` | 0 |
+| cache_write | `prompt_tokens_details.cache_creation_tokens` 等 | `usage.cacheWrite` | 0 |
+| cache_hit | `rawUsage.prompt_cache_hit_tokens` / `prompt_tokens_details.cached_tokens` | `usage.cacheHit` | 0 |
+| cache_write | `prompt_tokens_details.cache_creation_tokens` 等 | `usage.cacheWrite` | 0 |
+| cache_hit | `rawUsage.prompt_cache_hit_tokens` / `prompt_tokens_details.cached_tokens` | `usage.cacheHit` | 0 |
+| cache_write | `prompt_tokens_details.cache_creation_tokens` 等 | `usage.cacheWrite` | 0 |
+| cache_hit | `rawUsage.prompt_cache_hit_tokens` / `prompt_tokens_details.cached_tokens` | `usage.cacheHit` | 0 |
+| cache_write | `prompt_tokens_details.cache_creation_tokens` 等 | `usage.cacheWrite` | 0 |
 | 缓存命中 | `prompt_cache_hit_tokens` 或 `prompt_tokens_details.cached_tokens` | 无 | 0 |
 | 缓存写入 | `cached_creation_tokens` / `cache_write_tokens` | 无 | 0 |
 

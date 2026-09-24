@@ -20,18 +20,18 @@ use crate::tools;
 
 /// 基础循环轮数上限（默认值；可被环境变量覆盖）
 ///
-/// 覆盖方式：`FLOAT_AGENT_MAX_ITERATIONS=50`。
+/// 覆盖方式：`FLOAT_AGENT_MAX_ITERATIONS=100`。
 /// 为什么做成可配：不同模型/任务对轮数需求差别很大（简单问答 3 轮够，
 /// 长链路重构可能几十轮），编译期写死一个数字必然有一边不合适。
-const DEFAULT_MAX_ITERATIONS: usize = 50;
+const DEFAULT_MAX_ITERATIONS: usize = 100;
 
 /// 硬上限（默认值；可被环境变量覆盖）：插话可以**延长**预算，但不能无限延长。
 ///
 /// 不做硬顶的话，"用户一直插话"会让基础轮数变成事实上的无上限 —— 既烧钱，
 /// 也真的可能转不出来。到了这里仍然按"任务过大/模型陷入循环"报错。
 ///
-/// 覆盖方式：`FLOAT_AGENT_HARD_ITERATIONS=100`。
-const DEFAULT_HARD_ITERATIONS: usize = 100;
+/// 覆盖方式：`FLOAT_AGENT_HARD_ITERATIONS=250`。
+const DEFAULT_HARD_ITERATIONS: usize = 250;
 
 /// 读一个正整数环境变量；缺失/非法/为 0 时回退默认值。
 ///
@@ -374,7 +374,7 @@ fn drain_status_steps(log: &std::sync::Mutex<Vec<String>>, steps: &mut Vec<Agent
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentStep {
-    /// `assistant` | `tool_call` | `tool_result`
+    /// `assistant` | `tool_call` | `tool_result` | `steer` | …
     pub kind: String,
     pub name: Option<String>,
     pub detail: String,
@@ -622,6 +622,12 @@ pub async fn run(
         // 同一个权限网关，所以「越权」这条红线自动同样生效，不需要额外校验。
         for m in hub.drain().await {
             messages.push(build_user_message(cfg, data_dir, &m.text, &m.images));
+            // 插进 steps 时间线：重载后过程里能看到「跑到这一步时用户补了一句」
+            steps.push(AgentStep {
+                kind: "steer".into(),
+                name: Some(m.id.clone()),
+                detail: m.text.clone(),
+            });
             on_progress(Progress::Steer {
                 id: m.id.clone(),
                 text: m.text.clone(),
@@ -634,7 +640,7 @@ pub async fn run(
         // ---- 上下文预算检查（每轮 LLM 调用前）----
         //
         // 为什么必须有这一步：`messages` 在循环里**只增不减**（每轮 push
-        // assistant + N 条 tool 结果）。轮数上限拉到 50/100 后，不检查就会
+        // assistant + N 条 tool 结果）。轮数上限拉到 100/250 后，不检查就会
         // 一路顶穿模型窗口 → 413 / context_length_exceeded → 整轮报废。
         //
         // 策略是**渐进裁剪**而不是直接中止：
@@ -736,12 +742,27 @@ pub async fn run(
             }) as std::sync::Arc<llm::StatusFn>
         };
 
+        // 断流重试前作废半截正文 —— 与工具调用 DiscardStream 同语义（reasoning 保留）
+        let discard_cb = {
+            let cb = on_progress.clone();
+            let flag = streamed_this_round.clone();
+            let acc_t = round_text.clone();
+            std::sync::Arc::new(move |reason: String| {
+                flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(mut g) = acc_t.lock() {
+                    g.clear();
+                }
+                cb(Progress::DiscardStream { reason });
+            }) as std::sync::Arc<llm::DiscardFn>
+        };
+
         let out = match llm::chat_stream(
             cfg,
             messages.clone(),
             tools_arg,
             &delta_cb,
             status_cb.as_ref(),
+            discard_cb.as_ref(),
             cancel,
         )
         .await
@@ -884,12 +905,12 @@ pub async fn run(
             }
         }
 
-        // 截图产生的画面：作为 user 消息附进去，模型下一轮就能"看到"
+        // 工具附带的画面（截图 / view_image）：作为 user 消息附进去，模型下一轮就能"看到"
         if !pending_images.is_empty() {
             messages.push(build_user_message(
                 cfg,
                 data_dir,
-                "（以上是刚截取的屏幕画面）",
+                "（以上是刚获取的图片画面）",
                 &pending_images,
             ));
         }
@@ -916,8 +937,9 @@ pub async fn run(
     let mut r = interrupted_run(steps, steers, reason_total, String::new(), iter, usage_total);
     // 借用 stop_reason 说明是"轮数用尽"而非"用户停止"，前端据此显示不同提示
     r.stop_reason = Some(format!(
-        "已达轮数上限（{iter} 轮），以下是已产出的部分结果。可能是任务过大或模型陷入循环；\
-         可调大 FLOAT_AGENT_MAX_ITERATIONS / FLOAT_AGENT_HARD_ITERATIONS 后重试"
+        "已达轮数上限（{iter} 轮），以下是已产出的部分结果。可能是任务过大或模型陷入循环。\
+         你可以：① 直接说「继续」接着跑；② 先压缩上下文再说「继续」；③ 停止。\
+         也可调大 FLOAT_AGENT_MAX_ITERATIONS / FLOAT_AGENT_HARD_ITERATIONS"
     ));
     Ok(r)
 }
@@ -1014,6 +1036,11 @@ fn build_user_message(
 
 /// 把工具参数压成一行短摘要，供进度条展示
 fn summarize_args(raw: &str) -> String {
+    summarize_args_pub(raw)
+}
+
+/// 给 tools / perm 层用的参数摘要（截断 JSON）
+pub fn summarize_args_pub(raw: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
         return raw.chars().take(80).collect();
     };
@@ -1108,13 +1135,43 @@ pub fn build_system_prompt_for(data_dir: &Path, user_message: &str) -> String {
         stable.push(format!("# 长期记忆\n\n{m}"));
     }
 
+    // 激活项目（顶栏切换）→ 注入项目 MEMORY.md（跳脱主对话）
+    {
+        let s = crate::config::load_settings(data_dir);
+        if let Some(pid) = s.active_project_id {
+            if let Ok(list) = crate::pmem::list_projects(data_dir) {
+                if let Some(p) = list.into_iter().find(|x| x.id == pid) {
+                    if let Some(pm) = crate::pmem::project_memory_md(data_dir, &p.name) {
+                        stable.push(format!(
+                            "# 项目记忆（{name}）\n\n{pm}\n\n\
+                             当前处于项目「{name}」。\n\
+                             **你必须主动维护这份项目记忆**：\n\
+                             1. 结论、路径、术语、未决问题 → 本轮用 `remember` 写入（直接落盘）\n\
+                             2. 发现过时/错误条目 → `remember` 写「更正：…」并点明作废哪条\n\
+                             3. 不要写全局 MEMORY；主对话闲聊不进项目记忆\n\
+                             4. 每得出可复用结论就记，不要攒到最后",
+                            name = p.name
+                        ));
+                    } else {
+                        stable.push(format!(
+                            "# 项目（{name}）\n\n\
+                             当前处于项目「{name}」，项目记忆为空。\n\
+                             **必须用 `remember` 维护**（结论/路径/未决问题 → projects/{name}/MEMORY.md）。",
+                            name = p.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     // ── 稳定区：记忆使用规则（纯规则文字，条目本身在动态区）────────────
     stable.push(
         "# 记忆怎么用\n\n\
          `memory/MEMORY.md` 是**已批准**的跨项目长期记忆；\
-         `projects/<名>/MEMORY.md` 是绑定具体项目的记忆（工作目录/前台路径命中该项目 source.ref 时由系统附在尾部）。\n\n\
-         当你从对话里学到**值得跨会话记住**的东西时，调用 `remember` 提交候选 —— \
-         **不要直接写 MEMORY.md**（审批后才会进长期记忆）。\n\n\
+         `projects/<名>/MEMORY.md` 是项目记忆（顶栏切换项目后整段注入）。\n\n\
+         当你从对话里学到**值得跨会话记住**的东西时，调用 `remember` —— \
+         **主对话**进全局候选审批；**已切换项目**直接写项目 MEMORY.md，且结论/路径/未决问题**必须写**。\n\n\
          该记什么：\n\
          - 用户明确说过的偏好、雷区、称呼、工作习惯\n\
          - 踩过的坑与验证过的做法（要能复用，不是流水账）\n\
@@ -1136,7 +1193,11 @@ pub fn build_system_prompt_for(data_dir: &Path, user_message: &str) -> String {
 
     // 网页搜索（仅说明规则；工具是否出现由 tool_specs 按配置决定）
     stable.push(
-        "# 网页搜索 web_search\n\n\
+        "# 网页抓取 fetch_url\n\n\
+         工具列表里始终有 `fetch_url`：给一个 http/https URL，返回可读正文（Markdown 子集）。\n\
+         静态文档/博客用它；需要点击、登录、JS 渲染的页面改走 playwright MCP 组。\n\
+         不知道 URL 时先 `web_search`。URL 会直接请求目标站点。\n\n\
+         # 网页搜索 web_search\n\n\
          当工具列表里**出现** `web_search` 时，说明用户已在设置里配置了搜索后端（默认 Tavily）。\n\
          用于：公开事实、文档版本、知识截止之后的新闻等。\n\
          不用于：用户偏好/约定/本机路径/做过的事 —— 那些在长期记忆、项目记忆与 recall_turns。\n\
@@ -1194,10 +1255,18 @@ pub fn build_system_prompt_for(data_dir: &Path, user_message: &str) -> String {
     stable.push(
         "# 运行环境\n\n\
          你有文件工具（read_file / list_dir / glob_files / grep_files / write_file / edit_file / delete_file）\
-         和命令工具 `run_command`（在用户机器上跑 **PowerShell** 命令）。\n\
+         以及 move_file / copy_file / mkdir / file_info / append_file / git（只读），\
+         命令工具 `run_command`（在用户机器上跑 **PowerShell** 命令），\
+         以及 `fetch_url`（抓网页正文）。\n\
          **所有文件操作都受文件权限网关管辖**，越权会被拒绝。\n\
-         改文件优先 `edit_file`（精确字符串局部替换），不要整文件覆盖；\
-         写新文件/全文重写才用 `write_file`（写前会备份）。\n\
+         ## 工具选择硬规则（禁止用 PowerShell 绕过）\n\
+         - **读文件 / 搜内容 / 列目录** → 只用 `read_file` / `grep_files` / `glob_files` / `list_dir` / `file_info`。\n\
+           **禁止**用 `run_command` 跑 `Get-Content` / `Select-String` / `findstr` / `Get-ChildItem` 去读搜文件。\n\
+         - **改文件** 优先 `edit_file`（精确字符串局部替换），不要整文件覆盖；\
+         写新文件/全文重写才用 `write_file`（写前会备份）；追加用 `append_file`。\n\
+         - **复制 / 移动 / 建目录** → `copy_file` / `move_file` / `mkdir`，不要 `Copy-Item`/`Move-Item`/`New-Item`。\n\
+         - **git 只读**（status/diff/log/show/branch）→ 用 `git` 工具。\n\
+         - `run_command` **只用于**编译器、包管理器、自定义脚本、或确实没有对应内置工具的场景。\n\
          `delete_file` = **永远归档**到 `agent-data/.trash/`（需 full 权限），\
          **不会硬删**；用户点名硬删也只归档，物理删除请用户自行执行。\n\
          不要为了改/删文件去 `run_command` 绕过工具层 —— 危险命令仍会被硬阻断。\n\

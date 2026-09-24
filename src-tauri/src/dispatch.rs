@@ -537,6 +537,7 @@ mod tests {
             steps: vec![],
             reasoning: None,
             interrupted: false,
+            steer_id: None,
             model: None,
             usage: None,
             at: 1,
