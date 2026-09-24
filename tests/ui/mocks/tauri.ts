@@ -215,6 +215,9 @@ const emptyOk: Record<string, unknown> = {
   session_truncate: null,
   chat_steer: { id: "steer-1", queued: 1 },
   bootstrap_data: { ok: true },
+  pmem_list: [],
+  pmem_get_active: null,
+  pmem_session_map: {},
 };
 
 export async function invoke<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T> {
