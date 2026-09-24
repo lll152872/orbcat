@@ -85,10 +85,6 @@ const BUNDLED_SKILLS: &[(&str, &str)] = &[
         "dual-token-dashboard/references/adapter-schema.md",
         include_str!("../../tools/dual-token-dashboard/references/adapter-schema.md"),
     ),
-    (
-        "dispatch-workbuddy/SKILL.md",
-        include_str!("../../tools/dispatch-workbuddy/SKILL.md"),
-    ),
 ];
 
 /// 建目录骨架 + 最小配置文件。**不碰 `models.json` 之外的任何密钥**。
@@ -395,7 +391,6 @@ mod tests {
             "skills/dual-token-dashboard/panel/panel.css",
             "skills/dual-token-dashboard/panel/panel.js",
             "skills/dual-token-dashboard/references/adapter-schema.md",
-            "skills/dispatch-workbuddy/SKILL.md",
         ] {
             assert!(d.join(f).is_file(), "内置技能文件 {f} 应存在");
         }
@@ -445,8 +440,8 @@ mod tests {
         assert!(r.created_files.is_empty(), "不该重复写文件");
         assert_eq!(
             r.skipped.len(),
-            21,
-            "8 目录 + 6 骨架文件 + 7 内置技能文件 应全跳过: {:?}",
+            20,
+            "8 目录 + 6 骨架文件 + 6 内置技能文件 应全跳过: {:?}",
             r.skipped
         );
 

@@ -8,7 +8,6 @@ mod capture;
 mod command_policy;
 mod config;
 mod context;
-mod dispatch;
 mod fetch;
 mod history;
 mod images;
@@ -47,8 +46,8 @@ const PANEL_W_LOGICAL: f64 = 420.0;
 const PANEL_H_LOGICAL: f64 = 600.0;
 /// 右键菜单态尺寸（只够放一个小菜单卡片）
 const MENU_W_LOGICAL: f64 = 196.0;
-/// 右键菜单高度 —— 设置 / 记忆 / 对话 / 分发WB / 退出（5 项）
-const MENU_H_LOGICAL: f64 = 210.0;
+/// 右键菜单高度 —— 设置 / 记忆 / 对话 / 退出（4 项）
+const MENU_H_LOGICAL: f64 = 172.0;
 /// 距屏幕边缘留白
 const MARGIN_LOGICAL: f64 = 24.0;
 /// 胶囊在屏幕高度的这个比例处
@@ -964,86 +963,6 @@ fn set_blur_collapse(state: State<'_, AppState>, enable: bool) -> Result<(), Str
     let mut s = config::load_settings(&state.data_dir);
     s.blur_collapse = enable;
     config::save_settings(&state.data_dir, &s)
-}
-
-#[tauri::command]
-fn set_dispatch_wb_drop_dir(state: State<'_, AppState>, path: Option<String>) -> Result<(), String> {
-    let mut s = config::load_settings(&state.data_dir);
-    s.dispatch_wb_drop_dir = path.filter(|p| !p.trim().is_empty());
-    config::save_settings(&state.data_dir, &s)
-}
-
-/// UI / 手动创建 WB 交接：总结当前会话有效消息 + 附图，写好并尝试打开（source=user）。
-#[tauri::command]
-fn dispatch_create(
-    state: State<'_, AppState>,
-    title: Option<String>,
-    summary: Option<String>,
-    reason: Option<String>,
-    context: Option<String>,
-    open: Option<bool>,
-) -> Result<dispatch::HandoffMeta, String> {
-    let meta = dispatch::write_handoff_from_session(
-        &state.data_dir,
-        "", // 当前会话
-        "workbuddy",
-        title.as_deref(),
-        summary.as_deref(),
-        reason
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or("用户选择分发给 WorkBuddy（第一轮人工投递）"),
-        context.as_deref().unwrap_or(""),
-        "user",
-    )?;
-    if open.unwrap_or(true) {
-        let _ = dispatch::open_handoff_file(&meta.path);
-    }
-    // 可选 drop 目录：与工具路径一致（展开 %VAR% 后尝试复制，失败不阻断）
-    if let Some(drop) = config::load_settings(&state.data_dir)
-        .dispatch_wb_drop_dir
-        .filter(|s| !s.trim().is_empty())
-    {
-        let expanded = dispatch::expand_windows_env(&drop);
-        let drop_path = PathBuf::from(&expanded);
-        // UI 路径没有 ToolCtx/authorize，只做 best-effort：目录在且可写则复制
-        if drop_path.is_dir() || std::fs::create_dir_all(&drop_path).is_ok() {
-            if let Some(name) = Path::new(&meta.path).file_name() {
-                let dest = drop_path.join(name);
-                let _ = std::fs::copy(&meta.path, &dest);
-            }
-        }
-    }
-    Ok(meta)
-}
-
-#[tauri::command]
-fn dispatch_list(
-    state: State<'_, AppState>,
-    target: Option<String>,
-) -> Vec<dispatch::HandoffListItem> {
-    dispatch::list_handoffs(&state.data_dir, target.as_deref())
-}
-
-/// 打开某份交接文件（或打开目录）。
-#[tauri::command]
-fn dispatch_open(state: State<'_, AppState>, path: Option<String>) -> Result<String, String> {
-    match path.filter(|p| !p.trim().is_empty()) {
-        Some(p) => {
-            dispatch::open_handoff_file(&p)?;
-            Ok(p)
-        }
-        None => dispatch::reveal_target_dir(&state.data_dir, "workbuddy"),
-    }
-}
-
-/// 用资源管理器打开 dispatch 目录（默认 workbuddy）。
-#[tauri::command]
-fn dispatch_reveal(state: State<'_, AppState>, target: Option<String>) -> Result<String, String> {
-    dispatch::reveal_target_dir(
-        &state.data_dir,
-        target.as_deref().unwrap_or("workbuddy"),
-    )
 }
 
 /// 采集一次前台应用上下文（模型工具用；返回缓存的「非自身前台」）
@@ -2266,11 +2185,6 @@ pub fn run() {
             search_set,
             search_test,
             set_blur_collapse,
-            set_dispatch_wb_drop_dir,
-            dispatch_create,
-            dispatch_list,
-            dispatch_open,
-            dispatch_reveal,
             foreground_context,
             foreground_history,
             image_thumb,

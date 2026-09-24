@@ -1183,11 +1183,7 @@ pub fn build_system_prompt_for(data_dir: &Path, user_message: &str) -> String {
          **先**用 `remember` 提交候选，再结束回复：\n\
          - **做过什么**：可复用的结论/做法（不是流水账）\n\
          - **错因**：若失败或踩坑，写清原因与规避方式\n\
-         不要每次闲聊都提；不要写未验证的猜测。用户会在设置›记忆里批/驳。\n\n\
-         ## 解决不了时分发\n\n\
-         任务明显超出本助手时：若技能清单里有 **dispatch-workbuddy**，先 `load_skill` 再按手册执行。\
-         核心动作是调用 `dispatch_task`（target=`workbuddy`）——总结会话有效消息并附图写交接、尝试打开；\
-         **第一轮由用户手动**把文档交给 WorkBuddy，这即算分发完成。不要假装 WB 已接手，也不要硬扛半吊子交付。"
+         不要每次闲聊都提；不要写未验证的猜测。用户会在设置›记忆里批/驳。"
             .to_string(),
     );
 

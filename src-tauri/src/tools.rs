@@ -323,24 +323,6 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
             }),
         ),
         ToolSpec::new(
-            "dispatch_task",
-            "把**本助手解决不了**的任务分发给重 agent（首期 target=workbuddy）。\
-             会从当前会话总结有效消息并附上图片，写交接文件后由**用户第一轮手动**\
-             把内容交给 WorkBuddy；不会自动替 WB 开会话（自动化属第二轮，本期不做）。\
-             适用：长会话/大工程/明显超出悬浮小窗能力的活。不要用来逃避简单任务。",
-            json!({
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string", "description": "目标，目前仅 workbuddy" },
-                    "title": { "type": "string", "description": "交接标题（短）；空则用会话标题" },
-                    "summary": { "type": "string", "description": "任务摘要；空则由系统按有效消息压缩生成" },
-                    "reason": { "type": "string", "description": "为何分发：本助手缺什么能力/上下文" },
-                    "context": { "type": "string", "description": "补充上下文（路径、已尝试、约束），可空" }
-                },
-                "required": ["target", "reason"]
-            }),
-        ),
-        ToolSpec::new(
             "load_skill",
             "加载一个技能的完整操作手册（SKILL.md 全文 + 附属文件清单）。\
              当任务与 system prompt 技能清单里的某条匹配时，先加载再照做 —— \
@@ -696,7 +678,6 @@ pub async fn execute(
             Ok(ToolOutput::text(out))
         }
         "remember" => remember(args, ctx.data_dir),
-        "dispatch_task" => dispatch_task(args, ctx),
         "recall_turns" => recall_turns(args, ctx),
         "load_skill" => {
             let name = get_str(args, "name")?;
@@ -875,83 +856,6 @@ fn remember(args: &Value, data_dir: &Path) -> Result<ToolOutput, String> {
         "已提交全局记忆候选（id: {}），等用户在面板里确认后才会进入长期记忆。",
         c.id
     )))
-}
-
-/// 分发：总结会话有效消息 + 附图 → 写交接 → 打开文件（用户第一轮手动交给 WB）。
-fn dispatch_task(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
-    let target = get_str(args, "target")?;
-    let reason = get_str(args, "reason")?;
-    let title = args.get("title").and_then(Value::as_str).unwrap_or("");
-    let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
-    let context = args
-        .get("context")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
-    let meta = crate::dispatch::write_handoff_from_session(
-        ctx.data_dir,
-        ctx.session_id,
-        &target,
-        if title.trim().is_empty() {
-            None
-        } else {
-            Some(title)
-        },
-        if summary.trim().is_empty() {
-            None
-        } else {
-            Some(summary)
-        },
-        &reason,
-        &context,
-        "model",
-    )?;
-
-    let opened = crate::dispatch::open_handoff_file(&meta.path).is_ok();
-    let mut msg = format!(
-        "已写好交接文件（{}，有效消息 {} 条，图片 {} 张）：\n{}\n\
-         第一轮请用户**手动**把该文件内容/图片交给 WorkBuddy；\
-         自动化投递属第二轮，本期不做。{}",
-        meta.target,
-        meta.message_count,
-        meta.images.len(),
-        meta.path,
-        if opened {
-            "（已尝试用系统默认程序打开该文件）"
-        } else {
-            "（打开失败，请手动打开上述路径）"
-        }
-    );
-
-    // 可选：复制到用户配置的 WB 目录（须 Full 授权；失败不回滚主文件）
-    let drop = crate::config::load_settings(ctx.data_dir)
-        .dispatch_wb_drop_dir
-        .filter(|s| !s.trim().is_empty());
-    if let Some(drop_dir) = drop {
-        let expanded = crate::dispatch::expand_windows_env(&drop_dir);
-        let drop_path = PathBuf::from(&expanded);
-        match authorize(ctx, &drop_path, Access::Full) {
-            Ok(canon) => {
-                if let Err(e) = std::fs::create_dir_all(&canon) {
-                    msg.push_str(&format!("\n（drop 目录创建失败，已忽略：{e}）"));
-                } else {
-                    let dest = canon.join(std::path::Path::new(&meta.path).file_name().unwrap());
-                    match std::fs::copy(&meta.path, &dest) {
-                        Ok(_) => msg.push_str(&format!("\n已复制副本：{}", dest.display())),
-                        Err(e) => msg.push_str(&format!("\n（副本复制失败，已忽略：{e}）")),
-                    }
-                }
-            }
-            Err(e) => {
-                msg.push_str(&format!(
-                    "\n（配置的 drop 目录无权限，仅保留 agent-data 内主文件：{e}）"
-                ));
-            }
-        }
-    }
-
-    Ok(ToolOutput::text(msg))
 }
 
 // ---------------------------------------------------------------------------
@@ -2573,43 +2477,9 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_task_is_in_builtin_specs() {
+    fn builtin_specs_contains_core_tools() {
         let names: Vec<String> = builtin_specs().into_iter().map(|s| s.name).collect();
-        assert!(names.contains(&"dispatch_task".to_string()), "缺 dispatch_task");
-    }
-
-    #[tokio::test]
-    async fn dispatch_task_writes_handoff_from_session() {
-        let tmp = fresh_tmp("dispatch_tool");
-        let gate = gate_for(&tmp);
-        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
-        // 造一个会话：dispatch_task 会从当前会话总结有效消息
-        let _s = crate::sessions::ensure_current(&tmp);
-        crate::sessions::append_turn(
-            &tmp,
-            "帮我搞定复杂重构",
-            &[],
-            "我这边上下文不够，建议分发",
-            &[],
-        )
-        .unwrap();
-        let out = execute(
-            "dispatch_task",
-            &json!({
-                "target": "workbuddy",
-                "reason": "需要长会话与多文件对照"
-            }),
-            &ctx_for!(gate, &tmp, mcp),
-        )
-        .await
-        .unwrap();
-        assert!(out.text.contains("dispatch") || out.text.contains("交接"), "{}", out.text);
-        assert!(out.text.contains("第一轮"), "应标明第一轮人工投递：{}", out.text);
-        let items = crate::dispatch::list_handoffs(&tmp, Some("workbuddy"));
-        assert_eq!(items.len(), 1);
-        let body = std::fs::read_to_string(&items[0].path).unwrap();
-        assert!(body.contains("帮我搞定复杂重构") || body.contains("有效消息"));
-        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(names.contains(&"load_skill".to_string()), "缺 load_skill");
     }
 
     fn fresh_tmp(tag: &str) -> PathBuf {

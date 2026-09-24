@@ -3443,7 +3443,6 @@ function renderSettingsMenu(
       <input type="checkbox" id="blur-collapse" ${blurCollapse ? "checked" : ""} />
       面板失焦自动收起（点别处就缩回球，不挡屏幕）
     </label>
-    <div class="set-hint">分发 WB：对 agent 说「交给 WB / 分发给 WorkBuddy」（技能 dispatch-workbuddy），或收起后右键悬浮球。交接文件在 agent-data/dispatch/workbuddy/。</div>
     <div class="set-hint" id="exe-path">程序路径读取中…</div>
     <div class="set-actions" style="margin-top:10px">
       <button class="set-btn del" id="btn-quit">⏻ 退出 float-agent</button>
@@ -3479,9 +3478,6 @@ function bindSettingsMenu(root: HTMLElement): void {
       pushEntry("error", `设置失焦收起失败：${e}`);
     }
   });
-
-  // --- 分发走 skill：设置页不再配置路径；球菜单/agent 调 dispatch_task ---
-  // drop 目录仅 settings.json 高级字段，主 UI 不暴露。
 
   void invoke<string>("exe_path")
     .then((p) => {
@@ -5362,7 +5358,7 @@ async function send(): Promise<void> {
       }
       pushEntry(
         "system",
-        "若本轮超出能力，可对我说「交给 WB / 分发给 WorkBuddy」（技能 dispatch-workbuddy），会总结有效消息+附图写交接并打开；第一轮由你手动交给 WB。收起球后右键也有「分发 WB」。",
+        "若本轮超出能力，建议把问题拆小或补充上下文后重试。",
       );
     }
   } finally {
@@ -5590,7 +5586,6 @@ function renderMenu(): void {
       <button data-act="settings"><span>⚙</span>设置 / 模型</button>
       <button data-act="mem"><span>🧠</span>记忆</button>
       <button data-act="chat"><span>💬</span>对话</button>
-      <button data-act="dispatch"><span>↗</span>分发 WB</button>
       <button data-act="quit" class="danger"><span>⏻</span>退出</button>
     </div>
   `;
@@ -5604,41 +5599,6 @@ function renderMenu(): void {
       // 否则用户只能去任务管理器杀进程
       if (act === "quit") {
         await invoke("app_quit").catch(() => {});
-        return;
-      }
-
-      if (act === "dispatch") {
-        try {
-          const meta = await invoke<{
-            path: string;
-            images?: string[];
-            messageCount?: number;
-          }>("dispatch_create", {
-            title: null,
-            summary: null,
-            reason: "用户在悬浮窗菜单选择分发给 WorkBuddy（第一轮人工投递）",
-            context: "",
-            open: true,
-          });
-          view = "chat";
-          await applyMode("panel");
-          renderBody();
-          const imgs = meta.images?.length ?? 0;
-          pushEntry(
-            "system",
-            `已总结会话有效消息（${meta.messageCount ?? 0} 条，图片 ${imgs} 张）并写好 WB 交接，已尝试打开：\n${meta.path}\n第一轮请手动把文件内容/图片交给 WorkBuddy；自动化投递属第二轮。`,
-          );
-          const bd = document.getElementById("panel-body");
-          if (bd) {
-            paintMessages(bd);
-            bd.scrollTop = bd.scrollHeight;
-          }
-        } catch (err) {
-          view = "chat";
-          await applyMode("panel");
-          renderBody();
-          pushEntry("error", `分发失败：${err}`);
-        }
         return;
       }
 

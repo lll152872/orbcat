@@ -538,11 +538,6 @@ pub struct AgentSettings {
     /// 面板失去焦点时自动收起为悬浮球（防止一直挡屏幕）。
     /// 默认开 —— 悬浮球的本分是「用时展开、完事让路」。
     pub blur_collapse: bool,
-    /// 可选：WorkBuddy 交接文件的额外落盘目录（如 `~/.workbuddy/plans`）。
-    /// 空/未配置 = 只写 `agent-data/dispatch/workbuddy/`。
-    /// 非空时写入仍须过文件权限网关（Full），失败不阻断主交接。
-    #[serde(default)]
-    pub dispatch_wb_drop_dir: Option<String>,
     /// 快答模式：不发工具列表，system prompt 只带人格段（见
     /// `agent::build_quick_system_prompt`）。托盘菜单手动切换 —— 不做自动
     /// 启发式，误判（该带工具没带）比省那点 token 严重得多。
@@ -559,7 +554,6 @@ impl Default for AgentSettings {
             selected_model: None,
             last_session: None,
             blur_collapse: true,
-            dispatch_wb_drop_dir: None,
             quick_mode: false,
             active_project_id: None,
         }

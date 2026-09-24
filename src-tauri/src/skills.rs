@@ -598,7 +598,7 @@ mod tests {
         // 真实的写法：一个引号里用「 / 」并列多个例子
         seed(
             &d,
-            "dispatch-workbuddy",
+            "dispatch-demo",
             "分发时用。触发：用户说「发给 WB / 分发给 WorkBuddy / 交给 WB」「解决不了就给 WB」。",
         );
         // 只说其中一个例子 → 也要命中
@@ -637,11 +637,6 @@ mod tests {
             ("看看 token 用量", "dual-token-dashboard"),
             ("算一下花了多少 token", "dual-token-dashboard"),
             ("打开 token 看板", "dual-token-dashboard"),
-            // dispatch-workbuddy：多种说法都要中
-            ("这个太复杂了，交给 WB 吧", "dispatch-workbuddy"),
-            ("甩给 WB 算了", "dispatch-workbuddy"),
-            ("让 WorkBuddy 做吧", "dispatch-workbuddy"),
-            ("升级到 WorkBuddy", "dispatch-workbuddy"),
         ];
         for (msg, expect) in cases {
             let out = autoload(&dir, msg);

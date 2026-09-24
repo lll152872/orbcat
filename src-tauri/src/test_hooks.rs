@@ -38,10 +38,6 @@ fn system_prompt_includes_approved_memory_marker() {
         p.contains("做完后提议记忆"),
         "system prompt 应含「做完后提议记忆」规则"
     );
-    assert!(
-        p.contains("dispatch-workbuddy"),
-        "system prompt 应指向 dispatch-workbuddy 技能"
-    );
     // 批准记忆排在 RULES 之后
     let r = p.find("RULES_MARK_E2E").unwrap();
     let m = p.find("MEM_MARK_E2E").unwrap();
