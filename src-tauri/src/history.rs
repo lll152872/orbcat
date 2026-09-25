@@ -578,7 +578,7 @@ pub async fn compact(
     sessions::save(data_dir, &s)?;
 
     eprintln!(
-        "[float-agent] compact 完成：摘要 {} 条消息 → {} 字，保留原文 {} 条",
+        "[orbcat] compact 完成：摘要 {} 条消息 → {} 字，保留原文 {} 条",
         split, summary_chars, keep_recent
     );
     Ok(CompactOutcome {
@@ -792,7 +792,7 @@ mod tests {
 
     #[test]
     fn search_finds_keyword_in_current_session() {
-        let d = std::env::temp_dir().join("float_agent_history_search");
+        let d = std::env::temp_dir().join("orbcat_history_search");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
 
@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn build_history_returns_usable_chat_messages() {
-        let d = std::env::temp_dir().join("float_agent_history_build");
+        let d = std::env::temp_dir().join("orbcat_history_build");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
 
@@ -917,7 +917,7 @@ mod tests {
     /// 摘要生效：`summary_upto` 之前的消息不再逐条回灌，且摘要插在最前面
     #[test]
     fn summary_replaces_covered_messages() {
-        let d = std::env::temp_dir().join("float_agent_history_summary");
+        let d = std::env::temp_dir().join("orbcat_history_summary");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
 
@@ -952,7 +952,7 @@ mod tests {
     /// 截断落进摘要区 → 摘要必须失效（否则回灌一段对不上的上下文）
     #[test]
     fn truncate_inside_summary_invalidates_it() {
-        let d = std::env::temp_dir().join("float_agent_trunc_summary");
+        let d = std::env::temp_dir().join("orbcat_trunc_summary");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
 
@@ -976,7 +976,7 @@ mod tests {
     /// 截断发生在摘要区**之后** → 摘要仍然有效
     #[test]
     fn truncate_after_summary_keeps_it() {
-        let d = std::env::temp_dir().join("float_agent_trunc_keep");
+        let d = std::env::temp_dir().join("orbcat_trunc_keep");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
 

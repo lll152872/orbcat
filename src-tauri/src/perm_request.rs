@@ -479,14 +479,14 @@ impl PermHub {
         let grants = match self.cmd_grants.lock() {
             Ok(s) => s.grants().to_vec(),
             Err(e) => {
-                eprintln!("[float-agent] ⚠️ 命令授权表锁失败，本次未落盘: {e}");
+                eprintln!("[orbcat] ⚠️ 命令授权表锁失败，本次未落盘: {e}");
                 return;
             }
         };
         if let Err(e) = command_policy::save_grants(dir, &grants) {
             // 落盘失败**不回滚**已生效的内存授权：用户已经批了，让这次操作继续，
             // 只是"重启后失效"。把错误记下来即可。
-            eprintln!("[float-agent] ⚠️ 命令授权落盘失败（重启后会失效）: {e}");
+            eprintln!("[orbcat] ⚠️ 命令授权落盘失败（重启后会失效）: {e}");
         }
     }
 
@@ -870,7 +870,7 @@ impl PermHub {
         match self.cmd_grants.lock() {
             Ok(mut store) => store.add(grant.clone()),
             Err(e) => {
-                eprintln!("[float-agent] ⚠️ 命令授权表锁失败，本次批准未生效: {e}");
+                eprintln!("[orbcat] ⚠️ 命令授权表锁失败，本次批准未生效: {e}");
                 return None;
             }
         }
@@ -912,7 +912,7 @@ impl PermHub {
                 Some(prefix)
             }
             Err(e) => {
-                eprintln!("[float-agent] ⚠️ 授权表锁失败，本次批准未生效: {e}");
+                eprintln!("[orbcat] ⚠️ 授权表锁失败，本次批准未生效: {e}");
                 None
             }
         }
@@ -961,7 +961,7 @@ impl PermHub {
     fn emit_request(&self, view: &PendingView) {
         match serde_json::to_value(view) {
             Ok(v) => self.emit("perm-request", v),
-            Err(e) => eprintln!("[float-agent] ⚠️ 序列化权限申请失败: {e}"),
+            Err(e) => eprintln!("[orbcat] ⚠️ 序列化权限申请失败: {e}"),
         }
     }
 

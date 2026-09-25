@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""双数据源 Token 用量驾驶舱构建脚本（WorkBuddy + float-agent 小 agent）
+"""双数据源 Token 用量驾驶舱构建脚本（WorkBuddy + orbcat 小 agent）
 
 渲染层为自研「驾驶舱」前端（panel/index.html + panel.css + panel.js），
 本脚本只负责：扫日志 → 归一化 → 组装单文件 HTML + AI 可读 summary。
 
   · WorkBuddy  —— 扫 ~/.workbuddy/projects/**/*.jsonl 的 providerData.rawUsage/usage
-  · 小 agent   —— 扫 float-agent/agent-data/sessions/*.json 的 messages[].usage
+  · 小 agent   —— 扫 orbcat/agent-data/sessions/*.json 的 messages[].usage
 
 跨平台：Windows / macOS / Linux 通用，仅依赖 Python 标准库（3.8+）。
 
@@ -27,7 +27,7 @@ _ap = argparse.ArgumentParser(description="双数据源 Token 用量驾驶舱生
 _ap.add_argument("--projects", default=os.path.join(os.path.expanduser("~"), ".workbuddy", "projects"),
                  help="WorkBuddy 会话日志目录（默认 ~/.workbuddy/projects）")
 _ap.add_argument("--agent-data", default=None,
-                 help="float-agent 数据目录（默认自动探测 float-agent/agent-data）")
+                 help="orbcat 数据目录（默认自动探测 orbcat/agent-data）")
 _ap.add_argument("--out", default="dual-token-dashboard.html", help="输出 HTML 路径")
 _ap.add_argument("--summary-out", default=None,
                  help="AI 可读摘要 JSON 路径（默认与 --out 同目录 dual-token-dashboard.summary.json）")
@@ -51,10 +51,10 @@ def _find_agent_data(explicit):
     cwd = os.getcwd()
     for base in (root, cwd, os.path.join(cwd, "..")):
         cands += [
-            os.path.join(base, "float-agent", "agent-data"),
+            os.path.join(base, "orbcat", "agent-data"),
             os.path.join(base, "agent-data"),
         ]
-    cands.append(os.path.join(os.path.expanduser("~"), "float-agent", "agent-data"))
+    cands.append(os.path.join(os.path.expanduser("~"), "orbcat", "agent-data"))
     for c in cands:
         if c and os.path.isdir(os.path.join(c, "sessions")):
             return c
@@ -256,8 +256,8 @@ def _find_panel_dir():
         os.path.join(here, '..', 'panel'),
         os.path.join(here, 'panel'),
         os.path.join(os.getcwd(), 'panel'),
-        os.path.join(os.getcwd(), 'float-agent', 'tools', 'dual-token-dashboard', 'panel'),
-        os.path.join(here, '..', '..', '..', 'float-agent', 'tools', 'dual-token-dashboard', 'panel'),
+        os.path.join(os.getcwd(), 'orbcat', 'tools', 'dual-token-dashboard', 'panel'),
+        os.path.join(here, '..', '..', '..', 'orbcat', 'tools', 'dual-token-dashboard', 'panel'),
     ]
     for c in cands:
         c = os.path.abspath(c)

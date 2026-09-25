@@ -1,4 +1,4 @@
-//! float-agent — Tauri 后端入口
+//! orbcat — Tauri 后端入口
 
 mod agent;
 /// 测试钩子 / 集成用例（不进产品路径）
@@ -53,6 +53,17 @@ const MARGIN_LOGICAL: f64 = 24.0;
 /// 胶囊在屏幕高度的这个比例处
 const ORB_Y_RATIO: f64 = 0.40;
 
+/// 胶囊态窗口相对球体的额外留白（逻辑像素，每边）。
+///
+/// ⚠️ 作用：球外面还有三个「出球」的视觉效果 ——
+///   `.orb::after` 呼吸光环（`inset: -6px`，即球外 6px）
+///   `.orb:hover` 的 4px 高亮环
+///   呼吸动画 `transform: scale(1.035)`（球本体会放大）
+/// 窗口若紧贴球（= 球径 56），这些效果**全部伸出窗口矩形被 DWM 硬裁**，
+/// 表现为球四周出现一圈直角方框 —— 用户报的「外面的黑框」就是这么来的。
+/// 给窗口每边留 10px，三个效果（最多 ~6.7px）都落在窗内，硬裁消失。
+const ORB_PAD_LOGICAL: f64 = 10.0;
+
 // ---------------------------------------------------------------------------
 // 应用状态
 // ---------------------------------------------------------------------------
@@ -90,7 +101,7 @@ fn reload_grants_for_session(state: &AppState, id: &str) {
     let loaded = sessions::load_grants(&state.data_dir, id);
     match state.perm.grants().lock() {
         Ok(mut store) => store.replace(loaded),
-        Err(e) => eprintln!("[float-agent] ⚠️ 切换会话时重装授权失败: {e}"),
+        Err(e) => eprintln!("[orbcat] ⚠️ 切换会话时重装授权失败: {e}"),
     }
     // 上个会话的"最近一次拒绝"不能继续用来解释本会话的申请；
     // 「防骚扰」的被拒记录同理 —— 上个任务拒过的东西，不该管到这个任务。
@@ -127,7 +138,7 @@ impl AppState {
         gate.replace_rules(&f.rules);
         drop(gate);
         *self.perm_mtime.lock().unwrap() = Some(mtime);
-        eprintln!("[float-agent] 权限规则已从文件热加载（{} 条）", f.rules.len());
+        eprintln!("[orbcat] 权限规则已从文件热加载（{} 条）", f.rules.len());
     }
 }
 
@@ -138,7 +149,7 @@ impl AppState {
 /// 解析 agent-data 目录。
 ///
 /// 优先级：
-///   1. 环境变量 `FLOAT_AGENT_DATA_DIR`
+///   1. 环境变量 `ORBCAT_DATA_DIR`
 ///   2. 源码树里的 `<项目根>/agent-data`（开发期）
 ///   3. 系统应用数据目录（发布版）
 ///
@@ -146,15 +157,15 @@ impl AppState {
 /// 已在 `.gitignore` 里排除 —— 仓库里只保留 `初始化.md`，
 /// 新克隆的用户让 agent 读它即可自建整套结构。
 fn resolve_data_dir(app: &tauri::AppHandle) -> PathBuf {
-    if let Ok(p) = std::env::var("FLOAT_AGENT_DATA_DIR") {
+    if let Ok(p) = std::env::var("ORBCAT_DATA_DIR") {
         let p = PathBuf::from(p);
         if p.exists() {
             return p;
         }
     }
 
-    // 开发期：CARGO_MANIFEST_DIR = <项目根>/float-agent/src-tauri
-    // 往上**一级**即 float-agent/，故 agent-data 与 src-tauri 平级。
+    // 开发期：CARGO_MANIFEST_DIR = <项目根>/orbcat/src-tauri
+    // 往上**一级**即 orbcat/，故 agent-data 与 src-tauri 平级。
     // ⚠️ 这是编译期常量 —— 改动后必须重新构建，否则跑的还是旧路径。
     let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-data");
     if dev.exists() {
@@ -210,7 +221,19 @@ fn compute_bounds(
             let my_menu = orb_y;
             (mx_menu, my_menu, mw_menu, mh_menu)
         }
-        _ => (orb_x, orb_y, orb_px, orb_px),
+        // 胶囊态：窗口比球**大一圈**（每边 ORB_PAD_LOGICAL）。
+        //   orb_x / orb_y 仍按球径算 —— 球的右边缘与纵向位置完全不变，
+        //   只是窗口往左上各扩 pad，让球外光环/悬停环/呼吸放大有落脚处（见常量注释）。
+        //   球自身仍是 ORB_LOGICAL，在 #app 里 flex 居中，不受窗口变大影响。
+        _ => {
+            let pad = (ORB_PAD_LOGICAL * scale).round() as i32;
+            (
+                orb_x - pad,
+                orb_y - pad,
+                orb_px + pad * 2,
+                orb_px + pad * 2,
+            )
+        }
     }
 }
 
@@ -218,10 +241,10 @@ fn compute_bounds(
 #[cfg(windows)]
 fn apply_mode(win: &tauri::WebviewWindow, mode: &str) -> Result<(), String> {
     // ---- 诊断开关 ----
-    // 设了 FLOAT_AGENT_NO_WINDOW_MODE 就跳过所有窗口形态调整，
+    // 设了 ORBCAT_NO_WINDOW_MODE 就跳过所有窗口形态调整，
     // 用来把它与"渲染问题"隔离开做二分排查。
-    if std::env::var("FLOAT_AGENT_NO_WINDOW_MODE").is_ok() {
-        eprintln!("[float-agent] apply_mode 已被诊断开关跳过: {mode}");
+    if std::env::var("ORBCAT_NO_WINDOW_MODE").is_ok() {
+        eprintln!("[orbcat] apply_mode 已被诊断开关跳过: {mode}");
         return Ok(());
     }
 
@@ -339,7 +362,7 @@ fn perm_set_rules(state: State<'_, AppState>, rules: Vec<permission::Rule>) -> R
     drop(gate);
     stamp_perm_mtime(&state);
     eprintln!(
-        "[float-agent] 权限规则已更新并保存（{} 条 → {}）",
+        "[orbcat] 权限规则已更新并保存（{} 条 → {}）",
         rules.len(),
         path.display()
     );
@@ -541,7 +564,7 @@ fn set_selected_model(state: State<'_, AppState>, id: String) -> Result<(), Stri
 async fn test_model(state: State<'_, AppState>, id: String) -> Result<String, String> {
     let cfg = config::find_model(&state.data_dir, &id)?;
     eprintln!(
-        "[float-agent] 测试模型 {} @ {}（key {}）",
+        "[orbcat] 测试模型 {} @ {}（key {}）",
         cfg.id,
         cfg.url,
         cfg.redacted_key()
@@ -641,7 +664,7 @@ fn models_add(
     };
 
     config::add_model(&state.data_dir, m)?;
-    eprintln!("[float-agent] 已保存模型（显示名={display}）");
+    eprintln!("[orbcat] 已保存模型（显示名={display}）");
     Ok(display)
 }
 
@@ -715,7 +738,7 @@ fn models_edit(
     }
 
     eprintln!(
-        "[float-agent] 已编辑模型（显示名 {}{}）",
+        "[orbcat] 已编辑模型（显示名 {}{}）",
         key,
         rename_to
             .as_ref()
@@ -752,7 +775,7 @@ async fn models_fetch_remote(
         _ => Vec::new(),
     };
     // Key 可空：Ollama / 本地网关不需要鉴权（预设下 Key 输入框必须可写，前端负责）
-    eprintln!("[float-agent] 拉取模型列表 @ {}", config::models_endpoint_from_base(&url));
+    eprintln!("[orbcat] 拉取模型列表 @ {}", config::models_endpoint_from_base(&url));
     llm::fetch_models_list(&url, &api_key, &hs).await
 }
 
@@ -764,7 +787,7 @@ async fn models_fetch_remote_using(
 ) -> Result<Vec<llm::RemoteModelInfo>, String> {
     let cfg = config::find_model(&state.data_dir, id.trim())?;
     eprintln!(
-        "[float-agent] 用已配置模型 {} 拉取列表（key {}）",
+        "[orbcat] 用已配置模型 {} 拉取列表（key {}）",
         cfg.id,
         cfg.redacted_key()
     );
@@ -838,7 +861,7 @@ fn models_import_remote(
         &ctx,
     )?;
     eprintln!(
-        "[float-agent] 批量导入模型：新增 {}，跳过 {}（带上下文窗口 {} 个）",
+        "[orbcat] 批量导入模型：新增 {}，跳过 {}（带上下文窗口 {} 个）",
         added.len(),
         skipped.len(),
         ctx.len()
@@ -943,7 +966,7 @@ fn search_set(
 ) -> Result<search::SearchStatus, String> {
     let r = search::set_config(&state.data_dir, &provider, api_key.as_deref())?;
     eprintln!(
-        "[float-agent] 搜索配置: provider={} ready={} key={}",
+        "[orbcat] 搜索配置: provider={} ready={} key={}",
         r.provider,
         r.ready,
         if r.has_key { r.key_preview.as_str() } else { "(无)" }
@@ -992,7 +1015,7 @@ fn image_thumb(path: String, max_edge: Option<u32>) -> Result<String, String> {
         // 留痕：会话里引用的图片文件可能已被移动/删除（换了数据目录就会有这种历史路径）。
         // 前端会把这类图渲染成"图"占位，**只请求一次**；如果这里刷屏，
         // 说明前端的失败缓存又退化成"每次都重试"了。
-        eprintln!("[float-agent] 缩略图读不出来 {path}: {e}");
+        eprintln!("[orbcat] 缩略图读不出来 {path}: {e}");
     }
     r
 }
@@ -1022,14 +1045,14 @@ fn skills_list(state: State<'_, AppState>) -> Vec<serde_json::Value> {
 /// 结果就是**用户没有任何正常途径关掉它** —— 只能去任务管理器杀进程。
 #[tauri::command]
 fn app_quit(app: tauri::AppHandle) {
-    eprintln!("[float-agent] 用户要求退出");
+    eprintln!("[orbcat] 用户要求退出");
     app.exit(0);
 }
 
 #[cfg(windows)]
 mod autostart {
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-    const VALUE_NAME: &str = "float-agent";
+    const VALUE_NAME: &str = "orbcat";
 
     /// 当前可执行文件路径（包在引号里，防路径含空格）。
     ///
@@ -1044,7 +1067,7 @@ mod autostart {
         Ok(format!("\"{}\"", chosen.display()))
     }
 
-    /// `.../target/debug/float-agent.exe` → `.../target/release/float-agent.exe`（存在才返回）
+    /// `.../target/debug/orbcat.exe` → `.../target/release/orbcat.exe`（存在才返回）
     fn release_sibling(exe: &std::path::Path) -> Option<std::path::PathBuf> {
         let s = exe.to_string_lossy().replace("\\", "/");
         if !s.contains("/debug/") {
@@ -1079,7 +1102,7 @@ mod autostart {
             return; // release 还没构建，等构建后再说
         }
         if set(true).is_ok() {
-            eprintln!("[float-agent] 开机自启已改指向 release exe（无控制台黑框）");
+            eprintln!("[orbcat] 开机自启已改指向 release exe（无控制台黑框）");
         }
     }
 
@@ -1122,7 +1145,7 @@ fn autostart_set(enable: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
         autostart::set(enable)?;
-        eprintln!("[float-agent] 开机自启已{}", if enable { "开启" } else { "关闭" });
+        eprintln!("[orbcat] 开机自启已{}", if enable { "开启" } else { "关闭" });
         Ok(())
     }
     #[cfg(not(windows))]
@@ -1318,7 +1341,7 @@ async fn chat(
     // agent 与会话从此只认**文件路径**，是否转 base64 由模型能力决定。
     let imgs = images::save_all(&state.data_dir, &images.unwrap_or_default());
     eprintln!(
-        "[float-agent] chat: 模型={} 文字={} 字 图片={} 张",
+        "[orbcat] chat: 模型={} 文字={} 字 图片={} 张",
         cfg.id,
         input.chars().count(),
         imgs.len()
@@ -1341,7 +1364,7 @@ async fn chat(
     // 采集失败不影响对话，顶多少一段上下文。
     let fg = context::current();
     if let Some(f) = &fg {
-        eprintln!("[float-agent] 前台上下文: {}", f.summary());
+        eprintln!("[orbcat] 前台上下文: {}", f.summary());
     }
 
     // 进度回调用事件推给前端 —— 否则 agent loop 的 30-60 秒是黑盒
@@ -1378,7 +1401,7 @@ async fn chat(
     if let Ok(mut store) = state.perm.grants().lock() {
         let n = store.clear_tier(GrantTier::Turn);
         if n > 0 {
-            eprintln!("[float-agent] 一轮结束，清掉 {n} 条「本轮」授权");
+            eprintln!("[orbcat] 一轮结束，清掉 {n} 条「本轮」授权");
         }
     }
     // ⚠️ 命令授权**不参与**这里：永久档跨会话存活，靠设置页「撤销」才失效。
@@ -1401,7 +1424,7 @@ async fn chat(
             let agent::RunAbort { message, mut run } = ab;
             run.pending_steers = leftover.into_iter().map(|m| m.text).collect();
             eprintln!(
-                "[float-agent] 本轮失败（{}），已落盘部分结果：{} 条步骤 / {} 字正文",
+                "[orbcat] 本轮失败（{}），已落盘部分结果：{} 条步骤 / {} 字正文",
                 message.chars().take(60).collect::<String>(),
                 run.steps.len(),
                 run.answer.chars().count()
@@ -1417,7 +1440,7 @@ async fn chat(
     // 只能靠猜是模型不支持还是解析漏了。
     if run.reasoning.is_none() {
         eprintln!(
-            "[float-agent] 本轮未收到思维链（模型 {} 可能不支持思考，或字段名未覆盖）",
+            "[orbcat] 本轮未收到思维链（模型 {} 可能不支持思考，或字段名未覆盖）",
             cfg.id
         );
     }
@@ -1426,7 +1449,7 @@ async fn chat(
     run.pending_steers = leftover.into_iter().map(|m| m.text).collect();
     if !run.pending_steers.is_empty() {
         eprintln!(
-            "[float-agent] {} 条插话未送达，已回填输入框",
+            "[orbcat] {} 条插话未送达，已回填输入框",
             run.pending_steers.len()
         );
     }
@@ -1464,7 +1487,7 @@ fn persist_run(
             &sessions::strip_step_folds(&run.answer),
             run.steps.iter().filter(|s| s.kind == "tool_call").count(),
         ) {
-            eprintln!("[float-agent] 写日记失败: {e}");
+            eprintln!("[orbcat] 写日记失败: {e}");
         }
     }
     let steps = sessions::steps_from_agent(&run.steps);
@@ -1482,7 +1505,7 @@ fn persist_run(
             usage: run.usage,
         },
     ) {
-        eprintln!("[float-agent] 写会话失败: {e}");
+        eprintln!("[orbcat] 写会话失败: {e}");
     }
 }
 
@@ -1506,7 +1529,7 @@ fn chat_cancel(state: State<'_, AppState>) {
     state
         .perm
         .cancel_all("用户已停止本轮，此申请作废（不是对请求本身的拒绝）。");
-    eprintln!("[float-agent] 收到停止请求");
+    eprintln!("[orbcat] 收到停止请求");
 }
 
 /// **执行中插话**：把消息塞进收件箱，等当前轮（LLM 调用 + 工具）结束后
@@ -1589,7 +1612,7 @@ fn boot_state(state: State<'_, AppState>) -> serde_json::Value {
 fn bootstrap_data(state: State<'_, AppState>) -> Result<bootstrap::BootstrapReport, String> {
     let r = bootstrap::bootstrap_agent_data(&state.data_dir)?;
     eprintln!(
-        "[float-agent] 初始化完成: 建目录 {} 个 / 建文件 {} 个 / 跳过 {} 个",
+        "[orbcat] 初始化完成: 建目录 {} 个 / 建文件 {} 个 / 跳过 {} 个",
         r.created_dirs.len(),
         r.created_files.len(),
         r.skipped.len()
@@ -1608,7 +1631,7 @@ fn session_new(state: State<'_, AppState>) -> Result<sessions::Session, String> 
         return Err("对话进行中，先停止或等它结束再切换会话".into());
     }
     let s = sessions::new_session(&state.data_dir);
-    eprintln!("[float-agent] 新会话 {}", s.id);
+    eprintln!("[orbcat] 新会话 {}", s.id);
     // 新会话没有历史授权 —— 顺手清掉上一段残留的（尤其 `Once`/`Turn`）
     reload_grants_for_session(&state, &s.id);
     Ok(s)
@@ -1643,7 +1666,7 @@ fn session_fork(state: State<'_, AppState>, upto: usize) -> Result<sessions::Ses
     let s = sessions::fork(&state.data_dir, &cur, upto)?;
     reload_grants_for_session(&state, &s.id);
     eprintln!(
-        "[float-agent] 分叉 {} → {}（截至第 {upto} 条）",
+        "[orbcat] 分叉 {} → {}（截至第 {upto} 条）",
         cur.id, s.id
     );
     Ok(s)
@@ -1666,7 +1689,7 @@ fn session_truncate(state: State<'_, AppState>, upto: usize) -> Result<sessions:
     let cur = sessions::ensure_current(&state.data_dir);
     let s = sessions::truncate(&state.data_dir, &cur.id, upto)?;
     eprintln!(
-        "[float-agent] 删除消息：{} 从第 {} 条起截断，剩 {} 条",
+        "[orbcat] 删除消息：{} 从第 {} 条起截断，剩 {} 条",
         s.id,
         upto,
         s.messages.len()
@@ -1782,7 +1805,7 @@ fn perm_grant_revoke(
     if n > 0 {
         let sid = sessions::current_id(&state.data_dir).unwrap_or_default();
         if let Err(e) = state.perm.persist_task_grants(&state.data_dir, &sid) {
-            eprintln!("[float-agent] ⚠️ 撤销后同步授权文件失败: {e}");
+            eprintln!("[orbcat] ⚠️ 撤销后同步授权文件失败: {e}");
         }
     }
     Ok(n)
@@ -1979,25 +2002,25 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let icon = match app.default_window_icon() {
         Some(ic) => ic.clone(),
         None => {
-            eprintln!("[float-agent] 无默认窗口图标，跳过托盘");
+            eprintln!("[orbcat] 无默认窗口图标，跳过托盘");
             return Ok(());
         }
     };
 
-    let _tray = TrayIconBuilder::with_id("float-agent-tray")
+    let _tray = TrayIconBuilder::with_id("orbcat-tray")
         .icon(icon)
-        .tooltip("float-agent")
+        .tooltip("orbcat")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| {
             if event.id.as_ref() == "quit" {
-                eprintln!("[float-agent] 用户从托盘退出");
+                eprintln!("[orbcat] 用户从托盘退出");
                 app.exit(0);
             }
         })
         .build(app)?;
 
-    eprintln!("[float-agent] 托盘图标已注册（右键退出）");
+    eprintln!("[orbcat] 托盘图标已注册（右键退出）");
     Ok(())
 }
 
@@ -2017,7 +2040,7 @@ pub fn run() {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."));
 
-            eprintln!("[float-agent] agent-data 目录: {}", data_dir.display());
+            eprintln!("[orbcat] agent-data 目录: {}", data_dir.display());
 
             // 开机自启校准：若之前的自启项指向 debug exe，release 已存在则改指 release
             #[cfg(windows)]
@@ -2029,7 +2052,7 @@ pub fn run() {
             let gate = permission::load_gate(&data_dir, &app_dir);
             for r in gate.rules() {
                 eprintln!(
-                    "[float-agent] 权限规则: {} => {:?} ({})",
+                    "[orbcat] 权限规则: {} => {:?} ({})",
                     r.prefix.display(),
                     r.access,
                     r.label
@@ -2038,7 +2061,7 @@ pub fn run() {
 
             // 模型配置来源（便于排查）
             eprintln!(
-                "[float-agent] 模型配置: {}",
+                "[orbcat] 模型配置: {}",
                 config::models_json_path(&data_dir).display()
             );
 
@@ -2046,11 +2069,11 @@ pub fn run() {
             // 拉取在后台进行：server 没起来也不能拖慢应用启动。
             let servers = config::resolve_mcp_servers(&data_dir);
             let registry = if servers.is_empty() {
-                eprintln!("[float-agent] MCP 未配置（设置页可添加多个 server）");
+                eprintln!("[orbcat] MCP 未配置（设置页可添加多个 server）");
                 mcp::ToolRegistry::new("")
             } else {
                 eprintln!(
-                    "[float-agent] MCP servers: {}（后台拉取工具清单中…）",
+                    "[orbcat] MCP servers: {}（后台拉取工具清单中…）",
                     servers.len()
                 );
                 mcp::ToolRegistry::with_servers(&servers)
@@ -2077,7 +2100,7 @@ pub fn run() {
                 let handle = app.handle().clone();
                 perm.attach_emitter(Box::new(move |event, payload| {
                     if let Err(e) = handle.emit(event, payload) {
-                        eprintln!("[float-agent] ⚠️ 推送 {event} 事件失败: {e}");
+                        eprintln!("[orbcat] ⚠️ 推送 {event} 事件失败: {e}");
                     }
                 }));
             }
@@ -2092,10 +2115,10 @@ pub fn run() {
                     Ok(mut store) => {
                         let n = lasting_cmds.len();
                         store.replace(lasting_cmds);
-                        eprintln!("[float-agent] 已载入 {n} 条永久命令授权");
+                        eprintln!("[orbcat] 已载入 {n} 条永久命令授权");
                     }
                     Err(e) => {
-                        eprintln!("[float-agent] ⚠️ 命令授权表锁失败，永久授权未载入: {e}")
+                        eprintln!("[orbcat] ⚠️ 命令授权表锁失败，永久授权未载入: {e}")
                     }
                 }
             }
@@ -2114,7 +2137,7 @@ pub fn run() {
             #[cfg(windows)]
             if let Some(win) = app.get_webview_window("orb") {
                 if let Err(e) = apply_mode(&win, "orb") {
-                    eprintln!("[float-agent] 初始化窗口形态失败: {e}");
+                    eprintln!("[orbcat] 初始化窗口形态失败: {e}");
                 }
             }
 
@@ -2122,7 +2145,7 @@ pub fn run() {
             // skipTaskbar + TOOLWINDOW 会让应用在任务栏/「应用」列表里隐身，
             // 托盘是用户能正常关掉它的入口。打开面板仍靠悬浮球。
             if let Err(e) = setup_tray(app) {
-                eprintln!("[float-agent] 托盘初始化失败: {e}");
+                eprintln!("[orbcat] 托盘初始化失败: {e}");
             }
 
             Ok(())

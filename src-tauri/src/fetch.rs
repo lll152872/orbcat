@@ -39,7 +39,7 @@ pub async fn fetch_and_extract(url: &str, max_chars: usize) -> Result<String, St
 
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
-        .user_agent("float-agent/0.1 (+local desktop assistant)")
+        .user_agent("orbcat/0.1 (+local desktop assistant)")
         .build()
         .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
 

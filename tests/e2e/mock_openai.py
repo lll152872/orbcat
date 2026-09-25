@@ -5,7 +5,7 @@
   python tests/e2e/mock_openai.py          # 默认 127.0.0.1:8787
   python tests/e2e/mock_openai.py 8787
 
-在 float-agent 设置里加一个模型：
+在 orbcat 设置里加一个模型：
   id:   mock-local
   url:  http://127.0.0.1:8787/v1
   key:  mock-key
@@ -75,7 +75,7 @@ def pick_tool_call(tools: list, last_user: str) -> tuple[str | None, dict]:
         return "run_command", {"command": cmd}
     if re.search(r"USE_TOOL|调用工具|read_file", last_user, re.I):
         return "read_file", {
-            "path": r"D:\workplace\悬浮小agent\float-agent\README.md"
+            "path": r"D:\workplace\悬浮小agent\orbcat\README.md"
         }
     return None, {}
 
@@ -117,13 +117,13 @@ class Handler(BaseHTTPRequestHandler):
                         {
                             "id": "mock-local",
                             "object": "model",
-                            "owned_by": "float-agent-test",
+                            "owned_by": "orbcat-test",
                         }
                     ],
                 },
             )
             return
-        self._json(200, {"ok": True, "service": "float-agent-mock-openai"})
+        self._json(200, {"ok": True, "service": "orbcat-mock-openai"})
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0") or 0)

@@ -478,7 +478,7 @@ pub fn load_grants(data_dir: &Path, id: &str) -> Vec<permission::Grant> {
             // 坏文件按空表处理。方向是**保守的**：空表 = 回到纯规则判定 = 更严，
             // 不会因为文件损坏而多放行什么。
             eprintln!(
-                "[float-agent] ⚠️ {} 解析失败（{e}），本次按「无临时授权」处理",
+                "[orbcat] ⚠️ {} 解析失败（{e}），本次按「无临时授权」处理",
                 path.display()
             );
             Vec::new()
@@ -1146,7 +1146,7 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("float_agent_sess_{tag}"));
+        let p = std::env::temp_dir().join(format!("orbcat_sess_{tag}"));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p

@@ -77,12 +77,12 @@ function defaultState(): MockState {
   };
 }
 
-const g = globalThis as typeof globalThis & { __floatAgentMock?: MockBag };
-if (!g.__floatAgentMock) {
-  g.__floatAgentMock = { state: defaultState(), calls: [], listeners: [] };
+const g = globalThis as typeof globalThis & { __orbcatMock?: MockBag };
+if (!g.__orbcatMock) {
+  g.__orbcatMock = { state: defaultState(), calls: [], listeners: [] };
 }
 
-export const bag = g.__floatAgentMock;
+export const bag = g.__orbcatMock;
 export const state = bag.state;
 export const calls = bag.calls;
 
@@ -163,7 +163,7 @@ const emptyOk: Record<string, unknown> = {
   perm_cmd_policy_set: null,
   image_thumb: "",
   capture_screen: "data:image/jpeg;base64,xxxx",
-  exe_path: "C:\\mock\\float-agent.exe",
+  exe_path: "C:\\mock\\orbcat.exe",
   exe_cmd: "",
   autostart_status: false,
   foreground_context: null,

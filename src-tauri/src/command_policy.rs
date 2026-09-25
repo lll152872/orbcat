@@ -643,16 +643,16 @@ pub fn load_policy(data_dir: &Path) -> CommandPolicy {
             Ok(txt) => match serde_json::from_str::<CommandPolicy>(&txt) {
                 Ok(p) => return p,
                 Err(e) => eprintln!(
-                    "[float-agent] ⚠️ {} 解析失败（{e}），改用默认命令策略（文件未改动）",
+                    "[orbcat] ⚠️ {} 解析失败（{e}），改用默认命令策略（文件未改动）",
                     path.display()
                 ),
             },
-            Err(e) => eprintln!("[float-agent] ⚠️ 读 {} 失败（{e}），改用默认命令策略", path.display()),
+            Err(e) => eprintln!("[orbcat] ⚠️ 读 {} 失败（{e}），改用默认命令策略", path.display()),
         }
     }
     let p = CommandPolicy::default();
     if let Err(e) = save_policy(data_dir, &p) {
-        eprintln!("[float-agent] ⚠️ 写命令策略文件失败: {e}");
+        eprintln!("[orbcat] ⚠️ 写命令策略文件失败: {e}");
     }
     p
 }
@@ -1168,7 +1168,7 @@ pub fn load_grants(data_dir: &Path) -> Vec<CmdGrant> {
             // 坏文件按空表处理。方向是**保守的**：空表 = 回到"每条都问" = 更严，
             // 不会因为文件损坏而多放行一条命令。
             eprintln!(
-                "[float-agent] ⚠️ {} 解析失败（{e}），本次按「无命令授权」处理",
+                "[orbcat] ⚠️ {} 解析失败（{e}），本次按「无命令授权」处理",
                 path.display()
             );
             Vec::new()
@@ -1562,7 +1562,7 @@ mod tests {
 
     #[test]
     fn cmd_grants_round_trip_keeps_only_lasting() {
-        let dir = grants_dir("float_agent_cmd_grants_roundtrip");
+        let dir = grants_dir("orbcat_cmd_grants_roundtrip");
 
         let mut store = CmdGrantStore::new();
         store.add(grant_lasting(
@@ -1594,7 +1594,7 @@ mod tests {
 
     #[test]
     fn cmd_grants_empty_table_removes_file() {
-        let dir = grants_dir("float_agent_cmd_grants_empty");
+        let dir = grants_dir("orbcat_cmd_grants_empty");
 
         let one = [grant_lasting(
             "git status",
@@ -1612,7 +1612,7 @@ mod tests {
 
     #[test]
     fn cmd_grants_bad_file_falls_back_to_empty() {
-        let dir = grants_dir("float_agent_cmd_grants_bad");
+        let dir = grants_dir("orbcat_cmd_grants_bad");
         std::fs::write(grants_path(&dir), "{ 这不是 json").unwrap();
         assert!(
             load_grants(&dir).is_empty(),
@@ -1624,7 +1624,7 @@ mod tests {
     fn cmd_grants_file_with_once_entry_is_dropped() {
         // 手工塞一条 Once 进文件（脏数据 / 手工编辑）—— 必须被丢弃，
         // 否则「仅这一次」会跨重启变成「永远」。
-        let dir = grants_dir("float_agent_cmd_grants_dirty");
+        let dir = grants_dir("orbcat_cmd_grants_dirty");
         let dirty = serde_json::json!({
             "grants": [{
                 "fingerprint": "git status",
@@ -1643,7 +1643,7 @@ mod tests {
 
     #[test]
     fn audit_chain_links() {
-        let dir = std::env::temp_dir().join("float_agent_audit_test");
+        let dir = std::env::temp_dir().join("orbcat_audit_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1683,7 +1683,7 @@ mod tests {
 
     #[test]
     fn policy_roundtrip() {
-        let dir = std::env::temp_dir().join("float_agent_cmdpol_test");
+        let dir = std::env::temp_dir().join("orbcat_cmdpol_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 

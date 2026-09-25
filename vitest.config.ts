@@ -2,7 +2,7 @@ import { defineConfig } from "vitest/config";
 import path from "node:path";
 
 /**
- * float-agent 测试配置
+ * orbcat 测试配置
  *
  * ui 层：happy-dom 里跑「点击悬浮球 → 面板 → 输入 → 发送」全流程
  * （invoke/listen 全部 mock，不依赖 Tauri 运行时与真实 API）

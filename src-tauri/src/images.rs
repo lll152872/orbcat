@@ -122,7 +122,7 @@ pub fn save_all(data_dir: &Path, items: &[String]) -> Vec<String> {
         .filter_map(|u| match save_data_url(data_dir, u) {
             Ok(p) => Some(p),
             Err(e) => {
-                eprintln!("[float-agent] 图片落盘失败（已跳过）: {e}");
+                eprintln!("[orbcat] 图片落盘失败（已跳过）: {e}");
                 None
             }
         })
@@ -195,7 +195,7 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("float_agent_img_{tag}"));
+        let p = std::env::temp_dir().join(format!("orbcat_img_{tag}"));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p

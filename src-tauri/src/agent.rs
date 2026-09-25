@@ -20,7 +20,7 @@ use crate::tools;
 
 /// 基础循环轮数上限（默认值；可被环境变量覆盖）
 ///
-/// 覆盖方式：`FLOAT_AGENT_MAX_ITERATIONS=100`。
+/// 覆盖方式：`ORBCAT_MAX_ITERATIONS=100`。
 /// 为什么做成可配：不同模型/任务对轮数需求差别很大（简单问答 3 轮够，
 /// 长链路重构可能几十轮），编译期写死一个数字必然有一边不合适。
 const DEFAULT_MAX_ITERATIONS: usize = 100;
@@ -30,7 +30,7 @@ const DEFAULT_MAX_ITERATIONS: usize = 100;
 /// 不做硬顶的话，"用户一直插话"会让基础轮数变成事实上的无上限 —— 既烧钱，
 /// 也真的可能转不出来。到了这里仍然按"任务过大/模型陷入循环"报错。
 ///
-/// 覆盖方式：`FLOAT_AGENT_HARD_ITERATIONS=250`。
+/// 覆盖方式：`ORBCAT_HARD_ITERATIONS=250`。
 const DEFAULT_HARD_ITERATIONS: usize = 250;
 
 /// 读一个正整数环境变量；缺失/非法/为 0 时回退默认值。
@@ -42,7 +42,7 @@ fn env_usize(name: &str, default: usize) -> usize {
         Ok(v) => match v.trim().parse::<usize>() {
             Ok(n) if n > 0 => n,
             _ => {
-                eprintln!("[float-agent] 环境变量 {name}={v:?} 非法（需正整数），回退默认 {default}");
+                eprintln!("[orbcat] 环境变量 {name}={v:?} 非法（需正整数），回退默认 {default}");
                 default
             }
         },
@@ -52,12 +52,12 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 /// 基础轮数上限（读环境变量，每次调用求值 —— 便于测试与运行时调整）
 pub fn max_iterations() -> usize {
-    env_usize("FLOAT_AGENT_MAX_ITERATIONS", DEFAULT_MAX_ITERATIONS)
+    env_usize("ORBCAT_MAX_ITERATIONS", DEFAULT_MAX_ITERATIONS)
 }
 
 /// 硬上限（读环境变量）
 pub fn hard_iterations() -> usize {
-    env_usize("FLOAT_AGENT_HARD_ITERATIONS", DEFAULT_HARD_ITERATIONS)
+    env_usize("ORBCAT_HARD_ITERATIONS", DEFAULT_HARD_ITERATIONS)
 }
 
 /// 每消费一批插话，给预算加多少轮
@@ -521,7 +521,7 @@ pub async fn run(
         let trigger = ((context_window as f64) * crate::history::COMPACT_TRIGGER_RATIO) as usize;
         if est > trigger {
             eprintln!(
-                "[float-agent] 历史估算 {est} tok 超过 compact 水位 {trigger}，触发自动压缩"
+                "[orbcat] 历史估算 {est} tok 超过 compact 水位 {trigger}，触发自动压缩"
             );
             match crate::history::compact(
                 cfg,
@@ -535,14 +535,14 @@ pub async fn run(
             {
                 Ok(o) => {
                     eprintln!(
-                        "[float-agent] 自动 compact 成功：压 {} 条 → {} 字，保留 {} 条",
+                        "[orbcat] 自动 compact 成功：压 {} 条 → {} 字，保留 {} 条",
                         o.summarized, o.summary_chars, o.kept
                     );
                     history = crate::history::build_history(data_dir, session_id, now_ms());
                 }
                 Err(e) => {
                     // 压缩失败不该挡住对话 —— 后面还有循环内的裁剪兜底
-                    eprintln!("[float-agent] 自动 compact 跳过（{e}），改用循环内裁剪兜底");
+                    eprintln!("[orbcat] 自动 compact 跳过（{e}），改用循环内裁剪兜底");
                 }
             }
         }
@@ -554,7 +554,7 @@ pub async fn run(
     messages.push(first_user);
 
     eprintln!(
-        "[float-agent] 上下文回灌: 历史 {history_len} 条 + 本轮输入 1 条（会话 {session_id}）"
+        "[orbcat] 上下文回灌: 历史 {history_len} 条 + 本轮输入 1 条（会话 {session_id}）"
     );
 
     let mut steps: Vec<AgentStep> = Vec::new();
@@ -593,7 +593,7 @@ pub async fn run(
     // 裁剪时至少保留最近这么多条工具结果原文（它们是模型当前最可能依赖的）
     const KEEP_RECENT_TOOL_RESULTS: usize = 4;
     eprintln!(
-        "[float-agent] 上下文预算: 窗口 {} tok（{}）× {:.0}% = {} tok{}",
+        "[orbcat] 上下文预算: 窗口 {} tok（{}）× {:.0}% = {} tok{}",
         context_window,
         if cfg.max_input_tokens.is_some() { "模型配置" } else { "兜底默认" },
         CONTEXT_SAFE_RATIO * 100.0,
@@ -632,7 +632,7 @@ pub async fn run(
                 id: m.id.clone(),
                 text: m.text.clone(),
             });
-            eprintln!("[float-agent] 插话已送达（第 {iter} 轮）: {}", m.text);
+            eprintln!("[orbcat] 插话已送达（第 {iter} 轮）: {}", m.text);
             steers.push(m);
             budget = (budget + STEER_BONUS).min(hard_iters);
         }
@@ -652,13 +652,13 @@ pub async fn run(
             let trimmed = trim_old_tool_results(&mut messages, KEEP_RECENT_TOOL_RESULTS);
             let after = estimate_messages_tokens(&messages);
             eprintln!(
-                "[float-agent] 上下文预算超限（第 {iter} 轮）：估算 {est} > 预算 {context_budget}，\
+                "[orbcat] 上下文预算超限（第 {iter} 轮）：估算 {est} > 预算 {context_budget}，\
                  裁掉 {trimmed} 条旧工具结果 → {after} tok"
             );
             if after > context_budget {
                 // 裁剪救不回来 → 降级返回部分结果（不硬发必然失败的请求）
                 eprintln!(
-                    "[float-agent] 裁剪后仍超预算（{after} > {context_budget}），降级返回部分结果"
+                    "[orbcat] 裁剪后仍超预算（{after} > {context_budget}），降级返回部分结果"
                 );
                 let mut r =
                     interrupted_run(steps, steers, reason_total, String::new(), iter, usage_total);
@@ -932,14 +932,14 @@ pub async fn run(
     // 走 `interrupted_run` 的好处：`interrupted=true` 让 lib.rs 跳过日记（半截问答
     // 不该写进流水账），但**会话 JSON 照样落盘**，用户能看到提问与已产出内容。
     eprintln!(
-        "[float-agent] 已连续调用工具 {iter} 轮仍未给出结论，降级返回部分结果（预算 {budget}，硬顶 {hard_iters}）"
+        "[orbcat] 已连续调用工具 {iter} 轮仍未给出结论，降级返回部分结果（预算 {budget}，硬顶 {hard_iters}）"
     );
     let mut r = interrupted_run(steps, steers, reason_total, String::new(), iter, usage_total);
     // 借用 stop_reason 说明是"轮数用尽"而非"用户停止"，前端据此显示不同提示
     r.stop_reason = Some(format!(
         "已达轮数上限（{iter} 轮），以下是已产出的部分结果。可能是任务过大或模型陷入循环。\
          你可以：① 直接说「继续」接着跑；② 先压缩上下文再说「继续」；③ 停止。\
-         也可调大 FLOAT_AGENT_MAX_ITERATIONS / FLOAT_AGENT_HARD_ITERATIONS"
+         也可调大 ORBCAT_MAX_ITERATIONS / ORBCAT_HARD_ITERATIONS"
     ));
     Ok(r)
 }
@@ -1006,7 +1006,7 @@ fn build_user_message(
             match crate::images::to_data_url(p) {
                 Ok(u) => urls.push(u),
                 Err(e) => {
-                    eprintln!("[float-agent] 图片内联失败: {e}");
+                    eprintln!("[orbcat] 图片内联失败: {e}");
                     failed.push(p.clone());
                 }
             }
@@ -1453,7 +1453,7 @@ mod tests {
 
     #[test]
     fn system_prompt_includes_rules_first() {
-        let tmp = std::env::temp_dir().join("float_agent_prompt_test");
+        let tmp = std::env::temp_dir().join("orbcat_prompt_test");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("memory")).unwrap();
         std::fs::write(tmp.join("RULES.md"), "RULE_MARKER_XYZ").unwrap();
@@ -1470,7 +1470,7 @@ mod tests {
 
     #[test]
     fn system_prompt_without_files_still_works() {
-        let tmp = std::env::temp_dir().join("float_agent_prompt_empty");
+        let tmp = std::env::temp_dir().join("orbcat_prompt_empty");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let p = build_system_prompt(&tmp);
@@ -1484,7 +1484,7 @@ mod tests {
     /// 所以「动态内容的位置」是成本正确性问题，不是代码风格问题。
     #[test]
     fn dynamic_content_must_trail_static_content() {
-        let tmp = std::env::temp_dir().join("float_agent_prompt_order");
+        let tmp = std::env::temp_dir().join("orbcat_prompt_order");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("memory")).unwrap();
         std::fs::write(tmp.join("RULES.md"), "RULES_BODY").unwrap();
@@ -1546,7 +1546,7 @@ mod tests {
     /// 注意 `current_dir()` 在进程内恒定，所以整个 prompt 两次应完全一致。
     #[test]
     fn system_prompt_is_byte_stable_across_calls() {
-        let tmp = std::env::temp_dir().join("float_agent_prompt_stable");
+        let tmp = std::env::temp_dir().join("orbcat_prompt_stable");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("memory")).unwrap();
         std::fs::write(tmp.join("RULES.md"), "R").unwrap();
@@ -1562,7 +1562,7 @@ mod tests {
     /// 且不得破坏"静态在前、动态在后"的前缀稳定性。
     #[test]
     fn system_prompt_autoloads_matched_skill() {
-        let tmp = std::env::temp_dir().join("float_agent_prompt_autoload");
+        let tmp = std::env::temp_dir().join("orbcat_prompt_autoload");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("memory")).unwrap();
         std::fs::write(tmp.join("RULES.md"), "RULES_BODY_UNIQUE").unwrap();

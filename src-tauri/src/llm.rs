@@ -398,7 +398,7 @@ pub async fn chat(
                     break;
                 }
                 eprintln!(
-                    "[float-agent] {reason} 临时故障，{:?} 后重试（第 {attempt}/{MAX_RETRIES} 次）",
+                    "[orbcat] {reason} 临时故障，{:?} 后重试（第 {attempt}/{MAX_RETRIES} 次）",
                     backoff
                 );
                 tokio::time::sleep(backoff).await;
@@ -850,7 +850,7 @@ pub async fn chat_stream(
                 }
                 let wait = format!("{:?}", backoff);
                 eprintln!(
-                    "[float-agent] {reason} 临时故障，{wait} 后重试（第 {attempt}/{MAX_RETRIES} 次）"
+                    "[orbcat] {reason} 临时故障，{wait} 后重试（第 {attempt}/{MAX_RETRIES} 次）"
                 );
                 // 静默退避是「一直思考、界面无动静」的主因之一 —— 必须告诉用户在等什么
                 // 这个**值得**进时间线：撞限流/断流时用户最想看"它在等什么、重试到第几次"

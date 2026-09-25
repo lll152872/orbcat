@@ -706,7 +706,7 @@ pub async fn execute(
             let group = get_str(args, "name")?;
             let mut reg = ctx.mcp.lock().await;
             let msg = reg.load(&group)?;
-            eprintln!("[float-agent] MCP 组已加载: {group}");
+            eprintln!("[orbcat] MCP 组已加载: {group}");
             Ok(ToolOutput::text(msg))
         }
         "unload_tool_group" => {
@@ -1893,7 +1893,7 @@ async fn request_access(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, S
         if let Err(e) = ctx.perm.persist_task_grants(ctx.data_dir, ctx.session_id) {
             // 不回滚已生效的内存授权：用户已经批了，让这次操作继续，
             // 代价只是"重启后失效"。记日志即可。
-            eprintln!("[float-agent] ⚠️ 授权落盘失败（本次仍有效，重启后失效）: {e}");
+            eprintln!("[orbcat] ⚠️ 授权落盘失败（本次仍有效，重启后失效）: {e}");
         }
     }
 
@@ -2135,7 +2135,7 @@ fn audit_cmd(
         exit_code,
     };
     if let Err(e) = command_policy::audit_append(ctx.data_dir, rec) {
-        eprintln!("[float-agent] ⚠️ 写命令审计失败: {e}");
+        eprintln!("[orbcat] ⚠️ 写命令审计失败: {e}");
     }
 }
 
@@ -2284,7 +2284,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_then_read_roundtrip() {
-        let tmp = std::env::temp_dir().join("float_agent_tool_test");
+        let tmp = std::env::temp_dir().join("orbcat_tool_test");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -2326,7 +2326,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_outside_allowed_is_denied() {
-        let tmp = std::env::temp_dir().join("float_agent_perm_test");
+        let tmp = std::env::temp_dir().join("orbcat_perm_test");
         let _ = std::fs::create_dir_all(&tmp);
         let gate = gate_for(&tmp);
         let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
@@ -2344,7 +2344,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_dir_marks_subdirs() {
-        let tmp = std::env::temp_dir().join("float_agent_list_test");
+        let tmp = std::env::temp_dir().join("orbcat_list_test");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("sub")).unwrap();
         std::fs::write(tmp.join("a.txt"), b"hi").unwrap();
@@ -2367,7 +2367,7 @@ mod tests {
 
     #[tokio::test]
     async fn calling_unloaded_mcp_tool_is_rejected() {
-        let tmp = std::env::temp_dir().join("float_agent_mcp_reject_test");
+        let tmp = std::env::temp_dir().join("orbcat_mcp_reject_test");
         let _ = std::fs::create_dir_all(&tmp);
         let gate = gate_for(&tmp);
         let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
@@ -2391,7 +2391,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_turns_finds_earlier_conversation() {
-        let tmp = std::env::temp_dir().join("float_agent_recall_test");
+        let tmp = std::env::temp_dir().join("orbcat_recall_test");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -2487,7 +2487,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let d = std::env::temp_dir().join(format!("float_agent_{tag}_{stamp}"));
+        let d = std::env::temp_dir().join(format!("orbcat_{tag}_{stamp}"));
         std::fs::create_dir_all(&d).unwrap();
         d
     }

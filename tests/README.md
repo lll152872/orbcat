@@ -1,4 +1,4 @@
-# float-agent 测试框架
+# orbcat 测试框架
 
 目标：**从点击悬浮球到发送消息**都能被自动化验证。
 
@@ -16,7 +16,7 @@
 ## 快速开始
 
 ```powershell
-cd D:\workplace\悬浮小agent\float-agent
+cd D:\workplace\悬浮小agent\orbcat
 npm install
 npm run test:ui          # 点击→发送黄金路径
 npm run test:rust        # 后端
@@ -60,5 +60,5 @@ python tests/e2e/run_live_flow.py          # 打印手测清单
 
 - 临时文件/日志 → 仓库根 `../tmp/`
 - UI 测试**不**读真实 `agent-data/`（mock 全内存）
-- 真机验收使用 `float-agent/agent-data/`，注意 API key 不进仓库
+- 真机验收使用 `orbcat/agent-data/`，注意 API key 不进仓库
 - 改前端后先 `npm run test:ui` 再 `npm run build`

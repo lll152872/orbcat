@@ -1,5 +1,5 @@
 /**
- * float-agent — 悬浮球前端
+ * orbcat — 悬浮球前端
  *
  * 双态：orb（56x56 悬浮球）↔ panel（对话面板）
  *
@@ -450,13 +450,13 @@ async function checkBoot(): Promise<void> {
     needsInit = st.needsInit;
     hasModels = st.hasModels;
     if (needsInit) {
-      console.warn("[float-agent] 数据目录不存在，需要初始化:", st.dataDir);
+      console.warn("[orbcat] 数据目录不存在，需要初始化:", st.dataDir);
     } else if (!hasModels) {
-      console.warn("[float-agent] 还没有配置任何模型");
+      console.warn("[orbcat] 还没有配置任何模型");
     }
   } catch (e) {
     // 自检失败不该挡住正常使用 —— 保守起见当作"不需要初始化"
-    console.error("[float-agent] 启动自检失败:", e);
+    console.error("[orbcat] 启动自检失败:", e);
   }
 }
 
@@ -467,7 +467,7 @@ async function loadSession(): Promise<void> {
     sessionList = st.list;
     entries = sessionToEntries(st.session);
   } catch (e) {
-    console.error("[float-agent] 读取会话失败:", e);
+    console.error("[orbcat] 读取会话失败:", e);
   }
 }
 
@@ -1402,11 +1402,11 @@ let pendingMem = 0;
 let pendingPermCount = 0;
 
 const ORB_TITLE: Record<OrbState, string> = {
-  idle: "float-agent — 点击展开",
-  thinking: "float-agent — 正在思考…",
-  pending: "float-agent — 有权限申请等你批",
-  mem: "float-agent — 有记忆等你审",
-  error: "float-agent — 出错了，点开看看",
+  idle: "orbcat — 点击展开",
+  thinking: "orbcat — 正在思考…",
+  pending: "orbcat — 有权限申请等你批",
+  mem: "orbcat — 有记忆等你审",
+  error: "orbcat — 出错了，点开看看",
 };
 
 function currentOrbState(): OrbState {
@@ -2740,7 +2740,7 @@ function renderPanel(): void {
   app.innerHTML = `
     <div class="panel">
       <div class="panel-header" id="panel-header">
-        <span class="panel-title">float-agent</span>
+        <span class="panel-title">orbcat</span>
         <button class="panel-btn" id="btn-gear" title="设置 / 模型">⚙</button>
         <button class="panel-btn" id="btn-close" title="收起">—</button>
       </div>
@@ -2884,7 +2884,7 @@ async function refreshFgCtx(loop = true): Promise<void> {
       [] as FgCtx[],
     );
     const items = (list || [])
-      .filter((c) => c && c.app && !c.app.toLowerCase().includes("float-agent"))
+      .filter((c) => c && c.app && !c.app.toLowerCase().includes("orbcat"))
       .slice(0, FG_SHOW_MAX);
 
     if (items.length === 0) {
@@ -3184,7 +3184,7 @@ function bindInitPrompt(root: HTMLElement): void {
       }>("bootstrap_data");
 
       console.log(
-        `[float-agent] 初始化完成：建目录 ${r.createdDirs.length} 个 / 建文件 ${r.createdFiles.length} 个 / 跳过 ${r.skipped.length} 个 → ${r.dataDir}`,
+        `[orbcat] 初始化完成：建目录 ${r.createdDirs.length} 个 / 建文件 ${r.createdFiles.length} 个 / 跳过 ${r.skipped.length} 个 → ${r.dataDir}`,
       );
 
       // 重新自检 —— needsInit 变 false 后空态自动切到「去加模型」那一屏，
@@ -3197,7 +3197,7 @@ function bindInitPrompt(root: HTMLElement): void {
       // 顺手把人带到模型页，省得他去找设置入口
       void switchView("models");
     } catch (e) {
-      console.error("[float-agent] 初始化失败:", e);
+      console.error("[orbcat] 初始化失败:", e);
       btn.disabled = false;
       btn.textContent = "重试";
       const hint = root.querySelector<HTMLElement>(".init-hint");
@@ -3445,7 +3445,7 @@ function renderSettingsMenu(
     </label>
     <div class="set-hint" id="exe-path">程序路径读取中…</div>
     <div class="set-actions" style="margin-top:10px">
-      <button class="set-btn del" id="btn-quit">⏻ 退出 float-agent</button>
+      <button class="set-btn del" id="btn-quit">⏻ 退出 orbcat</button>
     </div>
   `;
 }
@@ -5502,7 +5502,7 @@ async function reloadSessionKeepScroll(expect = 0): Promise<void> {
     const fresh = sessionToEntries(st.session);
     if (fresh.length < expect) {
       console.warn(
-        `[float-agent] 会话重载后发现磁盘更旧（${fresh.length} < ${expect}），保留内存内容`,
+        `[orbcat] 会话重载后发现磁盘更旧（${fresh.length} < ${expect}），保留内存内容`,
       );
       return;
     }
@@ -5516,7 +5516,7 @@ async function reloadSessionKeepScroll(expect = 0): Promise<void> {
       if (atBottom) bd.scrollTop = bd.scrollHeight;
     }
   } catch (e) {
-    console.warn(`[float-agent] 重载会话失败：${e}`);
+    console.warn(`[orbcat] 重载会话失败：${e}`);
   }
 }
 
@@ -5666,7 +5666,7 @@ function boot(): void {
 
   // 双保险：Rust 侧 setup 已经应用过一次，这里再确认一次
   void invoke("set_window_mode", { mode: "orb" }).catch((e) =>
-    console.error("[float-agent] 初始化形态失败:", e),
+    console.error("[orbcat] 初始化形态失败:", e),
   );
 
   installPasteHandler();

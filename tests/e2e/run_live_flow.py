@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""真机 E2E：启动 mock 模型 + 可选启动 float-agent，指导/校验「点击到发送」。
+"""真机 E2E：启动 mock 模型 + 可选启动 orbcat，指导/校验「点击到发送」。
 
 模式：
   1) prepare-only（默认，无需 GUI 自动化权限）
      - 检查 mock 端口
-     - 打印在 float-agent 里应如何配置模型与手测步骤
+     - 打印在 orbcat 里应如何配置模型与手测步骤
      - 校验 dist / release exe 是否就绪
 
   2) --probe-http
@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 PORT = 8787
 URL = f"http://127.0.0.1:{PORT}/v1/chat/completions"
-EXE = ROOT / "src-tauri" / "target" / "release" / "float-agent.exe"
+EXE = ROOT / "src-tauri" / "target" / "release" / "orbcat.exe"
 DIST = ROOT / "dist" / "index.html"
 
 
@@ -54,7 +54,7 @@ def probe_http() -> int:
 
 
 def prepare_only() -> int:
-    print("=== float-agent 真机 E2E 准备清单 ===\n")
+    print("=== orbcat 真机 E2E 准备清单 ===\n")
     print("1) 启动假模型：")
     print(f"     python tests/e2e/mock_openai.py {PORT}\n")
     print("2) 启动 agent（任选其一）：")
@@ -68,7 +68,7 @@ def prepare_only() -> int:
     else:
         print("     ⚠️ dist 不存在 —— 先 npm run build（Tauri 读 ../dist）\n")
 
-    print("3) 在 float-agent 设置 › 模型 中添加：")
+    print("3) 在 orbcat 设置 › 模型 中添加：")
     print("     id:  mock-local")
     print(f"     url: http://127.0.0.1:{PORT}/v1")
     print("     key: mock-key\n")

@@ -23,7 +23,7 @@ use std::sync::{Mutex, OnceLock};
 /// 后台轮询缓存的「最近几个非自身的前台应用」（新的在前，去重）。
 ///
 /// 为什么需要缓存：面板展开时**自己就是前台窗口**，chat 时现采只会采到
-/// float-agent 自己。所以起一个轮询线程，持续记录「不是自己的前台」，
+/// orbcat 自己。所以起一个轮询线程，持续记录「不是自己的前台」，
 /// 对话时取这份缓存 —— 那才是用户真正在用的应用。
 ///
 /// 为什么是列表而不是单值：用户往往在多个应用间来回切（VSCode 写码 →
@@ -48,7 +48,7 @@ pub fn spawn_watcher() {
         let round = std::panic::catch_unwind(current_excluding_self);
         let Ok(Some(ctx)) = round else {
             if round.is_err() {
-                eprintln!("[float-agent] 前台采样单轮 panic，已忽略（线程继续）");
+                eprintln!("[orbcat] 前台采样单轮 panic，已忽略（线程继续）");
             }
             continue;
         };
@@ -83,14 +83,14 @@ pub fn recent_foregrounds() -> Vec<ForegroundContext> {
     last_other().lock().map(|g| g.clone()).unwrap_or_default()
 }
 
-/// 采集，但如果前台就是 float-agent 自己则返回 None
+/// 采集，但如果前台就是 orbcat 自己则返回 None
 pub fn current_excluding_self() -> Option<ForegroundContext> {
     let ctx = current()?;
     let self_stem = std::env::current_exe()
         .ok()
         .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_lowercase()))
         .unwrap_or_default();
-    if ctx.app.to_lowercase().contains("float-agent")
+    if ctx.app.to_lowercase().contains("orbcat")
         || ctx.app.to_lowercase() == self_stem
     {
         return None;

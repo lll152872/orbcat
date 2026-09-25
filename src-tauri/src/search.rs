@@ -348,7 +348,7 @@ pub async fn ping(cfg: &SearchConfig) -> Result<String, String> {
     if !cfg.is_ready() {
         return Err("尚未配置搜索后端与 key".into());
     }
-    let text = run(cfg, "float-agent ping", 2).await?;
+    let text = run(cfg, "orbcat ping", 2).await?;
     let n = text.lines().filter(|l| l.starts_with(char::is_numeric)).count();
     Ok(format!(
         "搜索连通正常 · {} · 约 {n} 条结果行",

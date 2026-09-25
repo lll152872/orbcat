@@ -59,7 +59,7 @@ pub fn resolve_interpreter() -> (String, bool) {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
             eprintln!(
-                "[float-agent] ⚠️ PATH 上找不到 pwsh（PowerShell 7+），\
+                "[orbcat] ⚠️ PATH 上找不到 pwsh（PowerShell 7+），\
                  回退 Windows PowerShell 5.1。建议安装 PS7 以获得更稳的解析。"
             );
         });

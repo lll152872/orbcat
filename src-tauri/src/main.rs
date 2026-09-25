@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    float_agent_lib::run()
+    orbcat_lib::run()
 }

@@ -387,7 +387,7 @@ pub fn bootstrap_gate(agent_data_dir: impl AsRef<Path>, app_dir: impl AsRef<Path
 
     let tmp = std::env::temp_dir();
     gate.add_rule(
-        tmp.join("float-agent"),
+        tmp.join("orbcat"),
         Access::ReadWrite,
         "agent 临时工作区（程序自身）",
     );
@@ -433,21 +433,21 @@ pub fn load_gate(agent_data_dir: impl AsRef<Path>, app_dir: impl AsRef<Path>) ->
                 }
                 Err(e) => {
                     eprintln!(
-                        "[float-agent] ⚠️ {} 解析失败（{e}），本次改用自举规则（文件未改动）",
+                        "[orbcat] ⚠️ {} 解析失败（{e}），本次改用自举规则（文件未改动）",
                         path.display()
                     );
                 }
             },
             Err(e) => {
-                eprintln!("[float-agent] ⚠️ 读取 {} 失败（{e}），改用自举规则", path.display());
+                eprintln!("[orbcat] ⚠️ 读取 {} 失败（{e}），改用自举规则", path.display());
             }
         }
     }
 
     let gate = bootstrap_gate(data_dir, app_dir);
     match save_gate(data_dir, &gate) {
-        Ok(p) => eprintln!("[float-agent] 已生成默认权限文件: {}", p.display()),
-        Err(e) => eprintln!("[float-agent] ⚠️ 写权限文件失败: {e}"),
+        Ok(p) => eprintln!("[orbcat] 已生成默认权限文件: {}", p.display()),
+        Err(e) => eprintln!("[orbcat] ⚠️ 写权限文件失败: {e}"),
     }
     gate
 }
@@ -973,7 +973,7 @@ mod tests {
 
     #[test]
     fn save_and_load_roundtrip() {
-        let dir = std::env::temp_dir().join("float_agent_perm_persist");
+        let dir = std::env::temp_dir().join("orbcat_perm_persist");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1000,7 +1000,7 @@ mod tests {
 
     #[test]
     fn load_generates_file_on_first_run() {
-        let dir = std::env::temp_dir().join("float_agent_perm_firstrun");
+        let dir = std::env::temp_dir().join("orbcat_perm_firstrun");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 

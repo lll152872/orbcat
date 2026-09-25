@@ -401,7 +401,7 @@ mod tests {
     use super::*;
 
     fn fresh_store(tag: &str) -> (MemoryStore, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("float_agent_mem_{tag}"));
+        let dir = std::env::temp_dir().join(format!("orbcat_mem_{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         (MemoryStore::new(&dir), dir)

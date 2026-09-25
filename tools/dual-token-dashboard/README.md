@@ -8,7 +8,7 @@
 tools/dual-token-dashboard/          ← 模板（在本仓库，进 git）
         │  include_str! 编译进二进制
         ▼
-float-agent.exe
+orbcat.exe
         │  首次初始化时释放（bootstrap.rs::bootstrap_agent_data）
         ▼
 agent-data/skills/dual-token-dashboard/   ← 真实副本（被 gitignore）

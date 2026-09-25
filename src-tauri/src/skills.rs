@@ -459,7 +459,7 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("float_agent_skills_{tag}"));
+        let p = std::env::temp_dir().join(format!("orbcat_skills_{tag}"));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -632,7 +632,7 @@ mod tests {
     fn real_autoload_smoke() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-data");
         let cases = [
-            ("帮我重新构建一下 float-agent", "self-rebuild"),
+            ("帮我重新构建一下 orbcat", "self-rebuild"),
             // dual-token-dashboard：多种说法都要中
             ("看看 token 用量", "dual-token-dashboard"),
             ("算一下花了多少 token", "dual-token-dashboard"),

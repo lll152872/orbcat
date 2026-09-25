@@ -248,7 +248,7 @@ impl McpClient {
                     "params": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {},
-                        "clientInfo": {"name": "float-agent", "version": env!("CARGO_PKG_VERSION")}
+                        "clientInfo": {"name": "orbcat", "version": env!("CARGO_PKG_VERSION")}
                     }
                 }),
                 None,
@@ -260,7 +260,7 @@ impl McpClient {
             .pointer("/result/serverInfo/name")
             .and_then(Value::as_str)
             .unwrap_or("mcp");
-        eprintln!("[float-agent] MCP 已连接: {server}（session={sid:?}）");
+        eprintln!("[orbcat] MCP 已连接: {server}（session={sid:?}）");
 
         // 2) notifications/initialized（无 id，失败不致命）
         let _ = self
@@ -486,7 +486,7 @@ impl ToolRegistry {
                 }
                 groups.sort_by(|a, b| b.tools.len().cmp(&a.tools.len()).then(a.name.cmp(&b.name)));
                 eprintln!(
-                    "[float-agent] MCP 工具已加载：{} 个组 / {} 个工具",
+                    "[orbcat] MCP 工具已加载：{} 个组 / {} 个工具",
                     groups.len(),
                     groups.iter().map(|g| g.tools.len()).sum::<usize>()
                 );
@@ -495,7 +495,7 @@ impl ToolRegistry {
                 self.error = None;
             }
             Err(e) => {
-                eprintln!("[float-agent] MCP 拉取失败（不影响其他功能）: {e}");
+                eprintln!("[orbcat] MCP 拉取失败（不影响其他功能）: {e}");
                 self.groups.clear();
                 self.active.clear();
                 self.connected = false;

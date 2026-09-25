@@ -1,4 +1,4 @@
-//! 复现 float-agent 的 reqwest 调用：小请求 vs 大请求
+//! 复现 orbcat 的 reqwest 调用：小请求 vs 大请求
 use std::time::Duration;
 
 #[tokio::main]

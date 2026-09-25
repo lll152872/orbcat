@@ -597,7 +597,7 @@
         order: ["wb", "local"],
         sources: {
           wb: { key: "wb", name: "WorkBuddy", ws: ["工作区"], models: [], sess: [] },
-          local: { key: "local", name: "小 agent", ws: ["float-agent"], models: [], sess: [] },
+          local: { key: "local", name: "小 agent", ws: ["orbcat"], models: [], sess: [] },
         },
       });
     }

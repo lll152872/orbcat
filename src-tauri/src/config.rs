@@ -1,7 +1,7 @@
 //! 模型配置加载
 //!
 //! ## 数据源优先级
-//!   1. 环境变量 `FLOAT_AGENT_MODELS_JSON` 指向的文件
+//!   1. 环境变量 `ORBCAT_MODELS_JSON` 指向的文件
 //!   2. `<data_dir>/models.json` —— 用户自己的模型列表（**含 API key，已 gitignore**）
 //!      这是**主数据源**：只要存在就用它，不再往后找。
 //!   3. `%USERPROFILE%\.workbuddy\models.json`（WorkBuddy 现有的模型列表，只读导入）
@@ -92,7 +92,7 @@ impl ModelConfig {
             out.push(("x-opencode-session".into(), session_id().to_string()));
             // 上游用量规范也建议标识客户端
             if !out.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-opencode-client")) {
-                out.push(("x-opencode-client".into(), "float-agent".into()));
+                out.push(("x-opencode-client".into(), "orbcat".into()));
             }
         }
 
@@ -178,7 +178,7 @@ impl From<&ModelConfig> for ModelView {
 ///      于是悄悄退到 `~/.workbuddy/models.json`，用户会以为"我的配置丢了"。
 /// 改成用运行时解析出来的 `data_dir`，两种形态（开发 / 发布）行为一致。
 pub fn models_json_path(data_dir: &Path) -> PathBuf {
-    if let Ok(p) = std::env::var("FLOAT_AGENT_MODELS_JSON") {
+    if let Ok(p) = std::env::var("ORBCAT_MODELS_JSON") {
         let p = PathBuf::from(p);
         if p.exists() {
             return p;
@@ -610,19 +610,19 @@ pub fn resolve_mcp_servers(data_dir: &Path) -> Vec<McpServerCfg> {
 
 /// 读全部 MCP 服务器（含禁用），设置页用。
 ///
-/// 环境变量 `FLOAT_AGENT_MCP_URL` 若存在，会在列表最前插入一条临时启用项
+/// 环境变量 `ORBCAT_MCP_URL` 若存在，会在列表最前插入一条临时启用项
 /// （不落盘）——保持旧调试入口可用。
 pub fn load_mcp_servers(data_dir: &Path) -> Vec<McpServerCfg> {
     let mut list = Vec::new();
 
-    if let Ok(u) = std::env::var("FLOAT_AGENT_MCP_URL") {
+    if let Ok(u) = std::env::var("ORBCAT_MCP_URL") {
         let u = u.trim().to_string();
         if !u.is_empty() {
             list.push(McpServerCfg {
                 id: "env".into(),
                 url: u,
                 enabled: true,
-                label: "环境变量 FLOAT_AGENT_MCP_URL".into(),
+                label: "环境变量 ORBCAT_MCP_URL".into(),
             });
         }
     }
@@ -788,7 +788,7 @@ mod tests {
         let sid = get(&hs, "x-opencode-session").expect("应自动补 x-opencode-session");
         assert!(!sid.is_empty());
         // 顺带标识客户端
-        assert_eq!(get(&hs, "x-opencode-client"), Some("float-agent"));
+        assert_eq!(get(&hs, "x-opencode-client"), Some("orbcat"));
     }
 
     #[test]
