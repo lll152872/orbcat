@@ -2556,6 +2556,7 @@ dependencies = [
  "futures-util",
  "glob",
  "image",
+ "indexmap 1.9.3",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",

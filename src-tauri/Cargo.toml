@@ -16,6 +16,26 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# --- 依赖兼容补丁（不是新增依赖，indexmap 本就在依赖树里）---
+# 报错现象（清 `target/**/build/` 后必现）：
+#   error[E0107]: struct takes 3 generic arguments but 2 were supplied
+#     --> schemars-0.8.22/src/lib.rs:12:32
+#     12 | pub type Map<K, V> = indexmap::IndexMap<K, V>;
+#
+# 链条：orbcat → (build-dep) tauri-build → schemars 0.8.22 →（preserve_order）
+#       indexmap 1.9.3
+# 根因：indexmap 1.9.3 把 `std` 做成**非默认** feature，正常靠自己的 build.rs 里
+#       `autocfg 0.8` 探测 sysroot 自动补。但 autocfg 0.8 在 rustc 1.96 下探测失效
+#       （实测该 build script 的 `output` 文件**为空**，没有 `rustc-cfg=has_std`）→
+#       `IndexMap<K,V,S>` 第三个泛型拿不到默认 `RandomState` → 编译失败。
+#
+# ⚠️ 关键：必须写在 **[build-dependencies]** 而不是 [dependencies]。
+#    Cargo 对 build-dep 图与 normal 图**分别解析 feature、不合并**；
+#    schemars 在 build-dep 图里，写在 [dependencies] 完全不起作用
+#    （`cargo tree -e features -i indexmap@1.9.3` 会把它显示成两块，一块无 std）。
+#
+# 旧 `target/` 缓存会掩盖这个问题 —— 故"改名/移动目录后重建"或任何一次干净构建都会撞上。
+indexmap = { version = "1.9.3", features = ["std"] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
