@@ -32,9 +32,13 @@ use std::time::Duration;
 /// 为什么不默认批准：用户不在电脑前时，模型不该因为"没人回"就拿到权限。
 pub const REQUEST_TIMEOUT_MS: u64 = 3 * 60 * 1000;
 
+/// `ask_user`（模型向用户提问）的等待上限。
+/// 比权限卡长：提问是等用户**打字**，不是点一下按钮，10 分钟更合理。
+pub const ASK_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+
 /// 这条拒绝是「用户停止本轮」造成的系统作废，不是对申请本身的否决。
 /// 这种情况不写防骚扰 memo。
-fn is_system_cancel(reason: &str) -> bool {
+pub fn is_system_cancel(reason: &str) -> bool {
     reason.contains("已停止本轮")
 }
 
@@ -205,6 +209,12 @@ pub struct PendingView {
     pub session_id: String,
     pub created_at: u64,
     pub timeout_ms: u64,
+
+    // ---- ask_user 字段（kind = "ask"）----
+    /// 问题正文（kind=ask 时使用；复用 command 字段会语义混乱，单列）
+    pub question: String,
+    /// 快捷选项（用户点一下即回答；空 = 自由输入）
+    pub options: Vec<String>,
 }
 
 /// 申请范围比被拒路径宽了几层。
@@ -251,11 +261,16 @@ impl PendingRequest {
             session_id: self.session_id.clone(),
             created_at: self.created_at,
             timeout_ms: self.timeout_ms,
+            question: String::new(),
+            options: Vec::new(),
         }
     }
 }
 
 /// 一条待用户拍板的**命令**执行申请。
+///
+/// 也承载 `ask_user`（模型向用户提问，id 前缀 `pa*`）—— 同一条「弹卡等回答」
+/// 通道，语义换成"请回答这个问题"；回答文本走 [`Verdict::reason`] 回传。
 pub struct PendingCmd {
     pub id: String,
     pub command: String,
@@ -267,15 +282,21 @@ pub struct PendingCmd {
     pub session_id: String,
     pub created_at: u64,
     pub timeout_ms: u64,
+    /// ask_user 专用：问题正文与快捷选项（命令/MCP 申请为空）
+    pub question: String,
+    pub options: Vec<String>,
     tx: tokio::sync::oneshot::Sender<Verdict>,
 }
 
 impl PendingCmd {
     pub fn view(&self) -> PendingView {
-        // `pm*` = MCP 工具申请，`pc*` = 命令申请。kind 必须从 id 推出来 ——
-        // pending_views() 会重新 view()，只在 emit 前改本地副本会在补拉时丢掉。
+        // `pm*` = MCP 工具申请，`pc*` = 命令申请，`pa*` = ask_user 提问。
+        // kind 必须从 id 推出来 —— pending_views() 会重新 view()，
+        // 只在 emit 前改本地副本会在补拉时丢掉。
         let kind = if self.id.starts_with("pm") {
             "mcp"
+        } else if self.id.starts_with("pa") {
+            "ask"
         } else {
             "command"
         };
@@ -298,6 +319,8 @@ impl PendingCmd {
             session_id: self.session_id.clone(),
             created_at: self.created_at,
             timeout_ms: self.timeout_ms,
+            question: self.question.clone(),
+            options: self.options.clone(),
         }
     }
 }
@@ -658,6 +681,53 @@ impl PermHub {
         n
     }
 
+    /// 只作废**某个会话**的待办（多会话并行 run：停 A 绝不能把 B 的待批一起作废）。
+    ///
+    /// `session_id` 传空串 = 与 [`cancel_all`] 等价（全部作废）。
+    pub fn cancel_all_in(&self, session_id: &str, reason: &str) -> usize {
+        if session_id.is_empty() {
+            return self.cancel_all(reason);
+        }
+        let mut n = 0usize;
+        // ⚠️ 不能用 `retain`：`tx.send` 要按值吃掉 `tx`，而 retain 只给 `&mut`。
+        //    先按 session 摘出 key，再 `remove` 拿到所有权。
+        if let Ok(mut map) = self.pending.lock() {
+            let keys: Vec<String> = map
+                .iter()
+                .filter(|(_, p)| p.session_id == session_id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in keys {
+                if let Some(p) = map.remove(&k) {
+                    let _ = p.tx.send(Verdict {
+                        decision: Decision::Deny,
+                        reason: reason.to_string(),
+                    });
+                    self.emit_resolved(&p.id, Decision::Deny);
+                    n += 1;
+                }
+            }
+        }
+        if let Ok(mut map) = self.pending_cmds.lock() {
+            let keys: Vec<String> = map
+                .iter()
+                .filter(|(_, p)| p.session_id == session_id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in keys {
+                if let Some(p) = map.remove(&k) {
+                    let _ = p.tx.send(Verdict {
+                        decision: Decision::Deny,
+                        reason: reason.to_string(),
+                    });
+                    self.emit_resolved(&p.id, Decision::Deny);
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     /// 登记一条申请并**阻塞等待**用户决定（超时 → [`Decision::Timeout`]）。
     ///
     /// 返回 `Decision` 而不是直接改授权表 —— 由调用方决定究竟批多大范围：
@@ -758,6 +828,8 @@ impl PermHub {
             session_id: session_id.to_string(),
             created_at: permission::now_ms(),
             timeout_ms,
+            question: String::new(),
+            options: Vec::new(),
             tx,
         };
         let view = req.view();
@@ -816,6 +888,8 @@ impl PermHub {
             session_id: session_id.to_string(),
             created_at: permission::now_ms(),
             timeout_ms,
+            question: String::new(),
+            options: Vec::new(),
             tx,
         };
         let view = req.view();
@@ -842,6 +916,65 @@ impl PermHub {
         }
         if !verdict.is_approved() && !is_system_cancel(&verdict.reason) {
             self.note_denied_cmd(session_id, &fp_for_memo, &verdict.reason);
+        }
+        self.emit_resolved(&id, verdict.decision);
+        Ok(verdict)
+    }
+
+    /// **模型向用户提问**（`ask_user` 工具）：弹一张问题卡并阻塞等回答。
+    ///
+    /// 与权限申请同走「弹卡等回答」通道（`pending_cmds`，id 前缀 `pa*`），
+    /// 但语义不同：这里没有批/拒，只有**回答文本**。约定：
+    /// - 用户提交回答 → `Verdict { decision: Approve, reason: 回答原文 }`
+    /// - 用户明确"跳过/不想答" → `Verdict { decision: Deny, reason: 跳过说明 }`
+    /// - 超时（10 分钟）→ `Decision::Timeout`，调用方回给模型「用户没回答」
+    ///
+    /// **不写防骚扰 memo** —— 提问被跳过不代表这个问题永远不该问。
+    pub async fn ask_user(
+        &self,
+        question: String,
+        options: Vec<String>,
+        hint: String,
+        session_id: &str,
+    ) -> Result<Verdict, String> {
+        let id = format!("pa{}", self.seq.fetch_add(1, Ordering::Relaxed) + 1);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let timeout_ms = ASK_TIMEOUT_MS;
+
+        let req = PendingCmd {
+            id: id.clone(),
+            command: String::new(),
+            normalized: String::new(),
+            risk: Risk::Low,
+            head_fp: String::new(),
+            full_fp: String::new(),
+            reason: hint,
+            session_id: session_id.to_string(),
+            created_at: permission::now_ms(),
+            timeout_ms,
+            question,
+            options,
+            tx,
+        };
+        let view = req.view();
+
+        {
+            let mut map = self
+                .pending_cmds
+                .lock()
+                .map_err(|e| format!("待办表锁失败: {e}"))?;
+            map.insert(id.clone(), req);
+        }
+        self.emit_request(&view);
+
+        let verdict = match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(_)) => Verdict::bare(Decision::Deny),
+            Err(_) => Verdict::bare(Decision::Timeout),
+        };
+
+        if let Ok(mut map) = self.pending_cmds.lock() {
+            map.remove(&id);
         }
         self.emit_resolved(&id, verdict.decision);
         Ok(verdict)

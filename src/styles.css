@@ -385,6 +385,26 @@ body {
   max-height: 160px;
 }
 
+/* ---------------- 「另一个会话在后台跑」提示条 ---------------- */
+
+.bg-run {
+  padding: 5px 12px;
+  font-size: 11.5px;
+  color: #cdd6f4;
+  background: rgba(120, 137, 255, 0.14);
+  border-bottom: 1px solid rgba(120, 137, 255, 0.28);
+  cursor: pointer;
+  flex-shrink: 0;
+  user-select: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bg-run:hover {
+  background: rgba(120, 137, 255, 0.24);
+}
+
 /* 「▾ 更多 N / ▴ 收起」翻牌按钮 */
 .fg-toggle {
   display: block;
@@ -1570,6 +1590,39 @@ body {
   border-color: rgba(245, 165, 36, 0.5);
 }
 
+/* ask_user 问题卡（模型向用户提问） */
+.perm-card-ask {
+  border-color: rgba(90, 140, 255, 0.5);
+}
+
+.perm-card-ask .perm-title {
+  color: #9db9ff;
+}
+
+.perm-card-ask .ask-input {
+  flex: 1;
+  min-width: 120px;
+}
+
+/* 工具执行心跳（toolTick）：跟在"调用 X"行后面的一行小字 */
+.tl-tick {
+  display: block;
+  margin: 2px 0 0 1.6em;
+  font-size: 11px;
+  color: rgba(150, 200, 255, 0.75);
+  animation: tl-tick-pulse 2s ease-in-out infinite;
+}
+
+@keyframes tl-tick-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 /* ---------------- 右键菜单（独立窗口形态，见 main.ts::renderMenu） ---------------- */
 
 .ctx-card {
@@ -1770,6 +1823,60 @@ body {
   height: 1px;
   margin: 4px 6px;
   background: rgba(255, 255, 255, 0.1);
+}
+
+/* 执行权限档位菜单：副标题一行说明 + 当前档高亮 */
+.ctx-sub {
+  margin-top: 2px;
+  font-size: 10px;
+  color: #8a93b8;
+  line-height: 1.4;
+}
+
+.ctx-item.checked {
+  background: rgba(120, 137, 255, 0.26);
+}
+
+.ctx-item.checked .ctx-sub {
+  color: #aab4d8;
+}
+
+/* 输入区档位 chip（WorkBuddy 权限选择器的等价物）：
+   常显当前档图标+短词，点击弹三档菜单 */
+.trust-chip {
+  /* ⚠️ 必须 flex: 0 0 auto —— 只写 flex-shrink: 0 时，输入框 flex:1 变长
+     会把 chip 的基准宽度压到 0，看起来就是"权限没了"（2026-09-26 用户报）。
+     另外给 min-width 兜底：JS 没来得及写文案时也不至于塌成一条线。 */
+  flex: 0 0 auto;
+  min-width: 52px;
+  white-space: nowrap;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #aab4d8;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease;
+  align-self: flex-end;
+  margin-bottom: 4px;
+}
+
+.trust-chip:hover {
+  background: rgba(120, 137, 255, 0.2);
+  border-color: rgba(120, 137, 255, 0.45);
+}
+
+/* 三档各自微染色 —— 让"全放"在扫一眼时就与"询问"分开 */
+.trust-chip[data-mode="smart"] {
+  color: #f5c46b;
+  border-color: rgba(245, 196, 107, 0.35);
+}
+
+.trust-chip[data-mode="full"] {
+  color: #ff9d8e;
+  border-color: rgba(255, 130, 110, 0.45);
 }
 
 /* 会话行：标题可截断，📁 固定不截断 */
@@ -2548,6 +2655,16 @@ details.tl-tool-res > summary {
   color: #e8eaf2;
 }
 
+/* 插话附带的图（插话不铺气泡，图只画在时间线这条条目上）。
+   比普通消息里的缩略图小一号 —— 它是"过程"里的信息，不该盖过正文。 */
+.tl-thumbs {
+  margin-top: 6px;
+}
+.tl-thumbs .thumb {
+  width: 84px;
+  height: 84px;
+}
+
 /* 多轮流式正文：按轮收进时间线，不要糊成一坨 */
 .tl-text {
   margin: 6px 0;
@@ -2585,6 +2702,14 @@ details.tl-tool-res > summary {
   color: #d8b25a;
 }
 
+/* 未跑完的轮（进程在轮内被关掉，"退出不丢轮"保下来的半截）：
+   与「已中断」区分 —— 那个是用户主动停，这个进程没了。 */
+.partial-tag {
+  margin-top: 4px;
+  font-size: 10.5px;
+  color: #e0736d;
+}
+
 .run-reason summary {
   cursor: pointer;
   user-select: none;
@@ -2611,8 +2736,11 @@ details.tl-tool-res > summary {
   padding: 7px 9px;
   margin: 4px 0 0;
   font-family: inherit;
-  max-height: 200px;
-  overflow-y: auto;
+  /* ⚠️ 不再限高（2026-09-26）：以前是 max-height: 200px + overflow-y: auto，
+     用户展开后只能看到一小截 —— 报「展开内容比标注字数少」。
+     思考过程按用户要求完全展示，由内层滚动改成随内容自然展开。 */
+  max-height: none;
+  overflow-y: visible;
 }
 
 /* ---------------- 轻提示（toast） ----------------

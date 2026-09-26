@@ -271,7 +271,7 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "超时秒数（可选，默认 60，范围 1-600）"
+                        "description": "超时秒数（可选，默认 600，范围 1-3600）。编译 / 构建 / 测试 / 装包这类长任务**直接跑即可**，不要为了确认而空转；只有预计超过 10 分钟（例如整库 release 构建、大型依赖安装）才需要显式调大。到点会连同子进程一起强杀；用户随时可点「停止」提前掐断。"
                     }
                 },
                 "required": ["command"]
@@ -308,6 +308,27 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
              当 system prompt 里的「用户当前正在看什么」可能过期，\
              或用户刚切换了窗口时调用。",
             json!({ "type": "object", "properties": {}, "required": [] }),
+        ),
+        ToolSpec::new(
+            "ask_user",
+            "向用户**提一个问题并等待回答**（弹出问题卡，用户打字/点选项后你才能继续）。\
+             适用：需要用户做选择、提供你无法从环境推断的信息（偏好、口令、确认方向）时。\
+             不适用：能用工具查到的信息、是非确认（那是权限卡的事）—— 先查再问。\
+             question 写清问题本身；options 给 2~5 个快捷选项（可空 = 自由输入）；\
+             hint 写「为什么要问」（用户看到的背景）。用户跳过/不答时按返回内容自行决定下一步。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string", "description": "要问的问题，一句话，具体" },
+                    "options": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "快捷选项（可选）：用户点一下即回答；不给则自由输入"
+                    },
+                    "hint": { "type": "string", "description": "为什么要问这个（给用户看的背景说明，可选）" }
+                },
+                "required": ["question"]
+            }),
         ),
         ToolSpec::new(
             "remember",
@@ -559,6 +580,12 @@ pub struct ToolCtx<'a> {
     /// 「申请权限」的授权表 + 待办通道。
     /// 打包成**一个引用**，避免以后每加一项能力就改一次 `agent::run` 的签名。
     pub perm: &'a PermHub,
+    /// 长工具执行期的心跳回调（`run_command` 用它每 2 秒推"已运行 N 秒 + 输出尾巴"）。
+    /// `None` = 不推心跳（测试与短工具）。见 `shell::TickFn`。
+    pub tick: Option<crate::shell::TickFn>,
+    /// 长工具执行期的**取消探针**（用户点「停止」→ `run_command` 立刻杀进程树）。
+    /// `None` = 不响应取消（测试与短工具）。见 `shell::CancelFn`。
+    pub cancel: Option<crate::shell::CancelFn>,
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +705,7 @@ pub async fn execute(
             Ok(ToolOutput::text(out))
         }
         "remember" => remember(args, ctx.data_dir),
+        "ask_user" => ask_user(args, ctx).await,
         "recall_turns" => recall_turns(args, ctx),
         "load_skill" => {
             let name = get_str(args, "name")?;
@@ -731,8 +759,12 @@ pub async fn execute(
                 }
                 drop(reg);
 
-                // Cline 式：默认问；「总是允许」写 mcp_grants.json 后免问
-                let allowed = crate::mcp::is_mcp_tool_allowed(ctx.data_dir, other);
+                // Cline 式：默认问；「总是允许」写 mcp_grants.json 后免问。
+                // 执行权限档位 `full` 也免问（与命令侧同一开关，见 config::ExecTrust）。
+                let allowed = crate::mcp::is_mcp_tool_allowed(ctx.data_dir, other)
+                    || crate::config::load_settings(ctx.data_dir)
+                        .exec_trust
+                        .auto_allows_mcp();
                 if !allowed {
                     let verdict = ctx
                         .perm
@@ -1962,6 +1994,71 @@ async fn web_search(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Strin
 /// ⚠️ 命令的副作用**无法静态穷举**（`python -c` / 嵌套 shell 都是逃生口），
 ///    所以本工具只承诺 **default-deny + 逐条用户批准**，不承诺"批了就绝对安全"。
 ///    这与各家 agent 的官方共识一致（静态规则不是安全边界）。
+/// `ask_user`：向用户提一个问题并阻塞等回答（2026-09-25 用户要求加的工具）。
+///
+/// 通道复用权限申请的「弹卡等回答」机制（[`PermHub::ask_user`]）：
+/// 张问题卡 → agent loop 阻塞在这里 → 用户打字/点选项 → 唤醒 → 回答进 tool 结果。
+///
+/// 返回给模型的语义：
+/// - 有回答 → `用户回答：<原文>`
+/// - 用户跳过 → 明确说"用户选择跳过"，让模型自己决定兜底
+/// - 超时（10 分钟）→ 明确说"用户没有回答"，模型**不要干等**，自行降级
+async fn ask_user(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
+    let question = get_str(args, "question")?;
+    if question.trim().is_empty() {
+        return Err("question 不能为空".into());
+    }
+    let options: Vec<String> = args
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let hint = args
+        .get("hint")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let verdict = ctx
+        .perm
+        .ask_user(question, options, hint, ctx.session_id)
+        .await?;
+
+    use crate::perm_request::Decision;
+    let msg = match verdict.decision {
+        // 回答文本走 reason 通道（perm_request_decide 把输入框内容放这里）
+        d if d == Decision::Approve => {
+            let a = verdict.reason.trim();
+            if a.is_empty() {
+                "用户提交了回答但内容为空。请按最保守的理解继续。".to_string()
+            } else {
+                format!("用户回答：{a}")
+            }
+        }
+        Decision::Timeout => "用户没有在时限内回答这个问题。请不要等待，按最合理的默认继续。".to_string(),
+        d if d == Decision::Deny && crate::perm_request::is_system_cancel(&verdict.reason) => {
+            return Err("已停止".into());
+        }
+        _ => {
+            let why = verdict.reason.trim();
+            if why.is_empty() {
+                "用户选择跳过这个问题。请按最合理的默认继续。".to_string()
+            } else {
+                format!("用户跳过了这个问题。用户留言：{why}。请据此调整。")
+            }
+        }
+    };
+    Ok(ToolOutput::text(msg))
+}
+
 async fn run_command(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     let cmd = get_str(args, "command")?;
     if cmd.trim().is_empty() {
@@ -1971,11 +2068,22 @@ async fn run_command(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Stri
     // ---- Gate 1：cwd 过文件路径网关 ----
     let cwd = resolve_command_cwd(args, ctx)?;
 
+    // 默认 600s（10 分钟）：**构建软件**这件事很容易超过 5 分钟 —— 本项目自己的
+    // `cargo build --release` 就跑了 5m24s，用户实报「build 4-5 分钟不输出很正常」。
+    // 以前默认 300s 会刚好卡在 5 分钟把 build 掐死，而模型又经常不显式传 timeout_secs。
+    //
+    // 硬上限提到 3600s（1 小时）：整库 release 构建、大型依赖安装都放得下。
+    // 提高默认值的代价很小 —— 命令跑飞了有 3 条路兜住：
+    //   ① 用户点「停止」立刻 kill_tree（见 shell::CancelFn，命令执行期间也响应）；
+    //   ② 每 2s 一次心跳，"已运行 N 秒" 一直涨，看得出它在动还是死了；
+    //   ③ 轮内已增量落盘，进程被杀也不丢这一轮。
+    // ⚠️ 安全相关的另有硬闸：命令策略的危险命令硬阻断、`-EncodedCommand` 硬阻断
+    //    都在**启动之前**判，跟超时长短无关。
     let timeout_secs = args
         .get("timeout_secs")
         .and_then(Value::as_u64)
-        .unwrap_or(60)
-        .clamp(1, 600);
+        .unwrap_or(600)
+        .clamp(1, 3600);
 
     // ---- Gate 2：命令策略 ----
     let policy = command_policy::load_policy(ctx.data_dir);
@@ -2037,45 +2145,62 @@ async fn run_command(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Stri
                     )));
                 }
 
-                // ③ 弹卡等用户当场拍板
-                let passed_head = norm.head();
-                let passed_full = norm.full();
-                let verdict = ctx
-                    .perm
-                    .ask_command(
-                        cmd.clone(),
-                        passed_full.clone(),
-                        passed_head,
-                        passed_full,
-                        risk,
-                        reason.clone(),
-                        ctx.session_id,
-                    )
-                    .await?;
+                // ③ 执行权限档位（settings.exec_trust）：smart/full 档免问直接跑。
+                //    ⚠️ 放在防骚扰**之后** —— 用户刚拒过的命令，切档位也不该偷偷放行。
+                let trust = crate::config::load_settings(ctx.data_dir).exec_trust;
+                if trust.auto_allows_command(risk == command_policy::Risk::High) {
+                    source = format!(
+                        "免问放行（{}档）",
+                        match trust {
+                            crate::config::ExecTrust::Smart => "智能",
+                            _ => "完全访问",
+                        }
+                    );
+                    audit_cmd(ctx, &cmd, &norm, &cwd, "allowed", "trust-auto", risk, None);
+                } else {
+                    // ④ 弹卡等用户当场拍板
+                    let passed_head = norm.head();
+                    let passed_full = norm.full();
+                    let verdict = ctx
+                        .perm
+                        .ask_command(
+                            cmd.clone(),
+                            passed_full.clone(),
+                            passed_head,
+                            passed_full,
+                            risk,
+                            reason.clone(),
+                            ctx.session_id,
+                        )
+                        .await?;
 
-                if !verdict.is_approved() {
-                    audit_cmd(ctx, &cmd, &norm, &cwd, "rejected", "user-denied", risk, None);
-                    return Ok(ToolOutput::text(verdict.to_model_message()));
+                    if !verdict.is_approved() {
+                        audit_cmd(ctx, &cmd, &norm, &cwd, "rejected", "user-denied", risk, None);
+                        return Ok(ToolOutput::text(verdict.to_model_message()));
+                    }
+
+                    let applied = ctx.perm.apply_cmd_decision(verdict.decision, &cmd, &reason);
+                    let Some(g) = applied else {
+                        return Ok(ToolOutput::text(
+                            "用户已批准，但命令授权写入失败，请重试一次。",
+                        ));
+                    };
+                    let scope_label = match g.scope {
+                        CmdScope::Prefix => "记住这类命令",
+                        CmdScope::Full => "记住完整命令",
+                    };
+                    source = format!("用户已批准（{scope_label}）");
+                    audit_cmd(ctx, &cmd, &norm, &cwd, "approved", "user-approved", risk, None);
                 }
-
-                let applied = ctx.perm.apply_cmd_decision(verdict.decision, &cmd, &reason);
-                let Some(g) = applied else {
-                    return Ok(ToolOutput::text(
-                        "用户已批准，但命令授权写入失败，请重试一次。",
-                    ));
-                };
-                let scope_label = match g.scope {
-                    CmdScope::Prefix => "记住这类命令",
-                    CmdScope::Full => "记住完整命令",
-                };
-                source = format!("用户已批准（{scope_label}）");
-                audit_cmd(ctx, &cmd, &norm, &cwd, "approved", "user-approved", risk, None);
             }
         }
     }
 
     // ---- 执行 ----
-    let out = match crate::shell::run_powershell(&cmd, &cwd, timeout_secs).await {
+    let tick = ctx.tick.clone();
+    let cancel = ctx.cancel.clone();
+    let out = match crate::shell::run_powershell_tick(&cmd, &cwd, timeout_secs, tick, cancel).await
+    {
         Ok(o) => o,
         Err(e) => {
             audit_cmd(ctx, &cmd, &norm, &cwd, "error", &source, risk, None);
@@ -2083,7 +2208,13 @@ async fn run_command(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Stri
         }
     };
 
-    let event = if out.timed_out { "timeout" } else { "executed" };
+    let event = if out.cancelled {
+        "cancelled"
+    } else if out.timed_out {
+        "timeout"
+    } else {
+        "executed"
+    };
     audit_cmd(ctx, &cmd, &norm, &cwd, event, &source, risk, out.exit_code);
 
     Ok(ToolOutput::text(format_command_output(
@@ -2151,6 +2282,14 @@ fn format_command_output(
         cwd.display(),
         out.interpreter
     );
+
+    if out.cancelled {
+        s.push_str(
+            "\n⚠️ **命令被用户「停止」掐断（连同子进程）。**\n\
+             以下输出是掐断前已收到的部分。若用户仍需要这个结果，请告知后重试。\n",
+        );
+        return s;
+    }
 
     if out.timed_out {
         s.push_str(&format!(
@@ -2236,6 +2375,8 @@ mod tests {
                 mcp: &$mcp,
                 session_id: "",
                 perm: leak_hub!(),
+                tick: None,
+                cancel: None,
             }
         };
     }
@@ -2249,6 +2390,8 @@ mod tests {
                 mcp: &$mcp,
                 session_id: $sid,
                 perm: leak_hub!(),
+                tick: None,
+                cancel: None,
             }
         };
     }

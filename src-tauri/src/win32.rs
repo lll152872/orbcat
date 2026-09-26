@@ -44,12 +44,17 @@ extern "system" {
     fn GetForegroundWindow() -> Hwnd;
     fn GetWindowTextW(hwnd: Hwnd, lp_string: *mut u16, n_max_count: i32) -> i32;
     fn GetWindowThreadProcessId(hwnd: Hwnd, lpdw_process_id: *mut u32) -> u32;
+    fn SetForegroundWindow(hwnd: Hwnd) -> i32;
+    fn BringWindowToTop(hwnd: Hwnd) -> i32;
+    fn SetFocus(hwnd: Hwnd) -> Hwnd;
+    fn AttachThreadInput(id_attach: u32, id_attach_to: u32, f_attach: i32) -> i32;
 }
 
 #[link(name = "kernel32")]
 extern "system" {
     fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> Hwnd;
     fn CloseHandle(handle: Hwnd) -> i32;
+    fn GetCurrentThreadId() -> u32;
     fn QueryFullProcessImageNameW(
         process: Hwnd,
         flags: u32,
@@ -300,6 +305,52 @@ pub fn keep_topmost_without_activating(hwnd: Hwnd) {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
+    }
+}
+
+/// **强行**把窗口提到前台 —— 绕开 Windows 的前台锁（foreground lock）。
+///
+/// 为什么单靠 Tauri 的 `set_focus()` 不够：
+///   进程不是前台时，`SetForegroundWindow` 会被系统**静默拒绝**（不报错、不生效）。
+///   于是窗口看上去打开了（bounds / 扩展样式都对），但 OS 级的「前台窗口」仍是用户
+///   原来那个应用 —— 任何 `SendInput`（自动化工具的 `Type`、模拟键盘）全落到那个
+///   应用上，面板输入框永远空。这正是「windows-mcp 点得开球、却打不进输入框」的
+///   根因（见 `allmemory/MEMORY.md` 的「已知环境坑」）。
+///
+/// 手法：`AttachThreadInput` 把**窗口线程**挂到当前前台线程上（绕前台锁），
+/// 同时把**调用线程**挂到窗口线程上（`SetFocus` 只认"已挂到自己队列"的窗口）；
+/// 用完两处都**立刻断开**，不给别的线程留副作用。
+///
+/// 只在**面板态**调用：球态刻意不抢焦点（`WS_EX_NOACTIVATE`），那是产品红线。
+pub fn force_foreground(hwnd: Hwnd) {
+    unsafe {
+        if hwnd.is_null() {
+            return;
+        }
+        let tid_win = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
+        let tid_me = GetCurrentThreadId();
+        let fg = GetForegroundWindow();
+        let tid_fg = if fg.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(fg, std::ptr::null_mut())
+        };
+
+        // ① 窗口线程 → 前台线程：让 SetForegroundWindow 被放行
+        let a_fg = tid_fg != 0 && tid_fg != tid_win && AttachThreadInput(tid_win, tid_fg, 1) != 0;
+        // ② 调用线程 → 窗口线程：让 SetFocus(hwnd) 合法
+        let a_win = tid_win != 0 && tid_win != tid_me && AttachThreadInput(tid_me, tid_win, 1) != 0;
+
+        BringWindowToTop(hwnd);
+        SetForegroundWindow(hwnd);
+        SetFocus(hwnd);
+
+        if a_win {
+            AttachThreadInput(tid_me, tid_win, 0);
+        }
+        if a_fg {
+            AttachThreadInput(tid_win, tid_fg, 0);
+        }
     }
 }
 

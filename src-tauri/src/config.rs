@@ -528,6 +528,67 @@ impl Default for ModelConfig {
 // 运行时设置（选中的模型等）
 // ---------------------------------------------------------------------------
 
+/// 执行权限档位 —— 控制 `run_command` / MCP 工具**弹卡问用户的频率**。
+///
+/// 灵感来自 WorkBuddy 的 permission modes（default / acceptEdits / dontAsk /
+/// bypassPermissions），但只收窄到「命令执行」一层：文件权限仍走
+/// `permissions.json` 三层闸门 + `request_access` 申请卡，两者互不影响。
+///
+/// 三档语义（`command_policy::evaluate` 的三路判定之上再叠一层"要不要问"）：
+///
+/// | 档位 | 白名单 | 硬阻断 | 其余命令 | MCP 工具 |
+/// |---|---|---|---|---|
+/// | `ask`（默认） | 免问 | 拦 | **弹卡** | **弹卡**（未授权时） |
+/// | `smart` | 免问 | 拦 | 低/中风险**免问**，高风险弹卡 | 弹卡 |
+/// | `full` | 免问 | **仍拦** | 全部免问 | 全部免问 |
+///
+/// ⚠️ **硬阻断在任何档位下都拦** —— 对齐 WorkBuddy「`-y` 也不是真全通，
+/// HIGH/CRITICAL 仍会确认」的设计；我们比它更严：直接不执行。
+/// `full` 免掉的是"问用户"，不是安全底线。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecTrust {
+    /// 每次询问（默认）：非白名单命令全部弹确认卡
+    #[default]
+    Ask,
+    /// 智能放行：低/中风险自动执行不弹卡，高风险仍弹卡
+    Smart,
+    /// 允许完全访问：命令与 MCP 全部免问（硬阻断仍拦）
+    Full,
+}
+
+impl ExecTrust {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "smart" => Self::Smart,
+            "full" => Self::Full,
+            _ => Self::Ask,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Smart => "smart",
+            Self::Full => "full",
+        }
+    }
+
+    /// 这条被判 `Ask` 的命令（`risk` 已给出）要不要**免问直接跑**。
+    pub fn auto_allows_command(&self, risk_high: bool) -> bool {
+        match self {
+            Self::Ask => false,
+            Self::Smart => !risk_high,
+            Self::Full => true,
+        }
+    }
+
+    /// 未授权的 MCP 工具要不要免问。
+    pub fn auto_allows_mcp(&self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentSettings {
@@ -546,6 +607,10 @@ pub struct AgentSettings {
     /// 当前激活的项目 id（pmem.projects）。`None` = 主对话（无项目记忆）。
     #[serde(default)]
     pub active_project_id: Option<i64>,
+    /// 执行权限档位（管 `run_command` / MCP 工具的弹卡频率，见 [`ExecTrust`]）。
+    /// 参考 WorkBuddy 的 permission modes，但收窄到「命令执行」这一层。
+    #[serde(default)]
+    pub exec_trust: ExecTrust,
 }
 
 impl Default for AgentSettings {
@@ -556,6 +621,7 @@ impl Default for AgentSettings {
             blur_collapse: true,
             quick_mode: false,
             active_project_id: None,
+            exec_trust: ExecTrust::Ask,
         }
     }
 }

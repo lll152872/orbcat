@@ -161,6 +161,20 @@ interface AgentStep {
   kind: string;
   name: string | null;
   detail: string;
+  /**
+   * 工具执行心跳（"⏳ 已运行 12s｜<输出尾巴>"）—— 只在 live 进行中气泡里用。
+   * 独立字段而不是塞 detail：tool_call 的 detail 是参数 JSON（要过 summarizeArgs），
+   * 混进心跳文本会把摘要搅掉。
+   */
+  tick?: string;
+  /**
+   * 插话（kind === "steer"）附带的图片**文件路径**。
+   *
+   * 为什么单独一个字段：steer 的 detail 是插话文字，图不能混进去（会污染文本）。
+   * 落盘时存在 user 消息的 `images` 里，读回来时由后端补到 steer 条目上
+   * （见 `sessions.rs` 的 `attach_steer_images`）。
+   */
+  images?: string[];
 }
 
 interface AgentRun {
@@ -207,6 +221,11 @@ interface PendingPerm {
   sessionId: string;
   createdAt: number;
   timeoutMs: number;
+  // ---- ask_user（kind = "ask"）----
+  /** 问题正文 */
+  question: string;
+  /** 快捷选项（点一下即回答；空 = 自由输入） */
+  options: string[];
 }
 
 interface ChatEntry {
@@ -248,6 +267,8 @@ interface ChatEntry {
   reasoning?: string;
   /** 本轮被「停止」/ 出错打断（回答是半截） */
   interrupted?: boolean;
+  /** **未跑完**：进程在轮内被关掉，磁盘上留下的是半截轮（见 StoredMsg.partial） */
+  partial?: boolean;
   /** 生成本条回答的模型 id（用量角标 / 台账用） */
   model?: string;
   /** 本轮问答的 token 用量合计（无则不计） */
@@ -292,6 +313,14 @@ interface StoredMsg {
   reasoning?: string;
   /** 本轮被中断（text 是半截） */
   interrupted?: boolean;
+  /**
+   * **未定稿**的助手消息（2026-09-26 加的"退出不丢轮"机制）。
+   *
+   * 进程在轮内被关掉时，磁盘上留下的是"跑到一半"的占位消息：它带着已产出的
+   * 思考与工具步骤，但没有最终正文。UI 要明确告诉用户"这轮没跑完"，
+   * 否则会被当成正常回答。
+   */
+  partial?: boolean;
   /** 插话 id —— UI 不铺气泡，画在 steps 时间线（真实交错） */
   steerId?: string;
   /** 生成本条回答的模型 id（用量统计用）。老数据没有 */
@@ -362,9 +391,14 @@ let hasModels = true;
  * 只截显示，不影响落盘与最终答案：回答落地时是用后端返回的完整 `run.answer`
  * 重建的。设它是为了让"模型疯狂重复输出"的时候界面还能动 —— 有个模型会把
  * 整篇正文重复吐进 reasoning 里。
+ *
+ * ⚠️ 思考过程**不设上限**（2026-09-26 用户拍板"完全不截"）：
+ * 以前这里是 20_000 字，配合落盘的 8KB 预算，导致用户看到的思考
+ * 比模型真实产出的少一大截（截图报的"思考过程明显不止这么少"）。
+ * 现在思考一行不截。正文仍保留上限 —— 它的完整版会由后端 `run.answer` 重建，
+ * 显示层截断不影响最终结果。
  */
 const MAX_STREAM_TEXT_CHARS = 60_000;
-const MAX_STREAM_REASON_CHARS = 20_000;
 
 /** 追加流式增量，超上限就停住（不再增长，避免每一帧都在拼超长字符串） */
 function capAppend(cur: string | undefined, chunk: string, limit: number): string {
@@ -404,6 +438,17 @@ function stripStepFolds(text: string): string {
 /** 把磁盘上的会话消息转成面板的 entries */
 function sessionToEntries(s: Session): ChatEntry[] {
   const out: ChatEntry[] = [];
+
+  // 插话附带的图：插话消息本身**不铺独立气泡**（见下），但它的图必须画在
+  // 时间线的 `kind=steer` 条目上 —— 否则用户在插话里塞的图永远看不到
+  // （2026-09-26 用户报的 bug1）。这里先按 steerId 收集，落到后面回填。
+  const steerImages = new Map<string, string[]>();
+  for (const m of s.messages) {
+    if (m.steerId && m.images && m.images.length) {
+      steerImages.set(m.steerId, m.images);
+    }
+  }
+
   s.messages.forEach((m, idx) => {
     // 插话：历史回灌仍按 user 进模型，但 UI **不铺气泡** ——
     // 它已作为 `kind=steer` 画在后续 assistant 的 steps 时间线里（真实交错）。
@@ -422,14 +467,21 @@ function sessionToEntries(s: Session): ChatEntry[] {
     ) {
       return;
     }
+    // 时间线条目：给 steer 条目补上插话的图（按 steerId = 条目 name 对齐）
+    const items = m.steps?.map((st) =>
+      st.kind === "steer" && st.name && !(st.images && st.images.length)
+        ? { ...st, images: steerImages.get(st.name) }
+        : st,
+    );
     out.push({
       role: m.role,
       text: stripStepFolds(m.text),
       // 磁盘上的 steps 就是时间线（后端保序落盘），直接当条目用
-      items: m.steps,
+      items,
       images: m.images,
       reasoning: m.reasoning,
       interrupted: m.interrupted,
+      partial: m.partial,
       model: m.model,
       usage: m.usage,
       // 磁盘下标：分叉点要用它，不能拿 entries 下标顶替
@@ -478,7 +530,8 @@ function ensureSessionLoaded(): Promise<void> {
 
 /** 开新会话 → 挂到**当前激活项目**（主对话则不绑） */
 async function newSession(): Promise<void> {
-  if (busy) return;
+  // 多会话并行 run：新建会话**放行**（后端也不拦）—— 新会话不碰别的会话，
+  // 而且你很可能正是因为"这边跑着、我还要开个新任务"才点它。
   try {
     const s = await invoke<Session>("session_new");
     currentSessionId = s.id;
@@ -494,6 +547,7 @@ async function newSession(): Promise<void> {
     }
     view = "chat";
     renderBody();
+    syncBusyUi();
   } catch (e) {
     pushEntry("error", `新建会话失败：${e}`);
   }
@@ -501,11 +555,20 @@ async function newSession(): Promise<void> {
 
 /** 进入会话：顶栏项目跟着会话走（主聊天 → 主对话） */
 async function switchSession(id: string): Promise<void> {
-  if (busy) return;
+  // ⚠️ 不再用 `busy` 拦住切换（2026-09-26 用户拍板：切走、后台继续跑）。
+  //    落盘路径自带开跑时的 session_id，回答不会写错会话；前端进度监听也按
+  //    `runningSessionId !== currentSessionId` 丢掉旧会话的事件（不会污染当前视图）。
+  if (id === currentSessionId) return; // 点自己：别白重载一次（会冲掉正在流式的气泡）
   try {
     const s = await invoke<Session>("session_switch", { id });
     currentSessionId = s.id;
     entries = sessionToEntries(s);
+    // 切回**正在跑的**会话时：磁盘上有一条 `partial` 占位（begin_turn 落的），
+    // 它会和随后由进度事件新建的"进行中"气泡把同一条进度画两遍 → 丢掉这条占位，
+    // 交给实时气泡接手（跑完后那次 reload 会用定稿版本重建）。
+    if (runningSessions.has(id) && entries.length && entries[entries.length - 1].partial) {
+      entries.pop();
+    }
     await refreshSessionList();
     await loadProjects();
     await refreshSessionProjectTags();
@@ -519,9 +582,38 @@ async function switchSession(id: string): Promise<void> {
     await invoke("pmem_set_active", { id: wantPid }).catch(() => {});
     view = "chat";
     renderBody();
+    syncBusyUi(); // 切换了会话 → busy / 停止按钮 / 提示条都要跟着这个会话走
   } catch (e) {
     pushEntry("error", `切换会话失败：${e}`);
   }
+}
+
+/**
+ * 「别的会话正在后台跑」提示条。
+ *
+ * 多会话并行 run（2026-09-26）：切走后**别的**会话还在跑，它们的结果落各自的会话。
+ * 不给提示的话，用户在 B 里看不到 A 的动静会以为任务停了。点这条切过去看。
+ */
+function updateBgRunBanner(): void {
+  const el = document.getElementById("bg-run");
+  if (!el) return;
+  const others = [...runningSessions].filter((id) => id !== currentSessionId);
+  if (others.length === 0) {
+    el.style.display = "none";
+    el.textContent = "";
+    el.onclick = null;
+    return;
+  }
+  const names = others
+    .map((id) => `「${sessionList.find((s) => s.id === id)?.title || "未命名"}」`)
+    .join("、");
+  el.style.display = "block";
+  el.textContent =
+    others.length === 1
+      ? `⏳ ${names} 正在后台运行 · 点此切回`
+      : `⏳ ${others.length} 个会话在后台运行：${names} · 点此切回`;
+  const next = others[0];
+  el.onclick = () => void switchSession(next);
 }
 
 /**
@@ -531,7 +623,10 @@ async function switchSession(id: string): Promise<void> {
  * 给模型的完全一致），不是到那条为止的全部历史 —— 之后两边各走各的。
  */
 async function forkSession(upto: number): Promise<void> {
-  if (busy) return;
+  if (busy) {
+    showToast("该会话正在运行，先停止或等它结束再分叉", "error");
+    return;
+  }
   try {
     const s = await invoke<Session>("session_fork", { upto });
     currentSessionId = s.id;
@@ -827,19 +922,21 @@ async function resendPrompt(text: string, imgs: string[]): Promise<void> {
 
   // 先放「进行中」气泡，进度事件会往里建时间线条目
   entries.push({ role: "running", text: "正在思考…", items: [] });
+  runningSessionId = currentSessionId;
+  const runSid = runningSessionId;
   const b0 = document.getElementById("panel-body");
   if (b0) {
     paintMessages(b0);
     b0.scrollTop = b0.scrollHeight;
   }
 
-  busy = true;
+  markRunStart(runSid);
   permMuteThisTurn = false;
-  setThinking(true);
-  setBusyUi(true);
 
   try {
     const run = await invoke<AgentRun>("chat", { input: text, images: imgs });
+    // 用户可能在等的时候切走了 → 别动当前视图（结果后端已落回它自己的会话）
+    if (runSid !== currentSessionId) return;
     const idx = entries.findIndex((x) => x.role === "running");
     if (idx >= 0) entries.splice(idx, 1);
     await reloadSessionKeepScroll(
@@ -857,13 +954,12 @@ async function resendPrompt(text: string, imgs: string[]): Promise<void> {
       );
     }
   } catch (e) {
+    if (runSid !== currentSessionId) return; // 切走了：别往别的会话塞红字
     const idx = entries.findIndex((x) => x.role === "running");
     if (idx >= 0) entries.splice(idx, 1);
     pushEntry("error", String(e));
   } finally {
-    busy = false;
-    setThinking(false);
-    setBusyUi(false);
+    markRunEnd(runSid);
   }
 }
 
@@ -883,7 +979,11 @@ function installRegenHandlers(): void {
 }
 
 async function deleteSession(id: string): Promise<void> {
-  if (busy) return;
+  // 只拦"**这条**会话正在跑" —— 其它会话在跑不影响删除（后端同判）
+  if (runningSessions.has(id)) {
+    showToast("该会话正在运行，先停止或等它结束再删除", "error");
+    return;
+  }
   try {
     const meta = sessionList.find((s) => s.id === id);
     const proj = meta?.projectName ?? null;
@@ -1021,6 +1121,17 @@ function bindSessionsView(root: HTMLElement): void {
 }
 
 /** 「＋」菜单：新建会话 / 新建项目（原「项+」并入） */
+/**
+ * 挂「点外面关掉」。
+ *
+ * ⚠️ 必须延后一拍（setTimeout 0）再挂：立刻挂会被**打开菜单的那次 click** 自己触发
+ *（事件从按钮冒泡到 window），菜单在渲染同帧就被移除 = "点了没用"。
+ * 2026-09-25 Playwright 实证：同帧日志 `menu opened → once-close FIRED`。
+ */
+function closeOnOutsideClick(close: () => void): void {
+  setTimeout(() => window.addEventListener("click", close, { once: true }), 0);
+}
+
 function showNewMenu(x: number, y: number): void {
   document.getElementById("new-ctx")?.remove();
   const menu = document.createElement("div");
@@ -1066,7 +1177,58 @@ function showNewMenu(x: number, y: number): void {
     }
     renderBody();
   });
-  window.addEventListener("click", close, { once: true });
+  closeOnOutsideClick(close);
+}
+
+/** 刷新输入区档位 chip 的图标+文字（面板重建后也要调，别只在切换时调） */
+function updateTrustChip(): void {
+  const el = document.getElementById("btn-trust");
+  if (!el) return;
+  const t = EXEC_TRUST_LABEL[execTrust] ?? EXEC_TRUST_LABEL.ask ?? { icon: "🛡", short: "询问", full: "每次询问" };
+  el.textContent = `${t.icon} ${t.short}`;
+  el.title =
+    `执行权限档位：${t.full}（点击切换）\n` +
+    "🛡 每次询问：命令/MCP 都弹卡\n" +
+    "⚡ 智能放行：低中风险免问，高风险仍弹卡\n" +
+    "🔓 完全访问：全部免问（危险命令仍硬阻断）\n" +
+    "文件权限申请不受此开关影响";
+  el.dataset.mode = execTrust;
+}
+
+/** 执行权限档位切换菜单（形态复用 showNewMenu 的 ctx-menu） */
+function showTrustMenu(x: number, y: number): void {
+  document.getElementById("trust-ctx")?.remove();
+  const menu = document.createElement("div");
+  menu.id = "trust-ctx";
+  menu.className = "ctx-menu";
+  const item = (mode: string, desc: string): string =>
+    `<div class="ctx-item${execTrust === mode ? " checked" : ""}" data-mode="${mode}">${
+      EXEC_TRUST_LABEL[mode].icon
+    } ${EXEC_TRUST_LABEL[mode].full}<div class="ctx-sub">${desc}</div></div>`;
+  menu.innerHTML = `
+    <div class="ctx-title">执行权限（命令 / MCP）</div>
+    ${item("ask", "每条命令都弹卡让你拍板")}
+    ${item("smart", "低/中风险自动执行，高风险才问")}
+    ${item("full", "全部自动执行；危险命令仍被硬阻断")}`;
+  menu.style.left = `${Math.min(x, window.innerWidth - 220)}px`;
+  menu.style.top = `${Math.min(y, window.innerHeight - 200)}px`;
+  document.body.appendChild(menu);
+  const close = (): void => menu.remove();
+  menu.addEventListener("click", async (e) => {
+    const t = (e.target as HTMLElement).closest<HTMLElement>(".ctx-item");
+    if (!t?.dataset.mode) return;
+    close();
+    const next = t.dataset.mode as typeof execTrust;
+    try {
+      const saved = await invoke<string>("set_exec_trust", { mode: next });
+      execTrust = (saved as typeof execTrust) || next;
+      updateTrustChip();
+      showToast(`执行权限：${EXEC_TRUST_LABEL[execTrust].full}`, "ok");
+    } catch (err) {
+      showToast(`切换执行权限失败：${err}`, "error");
+    }
+  });
+  closeOnOutsideClick(close);
 }
 
 /** 会话右键：挂靠 / 重命名会话 / 删除（打开用左键） */
@@ -1175,7 +1337,7 @@ function showSessionBindMenu(x: number, y: number, sid: string, kind: string): v
       close();
     }
   });
-  window.addEventListener("click", close, { once: true });
+  closeOnOutsideClick(close);
 }
 
 /** 拉 session→项目名 映射；顺带把误绑到项目上的主聊天解绑 */
@@ -1256,7 +1418,7 @@ function installSessionBindHandler(root: HTMLElement): void {
         showToast(`重命名失败：${err}`, "error");
       }
     });
-    window.addEventListener("click", close, { once: true });
+    closeOnOutsideClick(close);
   });
 }
 
@@ -1303,6 +1465,7 @@ interface ProgressEvent {
     | "toolCall"
     | "toolResult"
     | "toolError"
+    | "toolTick"
     | "answering"
     | "discardStream"
     | "steer";
@@ -1322,10 +1485,15 @@ interface ProgressEvent {
   args?: string;
   preview?: string;
   message?: string;
+  /** toolTick：长工具执行心跳（已运行秒数 + 输出尾巴） */
+  elapsedSecs?: number;
+  tail?: string;
   /** discardStream */
   reason?: string;
   /** steer：被消费掉的那条插话的 id */
   id?: string;
+  /** steer：插话附带的图片（文件路径）；插话不铺气泡，图要画在时间线 steer 条目上 */
+  images?: string[];
 }
 
 interface Candidate {
@@ -1365,8 +1533,49 @@ interface McpServerCfg {
 // ---------------- 状态 ----------------
 
 let mode: Mode = "orb";
+/** 当前会话是否在跑 —— 决定「发送」还是「插话」、显不显示 ■。**按会话**算（并行 run） */
 let busy = false;
 let thinking = false;
+/**
+ * 进行中气泡属于哪个会话 —— 进度事件到达时用来判断"用户是不是已经切走了"。
+ * 切走后到达的事件直接丢（那是旧会话的收尾），没切走则重建气泡接着画。
+ */
+let runningSessionId = "";
+
+/**
+ * **正在跑的会话集合**（2026-09-26 用户拍板：多会话并行 run）。
+ *
+ * 每个会话各自跑各自的 agent loop（后端 `RunRegistry` 按 session_id 分槽），
+ * 互不干扰 —— 切到没在跑的会话可以立刻开新任务，切到在跑的会话可以插话。
+ */
+const runningSessions = new Set<string>();
+
+/** 当前会话在不在跑 */
+function isCurBusy(): boolean {
+  return runningSessions.has(currentSessionId);
+}
+
+/** run 开始/结束、切会话之后：把 `busy` 与按钮布局对齐**当前会话**的状态 */
+function syncBusyUi(): void {
+  busy = isCurBusy();
+  setBusyUi(busy);
+  updateBgRunBanner();
+}
+
+/** 登记一轮开始（`runSid` = 这一轮归属的会话，开跑时就定死） */
+function markRunStart(runSid: string): void {
+  runningSessions.add(runSid);
+  setThinking(true); // 任一 run 在跑，球就该是"干活中"
+  syncBusyUi();
+}
+
+/** 一轮结束：注销并按当前会话重算 busy */
+function markRunEnd(runSid: string): void {
+  runningSessions.delete(runSid);
+  if (runningSessionId === runSid) runningSessionId = "";
+  setThinking(runningSessions.size > 0); // 还有别的会话在跑 → 球继续转
+  syncBusyUi();
+}
 
 /**
  * 输入框草稿。
@@ -1486,6 +1695,19 @@ let autostartOn = false;
 
 /** 失焦自动收起（防挡屏幕）。启动时从 Rust 读，设置页可改。 */
 let blurCollapse = true;
+
+/**
+ * 执行权限档位（settings.execTrust）—— 管 run_command / MCP 弹卡频率。
+ * 三档：ask 每次询问 / smart 低中风险免问 / full 全部免问（硬阻断永远拦）。
+ * 对应 Rust 侧 `config::ExecTrust`；文件权限申请不受它影响。
+ */
+let execTrust: "ask" | "smart" | "full" = "ask";
+
+const EXEC_TRUST_LABEL: Record<string, { icon: string; short: string; full: string }> = {
+  ask: { icon: "🛡", short: "询问", full: "每次询问" },
+  smart: { icon: "⚡", short: "智能", full: "智能放行（高风险仍问）" },
+  full: { icon: "🔓", short: "全放", full: "允许完全访问" },
+};
 
 /** 面板刚展开的时间戳 —— 展开瞬间可能收到 blur，忽略掉防抖 */
 let panelOpenedAt = 0;
@@ -1872,7 +2094,7 @@ function renderItem(s: AgentStep, live: boolean, idx = -1): string {
     case "tool_call":
       return `<div class="tl-line"${di}>🔧 调用 <code>${esc(s.name || "?")}</code>${
         s.detail ? ` <i>${esc(summarizeArgs(s.detail))}</i>` : ""
-      }</div>`;
+      }${s.tick ? `<span class="tl-tick">${esc(s.tick)}</span>` : ""}</div>`;
 
     case "tool_result": {
       const full = s.detail || "";
@@ -1902,10 +2124,21 @@ function renderItem(s: AgentStep, live: boolean, idx = -1): string {
         s.detail,
       )}</div>`;
 
-    case "steer":
-      return `<div class="tl-steer"${di}>💬 插话${s.name ? ` <i>${esc(s.name)}</i>` : ""}：${esc(
-        s.detail,
-      )}</div>`;
+    case "steer": {
+      // 插话附带的图（可选）：插话不铺独立气泡，这里是它唯一的展示位置。
+      // 复用历史消息那套缩略图渲染（文件路径 → image_thumb 异步加载 + 就地替换）。
+      const thumbs =
+        s.images && s.images.length
+          ? `<div class="thumbs tl-thumbs">${s.images
+              .map((src, i) => renderThumb(src, i, false))
+              .join("")}</div>`
+          : "";
+      // ⚠️ 不显示 `s.name`：steer 条目的 name 是**内部插话 id**（`st1790…`），
+      //    它的用途是与 user 消息的 `steerId` 对齐（回填图片 / 标记已送达），
+      //    画出来只会是一串看不懂的编号。
+      void s.name;
+      return `<div class="tl-steer"${di}>💬 插话：${esc(s.detail)}${thumbs}</div>`;
+    }
 
     case "text":
     case "stream":
@@ -2128,38 +2361,91 @@ function nodeFromHtml(html: string): HTMLElement | null {
  *
  * 流式 chunk 来得比帧还快（尤其 fast 模型），每个 chunk 都 patch 一次纯属浪费；
  * 用 rAF 合并后，视觉上仍是「逐字增长」，GPU 那边少干很多活。
+ *
+ * ⚠️ rAF **不是可靠的心跳**（2026-09-25 用户报「界面卡住不动，其实在跑」）：
+ * 窗口被最小化/完全遮挡时 WebView2 会暂停 requestAnimationFrame —— 回调
+ * 可能迟迟不来甚至被丢弃。一旦被丢弃，`runPaintScheduled` 就永远卡在 true，
+ * 后续所有 scheduleRunPaint() 直接 return —— 界面**彻底冻结**在某一帧，
+ * 只有刷新才能恢复。所以加 250ms 的 setTimeout 看门狗：rAF 没来就用定时器兜底，
+ * 两条路都调用同一个 flush（幂等，谁先到谁画）。
  */
 let runPaintScheduled = false;
 
 function scheduleRunPaint(): void {
   if (runPaintScheduled) return;
   runPaintScheduled = true;
-  requestAnimationFrame(() => {
+  const flush = () => {
+    if (!runPaintScheduled) return;
     runPaintScheduled = false;
-    if (view !== "chat") return;
-    const b = document.getElementById("panel-body");
-    if (!b) return;
-    const atBottom = b.scrollHeight - b.scrollTop - b.clientHeight < 60;
-    // 用户主动展开过过程块 → 禁止误滚走（E7）
-    const userExpanded = b.querySelector("details[data-user-open='1']");
-    patchRunning(b);
-    if (userExpanded) {
-      // 重建后按 data-open-key 恢复；若仍展开，别滚
-      return;
-    }
-    // 用户没往上翻时才自动跟到底部
-    if (atBottom) b.scrollTop = b.scrollHeight;
-  });
+    paintRunningNow();
+  };
+  requestAnimationFrame(flush);
+  window.setTimeout(flush, 250);
+}
+
+/** 实际重绘逻辑（rAF / 看门狗共用） */
+function paintRunningNow(): void {
+  if (view !== "chat") return;
+  const b = document.getElementById("panel-body");
+  if (!b) return;
+  const atBottom = b.scrollHeight - b.scrollTop - b.clientHeight < 60;
+  // 用户主动展开过过程块 → 禁止误滚走（E7）
+  const userExpanded = b.querySelector("details[data-user-open='1']");
+  patchRunning(b);
+  if (userExpanded) {
+    // 重建后按 data-open-key 恢复；若仍展开，别滚
+    return;
+  }
+  // 用户没往上翻时才自动跟到底部
+  if (atBottom) b.scrollTop = b.scrollHeight;
 }
 
 /** 绑定申请卡上的按钮（渲染后调用；每次重绘都会重新绑一批新的） */
 function bindPermButtons(root: ParentNode): void {
+  // ask_user 问题卡：点选项/发送/跳过 → 回答经 reason 通道回给模型
+  root.querySelectorAll<HTMLButtonElement>(".perm-btn[data-act^='ask-']").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const card = btn.closest<HTMLElement>(".perm-card");
+      const id = card?.dataset.perm;
+      if (!id) return;
+      const act = btn.dataset.act ?? "";
+      if (act === "ask-option") {
+        // 快捷选项：点一下即回答
+        void decidePerm(id, "approve", btn.dataset.val ?? "");
+      } else if (act === "ask-send") {
+        const val = card.querySelector<HTMLInputElement>(".ask-input")?.value.trim() ?? "";
+        if (!val) {
+          card.querySelector<HTMLInputElement>(".ask-input")?.focus();
+          return;
+        }
+        void decidePerm(id, "approve", val);
+      } else if (act === "ask-skip") {
+        const why = card.querySelector<HTMLInputElement>(".ask-input")?.value.trim() ?? "";
+        void decidePerm(id, "deny", why || "（用户选择跳过）");
+      }
+    });
+  });
+  // 提问输入框：Enter 发送
+  root.querySelectorAll<HTMLInputElement>(".ask-input").forEach((inp) => {
+    inp.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      const card = inp.closest<HTMLElement>(".perm-card");
+      const id = card?.dataset.perm;
+      const val = inp.value.trim();
+      if (!id || !val) return;
+      void decidePerm(id, "approve", val);
+    });
+  });
+
   root.querySelectorAll<HTMLButtonElement>(".perm-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       const card = btn.closest<HTMLElement>(".perm-card");
       const id = card?.dataset.perm;
       if (!id) return;
       const act = btn.dataset.act ?? "deny";
+      // ask 卡的动作在上面已单独绑定（回答走 reason 通道），这里绝不能再当"决定"处理
+      if (act.startsWith("ask-")) return;
 
       // ✎ → 才切到"写理由"形态。理由是可选的，所以默认那颗「拒绝」不拦人。
       if (act === "deny-why") {
@@ -2193,7 +2479,10 @@ function bindPermButtons(root: ParentNode): void {
 
   // 理由输入框：Enter 确认 / Esc 取消。
   // 全局键盘在有输入焦点时**故意不接管**，所以这两个键必须在这里接。
+  // ⚠️ ask 卡的输入框也用了 perm-reason 的样式类 —— 它的 Enter 是「回答」不是「拒绝」，
+  //    必须跳过（否则用户打字回车会被当成拒绝发出去）。
   root.querySelectorAll<HTMLInputElement>(".perm-reason").forEach((inp) => {
+    if (inp.classList.contains("ask-input")) return;
     inp.addEventListener("keydown", (ev) => {
       const id = inp.closest<HTMLElement>(".perm-card")?.dataset.perm;
       if (!id) return;
@@ -2339,6 +2628,13 @@ function renderMessagesInner(): string {
             : ""
         }
         ${
+          // 「未跑完」角标：进程在轮内被关掉（"退出不丢轮"保下来的半截轮）。
+          // 必须与 interrupted 区分开 —— 那个是用户点了停止，这个是进程没了。
+          e.partial
+            ? `<div class="partial-tag" title="这轮在进程退出时被截断，以下是当时已产出的部分（提问与步骤都已保留）">（未跑完：进程退出时中断）</div>`
+            : ""
+        }
+        ${
           e.queued
             ? `<div class="queued-tag">${
                 e.steerQueuePos ? `已排队（第 ${e.steerQueuePos} 位）` : "已排队"
@@ -2407,13 +2703,60 @@ const PERM_RISK_LABEL: Record<string, string> = {
 function renderPermCards(): string {
   return pendingPerms
     .map((p) =>
-      p.kind === "command"
-        ? renderCommandPermCard(p)
-        : p.kind === "mcp"
-          ? renderMcpPermCard(p)
-          : renderFilePermCard(p),
+      p.kind === "ask"
+        ? renderAskCard(p)
+        : p.kind === "command"
+          ? renderCommandPermCard(p)
+          : p.kind === "mcp"
+            ? renderMcpPermCard(p)
+            : renderFilePermCard(p),
     )
     .join("");
+}
+
+/**
+ * ask_user 问题卡（2026-09-25 用户要求）：模型向用户提问并等回答。
+ *
+ * 与权限卡的区别：没有批/拒，只有**回答**。快捷选项点一下即回；
+ * 也可以打字自由回答（Enter 发送）。跳过 = 明确告诉模型"用户不答"。
+ */
+function renderAskCard(p: PendingPerm): string {
+  const deadline = p.createdAt + p.timeoutMs;
+  const rest = Math.max(0, deadline - Date.now());
+  const mm = Math.floor(rest / 60000);
+  const ss = String(Math.floor((rest % 60000) / 1000)).padStart(2, "0");
+
+  const opts = (p.options ?? [])
+    .map(
+      (o) =>
+        `<button type="button" class="perm-btn ok" data-act="ask-option" data-val="${esc(o)}">${esc(o)}</button>`,
+    )
+    .join("");
+
+  return `
+  <div class="perm-card perm-card-ask" data-perm="${esc(p.id)}">
+    <div class="perm-head">
+      <span class="perm-title">💬 向你提问</span>
+      <span class="perm-timer" data-deadline="${deadline}">⏱ ${mm}:${ss}</span>
+    </div>
+    <div class="perm-row"><span class="perm-k">问题</span><span class="perm-v">${esc(
+      p.question || p.command,
+    )}</span></div>
+    ${
+      p.reason
+        ? `<div class="perm-row"><span class="perm-k">原因</span><span class="perm-v">${esc(p.reason)}</span></div>`
+        : ""
+    }
+    <div class="perm-actions">
+      ${opts}
+    </div>
+    <div class="perm-actions">
+      <input class="perm-reason ask-input" type="text" placeholder="或在这里打字回答…" />
+      <button type="button" class="perm-btn ok" data-act="ask-send">发送</button>
+      <button type="button" class="perm-btn" data-act="ask-skip">跳过</button>
+    </div>
+    <div class="perm-hint">Enter 发送 · 「跳过」= 不回答（AI 会按默认继续）</div>
+  </div>`;
 }
 
 /** 文件级申请卡（路径维度） */
@@ -2759,12 +3102,16 @@ function renderPanel(): void {
 
       <div class="fg-ctx" id="fg-ctx" title="用户当前前台应用（点击复制路径）" style="display:none"></div>
 
+      <!-- 「另一个会话在后台跑」提示条（切走后自动出现，点击切回） -->
+      <div class="bg-run" id="bg-run" style="display:none"></div>
+
       <div class="panel-body" id="panel-body"></div>
 
       <div class="thumbs" id="thumbs"></div>
       <div class="img-hint" id="img-hint" style="display:none"></div>
 
       <div class="panel-input">
+        <button id="btn-trust" class="trust-chip" title="执行权限档位：控制 run_command / MCP 还问不问你（文件权限不受影响）">🛡 询问</button>
         <textarea id="input" rows="1" placeholder="问点什么…（Enter 发送 / Shift+Enter 换行 / Ctrl+V 贴图）"></textarea>
         <button id="btn-stop" title="停止生成" hidden>■</button>
         <button id="btn-send" title="发送">↵</button>
@@ -2852,10 +3199,19 @@ function renderPanel(): void {
   document.getElementById("btn-send")!.addEventListener("click", () => void send());
   document.getElementById("btn-stop")!.addEventListener("click", () => void stopRun());
 
+  // 执行权限档位：chip 显示当前档，点击弹三档菜单（对齐 WorkBuddy 权限选择器形态）
+  const trustBtn = document.getElementById("btn-trust");
+  updateTrustChip();
+  trustBtn?.addEventListener("click", (e) => {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    showTrustMenu(r.left, r.bottom + 4);
+  });
+
   renderPreview();
   renderBody();
   // 面板可能是"跑着任务时收起 → 又展开"的，按钮布局要跟着当前状态走
   setBusyUi(busy);
+  updateBgRunBanner();
   input?.focus();
   void refreshFgCtx();
 }
@@ -4334,6 +4690,8 @@ function renderCmdPolicyView(
     <div class="set-hint" style="margin-bottom:8px">
       管的是 <code>run_command</code>（PowerShell）。三路判定：
       <b>白名单免问</b> / <b>硬阻断</b>（危险命令连问都不问）/ <b>其余弹确认卡</b>。<br>
+      <b>弹卡频率</b>由输入框左侧的<b>执行权限档位</b>控制（🛡 每次询问 / ⚡ 智能放行 / 🔓 允许完全访问）——
+      硬阻断在任何档位下都拦，档位免掉的只是"问你"。<br>
       规则文件：<code>${esc(path || "agent-data/command_policy.json")}</code>（也可手工改）。<br>
       命令授权是<strong>永久的</strong>：点卡片「记住这类 / 记住这条」会写进
       <code>command_grants.json</code>，跨会话、重启都还在 —— 要收回请用下面列表里的
@@ -4967,21 +5325,44 @@ function archiveStreamToItems(last: ChatEntry, tag?: string): void {
  * 没有这个的话用户面对的是**纯黑盒空白**，然后答案突然砸出来。
  */
 function installProgressListener(): void {
-  void listen<ProgressEvent>("agent-progress", (e) => {
-    const p = e.payload;
+  void listen<{ sessionId: string; p: ProgressEvent }>("agent-progress", (e) => {
+    const { sessionId, p } = e.payload;
+    // 多会话并行 run：只画**当前会话**那条 run 的进度。
+    // 别的会话在后台跑的事件直接丢 —— 它们的结果由后端落盘，切过去就能看到。
+    if (sessionId && sessionId !== currentSessionId) return;
 
-    // 「插话被送达」跟进行中气泡无关，先就地处理（改的是那条排队消息的角标）
+    // 「插话被送达」：改排队消息的角标 + 把它画进进行中气泡的时间线
+    // （与重载后的形态一致 —— 重载走 sessionToEntries，插话同样画在时间线上）
     if (p.kind === "steer") {
       const q = entries.find((x) => x.steerId === p.id);
       if (q) q.queued = false;
       if (p.id) markSteerDelivered(p.id);
+      // 送达的插话带图时，图只能画在时间线上（插话不铺独立气泡）
+      const run = entries.find((x) => x.role === "running");
+      if (run) {
+        run.items = run.items ?? [];
+        run.items.push({
+          kind: "steer",
+          name: null,
+          detail: p.text ?? "",
+          images: p.images && p.images.length ? p.images : undefined,
+        });
+        // 只调度重绘（内部会 rAF + 250ms 看门狗兜底），不需要传元素
+        scheduleRunPaint();
+      }
       return;
     }
 
     // ⚠️ 不能用 entries[len-1]：允许执行中「插话」后，队尾可能是刚排队的用户消息，
     //    那样所有进度事件都会被整批丢弃。进行中的气泡按 role 找。
-    const last = entries.find((x) => x.role === "running");
-    if (!last) return;
+    let last = entries.find((x) => x.role === "running");
+    if (!last) {
+      // running 气泡丢了（切会话/重载把它冲掉了）但后端还在跑 ——
+      // 以前这里直接 `return`，事件全被吞掉：用户看到的是「明明在动、界面不更新」。
+      // 现在补一个气泡把事件接住（会话归属已在上面按 sessionId 校验过）。
+      last = { role: "running", text: "正在思考…", items: [] };
+      entries.push(last);
+    }
     last.items = last.items ?? [];
 
     switch (p.kind) {
@@ -5015,7 +5396,9 @@ function installProgressListener(): void {
             last.items.push(cur);
             last.reasonOpen = true;
           }
-          cur.detail = capAppend(cur.detail, p.reasoning, MAX_STREAM_REASON_CHARS);
+          // 思考过程**不截**（用户拍板"完全不截"）：直接拼接，不设上限。
+          // 见 MAX_STREAM_TEXT_CHARS 的说明。
+          cur.detail = (cur.detail ?? "") + p.reasoning;
         }
         if (p.text) {
           last.streamText = capAppend(last.streamText, p.text, MAX_STREAM_TEXT_CHARS);
@@ -5031,7 +5414,21 @@ function installProgressListener(): void {
         last.reasonOpen = false;
         break;
 
+      case "toolTick": {
+        // 长工具心跳：只就地更新**最后一个** tool_call 条目 + 头部状态，
+        // 不新增时间线条目（每 2s 一条会把时间线刷成流水账）。
+        //
+        // ⚠️ 秒数由**前端本地每秒推**，后端这个 2s 心跳只负责对齐起点 + 带输出尾巴。
+        //    理由：后端心跳一旦中断（读任务被掐 / 事件被吞 / 单 run 被卡住），
+        //    显示就冻在某个秒数上 —— 用户 2026-09-26 实报「一直 4s」「心跳也没有了」，
+        //    看起来像死掉了。本地推的话，哪怕后端一个心跳都不来，秒数照样往前走。
+        startToolTick(p.name ?? "工具", p.elapsedSecs ?? 0, p.tail);
+        break;
+      }
+
       default: {
+        // 新一轮工具调用 / 工具结果落地 → 旧心跳收摊，秒数由新的接棒
+        if (p.kind === "toolCall" || p.kind === "toolResult") stopToolTick();
         const item = progressItem(p);
         if (item) last.items.push(item);
         break;
@@ -5042,6 +5439,54 @@ function installProgressListener(): void {
     // （重建会让悬停中的复制按钮反复淡入淡出 = 闪烁）
     scheduleRunPaint();
   });
+}
+
+// ---------------- 长工具心跳：前端本地每秒推 ----------------
+//
+// 后端每 2s 推一次 `toolTick`（带输出尾巴），但**秒数显示由前端自己每秒 +1**。
+// 理由见 `installProgressListener` 里 toolTick 分支的注释 —— 后端心跳一断，
+// 显示就冻在某个秒数上，看起来像死掉了；本地推就不会。
+let tickTimer: ReturnType<typeof setInterval> | undefined;
+/** 秒数起点（毫秒时间戳）。后端心跳到达时按它的秒数对齐一次 */
+let tickBaseAt = 0;
+let tickName = "";
+let tickTail = "";
+
+/** 后端心跳到达：对齐起点 + 更新工具名/输出尾巴（后端的秒数优先，它更准） */
+function startToolTick(name: string, elapsedSecs: number, tail?: string): void {
+  tickName = name;
+  if (tail) tickTail = tail;
+  tickBaseAt = Date.now() - elapsedSecs * 1000;
+  if (!tickTimer) {
+    tickTimer = setInterval(() => paintToolTick(), 1000);
+  }
+  paintToolTick();
+}
+
+/** 工具跑完 / 一轮结束 / 气泡没了 → 收摊 */
+function stopToolTick(): void {
+  if (tickTimer) clearInterval(tickTimer);
+  tickTimer = undefined;
+  tickTail = "";
+}
+
+/** 就地刷「已运行 Ns」——不新增时间线条目（每秒一条会刷成流水账） */
+function paintToolTick(): void {
+  const run = entries.find((x) => x.role === "running");
+  if (!run) {
+    stopToolTick();
+    return;
+  }
+  const secs = Math.max(0, Math.floor((Date.now() - tickBaseAt) / 1000));
+  const items = run.items ?? [];
+  const tailItem = items[items.length - 1];
+  // 为什么是"最后一个"：工具执行是串行的 —— toolCall 事件先到、tool_result 执行完
+  // 才补，所以执行期间 items 的尾条就是正在跑的那个调用。
+  if (tailItem && tailItem.kind === "tool_call") {
+    tailItem.tick = `⏳ 已运行 ${secs}s${tickTail ? `｜${tickTail}` : ""}`;
+  }
+  run.text = `正在执行 ${tickName || "工具"}…（${secs}s）`;
+  scheduleRunPaint();
 }
 
 /**
@@ -5221,6 +5666,29 @@ function installDropHandler(): void {
   });
 }
 
+/**
+ * 窗口拿到 OS 焦点后，把 DOM 焦点补回输入框。
+ *
+ * 为什么需要：窗口在"非前台"状态下构建时，WebView 里的 `input.focus()` 不生效
+ * （输入游标看不见、打字没反应）。`apply_mode(panel)` 现在会用
+ * `win32::force_foreground` 把窗口真正提到前台，但前台切换与 DOM 焦点建立的
+ * 先后顺序不保证 —— 这里在 `focus` 事件上补一次，对**自动化输入**尤其关键。
+ *
+ * 只补"面板内没有任何输入焦点"的情况：用户在消息区选字 / 点按钮 / 正在确认卡
+ * 里打字时不抢，免得打断。
+ */
+function installFocusRefocus(): void {
+  window.addEventListener("focus", () => {
+    if (mode !== "panel") return;
+    const input = document.getElementById("input") as HTMLTextAreaElement | null;
+    if (!input) return;
+    const ae = document.activeElement as HTMLElement | null;
+    const busyElsewhere =
+      ae != null && ae !== document.body && ae.closest("input, textarea, select, button, .msg-body, .confirm-mask") != null;
+    if (!busyElsewhere) input.focus();
+  });
+}
+
 // ---------------- 业务 ----------------
 
 async function loadModels(): Promise<void> {
@@ -5249,7 +5717,8 @@ async function loadProjects(): Promise<void> {
 }
 
 async function send(): Promise<void> {
-  // 忙碌中 → 走「插话」通道（排队），而不是静默吞掉用户打的字
+  // 当前会话在跑 → 走「插话」通道（排队），而不是静默吞掉用户打的字。
+  // ⚠️ `busy` 是**按会话**算的（多会话并行 run）：别的会话在跑不影响这里开新任务。
   if (busy) {
     await sendSteer();
     return;
@@ -5281,20 +5750,32 @@ async function send(): Promise<void> {
 
   // 先放一个「进行中」气泡，进度事件会往里建时间线条目；结束后替换成最终结果
   entries.push({ role: "running", text: "正在思考…", items: [] });
+  runningSessionId = currentSessionId;
+  // 这一轮归属哪个会话 —— 用户中途切走后，收尾逻辑要靠它判断"还该不该动当前视图"
+  const runSid = runningSessionId;
   const b0 = document.getElementById("panel-body");
   if (b0) {
     paintMessages(b0);
     b0.scrollTop = b0.scrollHeight;
   }
 
-  busy = true;
+  markRunStart(runSid);
   // 新的一轮 —— 上一轮的「本轮不再问」不该管到这一轮
   permMuteThisTurn = false;
-  setThinking(true);
-  setBusyUi(true);
 
   try {
     const run = await invoke<AgentRun>("chat", { input: text, images: imgs });
+    // ⚠️ 用户可能在等待期间切走了。切走后 entries 已经是**别的会话**的内容，
+    //    所以清气泡 / 重载 / 提示一律不动 —— 这一轮的结果后端已经落回它自己的
+    //    会话（`append_run_in`），切回去就能看到。
+    if (runSid !== currentSessionId) {
+      // 出错信号仍然要给（否则"后台跑挂了"完全无声）
+      if (run.interrupted) {
+        unseenError = true;
+        if (mode === "orb") applyOrbState();
+      }
+      return;
+    }
     // 去掉 running 气泡
     const idx = entries.findIndex((x) => x.role === "running");
     if (idx >= 0) entries.splice(idx, 1);
@@ -5325,10 +5806,14 @@ async function send(): Promise<void> {
     }
   } catch (e) {
     const msg = String(e);
+    // 用户已经切走 → 当前视图是别的会话，别往里写红色错误；只把"出事了"的信号留下
+    const stillHere = runSid === currentSessionId;
     if (msg.includes("已停止")) {
-      const idx = entries.findIndex((x) => x.role === "running");
-      if (idx >= 0) entries.splice(idx, 1);
-      pushEntry("system", "⏹ 已停止");
+      if (stillHere) {
+        const idx = entries.findIndex((x) => x.role === "running");
+        if (idx >= 0) entries.splice(idx, 1);
+        pushEntry("system", "⏹ 已停止");
+      }
     } else {
       // ⚠️ 出错时**不能只删掉进行中气泡**（2026-09-22 用户报的 bug）。
       //
@@ -5337,6 +5822,13 @@ async function send(): Promise<void> {
       // 结果落盘（见 `lib.rs::persist_run`），所以这里改成「以磁盘为准重载」：
       // 留下来的就是它真正做过的事，顺带拿到 `storedIdx`
       // （重新生成 / 删除 / 分叉 这些按钮要用它）。
+      if (!stillHere) {
+        // 后台那个会话挂了：给一条轻提示 + 亮红球，等用户切回去看细节
+        showToast(`后台会话出错：${msg.slice(0, 90)}`, "error", 4000);
+        unseenError = true;
+        if (mode === "orb") applyOrbState();
+        return;
+      }
       const idx = entries.findIndex((x) => x.role === "running");
       if (idx >= 0) entries.splice(idx, 1);
       await reloadSessionKeepScroll(
@@ -5362,12 +5854,14 @@ async function send(): Promise<void> {
       );
     }
   } finally {
-    busy = false;
-    setThinking(false);
-    setBusyUi(false);
+    stopToolTick();
+    // 注销本轮 + 按当前会话重算 busy / 后台运行提示条
+    markRunEnd(runSid);
   }
 
-  // 记忆候选若在本轮增加 → 提醒去设置审批（做完后提议记忆的产品闭环）
+  // 记忆候选若在本轮增加 → 提醒去设置审批（做完后提议记忆的产品闭环）。
+  // 切走了就不往当前会话塞这条提示 —— 它属于刚才那轮。
+  if (runSid !== currentSessionId) return;
   const pendingAfter = await invoke<Candidate[]>("mem_pending").catch(
     () => [] as Candidate[],
   );
@@ -5399,6 +5893,8 @@ async function sendSteer(): Promise<void> {
     const ack = await invoke<{ id: string; queued: number }>("chat_steer", {
       input: text,
       images: imgs,
+      // 多会话并行 run：插话必须路由到**当前会话**那个 run 的收件箱
+      sessionId: currentSessionId,
     });
     // 已经送出去了才清输入框
     input.value = "";
@@ -5436,7 +5932,7 @@ async function stopRun(): Promise<void> {
     btn.textContent = "…";
     btn.title = "正在停止…";
   }
-  await invoke("chat_cancel").catch(() => {});
+  await invoke("chat_cancel", { sessionId: currentSessionId }).catch(() => {});
   const run = entries.find((x) => x.role === "running");
   if (run) {
     run.text = "正在停止…";
@@ -5632,8 +6128,8 @@ function installContextMenu(): void {
     }
 
     closeCopyMenu();
-    if (busy) return;
-
+    // ⚠️ 不要用 `busy` 挡住球态菜单：它只是导航（设置/记忆/对话/退出），
+    //    跑着任务时更要能进去看设置、或去别的会话开新任务（并行 run）。
     // 只有胶囊态需要"弹菜单"；面板态内右键直接忽略（已经在面板里了）
     if (mode === "orb") {
       await applyMode("menu");
@@ -5671,6 +6167,7 @@ function boot(): void {
 
   installPasteHandler();
   installDropHandler();
+  installFocusRefocus();
   installContextMenu();
   installCopyHandlers();
   installForkHandlers();
@@ -5684,6 +6181,16 @@ function boot(): void {
   // 读的是本地小 JSONL，成本可忽略；这是胶囊态"金色 = 有事情等你拍板"的唯一数据源。
   void refreshPendingApprovals();
   window.setInterval(() => void refreshPendingApprovals(), 5000);
+
+  // 执行权限档位：启动拉一次（chip 默认 ask，拉到什么显什么）
+  void invoke<{ execTrust?: string }>("get_settings")
+    .then((s) => {
+      if (s?.execTrust) {
+        execTrust = s.execTrust as typeof execTrust;
+        updateTrustChip();
+      }
+    })
+    .catch(() => {});
 
   // 启动自检要先于会话预热：needsInit 决定了对话空态渲染成"引导语"还是"初始化提示"
   void checkBoot().then(() => ensureSessionLoaded());

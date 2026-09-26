@@ -31,45 +31,29 @@ const MAX_MESSAGES: usize = 400;
 /// 折叠后单条工具结果的展示上限（字符）
 const FOLDED_DETAIL_LIMIT: usize = 120;
 
-/// 单条助手消息保留的思考过程上限（字符）
-///
-/// 思维链有可能比正文长好几倍（长任务里一轮 CoT 几万字）。落盘只留**头部**
-/// 并加一行截断说明 —— 用户回看时想知道"它当时怎么想的"，不需要逐字复读；
-/// 而少数模型会把整篇正文重复吐在 reasoning 里，不设限会让会话文件失控。
-const REASONING_LIMIT: usize = 8 * 1024;
-
-/// 思考过程的截断说明（截断时追加在末尾）
-const REASONING_CUT_NOTE: &str = "\n\n……（思考过程过长，已截断）";
-
 /// 时间线条目单条的落盘上限（字符）。
 ///
 /// 为什么不像以前那样**整组折叠成一行**（见 [`cap_steps`]）：折叠把"做了几步、
 /// 哪一步的思考对应哪个工具"全部抹平了，用户回看时只剩
 /// `[已执行：read_file、grep（共 12 次工具调用）]` —— 等于"做过的事又消失一次"
 /// （2026-09-22 用户报的第二个问题）。现在保留条目与顺序，只在**单条**上截断。
+///
+/// ⚠️ 只作用于工具类条目（参数 / 结果）。**思考条目不受任何上限约束** ——
+/// 见 [`cap_steps`] 的说明。
 const STEP_DETAIL_LIMIT: usize = 300;
 
 /// 单轮落盘的时间线条目数上限（超出只留最近的，前面补一条省略说明）。
 ///
-/// 会话是**全量 JSON 读写**，单文件体积要控制：50 轮的 agent 跑法可能产生
-/// 150+ 条目。300 字 × 60 条 ≈ 18KB/轮，仍远低于"整篇工具输出原文"。
-const STEPS_LIMIT: usize = 60;
+/// 会话是**全量 JSON 读写**，单文件体积要控制。但上限不能压到会丢掉思考：
+/// 2026-09-26 实测用户一条长任务里单轮就产生 61 步、被砍掉 **199 步**更早的
+/// 步骤（`omitted` 标记实锤）—— 症状③「早期轮次思考块消失」就是这么来的。
+///
+/// 轮数硬顶 250 × 每轮约 3 条 ≈ 750 步，取值要高于它才不会误砍。
+/// 并且超限时**只丢最早的普通步骤，思考条目永不丢**（见 [`cap_steps`]）。
+const STEPS_LIMIT: usize = 1200;
 
 /// 单轮落盘的链路状态条目上限（限流退避通知这类，只留最后几条）
 const STATUS_STEPS_LIMIT: usize = 8;
-
-/// 按上限截断思考过程（只截落盘，不影响内存里已展示的内容）
-fn cap_reasoning(s: &str) -> String {
-    if s.len() <= REASONING_LIMIT {
-        return s.to_string();
-    }
-    // 按 char 边界安全地截到 REASONING_LIMIT 字节以内
-    let mut cut = REASONING_LIMIT;
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}{}", &s[..cut], REASONING_CUT_NOTE)
-}
 
 /// 按字符数（不是字节）截断，超限时追加截断说明。
 fn cap_chars(s: &str, limit: usize) -> String {
@@ -133,6 +117,16 @@ pub struct StoredMessage {
     /// 搜索和历史回灌的字节，且一旦落盘就再也分不清哪部分是模型原话。
     #[serde(default, skip_serializing_if = "is_false")]
     pub interrupted: bool,
+    /// **未定稿的占位消息**（2026-09-26 加的"退出不丢轮"机制）。
+    ///
+    /// 一轮对话开跑时，先落一条 `partial = true` 的助手占位消息；轮内每完成
+    /// 一段就增量更新它；轮结束由 `finish_turn` 定稿（清掉这个标记）。
+    /// 进程中途退出时，磁盘上留下的就是"提问 + 已经产出的部分"，
+    /// 而不是以前的**整轮蒸发**。
+    ///
+    /// 老数据没有这个字段 → 默认 `false`（= 已定稿），行为不变。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub partial: bool,
     /// 执行中插话的 id。有值时 UI **不在对话流铺气泡**，
     /// 而是在 assistant.steps 的 `kind=steer` 时间线里按位置画（真实交错）。
     /// 历史回灌仍按 user 角色进模型上下文。
@@ -730,6 +724,127 @@ pub struct TurnRecord<'a> {
     pub usage: crate::llm::TokenUsage,
 }
 
+/// 一轮**开跑时**立刻落盘：用户提问 + 一条 `partial` 助手占位。
+///
+/// ## 为什么需要（2026-09-26 用户报「退出后整轮清空」）
+///
+/// 以前整轮只在 `agent::run` 返回之后才走 [`append_run`]。用户在长命令
+/// 执行期等不及直接关掉进程时，那个 future 被直接丢弃，`append_run` 根本没
+/// 执行 —— 提问、思考、工具步骤、正文**一个字都没落盘**。
+/// 实证：`s1790400662188-0.json` 13:31 建、`messages: []`，而 grants 里
+/// 13:34 批的 `D:/mimo-proxy` 授权正是卡死那轮留下的。
+///
+/// 现在改成：开跑先落提问与占位 → 轮内 [`checkpoint_turn`] 增量更新 →
+/// 结束 [`append_run`] 定稿。哪怕进程被杀，磁盘上至少留下"问了什么 +
+/// 已经产出到哪一步"。
+pub fn begin_turn(data_dir: &Path, user_text: &str, images: &[String]) -> Result<(), String> {
+    begin_turn_in(data_dir, None, user_text, images)
+}
+
+/// 解析"这一轮该写进哪个会话"。
+///
+/// 显式 `session_id` 优先 —— 支持**切走会话、后台继续跑**（2026-09-26 用户拍板）：
+/// 用户中途切走时 `current.txt` 已经变了，但这一轮的结果必须落回**开跑时的那个**
+/// 会话（`chat` 开跑前就把 id 定死了）。id 为空 / 指向已不存在的会话时退回当前会话。
+fn target_session(data_dir: &Path, session_id: Option<&str>) -> Session {
+    if let Some(id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(s) = load(data_dir, id) {
+            return s;
+        }
+    }
+    ensure_current(data_dir)
+}
+
+/// 同 [`begin_turn`]，但**显式指定落盘会话**（切走会话、后台继续跑用）。
+pub fn begin_turn_in(
+    data_dir: &Path,
+    session_id: Option<&str>,
+    user_text: &str,
+    images: &[String],
+) -> Result<(), String> {
+    let mut s = target_session(data_dir, session_id);
+    let now = now_ms();
+
+    s.messages.push(StoredMessage {
+        role: "user".into(),
+        text: user_text.to_string(),
+        images: images.to_vec(),
+        steps: Vec::new(),
+        reasoning: None,
+        interrupted: false,
+        partial: false,
+        steer_id: None,
+        model: None,
+        usage: None,
+        at: now,
+    });
+    // 助手占位：`partial = true` 是"还没定稿"的标记，定稿时被 append_run 换掉。
+    s.messages.push(StoredMessage {
+        role: "assistant".into(),
+        text: String::new(),
+        images: Vec::new(),
+        steps: Vec::new(),
+        reasoning: None,
+        interrupted: false,
+        partial: true,
+        steer_id: None,
+        model: None,
+        usage: None,
+        at: now,
+    });
+
+    // 标题规则与 append_run 保持一致（首次有用户消息时定下来）
+    if !s.is_main() && s.title == "新会话" {
+        let t: String = user_text.trim().chars().take(24).collect();
+        if !t.is_empty() {
+            s.title = t;
+        }
+    }
+    s.updated_at = now;
+    write_session(data_dir, &s)
+}
+
+/// 轮内**增量更新**那条 `partial` 助手占位（提问已由 [`begin_turn`] 落盘）。
+///
+/// 由 agent 循环在轮边界 / 每个工具跑完后回调触发。找不到占位就静默返回 ——
+/// 说明这轮没走 `begin_turn`（老路径 / 分叉会话），不要在这里硬造一条消息。
+pub fn checkpoint_turn(
+    data_dir: &Path,
+    steps: &[StoredStep],
+    answer: &str,
+    reasoning: Option<&str>,
+) -> Result<(), String> {
+    checkpoint_turn_in(data_dir, None, steps, answer, reasoning)
+}
+
+/// 同 [`checkpoint_turn`]，但**显式指定落盘会话**（切走会话、后台继续跑用）。
+pub fn checkpoint_turn_in(
+    data_dir: &Path,
+    session_id: Option<&str>,
+    steps: &[StoredStep],
+    answer: &str,
+    reasoning: Option<&str>,
+) -> Result<(), String> {
+    let mut s = target_session(data_dir, session_id);
+    let Some(last) = s.messages.last_mut() else {
+        return Ok(());
+    };
+    if !(last.partial && last.role == "assistant") {
+        return Ok(());
+    }
+    last.steps = cap_steps(steps);
+    if !answer.trim().is_empty() {
+        last.text = strip_step_folds(answer);
+    }
+    if let Some(r) = reasoning {
+        if !r.is_empty() {
+            last.reasoning = Some(r.to_string());
+        }
+    }
+    s.updated_at = now_ms();
+    write_session(data_dir, &s)
+}
+
 /// 往当前会话追加一轮完整对话（用户消息 + 插话 + 助手结果）。
 ///
 /// ## 落盘顺序的取舍
@@ -743,28 +858,56 @@ pub struct TurnRecord<'a> {
 /// - 工具步骤在这里**只限长、不折叠**（见 [`cap_steps`]）：保留
 ///   `reasoning / tool_call / tool_result / status / error` 的顺序，界面才能
 ///   还原成交错时间线。喂给模型的那份仍走 [`fold_steps`]（`history.rs` 读时）。
-/// - `reasoning` 只留头部（[`REASONING_LIMIT`]），并加截断说明。这是**旧字段**，
+/// - `reasoning` **原文全存**（2026-09-26 起不截）。这是**旧字段**，
 ///   新数据以 `steps` 里的 `reasoning` 条目为准；保留写入是为了老前端 / 回滚安全。
 /// - `interrupted` 的中断轮**照样落盘** —— 用户要看到自己那条消息和已产出的部分。
 pub fn append_run(data_dir: &Path, rec: &TurnRecord<'_>) -> Result<(), String> {
-    let mut s = ensure_current(data_dir);
-    let now = now_ms();
+    append_run_in(data_dir, None, rec)
+}
 
-    s.messages.push(StoredMessage {
-        role: "user".into(),
-        text: rec.user_text.to_string(),
-        images: rec.images.to_vec(),
-        steps: Vec::new(),
-        reasoning: None,
-        interrupted: false,
-        steer_id: None,
-        model: None,
-        usage: None,
-        at: now,
-    });
+/// 同 [`append_run`]，但**显式指定落盘会话**（切走会话、后台继续跑用）。
+///
+/// ⚠️ 为什么要显式指定：切走会话后台继续跑时，`current.txt` 在跑的中途就变了；
+/// 仍按"当前会话"落盘的话，回答会写进**另一个**会话（见 `session_new` 的旧注释）。
+pub fn append_run_in(
+    data_dir: &Path,
+    session_id: Option<&str>,
+    rec: &TurnRecord<'_>,
+) -> Result<(), String> {
+    let mut s = target_session(data_dir, session_id);
+    let now = now_ms();
 
     // 插话（执行中追加的指令）—— 仍是 user 消息（历史回灌要按角色），
     // 但带 steer_id：UI 不单独铺气泡，改画在 steps 时间线里（与真实进度交错）。
+    // 「退出不丢轮」（2026-09-26）：开跑时 `begin_turn` 已经落了 [用户提问 +
+    // partial 助手占位]。这里若发现队尾是那条占位，就**就地定稿**：
+    //   - 用户消息**不再重复 push**（它已经在盘上）
+    //   - 把占位替换成真正的助手消息（补全 steps / 正文 / 用量）
+    // 插话仍按原有顺序插在助手结果之前。
+    let has_placeholder = matches!(
+        s.messages.last(),
+        Some(m) if m.partial && m.role == "assistant"
+    );
+    if !has_placeholder {
+        // 老路径 / 直接调用（测试、分叉）：自己补用户消息
+        s.messages.push(StoredMessage {
+            role: "user".into(),
+            text: rec.user_text.to_string(),
+            images: rec.images.to_vec(),
+            steps: Vec::new(),
+            reasoning: None,
+            interrupted: false,
+            partial: false,
+            steer_id: None,
+            model: None,
+            usage: None,
+            at: now,
+        });
+    } else {
+        // 定稿：先摘掉占位（插话要插在它前面），最后再 push 真正的助手消息
+        s.messages.pop();
+    }
+
     for m in rec.steers {
         s.messages.push(StoredMessage {
             role: "user".into(),
@@ -773,6 +916,7 @@ pub fn append_run(data_dir: &Path, rec: &TurnRecord<'_>) -> Result<(), String> {
             steps: Vec::new(),
             reasoning: None,
             interrupted: false,
+            partial: false,
             steer_id: Some(m.id.clone()),
             model: None,
             usage: None,
@@ -785,8 +929,11 @@ pub fn append_run(data_dir: &Path, rec: &TurnRecord<'_>) -> Result<(), String> {
         text: strip_step_folds(rec.answer),
         images: Vec::new(),
         steps: cap_steps(rec.steps),
-        reasoning: rec.reasoning.filter(|r| !r.is_empty()).map(cap_reasoning),
+        // 思考过程**原文全存**（2026-09-26 起不截）：回看时要能逐字复现它当时怎么想的
+        reasoning: rec.reasoning.filter(|r| !r.is_empty()).map(str::to_string),
         interrupted: rec.interrupted,
+        // 定稿：清掉 partial 标记
+        partial: false,
         steer_id: None,
         // 用量与模型只落在 assistant 这条上 —— 统计的就是"每次问答花了多少"
         model: Some(rec.model.to_string()),
@@ -967,20 +1114,27 @@ pub fn steps_from_agent(steps: &[crate::agent::AgentStep]) -> Vec<StoredStep> {
 /// ## 保留了什么
 /// - 顺序：不做任何重排、不合并相邻同种条目
 /// - 种类：reasoning / tool_call / tool_result / status / error / assistant 全留
-/// - 每条的 `detail`：截到 [`STEP_DETAIL_LIMIT`]，末尾加"（已截断）"
+/// - 思考条目：**原文全留**（见下）
+/// - 其余条目的 `detail`：截到 [`STEP_DETAIL_LIMIT`]，末尾加"（已截断）"
+///
+/// ## 思考过程为什么完全不截（2026-09-26 用户拍板）
+///
+/// 以前有 `REASONING_LIMIT = 8KB` 的**总预算**，且预算是按**字节**算的 ——
+/// 中文一个字 3 字节，实际只装得下约 2700 字；更糟的是预算一旦耗尽，
+/// **后续思考条目整条不落盘**（`continue`）。用户报的三个症状都由它引起：
+/// 展开后内容比标注字数少、早期轮次的思考块整个消失。
+///
+/// 现在的取舍：思维链是"它当时怎么想的"，正是回看时最想看的东西，
+/// 不设任何上限。会话文件会变大（用户已确认接受）。
 ///
 /// ## 砍掉了什么
-/// - reasoning 的**总预算**（[`REASONING_LIMIT`]）：超了就不再落后续思考条目，
-///   防止某个模型把整篇正文重复吐进 reasoning 里把会话文件撑爆
 /// - status 条目只留最后 [`STATUS_STEPS_LIMIT`] 条（限流退避通知会刷屏）
 /// - 总条数超 [`STEPS_LIMIT`] → 只留最近的，最前面补一条 `omitted` 说明
 pub fn cap_steps(steps: &[StoredStep]) -> Vec<StoredStep> {
     let total_status = steps.iter().filter(|s| s.kind == "status").count();
     let drop_status = total_status.saturating_sub(STATUS_STEPS_LIMIT);
     let mut seen_status = 0usize;
-    let mut reason_used = 0usize;
     let mut out: Vec<StoredStep> = Vec::with_capacity(steps.len());
-
     for s in steps {
         if s.kind == "status" {
             seen_status += 1;
@@ -989,16 +1143,8 @@ pub fn cap_steps(steps: &[StoredStep]) -> Vec<StoredStep> {
             }
         }
         let detail = if s.kind == "reasoning" || s.kind == "thought" {
-            if reason_used >= REASONING_LIMIT {
-                // 思考预算用尽 → 后面的思考条目直接不落（正文与工具照常保留）
-                continue;
-            }
-            let left = REASONING_LIMIT - reason_used;
-            // 思考条目只受**总预算**约束，不套用单条 300 字上限 ——
-            // "它当时怎么想的"正是回看时最想看的东西。
-            let d = cap_chars(&s.detail, left);
-            reason_used += d.len();
-            d
+            // 思考条目：**原文全留**，不截、不丢（见函数文档）
+            s.detail.clone()
         } else if s.kind == "text" || s.kind == "stream" {
             // 多轮流式正文按轮收进时间线 —— 回看要比 tool 参数更长一点
             cap_chars(&s.detail, 2000)
@@ -1013,18 +1159,43 @@ pub fn cap_steps(steps: &[StoredStep]) -> Vec<StoredStep> {
     }
 
     if out.len() > STEPS_LIMIT {
-        let cut = out.len() - STEPS_LIMIT;
-        out.drain(..cut);
-        out.insert(
-            0,
-            StoredStep {
-                kind: "omitted".into(),
-                name: None,
-                detail: format!("（本轮还有 {cut} 步更早的步骤，已省略）"),
-            },
-        );
+        // 超限时**思考条目永不丢** —— 只丢最早的普通步骤（tool_call / tool_result /
+        // status / error / text）。症状③「早期思考块消失」正是被这里的无差别
+        // `drain(..cut)` 砍掉的：用户一轮有 200+ 步时，最早那批思考全没了。
+        //
+        // 若可丢的普通步骤不够（思考本身就超限）→ 条数会略微超出 STEPS_LIMIT。
+        // 这是**刻意的**：宁可条数超一点，也不丢思考。
+        let must_drop = out.len().saturating_sub(STEPS_LIMIT);
+        let mut keep: Vec<StoredStep> = Vec::with_capacity(STEPS_LIMIT + 1);
+        let mut dropped = 0usize;
+        for s in out.iter() {
+            if dropped < must_drop && !is_keep_always(&s.kind) {
+                dropped += 1;
+                continue;
+            }
+            keep.push(s.clone());
+        }
+        if dropped > 0 {
+            keep.insert(
+                0,
+                StoredStep {
+                    kind: "omitted".into(),
+                    name: None,
+                    detail: format!("（本轮还有 {dropped} 步更早的非思考步骤，已省略）"),
+                },
+            );
+        }
+        out = keep;
     }
     out
+}
+
+/// 这些 kind 的条目**任何情况下都不丢**（超限时优先丢别的）。
+///
+/// 为什么只有思考：它是"它当时怎么想的"，回看时最想看、也最难从别处恢复
+/// （工具调用可以从工具结果反推，思考不行）。
+fn is_keep_always(kind: &str) -> bool {
+    kind == "reasoning" || kind == "thought"
 }
 
 /// 把 assistant 消息的 steps 压成一条摘要（历史回灌用）。
@@ -1150,6 +1321,230 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// 「退出不丢轮」：开跑即落盘 —— 提问与 partial 占位必须在 agent 跑之前就存在。
+    ///
+    /// 这是 2026-09-26 用户报「退出后整轮清空」的回归测试（实证：卡死那轮的
+    /// `s1790400662188-0.json` 是空的 `messages: []`）。
+    #[test]
+    fn begin_turn_persists_question_and_placeholder() {
+        let d = tmp("begin_turn");
+        begin_turn(&d, "帮我跑个长命令", &[]).unwrap();
+
+        // 模拟"进程在产出任何内容前被杀" → 直接重新读盘
+        let s = ensure_current(&d);
+        assert_eq!(s.messages.len(), 2, "应落 [提问, partial 占位] 两条");
+        assert_eq!(s.messages[0].role, "user");
+        assert_eq!(s.messages[0].text, "帮我跑个长命令");
+        assert!(!s.messages[0].partial, "用户消息不是占位");
+        assert_eq!(s.messages[1].role, "assistant");
+        assert!(s.messages[1].partial, "助手占位必须带 partial 标记");
+        assert!(
+            s.messages[1].text.is_empty() && s.messages[1].steps.is_empty(),
+            "占位开始时没有内容"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 轮内 checkpoint：把已产出的步骤/思考写进那条占位，且**不新增消息**。
+    #[test]
+    fn checkpoint_turn_updates_placeholder_in_place() {
+        let d = tmp("checkpoint");
+        begin_turn(&d, "问题", &[]).unwrap();
+
+        let steps = vec![
+            StoredStep {
+                kind: "reasoning".into(),
+                name: None,
+                detail: "先看看情况".into(),
+            },
+            StoredStep {
+                kind: "tool_call".into(),
+                name: Some("run_command".into()),
+                detail: "{\"command\":\"ping\"}".into(),
+            },
+        ];
+        checkpoint_turn(&d, &steps, "半截正文", Some("先看看情况")).unwrap();
+
+        let s = ensure_current(&d);
+        assert_eq!(s.messages.len(), 2, "checkpoint 不能新增消息");
+        let last = s.messages.last().unwrap();
+        assert!(last.partial, "还没定稿");
+        assert_eq!(last.steps.len(), 2, "步骤已增量落盘");
+        assert_eq!(last.reasoning.as_deref(), Some("先看看情况"));
+        assert_eq!(last.text, "半截正文");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 定稿：`append_run` 要把占位**换成**真正的助手消息，且**不重复**写用户消息。
+    #[test]
+    fn append_run_finalizes_placeholder_without_duplicating_user() {
+        let d = tmp("finalize");
+        begin_turn(&d, "问题", &[]).unwrap();
+        let steps = vec![StoredStep {
+            kind: "reasoning".into(),
+            name: None,
+            detail: "想了想".into(),
+        }];
+        checkpoint_turn(&d, &steps, "", Some("想了想")).unwrap();
+
+        append_run(
+            &d,
+            &TurnRecord {
+                user_text: "问题",
+                images: &[],
+                steers: &[],
+                answer: "最终答案",
+                reasoning: Some("想了想"),
+                steps: &steps,
+                interrupted: false,
+                model: "test-model",
+                usage: crate::llm::TokenUsage::default(),
+            },
+        )
+        .unwrap();
+
+        let s = ensure_current(&d);
+        assert_eq!(s.messages.len(), 2, "定稿后仍只有 [提问, 助手] 两条，不能重复");
+        assert_eq!(s.messages[0].role, "user");
+        assert_eq!(s.messages[0].text, "问题");
+        let a = &s.messages[1];
+        assert_eq!(a.role, "assistant");
+        assert!(!a.partial, "定稿后必须清掉 partial 标记");
+        assert_eq!(a.text, "最终答案");
+        assert_eq!(a.steps.len(), 1, "步骤保留");
+        assert_eq!(a.model.as_deref(), Some("test-model"));
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 没走 `begin_turn` 的老路径（直接 append_run）仍要自己补用户消息。
+    #[test]
+    fn append_run_without_placeholder_still_writes_user() {
+        let d = tmp("no_placeholder");
+        let _ = ensure_current(&d);
+        append_run(
+            &d,
+            &TurnRecord {
+                user_text: "直接一轮",
+                images: &[],
+                steers: &[],
+                answer: "答",
+                reasoning: None,
+                steps: &[],
+                interrupted: false,
+                model: "m",
+                usage: crate::llm::TokenUsage::default(),
+            },
+        )
+        .unwrap();
+
+        let s = ensure_current(&d);
+        assert_eq!(s.messages.len(), 2, "用户 + 助手");
+        assert_eq!(s.messages[0].text, "直接一轮");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 切走会话、后台继续跑：落盘必须回**开跑的那个**会话，而不是"当前会话"。
+    ///
+    /// 2026-09-26 用户拍板「切走 = 后台继续跑」。回归点：`begin_turn` /
+    /// `checkpoint_turn` / `append_run` 的老版本走 `ensure_current`，中途切走会把
+    /// 这一轮的回答写进**另一个**会话。
+    #[test]
+    fn pinned_session_writes_survive_switch_away() {
+        let d = tmp("pinned_switch");
+        let a = ensure_current(&d); // A：开跑的那个会话
+        let b = new_session(&d); // B：用户中途切过去的会话（new_session 会 set_current）
+
+        // 开跑：显式钉在 A —— 此刻 current 其实已经是 B
+        begin_turn_in(&d, Some(&a.id), "在 A 里问", &[]).unwrap();
+        checkpoint_turn_in(&d, Some(&a.id), &[], "半截答案", None).unwrap();
+        append_run_in(
+            &d,
+            Some(&a.id),
+            &TurnRecord {
+                user_text: "在 A 里问",
+                images: &[],
+                steers: &[],
+                answer: "A 的最终答案",
+                reasoning: None,
+                steps: &[],
+                interrupted: false,
+                model: "m",
+                usage: crate::llm::TokenUsage::default(),
+            },
+        )
+        .unwrap();
+
+        // A 拿到完整一轮；B 一个字都没多
+        let sa = load(&d, &a.id).unwrap();
+        assert_eq!(
+            sa.messages.len(),
+            2,
+            "A 应是 用户+助手 两条（占位被定稿替换，不重复），实际 {}",
+            sa.messages.len()
+        );
+        assert_eq!(sa.messages[0].text, "在 A 里问");
+        assert_eq!(sa.messages[1].text, "A 的最终答案");
+        assert!(!sa.messages[1].partial, "append_run_in 应定稿（清掉 partial）");
+
+        let sb = load(&d, &b.id).unwrap();
+        assert!(sb.messages.is_empty(), "B 不该被写进任何东西");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 不传 `session_id`（老路径 / 分叉等）→ 退回"当前会话"，行为与改动前一致。
+    #[test]
+    fn append_run_in_none_falls_back_to_current() {
+        let d = tmp("pin_fallback");
+        let cur = ensure_current(&d);
+        append_run_in(
+            &d,
+            None,
+            &TurnRecord {
+                user_text: "老路径",
+                images: &[],
+                steers: &[],
+                answer: "答",
+                reasoning: None,
+                steps: &[],
+                interrupted: false,
+                model: "m",
+                usage: crate::llm::TokenUsage::default(),
+            },
+        )
+        .unwrap();
+
+        let s = load(&d, &cur.id).unwrap();
+        assert_eq!(s.id, cur.id, "None 应写回当前会话");
+        assert_eq!(s.messages.len(), 2);
+
+        // 指到一个不存在的会话 id 也要退回当前会话，不能把内容弄丢
+        append_run_in(
+            &d,
+            Some("s-not-exist"),
+            &TurnRecord {
+                user_text: "坏 id",
+                images: &[],
+                steers: &[],
+                answer: "答2",
+                reasoning: None,
+                steps: &[],
+                interrupted: false,
+                model: "m",
+                usage: crate::llm::TokenUsage::default(),
+            },
+        )
+        .unwrap();
+        let s2 = load(&d, &cur.id).unwrap();
+        assert_eq!(s2.messages.len(), 4, "坏 id 应退回当前会话追加一轮");
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -1375,6 +1770,7 @@ mod tests {
                 steps: Vec::new(),
                 reasoning: None,
                 interrupted: false,
+                partial: false,
                 steer_id: None,
                 model: None,
                 usage: None,
@@ -1652,7 +2048,13 @@ mod tests {
         assert_eq!(out.len(), STEPS_LIMIT + 1, "超限时补一条省略说明");
         assert_eq!(out[0].kind, "omitted");
         assert!(out[0].detail.contains("10 步"), "要说明省了几步: {}", out[0].detail);
-        assert_eq!(out.last().unwrap().name.as_deref(), Some("tool69"), "留最近的那批");
+        // 留最近的那批 —— 最后一个必须是最后构造的那条（别写死下标，STEPS_LIMIT 会调）
+        let last_name = format!("tool{}", STEPS_LIMIT + 9);
+        assert_eq!(
+            out.last().unwrap().name.as_deref(),
+            Some(last_name.as_str()),
+            "留最近的那批"
+        );
 
         // 不超限时不该冒出 omitted
         let few = cap_steps(&steps[..3]);
@@ -1660,31 +2062,56 @@ mod tests {
         assert!(few.iter().all(|s| s.kind == "tool_call"));
     }
 
+    /// 思考条目**原文全留**：不截、不丢（2026-09-26 用户拍板"完全不截"）。
+    ///
+    /// 这是三个症状的回归测试：① 标注字数比真实少 ② 展开内容比标注少
+    /// ③ 早期轮次思考块消失 —— 根因都是旧的 8KB 字节预算。
     #[test]
-    fn cap_steps_stops_reasoning_after_budget() {
-        let mut steps = vec![StoredStep {
-            kind: "reasoning".into(),
-            name: None,
-            detail: "A".repeat(REASONING_LIMIT),
-        }];
-        steps.push(StoredStep {
-            kind: "reasoning".into(),
-            name: None,
-            detail: "这段不该落盘".into(),
-        });
-        steps.push(StoredStep {
-            kind: "tool_call".into(),
-            name: Some("read_file".into()),
-            detail: "{}".into(),
-        });
+    fn cap_steps_keeps_reasoning_verbatim() {
+        // 两条都很长的思考（远超声称的 8KB）+ 一条工具
+        let long_a = "思考甲".repeat(4000); // 12000 字 ≈ 36KB，旧预算下必被截
+        let long_b = "思考乙".repeat(4000);
+        let steps = vec![
+            StoredStep {
+                kind: "reasoning".into(),
+                name: None,
+                detail: long_a.clone(),
+            },
+            StoredStep {
+                kind: "reasoning".into(),
+                name: None,
+                detail: long_b.clone(),
+            },
+            StoredStep {
+                kind: "tool_call".into(),
+                name: Some("read_file".into()),
+                detail: "{}".into(),
+            },
+        ];
 
         let out = cap_steps(&steps);
-        assert_eq!(
-            out.iter().filter(|s| s.kind == "reasoning").count(),
-            1,
-            "思考总预算用尽后不再落思考条目（防模型把正文重复吐进 reasoning）"
+        let reasons: Vec<&StoredStep> =
+            out.iter().filter(|s| s.kind == "reasoning").collect();
+        assert_eq!(reasons.len(), 2, "两条思考都要落盘，一条都不能丢");
+        assert_eq!(reasons[0].detail, long_a, "思考甲必须逐字一致（不截不丢）");
+        assert_eq!(reasons[1].detail, long_b, "思考乙必须逐字一致（不截不丢）");
+        assert_eq!(out.last().unwrap().kind, "tool_call", "工具条目照常保留");
+    }
+
+    /// 工具条目仍然限长（思考放开了，不代表别的也放开）。
+    #[test]
+    fn cap_steps_still_caps_tool_detail() {
+        let steps = vec![StoredStep {
+            kind: "tool_result".into(),
+            name: Some("read_file".into()),
+            detail: "x".repeat(STEP_DETAIL_LIMIT + 100),
+        }];
+        let out = cap_steps(&steps);
+        assert!(
+            out[0].detail.ends_with("（已截断）"),
+            "工具结果仍按 STEP_DETAIL_LIMIT 截断: {}",
+            out[0].detail
         );
-        assert_eq!(out.last().unwrap().kind, "tool_call", "工具条目不受思考预算影响");
     }
 
     #[test]
@@ -1745,6 +2172,7 @@ mod tests {
                 steps: Vec::new(),
                 reasoning: None,
                 interrupted: false,
+                partial: false,
                 steer_id: None,
                 model: None,
                 usage: None,

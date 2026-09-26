@@ -85,7 +85,18 @@ pub fn build_history(data_dir: &std::path::Path, session_id: &str, now_ms: u64) 
             out.push(ChatMessage::system(format!("{SUMMARY_HEADER}\n\n{sum}")));
         }
     }
-    out.extend(picked.into_iter().map(to_chat_message));
+    out.extend(picked.into_iter().filter_map(|p| {
+        // ⚠️ 空的助手消息不回灌（2026-09-26）。来源：「退出不丢轮」机制在开跑时
+        // 落下的 `partial` 占位 —— 进程若在产出任何内容前被关掉，磁盘上就留着
+        // 一条 `text=""`、`steps=[]` 的助手消息。把它喂给模型，部分厂商 API 会
+        // 直接因"空 content"报 400。有 steps 的占位照常回灌（那是真实轨迹）。
+        let empty_assistant =
+            p.msg.role == "assistant" && p.msg.text.trim().is_empty() && p.msg.steps.is_empty();
+        if empty_assistant {
+            return None;
+        }
+        Some(to_chat_message(p))
+    }));
     out
 }
 
@@ -605,6 +616,7 @@ mod tests {
             steps: Vec::new(),
             reasoning: None,
             interrupted: false,
+            partial: false,
             steer_id: None,
             model: None,
             usage: None,

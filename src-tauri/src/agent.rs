@@ -63,6 +63,12 @@ pub fn hard_iterations() -> usize {
 /// 每消费一批插话，给预算加多少轮
 const STEER_BONUS: usize = 6;
 
+/// 「输出被 max_tokens 截断」自动续写的最大次数（防死循环）
+const MAX_LENGTH_CONTINUES: usize = 3;
+
+/// 「工具调用被写成正文」时提醒重发的最大次数（防死循环）
+const MAX_PSEUDO_NUDGES: usize = 2;
+
 /// 插话队列上限（满了就让用户等当前轮结束）
 const MAX_INBOX: usize = 8;
 
@@ -151,8 +157,15 @@ fn trim_old_tool_results(messages: &mut [ChatMessage], keep_recent: usize) -> us
 /// 为什么要这个：agent loop 一轮可能跑 30-60 秒（多次模型调用 + 工具执行），
 /// 中间是**完全黑盒**的 —— 用户只看到空白，然后答案突然出现。
 /// 把这些节点推给前端，就能实时显示「正在思考 / 调用了什么工具 / 工具返回了什么」。
+/// ## ⚠️ `rename_all_fields` 不能省（2026-09-26 修 bug）
+///
+/// serde 对**枚举**的 `rename_all` 只重命名**变体名**（`ToolTick` → `toolTick`），
+/// **不重命名字段**。本枚举里 `elapsed_secs` 是唯一的多词字段，只写 `rename_all`
+/// 时它序列化出去仍是 `elapsed_secs`，而前端读的是 `p.elapsedSecs` → 永远
+/// `undefined ?? 0` → 长命令心跳永远显示「已运行 0s」（用户截图实报）。
+/// `rename_all_fields` 才是"重命名所有变体的字段"的那个属性。
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Progress {
     /// 开始第 n 轮模型调用（模型在"思考"）
     Thinking { iteration: usize },
@@ -177,6 +190,14 @@ pub enum Progress {
     ToolCall { name: String, args: String },
     /// 工具返回了
     ToolResult { name: String, preview: String },
+    /// 工具执行**还在跑**（长命令每 2s 一次心跳）—— 前端据此刷"已运行 N 秒 + 输出尾巴"，
+    /// 消掉「界面卡在 run_com 步骤不动」的假死感（2026-09-25）。
+    ToolTick {
+        name: String,
+        elapsed_secs: u64,
+        /// 输出尾巴（单行，可能为空）
+        tail: String,
+    },
     /// 工具执行失败
     ToolError { name: String, message: String },
     /// 准备输出最终答案（流式下已经边收边发了，这里只作为收尾信号）
@@ -184,7 +205,17 @@ pub enum Progress {
     /// 本轮流了正文出来，但模型最终决定去调工具 —— 前端把那半截话淡化掉
     DiscardStream { reason: String },
     /// 执行中「插话」的用户消息**已被消费**（前端把「排队中」改成「已送达」）
-    Steer { id: String, text: String },
+    ///
+    /// `images` 是插话附带的图片（文件路径）。为什么一并推给前端：插话的图
+    /// 在对话流里不铺独立气泡（见 `steer_id` 的设计），只在**时间线的
+    /// `kind=steer` 条目**上画 —— 少了它，用户在"插话里带图"时只能看到文字
+    /// （2026-09-26 用户报的 bug1）。
+    Steer {
+        id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
+    },
 }
 
 /// 执行中「插话」进来的一条用户消息。
@@ -306,12 +337,163 @@ impl RunHub {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 多会话并行 run：按 session_id 分槽的运行时注册表（2026-09-26 用户拍板）
+// ---------------------------------------------------------------------------
+
+/// 一轮执行的运行时句柄。**每个会话一个**，互不干扰。
+///
+/// 为什么不是全局单例：用户要"切到别的会话继续干活"。全局单例时
+/// `chat_steer` 只有一个收件箱、`cancel` 只有一个标志 —— 停 A 会把 B 一起停掉，
+/// 插话也会串到另一个会话去。见 [`RunRegistry`]。
+pub struct RunSlot {
+    pub hub: std::sync::Arc<RunHub>,
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Clone for RunSlot {
+    fn clone(&self) -> Self {
+        Self {
+            hub: self.hub.clone(),
+            cancel: self.cancel.clone(),
+        }
+    }
+}
+
+/// 并发 run 注册表：`session_id → RunSlot`。多个会话可以同时跑各自的 agent loop。
+#[derive(Default)]
+pub struct RunRegistry {
+    slots: std::sync::Mutex<std::collections::HashMap<String, RunSlot>>,
+}
+
+impl RunRegistry {
+    /// 开跑前登记：拿到本会话专属的插话收件箱 + 取消标志。
+    ///
+    /// 同一会话重复 `begin`（理论上不该发生）时**复用同一个槽**，不覆盖 ——
+    /// 否则上一个 run 的插话和取消就都失效了。
+    ///
+    /// ⚠️ 必须调 `hub.begin()`：它负责把 `active` 置位并清空残留收件箱。
+    ///    漏了它 `RunHub::push` 会一直返回"当前没有进行中的对话"（插话全被拒）。
+    pub fn begin(&self, session_id: &str) -> RunSlot {
+        let mut g = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = g
+            .entry(session_id.to_string())
+            .or_insert_with(|| RunSlot {
+                hub: std::sync::Arc::new(RunHub::new()),
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            })
+            .clone();
+        // 复用槽位时也要重置状态：清掉上一轮残留 + 打开收件箱
+        slot.hub.begin();
+        slot.cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        slot
+    }
+
+    /// 收尾：取走残留插话（调用方回填给前端）并移除槽位。
+    /// 无论成功、失败、中断都要调。
+    pub fn end(&self, session_id: &str) -> Vec<SteeredMsg> {
+        let slot = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+        match slot {
+            Some(s) => s.hub.end(),
+            None => Vec::new(),
+        }
+    }
+
+    pub fn is_active(&self, session_id: &str) -> bool {
+        self.slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(session_id)
+    }
+
+    /// 是否有**任意**会话在跑（重载授权这类全局动作要靠它避让）
+    pub fn any_active(&self) -> bool {
+        !self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    /// 当前所有在跑的会话 id（`chat_cancel` 不带 sid 时全停用）
+    pub fn active_ids(&self) -> Vec<String> {
+        self.slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// 插话路由到**目标会话**的收件箱
+    pub async fn push(&self, session_id: &str, m: SteeredMsg) -> Result<SteerAck, String> {
+        let hub = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .map(|s| s.hub.clone())
+            .ok_or_else(|| "该会话没有进行中的对话".to_string())?;
+        hub.push(m).await
+    }
+
+    /// 停掉**目标会话**的 run；返回是否确实停到了一个。
+    pub fn cancel(&self, session_id: &str) -> bool {
+        let g = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        match g.get(session_id) {
+            Some(s) => {
+                s.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// 进度回调。用 Arc<dyn Fn> 而不是泛型，避免把泛型参数污染到整个 agent loop。
 pub type ProgressFn = std::sync::Arc<dyn Fn(Progress) + Send + Sync>;
 
 /// 什么都不做的回调（测试用）
 pub fn no_progress() -> ProgressFn {
     std::sync::Arc::new(|_| {})
+}
+
+/// **轮内增量落盘**的回调（2026-09-26 加，治「退出后整轮蒸发」）。
+///
+/// 参数：`(目前已产出的步骤, 目前流出的正文, 目前的思考过程)`。
+/// agent loop 在每个轮边界、以及每个工具跑完后调用；`lib.rs` 收到后写进会话里
+/// 那条 `partial` 助手占位（见 `sessions::checkpoint_turn`）。
+///
+/// 为什么不用 `ProgressFn` 顺手做：`Progress` 是**面向 UI 的增量事件**
+/// （单个 delta / 单条工具），要拿它还原"当前完整步骤"得再养一份影子状态，
+/// 容易漂移。这里直接给完整快照 —— 写进磁盘的就是最终形态。
+///
+/// ⚠️ 实现方必须**快速返回**：它在 loop 里被串行调用，慢了会拖慢整个 agent。
+pub type CheckpointFn = std::sync::Arc<dyn Fn(&[AgentStep], &str, &str) + Send + Sync>;
+
+/// 触发一次轮内增量落盘（没配回调就什么都不做）。
+///
+/// 位置刻意选在**轮边界**与**每个工具跑完后** —— 这两处正好覆盖
+/// "长命令卡住时用户关掉进程"的场景：磁盘上至少留下"问了什么 + 跑过哪几步"。
+fn checkpoint(cb: &Option<CheckpointFn>, steps: &[AgentStep], answer: &str, reasoning: &str) {
+    if let Some(f) = cb.as_ref() {
+        f(steps, answer, reasoning);
+    }
+}
+
+/// 取本轮已流出正文的**副本**（不清空累加器 —— 后面还要用它当半截正文返回）。
+fn peek_text(acc: &std::sync::Mutex<String>) -> String {
+    acc.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
 /// 把某一轮的思维链并入**时间线**与累计串。
@@ -343,6 +525,7 @@ fn absorb_reason(
         kind: "reasoning".into(),
         name: None,
         detail: txt.clone(),
+        images: Vec::new(),
     });
     if !total.is_empty() {
         total.push_str("\n\n");
@@ -367,6 +550,7 @@ fn drain_status_steps(log: &std::sync::Mutex<Vec<String>>, steps: &mut Vec<Agent
             kind: "status".into(),
             name: None,
             detail: text,
+            images: Vec::new(),
         });
     }
 }
@@ -378,6 +562,10 @@ pub struct AgentStep {
     pub kind: String,
     pub name: Option<String>,
     pub detail: String,
+    /// 图片文件路径。目前只有 `kind == "steer"` 会用到（插话里带的图）——
+    /// 插话不铺独立气泡，图只能画在时间线这条 steer 条目上。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -451,8 +639,10 @@ pub async fn run(
     user_input: &str,
     images: Vec<String>,
     on_progress: ProgressFn,
+    // 轮内增量落盘（可选）。`None` = 不增量写盘（测试）。
+    on_checkpoint: Option<CheckpointFn>,
     foreground: Option<&crate::context::ForegroundContext>,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     session_id: &str,
     // 执行中插话的收件箱
     hub: &RunHub,
@@ -569,7 +759,7 @@ pub async fn run(
     // 跨轮累计的思考过程（多轮时按「【第 N 轮】」分段）。
     //
     // 为什么要累加：模型每轮都会重新推演一遍，只留最后一轮会让用户看不懂
-    // "前面为什么这么绕"。落盘时按上限截断（见 `sessions::REASONING_LIMIT`）。
+    // "前面为什么这么绕"。落盘时**原文全存**（2026-09-26 起不截，见 `sessions::cap_steps`）。
     // ⚠️ 这是**旧字段**（兼容用）：新数据以 `steps` 里的 `reasoning` 条目为准。
     let mut reason_total = String::new();
 
@@ -586,6 +776,10 @@ pub async fn run(
     let hard_iters = hard_iterations().max(max_iters);
     let mut budget = max_iters;
     let mut iter = 0usize;
+
+    // 「假象终止」纠正的两种计数（各自有上限，防死循环）
+    let mut length_continues = 0usize; // finish_reason=length 自动续写
+    let mut pseudo_nudges = 0usize; // 伪工具调用解析回真调用
 
     // 上下文预算：模型配了就用，没配走保守兜底。乘安全水位。
     // （`context_window` 已在自动 compact 那一段算过，这里直接复用）
@@ -622,15 +816,18 @@ pub async fn run(
         // 同一个权限网关，所以「越权」这条红线自动同样生效，不需要额外校验。
         for m in hub.drain().await {
             messages.push(build_user_message(cfg, data_dir, &m.text, &m.images));
-            // 插进 steps 时间线：重载后过程里能看到「跑到这一步时用户补了一句」
+            // 插进 steps 时间线：重载后过程里能看到「跑到这一步时用户补了一句」。
+            // 图片一并挂上 —— 插话不铺独立气泡，这里是它唯一的展示位置。
             steps.push(AgentStep {
                 kind: "steer".into(),
                 name: Some(m.id.clone()),
                 detail: m.text.clone(),
+                images: m.images.clone(),
             });
             on_progress(Progress::Steer {
                 id: m.id.clone(),
                 text: m.text.clone(),
+                images: m.images.clone(),
             });
             eprintln!("[orbcat] 插话已送达（第 {iter} 轮）: {}", m.text);
             steers.push(m);
@@ -756,14 +953,14 @@ pub async fn run(
             }) as std::sync::Arc<llm::DiscardFn>
         };
 
-        let out = match llm::chat_stream(
+        let mut out = match llm::chat_stream(
             cfg,
             messages.clone(),
             tools_arg,
             &delta_cb,
             status_cb.as_ref(),
             discard_cb.as_ref(),
-            cancel,
+            &cancel,
         )
         .await
         {
@@ -796,38 +993,125 @@ pub async fn run(
                     kind: "error".into(),
                     name: None,
                     detail: e.clone(),
+                    images: Vec::new(),
                 });
                 return Err(RunAbort { message: e, run });
             }
         };
         drain_status_steps(&status_log, &mut steps);
         absorb_reason(&mut reason_total, iter, &round_reason, &mut steps);
+        // 轮内增量落盘：本轮思考/工具已进 steps，先写一份到磁盘
+        // （进程这会儿被关掉也不至于整轮蒸发）
+        checkpoint(
+            &on_checkpoint,
+            &steps,
+            &peek_text(&round_text),
+            &reason_total,
+        );
         // 本轮的 token 用量并入合计（无论这轮是出答案还是调工具）
         if let Some(u) = out.usage {
             usage_total.add(&u);
         }
-        let calls: Vec<llm::ToolCall> = out.tool_calls().to_vec();
+        let mut calls: Vec<llm::ToolCall> = out.tool_calls().to_vec();
 
-        // --- 没有工具调用：这就是最终答案（流式内容已经在界面上）---
+        // --- 没有工具调用：先分辨"真的答完了"还是"假象"（2026-09-25 用户报提前停止）---
+        //
+        // 两种假象必须先排掉，否则都会被当成最终答案收工：
+        // ① 输出被 max_tokens 掐断（finish_reason=length）——半截正文不是答案；
+        // ② 模型把工具调用**写成正文**（模仿历史回灌的 «steps…调用 X…» 格式，
+        //    mimo 实测会这样）—— 没有真 tool_calls，但意图是"继续干活"。
         if calls.is_empty() {
             let text = out.text();
-            on_progress(Progress::Answering);
-            steps.push(AgentStep {
-                kind: "assistant".into(),
-                name: None,
-                detail: text.clone(),
-            });
-            return Ok(AgentRun {
-                answer: text,
-                steps,
-                iterations: iter,
-                reasoning: (!reason_total.is_empty()).then_some(reason_total),
-                interrupted: false,
-                steers,
-                pending_steers: Vec::new(),
-                stop_reason: None,
-                usage: usage_total,
-            });
+
+            // ② 伪工具调用：正文里有 «steps /「调用 x / 参数: {…}」→ 解析回真调用
+            if smells_like_pseudo(&text) {
+                if let Some(pseudo) = extract_pseudo_calls(&text) {
+                    if pseudo_nudges < MAX_PSEUDO_NUDGES {
+                        pseudo_nudges += 1;
+                        eprintln!(
+                            "[orbcat] 检测到 {} 个写进正文的伪工具调用（第 {} 次），解析回真 tool_calls 继续执行",
+                            pseudo.len(),
+                            pseudo_nudges
+                        );
+                        on_progress(Progress::Status {
+                            text: "模型把工具调用写成了文字，已自动纠正为真实调用…".into(),
+                            retry: true,
+                        });
+                        steps.push(AgentStep {
+                            kind: "status".into(),
+                            name: None,
+                            detail: format!(
+                                "⚠️ 模型把 {} 个工具调用写成了正文（未真正执行），已解析回真实调用继续",
+                                pseudo.len()
+                            ),
+                            images: Vec::new(),
+                        });
+                        // 正文那半截是"伪日志"，不作为最终答案。
+                        // assistant 这条**不在这 push** —— 下面"有工具调用"分支会统一
+                        // push out.message，这里只把 tool_calls 修正进它，避免推两条。
+                        out.message.tool_calls = Some(pseudo.clone());
+                        calls = pseudo;
+                        // 走下面的工具执行分支（与真 tool_calls 同一条路）
+                    }
+                }
+            }
+
+            // ① 截断续写：还有下半截要生成
+            if calls.is_empty() && out.finish_reason.as_deref() == Some("length") {
+                if length_continues < MAX_LENGTH_CONTINUES {
+                    length_continues += 1;
+                    eprintln!(
+                        "[orbcat] 输出被 max_tokens 截断（第 {length_continues}/{MAX_LENGTH_CONTINUES} 次），自动续写"
+                    );
+                    messages.push(ChatMessage::assistant(text));
+                    messages.push(ChatMessage::user(
+                        "（上一条输出被长度上限截断了。请**从中断处直接继续**，不要重复已输出的内容；\
+                         若刚才正要调用工具，请直接调用工具而不是描述它。）",
+                    ));
+                    on_progress(Progress::Status {
+                        text: "输出被长度上限截断，自动续写中…".into(),
+                        retry: true,
+                    });
+                    continue;
+                }
+                // 续写次数用尽：把半截当答案，但明说被截断
+                let mut r = interrupted_run(
+                    steps,
+                    steers,
+                    reason_total,
+                    text,
+                    iter,
+                    usage_total,
+                );
+                r.stop_reason = Some(
+                    "输出连续被长度上限截断（已自动续写多次仍被截）。\
+                     可在模型配置里调大 maxOutputTokens 后继续。"
+                        .into(),
+                );
+                return Ok(r);
+            }
+
+            // 真的答完了：这就是最终答案（流式内容已经在界面上）
+            if calls.is_empty() {
+                on_progress(Progress::Answering);
+                steps.push(AgentStep {
+                    kind: "assistant".into(),
+                    name: None,
+                    detail: text.clone(),
+                    images: Vec::new(),
+                });
+                return Ok(AgentRun {
+                    answer: text,
+                    steps,
+                    iterations: iter,
+                    reasoning: (!reason_total.is_empty()).then_some(reason_total),
+                    interrupted: false,
+                    steers,
+                    pending_steers: Vec::new(),
+                    stop_reason: None,
+                    usage: usage_total,
+                });
+            }
         }
 
         // --- 有工具调用：本轮若已流过正文，告诉前端把那半截话淡化掉 ---
@@ -861,15 +1145,38 @@ pub async fn run(
                 kind: "tool_call".into(),
                 name: Some(call.function.name.clone()),
                 detail: call.function.arguments.clone(),
+                images: Vec::new(),
             });
 
             let output = {
+                // 长命令心跳：每 2s 把「已运行 N 秒 + 输出尾巴」推给前端（工具名绑进闭包）
+                let tick: crate::shell::TickFn = {
+                    let cb = on_progress.clone();
+                    let name = call.function.name.clone();
+                    std::sync::Arc::new(move |elapsed_secs: u64, tail: String| {
+                        cb(Progress::ToolTick {
+                            name: name.clone(),
+                            elapsed_secs,
+                            tail: tail.clone(),
+                        });
+                    })
+                };
+                // 取消探针：让 run_command 在**执行期间**也能被「停止」掐断
+                // （2026-09-26 修：以前 cancel 只在轮边界读，命令跑 600s 就得等 600s）。
+                // 现在 `cancel` 是**每 run 一个** `Arc<AtomicBool>`（多会话并行 run），
+                // 闭包直接捕获它的 clone —— 不再依赖 `'static` 全局，停 A 不会误停 B。
+                let cancel_flag = cancel.clone();
+                let cancel_probe: crate::shell::CancelFn = std::sync::Arc::new(move || {
+                    cancel_flag.load(std::sync::atomic::Ordering::Relaxed)
+                });
                 let ctx = tools::ToolCtx {
                     gate,
                     data_dir,
                     mcp,
                     session_id,
                     perm,
+                    tick: Some(tick),
+                    cancel: Some(cancel_probe),
                 };
                 match tools::execute(&call.function.name, &args, &ctx).await {
                     Ok(o) => o,
@@ -894,7 +1201,17 @@ pub async fn run(
                 kind: "tool_result".into(),
                 name: Some(call.function.name.clone()),
                 detail: preview,
+                images: Vec::new(),
             });
+
+            // 每个工具跑完就落一次盘：长命令是"用户等不及直接关进程"的高发区，
+            // 这里落完，磁盘上至少能看到"跑到哪个工具、参数是什么"。
+            checkpoint(
+                &on_checkpoint,
+                &steps,
+                &peek_text(&round_text),
+                &reason_total,
+            );
 
             // 回灌时截断，避免撑爆上下文
             let for_model: String = output.text.chars().take(TOOL_RESULT_LIMIT).collect();
@@ -902,6 +1219,21 @@ pub async fn run(
 
             if let Some(img) = output.image {
                 pending_images.push(img);
+            }
+
+            // 工具被「停止」掐断 → 剩余工具不再执行，直接返回部分结果。
+            // 为什么同一批 tool_calls 里剩下的也要跳过：命令已经证明是长任务，
+            // 继续跑下一个既违背用户"停下"的意图，也是纯浪费。
+            if cancel.load(Ordering::Relaxed) {
+                let half = take_text(&round_text);
+                return Ok(interrupted_run(
+                    steps,
+                    steers,
+                    reason_total,
+                    half,
+                    iter,
+                    usage_total,
+                ));
             }
         }
 
@@ -976,6 +1308,75 @@ fn interrupted_run(
 /// 取走某一轮累积的正文（空则返回空串）
 fn take_text(acc: &std::sync::Mutex<String>) -> String {
     acc.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// 从正文里解析**写成文字的伪工具调用**，还原成真 `tool_calls`。
+///
+/// ## 为什么需要（2026-09-25 用户报「mimo 老是提前停止」后定案）
+///
+/// 历史回灌把工具轨迹以 `«steps … 调用 X / 参数: {…} …»` 文本形式拼进
+/// assistant 消息（见 `history::fold_steps_to_line`）。部分模型（mimo 实测）
+/// 会**模仿这个格式**：它把下一步要调的工具写成正文「调用 run_command
+/// 参数: {...}」，然后就此收工 —— 没有真 `tool_calls`，agent loop 判定
+/// "没有调用 = 答完了"，任务停在半路。
+///
+/// 解析规则（对齐 fold_steps_to_line 的输出格式）：
+/// - `调用 <name>` 行（行首允许缩进）→ 工具名
+/// - 其后的 `参数: <json>` 行 → 参数（必须是合法 JSON 对象才收）
+/// - 只认**成对**出现的；单有名字没参数的忽略（可能是正文提到"调用"一词）
+///
+/// 返回 `None` = 正文里没有伪调用（正常回答）。解析出 0 个有效对也是 `None`。
+pub fn extract_pseudo_calls(text: &str) -> Option<Vec<llm::ToolCall>> {
+    let mut out: Vec<llm::ToolCall> = Vec::new();
+    let mut pending_name: Option<String> = None;
+
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("调用 ") {
+            let name = rest.trim();
+            // 工具名形态校验：字母/数字/下划线/连字符，别把正文句子当名字
+            if !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                pending_name = Some(name.to_string());
+            } else {
+                pending_name = None;
+            }
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("参数:") {
+            if let Some(name) = pending_name.take() {
+                let raw = rest.trim();
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+                    if v.is_object() {
+                        out.push(llm::ToolCall {
+                            id: format!("pseudo_{}", out.len()),
+                            kind: "function".into(),
+                            function: llm::FunctionCall {
+                                name,
+                                arguments: raw.to_string(),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// 正文里有没有伪调用的"气味"（«steps 轨迹块 / 调用+参数 行）。
+/// 先便宜地嗅一下，命中才跑 [`extract_pseudo_calls`]。
+fn smells_like_pseudo(text: &str) -> bool {
+    text.contains("«steps") || (text.contains("\n调用 ") && text.contains("参数:"))
 }
 
 /// 组装一条带图（或带图占位）的 user 消息。
@@ -1247,6 +1648,20 @@ pub fn build_system_prompt_for(data_dir: &Path, user_message: &str) -> String {
         ));
     }
 
+    // ── 稳定区：工具调用格式红线（2026-09-25 mimo 提前停止的根因之一）────
+    // 历史回灌把工具轨迹拼成 «steps … 调用 X / 参数: …» 文本（history.rs），
+    // 部分模型会把它当成"输出格式"模仿 —— 调用写成文字、没有 tool_calls，
+    // agent 只能判定"答完了"。必须显式禁止。
+    stable.push(
+        "# 工具调用的格式（违反 = 调用不会被执行）\n\n\
+         调用工具**只能**通过 tool_calls（function calling）发出。\n\
+         **绝对不要**在正文里写 `«steps…»`、`调用 xxx`、`参数: {...}`、`·think` \
+         这类文字冒充工具调用 —— 那是历史记录的折叠格式，只供你回看，\
+         写进正文不会执行任何工具，只会让任务停在半路。\n\
+         正文里只写给用户看的话；要干活，就发 tool_calls。"
+            .to_string(),
+    );
+
     // ── 稳定区：运行环境（**纯规则文字**，工作目录值挪到尾部）──────────
     stable.push(
         "# 运行环境\n\n\
@@ -1371,7 +1786,129 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
-    // ---------------- 排障：导出真实 system prompt ----------------
+    // ---------------- 进度事件的字段名契约 ----------------
+
+    /// `Progress` 的字段**必须是 camelCase** —— 前端按 camelCase 读。
+    ///
+    /// 回归测试对象：2026-09-26 用户报「长命令一直显示已运行 0s」。
+    /// 根因是 serde 对**枚举**的 `rename_all` 只重命名变体、不重命名字段，
+    /// `elapsed_secs` 出去还是 snake_case，前端 `p.elapsedSecs ?? 0` 永远取到 0。
+    /// 修法是给枚举加 `rename_all_fields = "camelCase"`（见 Progress 定义）。
+    #[test]
+    fn progress_fields_serialize_as_camel_case() {
+        let tick = Progress::ToolTick {
+            name: "run_command".into(),
+            elapsed_secs: 7,
+            tail: "x".into(),
+        };
+        let j = serde_json::to_string(&tick).unwrap();
+        assert!(
+            j.contains("\"elapsedSecs\":7"),
+            "心跳秒数必须是 camelCase（前端读 p.elapsedSecs）: {j}"
+        );
+        assert!(
+            !j.contains("elapsed_secs"),
+            "不能漏出 snake_case 字段名: {j}"
+        );
+        // 变体名也仍是 camelCase（原有的 rename_all 行为不能回退）
+        assert!(j.contains("\"kind\":\"toolTick\""), "变体名: {j}");
+    }
+
+    /// 插话事件必须带上图片路径 —— 插话不铺气泡，图只能画在时间线 steer 条目上。
+    #[test]
+    fn progress_steer_carries_images() {
+        let p = Progress::Steer {
+            id: "st1".into(),
+            text: "看这张图".into(),
+            images: vec!["D:\\x\\a.png".into()],
+        };
+        let j = serde_json::to_string(&p).unwrap();
+        assert!(j.contains("\"kind\":\"steer\""), "{j}");
+        assert!(j.contains("\"images\":[\"D:\\\\x\\\\a.png\"]"), "图路径要带上: {j}");
+
+        // 没图时不写空数组（省带宽，前端按 undefined 处理）
+        let empty = Progress::Steer {
+            id: "st2".into(),
+            text: "只说话".into(),
+            images: Vec::new(),
+        };
+        let j2 = serde_json::to_string(&empty).unwrap();
+        assert!(!j2.contains("images"), "空图不该出现字段: {j2}");
+    }
+
+    /// 多会话并行 run：**停 A 绝不能停 B**（每 run 独立的取消标志）。
+    ///
+    /// 2026-09-26 用户拍板。以前是全局单个 `CHAT_CANCEL`，`chat_cancel` 一按
+    /// 所有会话全停。
+    #[test]
+    fn run_registry_isolates_cancel_per_session() {
+        let reg = RunRegistry::default();
+        let a = reg.begin("A");
+        let b = reg.begin("B");
+        assert!(reg.is_active("A") && reg.is_active("B"), "两个会话都该在跑");
+        assert_eq!(reg.active_count(), 2);
+
+        // 停 A：只置 A 的标志
+        assert!(reg.cancel("A"), "A 在跑，应停到");
+        assert!(
+            a.cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "A 应被取消"
+        );
+        assert!(
+            !b.cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "B 不该被误停"
+        );
+
+        // 收尾 A：B 还在；A 的槽位要摘掉
+        reg.end("A");
+        assert!(!reg.is_active("A"), "A 的槽位应已摘掉");
+        assert!(reg.is_active("B"), "B 不受影响");
+        assert_eq!(reg.active_count(), 1);
+
+        reg.end("B");
+        assert_eq!(reg.active_count(), 0);
+    }
+
+    /// 插话必须**按会话路由**：B 会话里打的字绝不能插进 A 的对话。
+    #[tokio::test]
+    async fn run_registry_routes_steers_per_session() {
+        let reg = RunRegistry::default();
+        let _a = reg.begin("A");
+        let _b = reg.begin("B");
+
+        let ack = reg
+            .push(
+                "B",
+                SteeredMsg {
+                    id: "s1".into(),
+                    text: "只给 B".into(),
+                    images: Vec::new(),
+                },
+            )
+            .await;
+        assert!(ack.is_ok(), "B 在跑，插话应成功: {ack:?}");
+
+        let got_a = reg.end("A");
+        assert!(got_a.is_empty(), "A 不该收到 B 的插话: {:?}", got_a);
+        let got_b = reg.end("B");
+        assert_eq!(got_b.len(), 1, "B 应收到 1 条");
+        assert_eq!(got_b[0].text, "只给 B");
+
+        // 已收尾的会话再插话 → 必须报错，不能塞进没人消费的队列
+        let again = reg
+            .push(
+                "A",
+                SteeredMsg {
+                    id: "s2".into(),
+                    text: "迟到".into(),
+                    images: Vec::new(),
+                },
+            )
+            .await;
+        assert!(again.is_err(), "A 已收尾，插话应报错");
+    }
+
+    /// 排障：导出真实 system prompt ----------------
 
     /// 把**真实数据目录**下组装出来的 system prompt 原样打印出来。
     ///
@@ -1410,6 +1947,7 @@ mod tests {
             kind: "tool_call".into(),
             name: Some("list_dir".into()),
             detail: "{}".into(),
+            images: Vec::new(),
         });
 
         let r2 = std::sync::Mutex::new("第二轮：再看 sessions.rs".to_string());
@@ -1630,8 +2168,10 @@ mod tests {
             "看看 D:\\myword 目录下有哪些内容，简要列一下",
             vec![],
             std::sync::Arc::new(|p| eprintln!("[progress] {p:?}")),
+            // 联调不增量落盘（None = 不写盘）
             None,
-            &std::sync::atomic::AtomicBool::new(false),
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // 传当前会话 id → 顺带验证历史回灌
             &crate::sessions::ensure_current(&data_dir).id,
             // 手工联调不走插话通道
@@ -1656,5 +2196,40 @@ mod tests {
             run.steps.iter().any(|s| s.kind == "tool_call"),
             "应该至少发起过一次工具调用"
         );
+    }
+
+    // ---- 伪工具调用解析（mimo 提前停止的兜底）----
+
+    #[test]
+    fn pseudo_calls_parsed_from_folded_text() {
+        // 真实案例形态（2026-09-25 会话 s1790306950716）：mimo 把工具调用
+        // 模仿成历史回灌的 «steps 折叠格式写进正文
+        let text = "继续验证反代。跑最终测试。\n«steps\n·think Let me check\n\
+                    调用 run_command\n  参数: {\"command\": \"echo hi\"}\n\
+                    run_command 返回:\n$ echo hi\n»";
+        let calls = super::extract_pseudo_calls(text).expect("应解析出伪调用");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "run_command");
+        assert!(calls[0].function.arguments.contains("echo hi"));
+        assert!(super::smells_like_pseudo(text));
+    }
+
+    #[test]
+    fn pseudo_calls_multiple_and_invalid_json_skipped() {
+        let text = "调用 read_file\n  参数: {\"path\": \"a.txt\"}\n\
+                    调用 write_file\n  参数: {不是合法json}\n\
+                    调用 list_dir\n  参数: {\"path\": \"d\"}";
+        let calls = super::extract_pseudo_calls(text).expect("应解析出 2 个");
+        assert_eq!(calls.len(), 2, "非法 JSON 的那条应被跳过");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[1].function.name, "list_dir");
+    }
+
+    #[test]
+    fn plain_answer_is_not_pseudo() {
+        // 正常回答里提到"调用"一词不算；没有「参数:」配对不收
+        let text = "这个函数会调用 read_file 来读取文件。";
+        assert!(super::extract_pseudo_calls(text).is_none());
+        assert!(!super::smells_like_pseudo(text));
     }
 }

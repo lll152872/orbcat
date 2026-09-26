@@ -21,6 +21,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
@@ -29,6 +30,28 @@ use tokio::process::Command;
 /// 单次命令输出上限（stdout / stderr 各自）
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
+/// 命令执行期间的心跳回调：`(已运行秒数, 输出尾巴)`。
+///
+/// 为什么需要（2026-09-25 用户报「界面卡在 run_com 步骤不动」后加）：
+/// 长命令（编译/安装包/测试，最长 600s）执行期间**一个事件都没有**，
+/// 用户看到的就是界面冻住 —— 其实命令一直在跑。每 2 秒推一次
+/// 「已运行 N 秒 + 最新输出」，界面就有了呼吸感。
+pub type TickFn = Arc<dyn Fn(u64, String) + Send + Sync>;
+
+/// 命令执行期的**取消探针**：返回 true 表示用户已请求停止本轮。
+///
+/// 为什么需要（2026-09-26 用户报「点停止没用」）：
+/// 在这之前，cancel 只在「每轮开始」「工具全跑完」两个检查点被读；命令执行
+/// 期间（最长 600s）**没有任何取消通道** —— 用户点了停止，得等命令自己跑完
+/// （或撞满 600s 超时）才有反应，观感就是"停止按钮坏了"。
+/// 这个探针让 `run_powershell_tick` 的 select 多一个分支：一旦置位立即
+/// `kill_tree` 收掉整棵进程树。
+///
+/// 用 `Arc<dyn Fn() -> bool>` 而不是 `&AtomicBool`：命令执行是跨 await 的，
+/// 而 agent loop 那边要能从 `CHAT_CANCEL`（一个 `'static` 全局）里读 —— 闭包
+/// 捕获引用活不够长，所以包一层 `Arc` 传值进来。
+pub type CancelFn = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// 命令执行结果。
 #[derive(Debug, Clone)]
 pub struct CmdOutput {
@@ -36,14 +59,17 @@ pub struct CmdOutput {
     pub stderr: String,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    /// 被用户「停止」掐掉的（与超时区分：超时是到点自己断，取消是用户主动断）。
+    /// `true` 时 `exit_code` 恒为 None（进程树被强杀，退出码没有意义）。
+    pub cancelled: bool,
     pub interpreter: String,
 }
 
 impl CmdOutput {
-    /// 命令是否成功（未超时且退出码 0）。
+    /// 命令是否成功（未超时、未取消且退出码 0）。
     #[allow(dead_code)]
     pub fn success(&self) -> bool {
-        !self.timed_out && self.exit_code == Some(0)
+        !self.timed_out && !self.cancelled && self.exit_code == Some(0)
     }
 }
 
@@ -87,6 +113,21 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 /// `timeout_secs` 会被夹到 `1..=600`。超时**不算失败** —— 返回
 /// `timed_out = true` 的结果，由上层决定怎么告诉模型。
 pub async fn run_powershell(cmd: &str, cwd: &Path, timeout_secs: u64) -> Result<CmdOutput, String> {
+    run_powershell_tick(cmd, cwd, timeout_secs, None, None).await
+}
+
+/// 跑一条 PowerShell 命令，执行期间每 2 秒回调一次心跳（见 [`TickFn`]），
+/// 并响应取消探针（见 [`CancelFn`]）。
+///
+/// `tick = None` 时与 [`run_powershell`] 完全等价（普通工具不需要心跳）。
+/// `cancel = None` 时没有取消通道（测试与不关心中断的场景）。
+pub async fn run_powershell_tick(
+    cmd: &str,
+    cwd: &Path,
+    timeout_secs: u64,
+    tick: Option<TickFn>,
+    cancel: Option<CancelFn>,
+) -> Result<CmdOutput, String> {
     let (exe, _is7) = resolve_interpreter();
     let wrapped = wrap_utf8(cmd);
 
@@ -113,58 +154,177 @@ pub async fn run_powershell(cmd: &str, cwd: &Path, timeout_secs: u64) -> Result<
     let mut child = c.spawn().map_err(|e| format!("启动 {exe} 失败: {e}"))?;
     let pid = child.id();
 
-    // 先把两条管道拿走，交给独立任务读干 —— 不读的话子进程输出一多就写满管道死锁。
+    // 先把两条管道拿走，交给独立任务**边读边写**共享缓冲 ——
+    // 不读的话子进程输出一多就写满管道死锁；写共享缓冲则是心跳能拿到输出尾巴的前提。
+    let out_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let err_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let out_task = tokio::spawn(read_all(stdout));
-    let err_task = tokio::spawn(read_all(stderr));
+    let mut out_task = tokio::spawn(read_into(stdout, out_buf.clone()));
+    let mut err_task = tokio::spawn(read_into(stderr, err_buf.clone()));
 
-    let timeout = Duration::from_secs(timeout_secs.clamp(1, 600));
+    // 上限 3600s（1 小时）：构建/装包这类长任务要放得下（用户实报「build 4-5 分钟
+    // 不输出很正常」）。这里的 clamp 是**最后一道**，`run_command` 那边还有一次。
+    let timeout = Duration::from_secs(timeout_secs.clamp(1, 3600));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let started = std::time::Instant::now();
 
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => {
-            let out_buf = out_task.await.unwrap_or_default();
-            let err_buf = err_task.await.unwrap_or_default();
+    // 等子进程结束，同时按 2s 间隔推心跳、响应取消；到超时线就退出去杀进程树。
+    // `child.wait()` 是 cancel-safe 的（tokio 文档保证），select 丢弃它无副作用。
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 第一次 tick 立即触发 —— 吞掉，心跳从"跑了 2 秒"开始
+    interval.tick().await;
+
+    /// 等待结果：子进程结束 / 超时 / 用户取消
+    enum Waited {
+        Done(std::io::Result<std::process::ExitStatus>),
+        Timeout,
+        Cancelled,
+    }
+
+    let waited = loop {
+        // 取消探针每 2s 轮询一次即可 —— 与心跳同频，用户感知上就是"点下去马上停"。
+        let cancel_probe = async {
+            match cancel.as_ref() {
+                Some(f) => {
+                    loop {
+                        if f() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+                // 没有取消探针 → 永不触发的 future
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            r = child.wait() => break Waited::Done(r),
+            _ = interval.tick(), if tick.is_some() => {
+                if let Some(cb) = tick.as_ref() {
+                    let tail = tail_of(&out_buf, &err_buf);
+                    cb(started.elapsed().as_secs(), tail);
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break Waited::Timeout,
+            _ = cancel_probe => break Waited::Cancelled,
+        }
+    };
+
+    match waited {
+        Waited::Done(Ok(status)) => {
+            drain_reader(&mut out_task).await;
+            drain_reader(&mut err_task).await;
+            let out_bytes = out_buf.lock().map(|g| g.clone()).unwrap_or_default();
+            let err_bytes = err_buf.lock().map(|g| g.clone()).unwrap_or_default();
             Ok(CmdOutput {
-                stdout: truncate(&out_buf),
-                stderr: truncate(&err_buf),
+                stdout: truncate(&out_bytes),
+                stderr: truncate(&err_bytes),
                 exit_code: status.code(),
                 timed_out: false,
+                cancelled: false,
                 interpreter: exe,
             })
         }
-        Ok(Err(e)) => {
+        Waited::Done(Err(e)) => {
             let _ = child.start_kill();
             Err(format!("等待 {exe} 结束失败: {e}"))
         }
-        Err(_) => {
+        Waited::Timeout => {
             // ---- 超时：杀整棵进程树 ----
             if let Some(pid) = pid {
                 kill_tree(pid).await;
             }
             let _ = child.start_kill();
             let _ = child.wait().await;
-            // 进程死了 → 管道 EOF → 读取任务自然收尾
-            let _ = out_task.await;
-            let _ = err_task.await;
+            // 进程死了 → 管道 EOF → 读取任务自然收尾（有界等，防残留孙子进程占着句柄）
+            drain_reader(&mut out_task).await;
+            drain_reader(&mut err_task).await;
             Ok(CmdOutput {
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: None,
                 timed_out: true,
+                cancelled: false,
+                interpreter: exe,
+            })
+        }
+        Waited::Cancelled => {
+            // ---- 用户点「停止」：与超时同样杀整棵进程树，但**已经收到的输出保留** ----
+            // 保留输出很重要：用户点了停止，但"命令跑到哪一步"本身是有效信息。
+            if let Some(pid) = pid {
+                kill_tree(pid).await;
+            }
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            drain_reader(&mut out_task).await;
+            drain_reader(&mut err_task).await;
+            let out_bytes = out_buf.lock().map(|g| g.clone()).unwrap_or_default();
+            let err_bytes = err_buf.lock().map(|g| g.clone()).unwrap_or_default();
+            Ok(CmdOutput {
+                stdout: truncate(&out_bytes),
+                stderr: truncate(&err_bytes),
+                exit_code: None,
+                timed_out: false,
+                cancelled: true,
                 interpreter: exe,
             })
         }
     }
 }
 
-/// 读干一个可选管道。
-async fn read_all(pipe: Option<impl AsyncReadExt + Unpin>) -> Vec<u8> {
-    let mut buf = Vec::new();
+/// 边读边追加进共享缓冲（有上限，防止失控命令把内存吃光）。
+async fn read_into(pipe: Option<impl AsyncReadExt + Unpin>, buf: Arc<Mutex<Vec<u8>>>) {
+    const CAP: usize = 256 * 1024;
     if let Some(mut p) = pipe {
-        let _ = p.read_to_end(&mut buf).await;
+        let mut chunk = [0u8; 8192];
+        loop {
+            match p.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut g) = buf.lock() {
+                        if g.len() < CAP {
+                            g.extend_from_slice(&chunk[..n]);
+                        }
+                    }
+                }
+            }
+        }
     }
-    buf
+}
+
+/// 有界地等读任务收尾 —— **绝不无条件 `join`**。
+///
+/// ⚠️ 这是 2026-09-26 用户实报「任务卡死 / 心跳永远停在 4s」的根因：
+///   命令若是 `Start-Process` 这类**派生常驻子进程**的，孙子进程会继承
+///   stdout/stderr 管道句柄。pwsh 自己已经退出（`child.wait()` 返回），
+///   但管道写端还开着 —— 读任务永远等不到 EOF，`out_task.await` 就永久挂住。
+///   同时因为心跳循环已随 `child.wait()` 退出，秒数停在最后一拍（"已运行 4s"不动）。
+///
+/// 做法：给 400ms 宽限让正常输出收尾，超时就以**已读到的缓冲**为准，把读任务掐掉。
+/// 输出缓冲本身有 256KB 上限（见 [`read_into`]），就算读任务没被及时掐掉也不吃内存。
+async fn drain_reader(h: &mut tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(Duration::from_millis(400), &mut *h).await.is_err() {
+        h.abort();
+    }
+}
+
+/// 输出尾巴（给心跳展示）：两条流合并后取最后 200 字符，压成单行。
+fn tail_of(out_buf: &Arc<Mutex<Vec<u8>>>, err_buf: &Arc<Mutex<Vec<u8>>>) -> String {
+    let mut merged = Vec::new();
+    if let Ok(g) = out_buf.lock() {
+        merged.extend_from_slice(&g);
+    }
+    if let Ok(g) = err_buf.lock() {
+        merged.extend_from_slice(&g);
+    }
+    if merged.is_empty() {
+        return String::new();
+    }
+    let s = String::from_utf8_lossy(&merged);
+    let tail: String = s.chars().rev().take(200).collect::<String>().chars().rev().collect();
+    tail.replace('\n', " ").replace('\r', " ")
 }
 
 /// 收掉整棵进程树（含子进程）。失败不致命 —— 后面还有 `start_kill` 兜底。
@@ -196,13 +356,24 @@ fn wrap_utf8(cmd: &str) -> String {
 }
 
 /// 截断 + UTF-8 lossy 解码。
+///
+/// ⚠️ 超限时**留头也留尾**（各一半）：只留头是坑 —— 编译 / 构建 / 测试这类命令的
+/// 报错和结论恰恰在**末尾**，只留头等于把真正要看的东西截掉，模型只能看到一堆
+/// `Compiling xxx`（2026-09-26 用户提「build 4-5 分钟」时顺带发现）。
 fn truncate(buf: &[u8]) -> String {
-    let over = buf.len() > MAX_OUTPUT_BYTES;
-    let slice = if over { &buf[..MAX_OUTPUT_BYTES] } else { buf };
-    let mut s = String::from_utf8_lossy(slice).to_string();
-    if over {
-        s.push_str("\n… [输出超过 64KB，已截断]");
+    if buf.len() <= MAX_OUTPUT_BYTES {
+        return String::from_utf8_lossy(buf).to_string();
     }
+    let half = MAX_OUTPUT_BYTES / 2;
+    let head = &buf[..half];
+    let tail = &buf[buf.len() - half..];
+    let mut s = String::from_utf8_lossy(head).into_owned();
+    s.push_str(&format!(
+        "\n… [输出共 {} 字节，中间省略 {} 字节；以下是末尾] …\n",
+        buf.len(),
+        buf.len() - MAX_OUTPUT_BYTES
+    ));
+    s.push_str(&String::from_utf8_lossy(tail));
     s
 }
 
@@ -247,6 +418,96 @@ mod tests {
             Err(_) => return,
         };
         assert!(out.timed_out, "应在 1 秒后超时");
+        assert!(!out.cancelled, "超时不等于取消");
+    }
+
+    /// 取消探针置位后必须**立刻**杀掉长命令（而不是等它自己跑完）。
+    ///
+    /// 这是 2026-09-26 用户报「点停止没用」的回归测试：命令跑 30s，
+    /// 探针 300ms 后就置位，整个调用必须在 ~2s 内返回且 `cancelled = true`。
+    #[tokio::test]
+    async fn cancel_kills_long_command_promptly() {
+        let dir = std::env::temp_dir();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f = flag.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            f.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let cancel: CancelFn = std::sync::Arc::new(move || {
+            flag.load(std::sync::atomic::Ordering::Relaxed)
+        });
+
+        let started = std::time::Instant::now();
+        let out = match run_powershell_tick(
+            "Start-Sleep -Seconds 30",
+            &dir,
+            600,
+            None,
+            Some(cancel),
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(_) => return, // 起不了进程 → 跳过
+        };
+        assert!(out.cancelled, "应被标记为取消");
+        assert!(!out.timed_out, "取消不是超时");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "取消要立刻生效（实际耗时 {:?}）",
+            started.elapsed()
+        );
+    }
+
+    /// 回归：命令**派生出常驻子进程**时，`run_powershell_tick` 必须按时返回。
+    ///
+    /// 2026-09-26 用户实报「任务卡死」+「心跳永远停在 4s」：
+    ///   `Start-Process` 起的孙子进程继承了 stdout/stderr 管道句柄，pwsh 自己已退出、
+    ///   管道写端却还开着 → 读任务永远等不到 EOF → 无条件 `join` 读任务把整个工具调用
+    ///   挂死；同时心跳循环随 `child.wait()` 退出，秒数就冻在最后一拍。
+    ///
+    /// 断言：孙进程还活着的时候调用就必须返回（< 5s），且父进程自己的输出没丢。
+    #[tokio::test]
+    async fn detached_child_does_not_hang_tool_call() {
+        let dir = std::env::temp_dir();
+        // 孙进程自己活 8 秒后退出（测试不收它，但也不会永久泄漏）
+        let cmd = "Write-Output 'BEFORE'; \
+                   Start-Process -FilePath 'powershell.exe' \
+                     -ArgumentList '-NoProfile','-NonInteractive','-c','Start-Sleep 8' \
+                     -WindowStyle Hidden; \
+                   Write-Output 'AFTER'";
+        let started = std::time::Instant::now();
+        let out = match run_powershell_tick(cmd, &dir, 600, None, None).await {
+            Ok(o) => o,
+            Err(_) => return, // 起不了进程 → 跳过
+        };
+        let dt = started.elapsed();
+        assert!(
+            dt < Duration::from_secs(5),
+            "派生常驻子进程时不该挂死（实际等了 {dt:?}）"
+        );
+        assert!(
+            out.stdout.contains("BEFORE") && out.stdout.contains("AFTER"),
+            "父进程自己的输出不应丢: {:?}",
+            out.stdout
+        );
+    }
+
+    /// 超长输出**留头也留尾**。
+    ///
+    /// 2026-09-26 用户提「build 4-5 分钟」时顺带发现：以前只留头，
+    /// 而编译/构建的报错与结论都在**末尾** —— 等于把要看的东西截掉。
+    #[test]
+    fn truncate_keeps_head_and_tail() {
+        let mut big = Vec::new();
+        big.extend_from_slice(b"HEAD_MARK ");
+        big.extend(std::iter::repeat(b'x').take(MAX_OUTPUT_BYTES * 2));
+        big.extend_from_slice(b" TAIL_MARK");
+        let s = truncate(&big);
+        assert!(s.contains("HEAD_MARK"), "要留头，实际 len={}", s.len());
+        assert!(s.contains("TAIL_MARK"), "要留尾（报错在末尾），实际 len={}", s.len());
+        assert!(s.contains("中间省略"), "要有省略说明: {}", s.chars().rev().take(60).collect::<String>());
     }
 
     #[test]

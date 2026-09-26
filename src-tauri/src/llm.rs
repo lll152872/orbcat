@@ -318,6 +318,15 @@ struct ChatRequest {
     /// 不设这个，流式响应里**不会**有 usage，用量就记不到账。
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<Value>,
+    /// 生成上限（模型配置 `maxOutputTokens`）。
+    ///
+    /// 为什么必须上行（2026-09-25 用户报「mimo 老是提前停止」后补）：
+    /// 这个字段以前只是配置里的摆设 —— 从没进过请求体，服务端就用它自己的
+    /// 默认值（很多网关只有 4k）。一旦回答长一点，就被 `finish_reason=length`
+    /// 掐断在半截，agent 却把半截当成答完 → 表现就是"提前停止"。
+    /// 未配置则不发（`skip_serializing_if`），走服务端默认。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -499,8 +508,14 @@ struct DeltaToolCall {
 struct DeltaFunction {
     #[serde(default)]
     name: Option<String>,
+    /// 工具参数分片。**形态不统一**（2026-09-25）：
+    /// 绝大多数网关按 OpenAI 规范给**字符串**分片（多片拼接成 JSON 串）；
+    /// 个别实现直接给**整个 JSON 对象**（一次给完）。
+    /// 只收 String 的后果：`serde_json::from_str::<StreamChunk>` 反序列化失败，
+    /// 整个 chunk 被静默 `continue` —— 工具调用凭空消失，模型"调了个寂寞"，
+    /// agent 拿到空 tool_calls 就当答完收工。所以对象形态也要收。
     #[serde(default)]
-    arguments: Option<String>,
+    arguments: Option<Value>,
 }
 
 /// 流式增量回调：`(正文增量, 思维链增量)`
@@ -607,10 +622,15 @@ async fn chat_stream_once(
     use futures_util::StreamExt;
     use std::sync::atomic::Ordering;
 
-    // connect 超时单独收紧：连不上应在十几秒内报错，而不是干等 300s 总超时
+    // connect 超时单独收紧：连不上应在十几秒内报错，而不是干等总超时。
+    //
+    // ⚠️ 总超时从 180s 放宽到 600s（2026-09-25）：reqwest 的 `timeout` 覆盖
+    // **整个请求含流式读取**。mimo 这类"长思考 + 长输出"的模型，一次调用
+    // 跑三四分钟很常见 —— 180s 会把流拦腰掐断，看起来就像"提前停止/反复重试"。
+    // 打断长流靠用户点「停止」（cancel 每个 chunk 都检查），不靠总超时。
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| ChatError::Fatal(format!("创建 HTTP 客户端失败: {e}")))?;
 
@@ -622,6 +642,7 @@ async fn chat_stream_once(
         stream: true,
         // 要求末片带 usage —— 否则流式拿不到 token 用量，账记不了
         stream_options: Some(json!({ "include_usage": true })),
+        max_tokens: cfg.max_output_tokens,
     };
 
     let endpoint = cfg.chat_endpoint();
@@ -679,6 +700,8 @@ async fn chat_stream_once(
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut finish_reason: Option<String> = None;
+    // 是否收到过流终止标记（[DONE]）—— 用来区分"正常结束"与"被掐断"
+    let mut saw_done = false;
     // 流式用量：只在**末片**出现（那一片的 choices 是空的）
     let mut usage: Option<TokenUsage> = None;
     // index → (id, name, arguments)
@@ -706,11 +729,20 @@ async fn chat_stream_once(
                 continue;
             }
             if payload == "[DONE]" {
+                saw_done = true;
                 break;
             }
 
             let Ok(ch) = serde_json::from_str::<StreamChunk>(payload) else {
-                continue; // 个别实现会插入注释行，忽略即可
+                // 以前这里静默 continue —— 服务端换了字段形态时工具调用会"无声消失"。
+                // 打一行日志留证据；注释行（`: ping` 之类）很常见，不用每次都刷屏。
+                if payload.len() > 1 && !payload.starts_with(':') {
+                    eprintln!(
+                        "[orbcat] SSE chunk 解析失败（忽略）：{}",
+                        payload.chars().take(160).collect::<String>()
+                    );
+                }
+                continue;
             };
             // ⚠️ 用量必须**在取 choice 之前**读 —— 末片的 choices 是空数组，
             //    一旦先走下面的 `else { continue }`，usage 就永远丢了。
@@ -758,8 +790,11 @@ async fn chat_stream_once(
                                 slot.1.push_str(&n);
                             }
                         }
-                        if let Some(a) = f.arguments {
-                            slot.2.push_str(&a);
+                        // 参数可能是字符串分片（主流）或一次性整对象（个别网关）
+                        match f.arguments {
+                            None | Some(Value::Null) => {}
+                            Some(Value::String(s)) => slot.2.push_str(&s),
+                            Some(other) => slot.2.push_str(&other.to_string()),
                         }
                     }
                 }
@@ -781,6 +816,28 @@ async fn chat_stream_once(
             function: FunctionCall { name, arguments },
         })
         .collect();
+
+    // ---- 流"干净地"结束了 ≠ 模型答完了 ----
+    //
+    // 2026-09-25 用户报「mimo 老是提前停止」后的核心修复：
+    // 网络/代理/网关掐流时，SSE 连接会**提前正常关闭** —— 既没有 [DONE]，
+    // 也没有 finish_reason，但 `while let Some(chunk)` 照样"正常"退出。
+    // 旧代码把这种情况当成完整回答返回，agent 拿到半截正文就收工 → 提前停止。
+    //
+    // 判据：终止标记 `[DONE]` 和 `finish_reason` **一个都没有**才判截断。
+    // （有些网关不发 [DONE] 但会发 finish_reason，反之亦然 —— 只要有其一就算完整。）
+    if !saw_done && finish_reason.is_none() {
+        return Err(ChatError::Retryable(
+            "流提前中断".into(),
+            format!(
+                "SSE 流在没有 [DONE]/finish_reason 的情况下提前关闭（多半是网络/代理/网关掐断）。\
+                 已收正文 {} 字、思维链 {} 字、工具调用 {} 个 —— 这些是半截数据，作废后自动重试。",
+                content.chars().count(),
+                reasoning.chars().count(),
+                tool_calls.len()
+            ),
+        ));
+    }
 
     let has_calls = !tool_calls.is_empty();
     Ok(ChatOutcome {
@@ -879,7 +936,7 @@ async fn chat_once(
     tools: Option<Vec<Value>>,
 ) -> Result<ChatOutcome, ChatError> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_secs(300))
         .build()
         .map_err(|e| ChatError::Fatal(format!("创建 HTTP 客户端失败: {e}")))?;
 
@@ -890,6 +947,7 @@ async fn chat_once(
         tool_choice: Some("auto".into()),
         stream: false,
         stream_options: None,
+        max_tokens: cfg.max_output_tokens,
     };
 
     let endpoint = cfg.chat_endpoint();

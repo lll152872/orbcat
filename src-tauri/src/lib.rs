@@ -84,9 +84,10 @@ struct AppState {
     /// 用 Arc 是因为工具层要以 `&PermHub` 借它（见 `tools::ToolCtx`），
     /// 而 Tauri 的 `State` 只能给出借用，不能把所有权传进去。
     perm: std::sync::Arc<perm_request::PermHub>,
-    /// 执行中「插话」的收件箱（全局单例，同一时刻只有一个 run）。
-    /// `chat` 开跑前 `begin()`、收尾时 `end()`；`chat_steer` 往里面塞消息。
-    run: agent::RunHub,
+    /// 执行中「插话」的收件箱 + 取消标志，**按会话分槽**（2026-09-26 用户拍板：
+    /// 多会话并行 run）。`chat` 开跑前 `begin(session_id)` 拿槽、收尾 `end()` 归还；
+    /// `chat_steer` / `chat_cancel` 都带 `session_id` 路由到对应槽。
+    runs: agent::RunRegistry,
 }
 
 /// 换会话时重装临时授权（**仅文件授权**）。
@@ -269,7 +270,14 @@ fn apply_mode(win: &tauri::WebviewWindow, mode: &str) -> Result<(), String> {
         win32::set_no_activate(ptr);
     } else {
         win32::clear_no_activate(ptr);
+        // 先走 Tauri 的正常路径，再用 `force_foreground` 兜底绕前台锁。
+        // ⚠️ 只加在**面板态**：球态/菜单态抢焦点没意义，面板态不抢则输入框永远
+        //    拿不到 OS 级焦点 —— 自动化工具（windows-mcp 等）打的字会全落到别的
+        //    应用里。详见 `win32::force_foreground` 的注释。
         let _ = win.set_focus();
+        if mode == "panel" {
+            win32::force_foreground(ptr);
+        }
     }
 
     Ok(())
@@ -988,6 +996,18 @@ fn set_blur_collapse(state: State<'_, AppState>, enable: bool) -> Result<(), Str
     config::save_settings(&state.data_dir, &s)
 }
 
+/// 设置执行权限档位（`ask` / `smart` / `full`）。
+/// 管的是 `run_command` / MCP 弹卡频率 —— 文件权限不受影响。
+#[tauri::command]
+fn set_exec_trust(state: State<'_, AppState>, mode: String) -> Result<String, String> {
+    let t = config::ExecTrust::parse(&mode);
+    let mut s = config::load_settings(&state.data_dir);
+    s.exec_trust = t;
+    config::save_settings(&state.data_dir, &s)?;
+    eprintln!("[orbcat] 执行权限档位: {}", t.as_str());
+    Ok(t.as_str().to_string())
+}
+
 /// 采集一次前台应用上下文（模型工具用；返回缓存的「非自身前台」）
 #[tauri::command]
 fn foreground_context() -> Option<context::ForegroundContext> {
@@ -1347,15 +1367,16 @@ async fn chat(
         imgs.len()
     );
 
-    // 新对话开始：清掉可能残留的取消请求，并打开插话收件箱
-    CHAT_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
-    state.run.begin();
-
     // 当前会话 id —— 回灌历史要用。
     // ⚠️ 时序：必须在这里取（`append_turn` 落盘**之前**），
     //    否则 agent 会把本轮问题也当成历史读回来，重复一遍。
     let session_id = sessions::current_id(&data_dir)
         .unwrap_or_else(|| sessions::ensure_current(&data_dir).id);
+
+    // 新的一轮：登记到**本会话专属**的槽位（多会话并行 run）。
+    // 取消标志是每 run 一个 `Arc<AtomicBool>`，停 A 不会停 B；
+    // 插话收件箱同理，`chat_steer` 只会塞进目标会话那个。
+    let slot = state.runs.begin(&session_id);
 
     // imgs 会被 move 进 agent::run，这里留一份给会话落盘
     let imgs_for_store = imgs.clone();
@@ -1367,11 +1388,41 @@ async fn chat(
         eprintln!("[orbcat] 前台上下文: {}", f.summary());
     }
 
-    // 进度回调用事件推给前端 —— 否则 agent loop 的 30-60 秒是黑盒
+    // 进度回调用事件推给前端 —— 否则 agent loop 的 30-60 秒是黑盒。
+    // ⚠️ 事件**带 session id**（信封 `{sessionId, p}`）：并行 run 时前端要能分清
+    //    这条进度是谁的，否则 B 会话的进度会画进 A 会话的时间线。
     let progress: agent::ProgressFn = {
         let win = window.clone();
+        let sid = session_id.clone();
         std::sync::Arc::new(move |p: agent::Progress| {
-            let _ = win.emit("agent-progress", &p);
+            let _ = win.emit(
+                "agent-progress",
+                &serde_json::json!({ "sessionId": sid, "p": p }),
+            );
+        })
+    };
+
+    // 轮内增量落盘（2026-09-26 治「退出后整轮清空」）：
+    // 开跑先把 [提问 + partial 占位] 写进会话，然后 agent loop 每到一个轮边界 /
+    // 工具跑完就回调这里，把"目前已产出"覆盖进那条占位。
+    // 进程中途被关掉时，磁盘上留下的是"问了什么 + 已经跑到哪一步"，而不是空文件。
+    //
+    // ⚠️ 顺序必须在 `agent::run` **之前**：占位要在 loop 跑起来前就存在，
+    //    否则第一段产出的 checkpoint 找不到占位（`checkpoint_turn` 会静默跳过）。
+    if let Err(e) = sessions::begin_turn_in(&data_dir, Some(&session_id), &input, &imgs_for_store) {
+        eprintln!("[orbcat] ⚠️ 开跑落盘失败（不影响对话）: {e}");
+    }
+    let on_checkpoint: agent::CheckpointFn = {
+        let dd = data_dir.clone();
+        // ⚠️ 会话 id 跟着跑：用户中途切走时，"当前会话"已经变了，
+        //    但这一轮的增量必须落回**开跑时**那个会话（切走会话、后台继续跑）。
+        let sid = session_id.clone();
+        std::sync::Arc::new(move |steps: &[agent::AgentStep], answer: &str, reasoning: &str| {
+            let stored = sessions::steps_from_agent(steps);
+            let r = if reasoning.is_empty() { None } else { Some(reasoning) };
+            if let Err(e) = sessions::checkpoint_turn_in(&dd, Some(&sid), &stored, answer, r) {
+                eprintln!("[orbcat] ⚠️ 轮内落盘失败（不影响对话）: {e}");
+            }
         })
     };
 
@@ -1387,29 +1438,35 @@ async fn chat(
         &input,
         imgs,
         progress,
+        Some(on_checkpoint),
         fg.as_ref(),
-        &CHAT_CANCEL,
+        slot.cancel.clone(),
         &session_id,
-        &state.run,
+        &slot.hub,
         &state.perm,
     )
     .await;
 
+    // 关闭本会话的插话收件箱并取走残留。
+    // ⚠️ 必须在 `match result` **之前**：否则失败/中断路径上槽位会一直挂着，
+    //    下一次 `chat_steer` 会把消息塞进一个永远没人消费的队列。
+    let leftover = state.runs.end(&session_id);
+
     // 一轮结束 → 清掉「本轮」档授权。
-    // ⚠️ 必须放在下面那个 `match result` **之前**：出错提前返回时同样要清，
+    // ⚠️ 必须放在 `match result` **之前**：出错提前返回时同样要清，
     //    否则失败那一轮批的"本轮"授权会活到下一次对话，"一轮"语义当场破掉。
-    if let Ok(mut store) = state.perm.grants().lock() {
-        let n = store.clear_tier(GrantTier::Turn);
-        if n > 0 {
-            eprintln!("[orbcat] 一轮结束，清掉 {n} 条「本轮」授权");
+    // ⚠️ 并行 run 时**不能无条件清**：grant 表是全局内存的，A 收尾会把 B 刚批的
+    //    「本轮」授权一起清掉。所以只有"没有别的会话在跑"时才清；还有别的 run 时
+    //    留到它最后一个收尾时清（略滞后，可接受）。
+    if state.runs.active_count() == 0 {
+        if let Ok(mut store) = state.perm.grants().lock() {
+            let n = store.clear_tier(GrantTier::Turn);
+            if n > 0 {
+                eprintln!("[orbcat] 一轮结束，清掉 {n} 条「本轮」授权");
+            }
         }
     }
     // ⚠️ 命令授权**不参与**这里：永久档跨会话存活，靠设置页「撤销」才失效。
-
-    // 关闭插话收件箱并取走残留。
-    // ⚠️ 同样必须在 `match result` **之前**：否则失败/中断路径上 `active` 会一直开着，
-    //    下一次 `chat_steer` 会把消息塞进一个永远没人消费的队列。
-    let leftover = state.run.end();
 
     // ⚠️ **成功与失败都要走落盘**（2026-09-22 修 bug）。
     //
@@ -1429,7 +1486,7 @@ async fn chat(
                 run.steps.len(),
                 run.answer.chars().count()
             );
-            persist_run(&state, &cfg.id, &input, &imgs_for_store, &run);
+            persist_run(&state, &session_id, &cfg.id, &input, &imgs_for_store, &run);
             return Err(message);
         }
     };
@@ -1454,7 +1511,7 @@ async fn chat(
         );
     }
 
-    persist_run(&state, &cfg.id, &input, &imgs_for_store, &run);
+    persist_run(&state, &session_id, &cfg.id, &input, &imgs_for_store, &run);
 
     Ok(run)
 }
@@ -1476,6 +1533,7 @@ async fn chat(
 /// 落盘失败只打日志、不影响主流程（用户已经看到回答了）。
 fn persist_run(
     app: &AppState,
+    session_id: &str,
     model_id: &str,
     input: &str,
     images: &[String],
@@ -1491,8 +1549,10 @@ fn persist_run(
         }
     }
     let steps = sessions::steps_from_agent(&run.steps);
-    if let Err(e) = sessions::append_run(
+    // ⚠️ 显式传 session_id：用户可能已经切走，"当前会话"不再是这一轮的目标。
+    if let Err(e) = sessions::append_run_in(
         &app.data_dir,
+        Some(session_id),
         &sessions::TurnRecord {
             user_text: input,
             images,
@@ -1520,16 +1580,31 @@ async fn usage_report(state: State<'_, AppState>) -> Result<Vec<sessions::UsageR
 /// 「正在思考」中的取消标志。chat 每轮循环检查，置位后尽快返回"已停止"。
 static CHAT_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 前端「停止」按钮：请求中断当前对话轮
+/// 取取消标志的 `'static` 引用，给工具层做「执行期取消探针」用
+/// （见 `shell::CancelFn`）—— 命令跑到一半也能被「停止」掐断，而不是等到轮边界。
+pub fn chat_cancel_flag() -> &'static std::sync::atomic::AtomicBool {
+    &CHAT_CANCEL
+}
+
+/// 前端「停止」按钮：只停**指定会话**的那一轮（多会话并行 run）。
+///
+/// 不传 `session_id` = 兼容旧调用，停掉**所有**在跑的会话。
 #[tauri::command]
-fn chat_cancel(state: State<'_, AppState>) {
-    CHAT_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
-    // 权限申请是**阻塞**在 ask* 上的：只置 cancel 标志叫不醒它，
-    // 用户会看到「点了停止还一直转」。一并作废所有待办，立刻放行 agent loop。
-    state
-        .perm
-        .cancel_all("用户已停止本轮，此申请作废（不是对请求本身的拒绝）。");
-    eprintln!("[orbcat] 收到停止请求");
+fn chat_cancel(state: State<'_, AppState>, session_id: Option<String>) {
+    let ids: Vec<String> = match session_id {
+        Some(s) if !s.is_empty() => vec![s],
+        _ => state.runs.active_ids(),
+    };
+    for id in &ids {
+        // 只置**本会话**的取消标志 —— 停 A 绝不能连 B 一起停
+        state.runs.cancel(id);
+        // 权限申请是**阻塞**在 ask* 上的：只置 cancel 标志叫不醒它，
+        // 用户会看到「点了停止还一直转」。一并作废该会话的待办，立刻放行它的 agent loop。
+        state
+            .perm
+            .cancel_all_in(id, "用户已停止本轮，此申请作废（不是对请求本身的拒绝）。");
+    }
+    eprintln!("[orbcat] 收到停止请求：{}", ids.join(", "));
 }
 
 /// **执行中插话**：把消息塞进收件箱，等当前轮（LLM 调用 + 工具）结束后
@@ -1548,8 +1623,15 @@ async fn chat_steer(
     state: State<'_, AppState>,
     input: String,
     images: Option<Vec<String>>,
+    session_id: Option<String>,
 ) -> Result<agent::SteerAck, String> {
-    if !state.run.is_active() {
+    // 显式指定目标会话；不传则退回"当前会话"（旧调用兼容）。
+    // ⚠️ 并行 run 下必须显式路由 —— 否则 B 会话里打的字会插进 A 的对话里。
+    let sid = match session_id {
+        Some(s) if !s.is_empty() => s,
+        _ => sessions::current_id(&state.data_dir).unwrap_or_default(),
+    };
+    if sid.is_empty() {
         return Err("当前没有进行中的对话".into());
     }
     let text = input.trim().to_string();
@@ -1559,12 +1641,15 @@ async fn chat_steer(
         return Err("插话内容为空".into());
     }
     state
-        .run
-        .push(agent::SteeredMsg {
-            id: agent::new_steer_id(),
-            text,
-            images: imgs,
-        })
+        .runs
+        .push(
+            &sid,
+            agent::SteeredMsg {
+                id: agent::new_steer_id(),
+                text,
+                images: imgs,
+            },
+        )
         .await
 }
 
@@ -1622,30 +1707,35 @@ fn bootstrap_data(state: State<'_, AppState>) -> Result<bootstrap::BootstrapRepo
 
 /// 新建会话（旧的自动保留在列表里）
 ///
-/// ⚠️ 对话进行中禁止切换/新建/删除会话：`chat` 在开跑时就把 `session_id`
-/// 定死了，中途换会话会让回答落进**另一个**会话（`append_run` 走的是
-/// `current.txt`）。前端 busy 时也会拦，但这里才是硬保护。
+/// 多会话并行 run 下**放行**：新建不碰别的会话，落盘各自带着自己的 `session_id`。
+/// 仍然**禁止**的只剩"改动某个会话本身"的动作（删除/截断/分叉**该会话**），见各自命令。
 #[tauri::command]
 fn session_new(state: State<'_, AppState>) -> Result<sessions::Session, String> {
-    if state.run.is_active() {
-        return Err("对话进行中，先停止或等它结束再切换会话".into());
-    }
     let s = sessions::new_session(&state.data_dir);
     eprintln!("[orbcat] 新会话 {}", s.id);
-    // 新会话没有历史授权 —— 顺手清掉上一段残留的（尤其 `Once`/`Turn`）
-    reload_grants_for_session(&state, &s.id);
+    // 新会话没有历史授权 —— 顺手清掉上一段残留的（尤其 `Once`/`Turn`）。
+    // ⚠️ 但**有 run 在跑时跳过**：`reload_grants_for_session` 会把内存授权换成新会话的，
+    //    正在跑的任务会当场丢权限（工具调用全被拒）。
+    if !state.runs.any_active() {
+        reload_grants_for_session(&state, &s.id);
+    }
     Ok(s)
 }
 
 /// 切换到指定会话
+///
+/// **允许在别的会话跑着的时候切走，也允许切到另一个正在跑的会话**（多会话并行 run）。
+/// 落盘路径（`*_in` 系列）带着开跑时的 `session_id`，回答不会写错会话。
+///
+/// ⚠️ 但**有任意 run 在跑时不重载授权**：`reload_grants_for_session` 会把内存里那份
+/// 换成"目标会话"的，正在跑的任务会因此**当场丢权限**（它的工具调用全被拒）。
 #[tauri::command]
 fn session_switch(state: State<'_, AppState>, id: String) -> Result<sessions::Session, String> {
-    if state.run.is_active() {
-        return Err("对话进行中，先停止或等它结束再切换会话".into());
-    }
     // 换会话 = 上一段「整个任务」结束。不清的话，A 任务批的授权会漏到 B 任务里去；
     // 同时把新会话自己落盘的那份装回来。
-    reload_grants_for_session(&state, &id);
+    if !state.runs.any_active() {
+        reload_grants_for_session(&state, &id);
+    }
     sessions::switch(&state.data_dir, &id)
 }
 
@@ -1659,12 +1749,15 @@ fn session_switch(state: State<'_, AppState>, id: String) -> Result<sessions::Se
 ///    `<id>.grants.json` 里，删掉分叉就一并没有）。
 #[tauri::command]
 fn session_fork(state: State<'_, AppState>, upto: usize) -> Result<sessions::Session, String> {
-    if state.run.is_active() {
-        return Err("对话进行中，先停止或等它结束再分叉".into());
-    }
     let cur = sessions::ensure_current(&state.data_dir);
+    // 只拦"**这条会话**正在跑" —— 其它会话在跑不影响分叉
+    if state.runs.is_active(&cur.id) {
+        return Err("该会话正在运行，先停止或等它结束再分叉".into());
+    }
     let s = sessions::fork(&state.data_dir, &cur, upto)?;
-    reload_grants_for_session(&state, &s.id);
+    if !state.runs.any_active() {
+        reload_grants_for_session(&state, &s.id);
+    }
     eprintln!(
         "[orbcat] 分叉 {} → {}（截至第 {upto} 条）",
         cur.id, s.id
@@ -1678,15 +1771,15 @@ fn session_fork(state: State<'_, AppState>, upto: usize) -> Result<sessions::Ses
 /// 前端必须二次确认。删完直接覆盖写盘，所以下一轮喂给模型的上下文立刻变短
 /// （`history::pick_window` 读的就是这份 messages）。
 ///
-/// ⚠️ 对话进行中禁止：`chat` 跑的时候正在用这份 messages，中途截断会让
-///    `append_run` 把回答落进一条逻辑上已经不存在的对话里/或重复落盘。
-///    前端 busy 时也不渲染删除按钮，但这里才是硬保护。
+/// ⚠️ **该会话**正在跑时禁止：`chat` 跑的时候正在用这份 messages，中途截断会让
+///    `append_run_in` 把回答落进一条逻辑上已经不存在的对话里/或重复落盘。
+///    只拦这一条会话 —— 其它会话在跑不影响。
 #[tauri::command]
 fn session_truncate(state: State<'_, AppState>, upto: usize) -> Result<sessions::Session, String> {
-    if state.run.is_active() {
-        return Err("对话进行中，先停止或等它结束再删除消息".into());
-    }
     let cur = sessions::ensure_current(&state.data_dir);
+    if state.runs.is_active(&cur.id) {
+        return Err("该会话正在运行，先停止或等它结束再删除消息".into());
+    }
     let s = sessions::truncate(&state.data_dir, &cur.id, upto)?;
     eprintln!(
         "[orbcat] 删除消息：{} 从第 {} 条起截断，剩 {} 条",
@@ -1707,14 +1800,16 @@ async fn session_compact(
     state: State<'_, AppState>,
     force: Option<bool>,
 ) -> Result<history::CompactOutcome, String> {
-    if state.run.is_active() {
-        return Err("对话进行中，先停止或等它结束再压缩上下文".into());
+    let cur = sessions::ensure_current(&state.data_dir);
+    // 只拦"**这条会话**正在跑" —— 压缩会改写 summary/summary_upto，
+    // 跑到一半的那轮 checkpoint 会写进一份对不上的上下文。
+    if state.runs.is_active(&cur.id) {
+        return Err("该会话正在运行，先停止或等它结束再压缩上下文".into());
     }
     let model_id = config::load_settings(&state.data_dir)
         .selected_model
         .ok_or_else(|| "尚未选择模型，无法生成摘要".to_string())?;
     let cfg = config::find_model(&state.data_dir, &model_id)?;
-    let cur = sessions::ensure_current(&state.data_dir);
     history::compact(
         &cfg,
         &state.data_dir,
@@ -1729,14 +1824,19 @@ async fn session_compact(
 /// 删除会话
 #[tauri::command]
 fn session_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    if state.run.is_active() {
-        return Err("对话进行中，先停止或等它结束再删除会话".into());
+    // 只拦"**这条会话**正在跑" —— 它的 run 还在往这个文件里写，
+    // 删掉之后 `append_run_in` 会复活/写坏一份已被删的会话。
+    // 其它会话在跑不影响删除。
+    if state.runs.is_active(&id) {
+        return Err("该会话正在运行，先停止或等它结束再删除".into());
     }
     sessions::delete(&state.data_dir, &id)?;
     // 会话文件连同它的 `.grants.json` 一起没了，内存里那份也得跟着走。
     // `delete` 内部在删当前会话时会自动 `ensure_current`，所以这里取到的一定是有效 id。
     let cur = sessions::current_id(&state.data_dir).unwrap_or_default();
-    reload_grants_for_session(&state, &cur);
+    if !state.runs.any_active() {
+        reload_grants_for_session(&state, &cur);
+    }
     Ok(())
 }
 
@@ -1758,11 +1858,12 @@ fn perm_request_decide(
     let d = perm_request::Decision::parse(&decision).ok_or_else(|| {
         format!("未知的决定：{decision}（只能是 approve / narrow / prefix / full / always / deny）")
     })?;
-    // id 前缀路由：`pr*` = 文件级（pending），`pc*` / `pm*` = 命令 / MCP 级（pending_cmds）。
+    // id 前缀路由：`pr*` = 文件级（pending），`pc*` / `pm*` / `pa*` = 命令 / MCP / ask_user（pending_cmds）。
     // ⚠️ `pm*` 必须走 decide_command —— 它登记在 pending_cmds 里；
     //    早先只认 `pc` 打头，MCP 申请被误送进 decide() 后报「不存在或已处理」，
     //    前端还把卡片删了，agent 一直阻塞到 3 分钟超时（用户看到的就是卡死）。
-    if id.starts_with("pc") || id.starts_with("pm") {
+    // `pa*`（ask_user）同理；它的"决定"只有 approve/deny，**回答文本放在 reason 里**。
+    if id.starts_with("pc") || id.starts_with("pm") || id.starts_with("pa") {
         state.perm.decide_command(&id, d, reason.unwrap_or_default())
     } else {
         state.perm.decide(&id, d, reason.unwrap_or_default())
@@ -2130,7 +2231,7 @@ pub fn run() {
                 memory: memory::MemoryStore::new(data_dir),
                 mcp: shared,
                 perm,
-                run: agent::RunHub::new(),
+                runs: agent::RunRegistry::default(),
             });
 
             // --- 窗口初始形态 ---
@@ -2208,6 +2309,7 @@ pub fn run() {
             search_set,
             search_test,
             set_blur_collapse,
+            set_exec_trust,
             foreground_context,
             foreground_history,
             image_thumb,
