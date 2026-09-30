@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "orbcat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.orbcat.desktop",
   "build": {
     "beforeBuildCommand": "npm run build",
-    "frontendDist": "../dist"
+    "frontendDist": "./stub-dist"
   },
   "app": {
     "withGlobalTauri": true,
@@ -27,7 +27,7 @@
         "center": true,
         "visible": true,
         "dragDropEnabled": false,
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force-renderer-accessibility"
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force-renderer-accessibility --disable-gpu-compositing --disable-gpu-rasterization --disable-gpu-vsync --disable-frame-rate-limit"
       }
     ],
     "security": {
