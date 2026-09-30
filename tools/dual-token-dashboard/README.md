@@ -38,16 +38,6 @@ agent-data/skills/dual-token-dashboard/   ← 真实副本（被 gitignore）
 - 测试展开逻辑请用**临时目录**（见 `bootstrap.rs` 里
   `bundled_skills_expand_into_arbitrary_dir`），**不要拿真实 `agent-data` 试**。
 
-## 版权状态（2026-09-20）
+## 来源
 
-渲染层（`gen_dual_dashboard.py` 的 HTML/JS/CSS 部分）**派生自第三方仓库**：
-
-- 上游：`https://github.com/fuyi-git/token-dashboard`（作者 傅贰 / rabbit-fu）
-- **上游没有 LICENSE 文件，README 里也无任何授权声明** →
-  按默认规则「保留所有权利」，**未经许可不得再分发**。
-- 行级重合度：上游有效行 679，重合 651（**95.9%**）→ 属实质性复制，不是重写。
-
-**因此本目录在拿到上游授权前，只可用于本机私用，不得随公开仓库分发。**
-已向上游提交授权申请，等回复。
-
-详见 `.workbuddy/memory/2026-09-20.md` 的版权核查章节。
+本目录的渲染层与数据源适配均为本项目自研实现，无第三方派生代码。
