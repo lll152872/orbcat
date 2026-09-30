@@ -167,6 +167,37 @@ body {
   animation: orb-pop 320ms cubic-bezier(0.2, 0.8, 0.3, 1.25);
 }
 
+/* ---------------- 睡眠态 ----------------
+   球留在屏幕上但"睡着"了：整体缩小一圈，帧图压暗，并**停掉所有帧动画**
+   （思考摇尾 / 待命呼吸 / 记忆 peek 全部静止）—— 睡着还在动是矛盾的。
+
+   为什么用 grayscale 而不是直接降 opacity：
+   球是三帧透明 PNG，降 opacity 会让它看起来像"渲染残影"；
+   grayscale + 降亮更像"熄了灯"，同时保留轮廓让用户找得到它。
+
+   ⚠️ 滤镜只加在 `.orb-frame` 上，**不加在 .orb 上** ——
+   加在父元素会把角标（待批权限 / 错误 / 记忆）一起压暗，
+   而那些是"必须被看见"的信号，睡着也不该被藏掉。
+
+   ⚠️ 必须放在所有 .orb--<state> 规则之后：睡眠是**覆盖层**，
+   要能盖掉 idle/thinking/pending/mem/error 各自的 animation。 */
+/* ---------------- 睡眠态（2026-09-30 语义变更） ----------------
+   ⚠️ 睡眠现在 = **球从屏幕上完全隐藏**（后端 `win.hide()`），
+   所以这里**没有"变暗缩小"那套视觉**了 —— 一个已经不可见的窗口，
+   给它写滤镜/缩放没有任何意义，只会让后来人以为睡眠还是"留在屏幕上"。
+
+   保留 `.orb--sleeping` 类名是因为前端仍同步 `orbSleeping` 状态
+   （`title` 文案与右键菜单措辞用它），但它**只作语义标记，不作视觉**。
+   下面这条规则是**有意的空声明**：让读代码的人知道
+   "睡眠不再有视觉形态"是刻意为之，而不是漏写。
+
+   历史：旧实现是 `transform: scale(0.86)` + `filter: grayscale(0.85)`、
+   hover 放大、以及"点一下球唤醒"的 cursor 提示 —— 全部随语义变更删除。
+   （2026-09-29 曾按"留在屏幕上"实现，2026-09-30 用户纠正为"消失"。） */
+.orb--sleeping {
+  /* 故意为空：睡眠时窗口已被隐藏，不存在可渲染的球 */
+}
+
 @keyframes orb-pop {
   0%   { transform: scale(0.92); }
   60%  { transform: scale(1.1); }
@@ -238,6 +269,8 @@ body {
   height: 100%;
   border-radius: 14px;
   display: flex;
+  /* ⚠️ 必须是 relative：模型大面板 .models-overlay 用 absolute inset:0 铺满它 */
+  position: relative;
   flex-direction: column;
   overflow: hidden;
 
@@ -312,7 +345,78 @@ body {
   border-radius: 3px;
 }
 
-/* ---------------- 工具栏（模型选择） ---------------- */
+/* ---------------- 工具栏（项目选择 + 工具按钮 + 模型 chip） ----------------
+   工具栏**只有一行**（2026-09-29 二次压缩，用户截图圈出右侧空位：
+   "压缩到画圈的部分"）。模型 chip 从"独占一整行"改为挂在项目行**最右侧**，
+   只留 🐱 + 显示名 + ▾ —— 上下文 / host / 功能标签全部挪进 title tooltip。
+   点卡片本体弹「模型管理」独立窗口，点 ▾ 出纯名称下拉。 */
+
+.model-chip {
+  /* 2026-10 用户："那块空出来的正好是红色区域，这个是让你放模型的部分啊，组别+模型名"
+     → 卡片要**占满**工具栏剩余宽度（原来 max-width:46% 把面板加宽后的空档留白了）。
+     `flex: 1 1 auto` + `min-width: 0` 让它吃掉 select 之外的所有剩余空间，
+     内部两行（组别 / 模型名）各自 ellipsis。 */
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0;
+  padding: 3px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(120, 137, 255, 0.34);
+  background: linear-gradient(
+    180deg,
+    rgba(120, 137, 255, 0.2),
+    rgba(120, 137, 255, 0.08)
+  );
+  color: #e8eaf2;
+  cursor: pointer;
+  text-align: left;
+  line-height: 1.15;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease;
+}
+
+.model-chip:hover {
+  background: linear-gradient(
+    180deg,
+    rgba(120, 137, 255, 0.3),
+    rgba(120, 137, 255, 0.14)
+  );
+  border-color: rgba(120, 137, 255, 0.55);
+}
+
+/* 组别行：小一号、弱化，给"模型名"当上下文 */
+.mc-group {
+  font-size: 9.5px;
+  color: #8f98ba;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mc-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: #eef1fa;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mc-caret {
+  font-size: 9px;
+  color: #8f98ba;
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+}
 
 .panel-toolbar {
   display: flex;
@@ -1686,6 +1790,34 @@ body {
   margin-bottom: 8px;
 }
 
+/* 「设置 › 行为」里的模式 / 权限卡片：**收音机在左，右侧纵向堆叠**。
+   不能沿用 `.set-check` 的 `flex` 横排 —— 那样标题、说明、组影响会被
+   摊成同一行的三列，说明被挤成右侧一根竖条（截图里"不预载外部工具组"
+   被断成三行、"智能放行（高风险仍问）"折成两行）。
+   ⚠️ 选择器必须写成 `.set-check.bh-row`：两者都是单类选择器，
+   `.set-check` 定义在后面，只写 `.bh-row` 会被它的 `display:flex` 盖掉。 */
+.set-check.bh-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 3px 8px;
+}
+
+.set-check.bh-row > input {
+  margin-top: 2px;
+}
+
+/* 说明与组影响行都归到第二列（第一行是 <b> 标题，自动落第二列） */
+.set-check.bh-row > .ctx-sub,
+.set-check.bh-row > .mg-line {
+  grid-column: 2;
+}
+
+.set-check.bh-row .ctx-sub {
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 /* 面板标题栏的齿轮按钮（title 是 flex:1，所以它自然靠右） */
 #btn-gear {
   margin-right: 6px;
@@ -1693,6 +1825,487 @@ body {
 }
 
 /* ---------------- 设置视图 ---------------- */
+
+/* 语言模型列表（VS Code「语言模型」式：按 Base URL 分组 + 表格 + 组菜单）
+   ⚠️ 布局要点：以前每行是 `1fr auto auto auto` 的窄网格，在 420px 面板里
+   `lm-label` 与 `lm-api` 会被压到换行重叠（用户截图里的 `model=glm-` 压 `1049K`）。
+   现在改成**真表格**：四列定宽 + 名称列弹性，名字过长走省略号不再挤压别的列。 */
+
+.lm-list {
+  margin-bottom: 12px;
+}
+
+.lm-group {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  margin-bottom: 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.lm-group.cur {
+  border-color: rgba(120, 137, 255, 0.45);
+}
+
+/* 组头行：折叠按钮 + 齿轮。齿轮绝对定位在右侧，不参与折叠点击区 */
+.lm-head-wrap {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+}
+
+.lm-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+  padding: 9px 34px 9px 11px;
+  border: none;
+  border-radius: 10px 10px 0 0;
+  background: transparent;
+  color: #e8eaf2;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+}
+
+.lm-head:hover {
+  background: rgba(120, 137, 255, 0.14);
+}
+
+.lm-chev {
+  font-size: 10px;
+  color: #7c85a3;
+  width: 10px;
+  flex: 0 0 auto;
+}
+
+.lm-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lm-count {
+  font-size: 10px;
+  font-weight: 500;
+  color: #7c85a3;
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 8px;
+  padding: 1px 6px;
+  flex: 0 0 auto;
+}
+
+/* 组齿轮 */
+.lm-gear {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 22px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: #8f98ba;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.lm-gear:hover,
+.lm-gear.on {
+  background: rgba(255, 255, 255, 0.14);
+  color: #e8eaf2;
+}
+
+/* 组菜单：贴在齿轮下方 */
+.lm-menu {
+  position: absolute;
+  right: 6px;
+  top: calc(100% - 2px);
+  z-index: 6;
+  min-width: 148px;
+  padding: 4px;
+  border-radius: 9px;
+  background: #232739;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+}
+
+.lm-mi {
+  border: none;
+  background: none;
+  color: #dfe3f0;
+  font-size: 12px;
+  text-align: left;
+  padding: 7px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.lm-mi:hover {
+  background: rgba(120, 137, 255, 0.22);
+}
+
+.lm-mi.danger {
+  color: #ff9a9a;
+}
+
+.lm-mi.danger:hover {
+  background: rgba(255, 107, 107, 0.2);
+}
+
+.lm-sep {
+  height: 1px;
+  margin: 3px 4px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* 表体 */
+.lm-body {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-bottom: 3px;
+}
+
+/* 列头：与数据行共用同一套列宽（--lm-cols） */
+.lm-th,
+.lm-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 74px 92px 118px;
+  align-items: center;
+  gap: 8px;
+}
+
+.lm-th {
+  padding: 6px 11px 4px 24px;
+  font-size: 10px;
+  color: #6f7899;
+  letter-spacing: 0.03em;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.lm-row {
+  padding: 9px 11px 9px 24px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.lm-row:last-child {
+  border-bottom: none;
+}
+
+.lm-row.cur {
+  background: rgba(120, 137, 255, 0.1);
+}
+
+/* 名称列：◎ + 显示名 + 接口 id（同一行，超长省略，不再换行重叠） */
+.lm-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.lm-eye {
+  border: none;
+  background: none;
+  color: #565e78;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.lm-eye:hover {
+  color: #9aa4c8;
+}
+
+.lm-eye.on {
+  color: #6ee7a0;
+}
+
+.lm-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: #e8eaf2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.lm-api {
+  font-size: 10px;
+  color: #7c85a3;
+  font-family: ui-monospace, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 auto;
+  min-width: 0;
+  opacity: 0.8;
+}
+
+.lm-nokey {
+  font-size: 9.5px;
+  color: #d8b46a;
+  border: 1px solid rgba(216, 180, 106, 0.35);
+  border-radius: 5px;
+  padding: 0 4px;
+  flex: 0 0 auto;
+}
+
+/* 上下文大小列：手填值，右对齐数字 */
+.lm-ctx {
+  font-size: 11px;
+  color: #a3accb;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+}
+
+.lm-tags {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.lm-tag {
+  font-size: 9.5px;
+  color: #a9b2d6;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 5px;
+  padding: 0 5px;
+  line-height: 15px;
+}
+
+.lm-ops {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+}
+
+.lm-ops .set-btn {
+  padding: 3px 8px;
+  font-size: 10.5px;
+}
+
+/* 工具条：搜索框 + 添加模型（VS Code「语言模型」页顶部同款排布）
+   双类名，否则被后面的 .set-form（column）盖掉 */
+.set-form.lm-tools {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  margin-bottom: 8px;
+}
+
+/* 用 id 提权：`.set-form input:not([type])` 同为 0-2-1，且在文件更后面，会盖掉这条 */
+.set-form.lm-tools input#model-search {
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
+}
+
+.lm-tools .set-btn.add {
+  background: rgba(255, 255, 255, 0.09);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  color: #e2e6f5;
+  padding: 6px 11px;
+  font-size: 11.5px;
+}
+
+.lm-tools .set-btn.add:hover {
+  background: rgba(120, 137, 255, 0.28);
+}
+
+/* ---------------- 模型大面板（外弹层） ----------------
+   点顶栏模型体现区，铺满内容区；关闭即回对话。
+   ⚠️ 这是"展开后要够大"的落点：整块面板宽度都用上，行高给足。 */
+
+.models-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  background: #171a26;
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.mo-inner {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  font-size: 13px;
+}
+
+.mo-close {
+  margin-left: auto;
+}
+
+/* ---------------- 添加 / 编辑模型弹窗（VS Code 式模态框） ----------------
+   面板只有 420x600，表单平铺在列表下面会挤成一团；
+   改成遮罩 + 居中卡片，头/脚固定、中间自己滚。 */
+
+.mm-mask {
+  position: fixed;
+  inset: 0;
+  /* 层级：弹窗 8900 < toast 9000（导入提示要能盖住弹窗）< confirm 9500（删除二次确认压最上） */
+  z-index: 8900;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  background: rgba(8, 10, 16, 0.68);
+  border-radius: 14px; /* fixed 逃出 .panel 的 overflow:hidden，圆角自己补 */
+}
+
+.mm-dialog {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-height: 100%;
+  border-radius: 12px;
+  background: #1e2231; /* 必须不透明：窗口 transparent */
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+.mm-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 9px 11px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* 类型选择弹窗（图 8 那步）：不需要表单那么宽 */
+.mm-dialog.mm-narrow {
+  max-width: 340px;
+}
+
+.mm-type-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px 11px 12px;
+}
+
+.mm-type {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  padding: 10px 11px;
+  border-radius: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.05);
+  color: #e8eaf2;
+  cursor: pointer;
+}
+
+.mm-type:hover {
+  background: rgba(120, 137, 255, 0.22);
+  border-color: rgba(120, 137, 255, 0.45);
+}
+
+.mm-type b {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.mm-type i {
+  font-size: 11px;
+  font-style: normal;
+  color: #9aa4c8;
+}
+
+/* askInput 的单行输入框（prompt() 在 WebView 里被禁用，自己画） */
+.confirm-input {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 2px 0 4px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(0, 0, 0, 0.28);
+  color: #eef1fa;
+  font-size: 12.5px;
+  outline: none;
+  font-family: inherit;
+}
+
+.confirm-input:focus {
+  border-color: rgba(120, 137, 255, 0.6);
+}
+
+.mm-title {
+  flex: 1;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #e8eaf2;
+}
+
+.mm-x {
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 5px;
+  background: none;
+  color: #9aa4c8;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.mm-x:hover {
+  background: rgba(255, 255, 255, 0.14);
+  color: #e8eaf2;
+}
+
+/* 内容区：继续用 .set-form 的控件样式，但去掉外框（弹窗就是那张框）。
+   选择器写双类名 —— .set-form 的 border/padding/background 在文件里排得更靠后，
+   单类名会被它盖掉。 */
+.set-form.mm-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  border: none;
+  border-radius: 0;
+  background: none;
+  padding: 11px;
+}
+
+/* 弹窗内容区的滚动条跟面板一致（默认亮条在深色里很扎眼） */
+.set-form.mm-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.set-form.mm-body::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 3px;
+}
+
+.mm-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  flex: 0 0 auto;
+  padding: 9px 11px;
+  border-top: 1px solid rgba(255, 255, 255, 0.09);
+  background: rgba(255, 255, 255, 0.03);
+}
 
 .set-list {
   margin-bottom: 12px;
@@ -1841,43 +2454,50 @@ body {
   color: #aab4d8;
 }
 
-/* 输入区档位 chip（WorkBuddy 权限选择器的等价物）：
-   常显当前档图标+短词，点击弹三档菜单 */
-.trust-chip {
-  /* ⚠️ 必须 flex: 0 0 auto —— 只写 flex-shrink: 0 时，输入框 flex:1 变长
-     会把 chip 的基准宽度压到 0，看起来就是"权限没了"（2026-09-26 用户报）。
-     另外给 min-width 兜底：JS 没来得及写文案时也不至于塌成一条线。 */
+/* 组影响那一行：允许 / 收起 / 写了但不存在（标灰）—— 现在只在「设置 › 行为」页出现 */
+.mg-label {
+  color: #7c85a6;
+  margin-right: 5px;
+}
+.mg-line {
+  margin-top: 3px;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.mg-ok {
+  color: #7fd6c9;
+}
+
+.mg-off {
+  color: #8a93b8;
+}
+
+.mg-unknown {
+  color: #6b7290;
+  text-decoration: line-through dotted rgba(255, 255, 255, 0.25);
+}
+
+/* ── 输入行的「行为」logo（2026-10）────────────────────────────────────
+   演进：三颗独立 chip（执行位置 / Agent 模式 / 执行权限）→ 合并成一颗
+   `status-chip`（约 110px）→ **整组搬进「设置 › 行为」页，输入行只留一颗
+   30px 的 🎛 图标**。
+
+   为什么最后是这个形态：模式/执行位置/权限都是**低频设置**，用户原话
+   「不要设置我这个页面有设置的啊」「那块空出来的正好是红色区域，这个是让你
+   放模型的部分啊，组别+模型名 / 绿色放行为」—— 输入行（绿色区）只放一颗
+   行为入口，模型组别+名字挪去顶栏（红色区）占满。
+
+   `status-chip` / `.sc-seg` / `.sc-sep` 的样式已随那三颗 chip 一起删除。 */
+.behavior-btn {
   flex: 0 0 auto;
-  min-width: 52px;
-  white-space: nowrap;
-  height: 28px;
-  padding: 0 8px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.06);
-  color: #aab4d8;
-  font-size: 11px;
-  cursor: pointer;
-  transition: background 140ms ease, border-color 140ms ease;
-  align-self: flex-end;
-  margin-bottom: 4px;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
 }
 
-.trust-chip:hover {
-  background: rgba(120, 137, 255, 0.2);
-  border-color: rgba(120, 137, 255, 0.45);
-}
-
-/* 三档各自微染色 —— 让"全放"在扫一眼时就与"询问"分开 */
-.trust-chip[data-mode="smart"] {
-  color: #f5c46b;
-  border-color: rgba(245, 196, 107, 0.35);
-}
-
-.trust-chip[data-mode="full"] {
-  color: #ff9d8e;
-  border-color: rgba(255, 130, 110, 0.45);
-}
 
 /* 会话行：标题可截断，📁 固定不截断 */
 .sess-title-row {
@@ -3037,6 +3657,9 @@ details.tl-tool-res > summary {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* 名字吃掉剩余宽度，把徽标与数值顶到右边（否则三者会散开） */
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .usage-model b {
@@ -3045,4 +3668,393 @@ details.tl-tool-res > summary {
   color: #cdd2e6;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
+}
+
+/* ---------------- 缓存命中率（2026-09-30） ----------------
+   为什么单独一块：prompt token 的大头走缓存命中价，真正按全价计费的只有
+   「输入 − 命中」那一截。总量看不出成本变化，命中率才看得出 ——
+   所以它值得一张自己的卡，而不是塞进 tooltip。 */
+.usage-cache {
+  margin: -4px 0 12px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(91, 140, 255, 0.28);
+  background: rgba(91, 140, 255, 0.09);
+}
+
+.usage-cache--warn {
+  border-color: rgba(245, 165, 36, 0.4);
+  background: rgba(245, 165, 36, 0.1);
+}
+
+.usage-cache-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  color: #c7cee6;
+}
+
+.usage-cache-head b {
+  color: #e8eaf2;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-cache-miss {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: #9aa3c0;
+  font-variant-numeric: tabular-nums;
+  cursor: help;
+}
+
+.usage-cache-hint {
+  margin-top: 3px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: #8b93b0;
+}
+
+.usage-cache-day {
+  margin-left: 8px;
+  font-size: 10.5px;
+  color: #8b93b0;
+  cursor: help;
+}
+
+.usage-cache-day.is-warn {
+  color: #f0b34a;
+}
+
+.usage-cache-badge {
+  flex-shrink: 0;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 6px;
+  font-style: normal;
+  font-size: 10px;
+  line-height: 15px;
+  color: #8fb0ff;
+  background: rgba(91, 140, 255, 0.14);
+  cursor: help;
+}
+
+.usage-cache-badge.is-warn {
+  color: #f0b34a;
+  background: rgba(245, 165, 36, 0.16);
+}
+
+/* 模型行改成「名字 … 徽标 数值」，名字要能吃掉剩余宽度 */
+.usage-model {
+  align-items: baseline;
+}
+
+/* ============================================================
+   模型管理 —— 独立第二窗口（2026-09-29 定稿）
+   编辑/管理全部弹到面板外面的独立窗口；选择留在面板（▾ 下拉）。
+   ============================================================ */
+
+/* models.html 的 body：普通实底窗口（transparent:false），覆盖
+   html/body 的悬浮球透明底 —— 不覆盖会闪出透明窗口。 */
+body.models-page {
+  background: #151722;
+  overflow: hidden;
+  height: 100%;
+}
+
+#models-app {
+  width: 100%;
+  height: 100%;
+}
+
+/* 窗口骨架：无边框窗口里自己画一层壳 + 自绘标题栏 */
+.mw-window {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: #171926;
+  border: 1px solid rgba(120, 137, 255, 0.35);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
+}
+
+.mw-titlebar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 42px;
+  padding: 0 8px 0 14px;
+  background: linear-gradient(180deg, rgba(120, 137, 255, 0.16), rgba(120, 137, 255, 0.05));
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  cursor: default;
+  user-select: none; /* 整窗可拖，见 models.ts bindWindowDrag() */
+}
+
+.mw-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: #eef1fa;
+  flex-shrink: 0;
+}
+
+.mw-count {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: #9aa4c8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.mw-close {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: #aab3d4;
+  font-size: 13px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.mw-close:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+.mw-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 10px 12px 12px;
+}
+
+.mw-body .lm-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.mw-body .lm-tools {
+  margin-bottom: 8px;
+}
+
+/* 独立窗口 toast（右上角浮现，2.6s 自动消失） */
+.mw-toast {
+  position: fixed;
+  top: 52px;
+  right: 14px;
+  z-index: 9900;
+  max-width: 70%;
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  background: #262a3d;
+  border: 1px solid rgba(120, 137, 255, 0.4);
+  color: #e8eaf2;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+  animation: mw-toast-in 160ms ease;
+}
+
+.mw-toast.ok {
+  border-color: rgba(94, 200, 136, 0.55);
+}
+
+.mw-toast.error {
+  border-color: rgba(230, 108, 108, 0.6);
+}
+
+.mw-toast.info {
+  border-color: rgba(120, 137, 255, 0.5);
+}
+
+@keyframes mw-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---------------- 面板 ▾ 纯名称下拉（只选不管） ----------------
+   挂在 .model-chip 内部，绝对定位到卡片下方。 */
+
+.model-chip {
+  position: relative; /* .mc-menu 的定位锚点 */
+}
+
+.mc-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0; /* chip 挂在工具栏最右，下拉向左展开 */
+  left: auto;
+  min-width: 200px;
+  max-width: 280px;
+  z-index: 4000; /* 与既有 overlay 惯例对齐 */
+  max-height: 240px;
+  overflow-y: auto;
+  background: #1e2233;
+  border: 1px solid rgba(120, 137, 255, 0.4);
+  border-radius: 9px;
+  padding: 4px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+}
+
+.mc-mi {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: #dfe3f0;
+  font-size: 12.5px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.mc-mi:hover {
+  background: rgba(120, 137, 255, 0.18);
+}
+
+.mc-mi.cur {
+  background: rgba(120, 137, 255, 0.26);
+}
+
+.mc-mi-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mc-mi-check {
+  flex-shrink: 0;
+  color: #8fa4ff;
+  font-size: 12px;
+}
+
+.mc-mi-empty {
+  padding: 10px 9px;
+  font-size: 12px;
+  color: #8b93b0;
+  text-align: center;
+}
+
+/* ---------------- 备份与回收站（2026-09-30） ----------------
+   为什么要有这个视图：backups/ 与 .trash/ 此前只进不出，
+   「一键还原」是 00-CONCEPT 决策 8 承诺过但一直没实现的那一半。 */
+.rec-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+.rec-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.rec-row--gone {
+  opacity: 0.5;
+}
+
+.rec-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.rec-name {
+  font-size: 11.5px;
+  color: #dfe3f0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rec-main i {
+  font-style: normal;
+  font-size: 10px;
+  color: #8b93b0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rec-unknown {
+  color: #f0b34a !important;
+}
+
+.rec-meta {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: #7d85a3;
+  font-variant-numeric: tabular-nums;
+}
+
+.rec-restore,
+.rec-untrash {
+  flex-shrink: 0;
+  padding: 3px 9px !important;
+  font-size: 11px !important;
+}
+
+.rec-prune {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: #9aa3c0;
+}
+
+.rec-prune label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.rec-prune input {
+  width: 68px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.25);
+  color: #e8eaf2;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rec-ok {
+  color: #5fd39a;
+}
+
+.rec-err {
+  color: #ff8a8a;
 }

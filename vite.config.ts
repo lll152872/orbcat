@@ -27,4 +27,13 @@ export default defineConfig(() => ({
       ignored: ["**/src-tauri/**"],
     },
   },
+  // 多页入口：index.html = 悬浮球主面板；models.html = 「模型管理」独立窗口
+  build: {
+    rollupOptions: {
+      input: {
+        main: "index.html",
+        models: "models.html",
+      },
+    },
+  },
 }));

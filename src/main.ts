@@ -16,6 +16,35 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { mdToHtml } from "./markdown";
+// 纯格式化/工具函数已抽到 format.ts（2026-09-30 拆模块，见该文件头部说明）。
+// 这里集中 re-import，避免散落各处 import 语句。
+import {
+  aggregateUsage,
+  cacheHitRate,
+  cacheVerdict,
+  todayTokenTotal,
+  type UsageRecord,
+} from "./usage";
+import {
+  bindRecoveryView,
+  recoverySummaryText,
+  renderRecoveryView,
+  type RecoveryState,
+} from "./views/recovery";
+import {
+  capAppend,
+  esc,
+  escMd,
+  fmtAuditTime,
+  fmtTime,
+  fmtTokens,
+  isTypingInInput,
+  leafName,
+  localDateKey,
+  shortHost,
+  stripStepFolds,
+  summarizeArgs,
+} from "./format";
 
 /** 判定"拖动"的像素阈值 */
 const DRAG_THRESHOLD = 6;
@@ -54,108 +83,6 @@ interface ProjectRow {
   createdAt: string;
 }
 
-/** 远端 GET /models 返回的一项 */
-interface RemoteModelInfo {
-  id: string;
-  ownedBy?: string;
-  /** 上下文窗口（token）。部分网关提供，导入时自动填 maxInputTokens */
-  contextLength?: number;
-  /** 最大输出（token） */
-  maxOutputLength?: number;
-}
-
-/** 编辑表单回填（不含完整 Key） */
-interface ModelEditView {
-  id: string;
-  name: string;
-  vendor: string;
-  url: string;
-  supportsToolCall: boolean;
-  supportsImages: boolean;
-  headersText: string;
-  hasKey: boolean;
-  keyPreview: string;
-  maxInputTokens?: number | null;
-  maxOutputTokens?: number | null;
-}
-
-/** 添加/编辑表单的会话内状态（re-render 时保住输入，错误也能回填） */
-interface ModelFormState {
-  /** null = 新建；否则为正在编辑的旧 id */
-  editId: string | null;
-  name: string;
-  id: string;
-  url: string;
-  /** 明文 Key（仅内存；不落日志） */
-  apiKey: string;
-  clearKey: boolean;
-  tool: boolean;
-  img: boolean;
-  headersText: string;
-  maxIn: string;
-  maxOut: string;
-  /** 内联错误（不进聊天、不丢表单） */
-  error?: string;
-  /** 预设 key，用于填 URL */
-  preset: string;
-}
-
-/** 设置页「拉取模型列表」的会话内状态（re-render 时要保住） */
-interface RemoteFetchState {
-  items: RemoteModelInfo[];
-  /**
-   * 来源：
-   *   `custom`              手动填 URL + Key
-   *   `preset:<key>`        常见提供商预设（自动填 Base URL）
-   *   `model:<id>`          用已配置模型的提供商凭据
-   */
-  source: string;
-  sourceUrl: string;
-  apiKey: string;
-  headersText: string;
-  tool: boolean;
-  img: boolean;
-  error?: string;
-  /** 本地已配置的 id 集合，渲染时用来标「已配置」 */
-  localIds: Set<string>;
-  checked: Set<string>;
-  /** 最近一次拉取实际请求的提供商端点，展示用 */
-  lastEndpoint?: string;
-}
-
-/** 常见提供商 → OpenAI 兼容 Base URL（拉列表 = GET {url}/models） */
-const PROVIDER_PRESETS: { key: string; name: string; url: string }[] = [
-  { key: "openrouter", name: "OpenRouter", url: "https://openrouter.ai/api/v1" },
-  { key: "deepseek", name: "DeepSeek", url: "https://api.deepseek.com/v1" },
-  { key: "zhipu", name: "智谱 GLM", url: "https://open.bigmodel.cn/api/paas/v4" },
-  { key: "volces", name: "火山方舟", url: "https://ark.cn-beijing.volces.com/api/v3" },
-  { key: "sensenova", name: "商汤 SenseNova", url: "https://token.sensenova.cn/v1" },
-  { key: "xfyun", name: "讯飞 MaaS", url: "https://maas-api.cn-huabei-1.xf-yun.com/v2" },
-  { key: "moonshot", name: "Moonshot", url: "https://api.moonshot.cn/v1" },
-  {
-    key: "dashscope",
-    name: "阿里百炼",
-    url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  },
-  { key: "openai", name: "OpenAI", url: "https://api.openai.com/v1" },
-  { key: "ollama", name: "Ollama（本地）", url: "http://127.0.0.1:11434/v1" },
-];
-
-function providerPreset(key: string): { key: string; name: string; url: string } | undefined {
-  return PROVIDER_PRESETS.find((p) => p.key === key);
-}
-
-function shortHost(url: string): string {
-  try {
-    return new URL(url).host;
-  } catch {
-    return url.replace(/^https?:\/\//, "").split("/")[0] || url;
-  }
-}
-
-function modelsEndpointPreview(baseUrl: string): string {
-  return `${baseUrl.replace(/\/+$/, "")}/models`;
-}
 
 interface AgentStep {
   kind: string;
@@ -400,40 +327,7 @@ let hasModels = true;
  */
 const MAX_STREAM_TEXT_CHARS = 60_000;
 
-/** 追加流式增量，超上限就停住（不再增长，避免每一帧都在拼超长字符串） */
-function capAppend(cur: string | undefined, chunk: string, limit: number): string {
-  const base = cur ?? "";
-  if (base.length >= limit) return base;
-  const s = base + chunk;
-  return s.length <= limit ? s : `${s.slice(0, limit)}\n…（显示已截断）`;
-}
 
-/** 剥掉正文里混入的工具轨迹/思考尾巴（老数据 + 模型回显兜底，与后端 strip_step_folds 对齐） */
-function stripStepFolds(text: string): string {
-  if (!text) return text;
-  const markers = [
-    "\n«steps\n",
-    "\n«steps",
-    "\n[思考] ",
-    "\n[状态] ",
-    "\n[中间正文] ",
-    "\n[已执行",
-    "\n·think ",
-    "\n·status ",
-    "\n·text ",
-    "\n调用 ",
-    "\n  参数: ",
-  ];
-  let cut = text.length;
-  for (const m of markers) {
-    const i = text.indexOf(m);
-    if (i > 0 && i < cut) cut = i;
-  }
-  let out = text.slice(0, cut).trimEnd();
-  // 整块删掉嵌在中间的 «steps … »
-  out = out.replace(/«steps\n[\s\S]*?\n»/g, "").trimEnd();
-  return out;
-}
 
 /** 把磁盘上的会话消息转成面板的 entries */
 function sessionToEntries(s: Session): ChatEntry[] {
@@ -785,6 +679,11 @@ function askConfirm(
 }
 
 /**
+ * （askInput 已随「模型管理」一起搬进独立窗口 models.ts —— 面板里没有
+ * 单行输入弹窗的需求了，组重命名/改Key 都发生在那边。）
+ */
+
+/**
  * 删除消息：从第 `upto` 条起（含）到末尾，全部丢掉。
  *
  * 用户在对话流里点某条消息的「删除」就到这里 —— 语义是"这条以及它后面引出的
@@ -1025,12 +924,6 @@ async function refreshSessionList(): Promise<void> {
   }
 }
 
-function fmtTime(ms: number): string {
-  if (!ms) return "";
-  const d = new Date(ms);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
 
 /** 会话页：**上方主聊天（唯一、不可删）**，下方任务会话列表 */
 /** 会话页：按**项目**分组；📁 标签独立、不被标题省略吃掉 */
@@ -1180,55 +1073,68 @@ function showNewMenu(x: number, y: number): void {
   closeOnOutsideClick(close);
 }
 
-/** 刷新输入区档位 chip 的图标+文字（面板重建后也要调，别只在切换时调） */
-function updateTrustChip(): void {
-  const el = document.getElementById("btn-trust");
-  if (!el) return;
-  const t = EXEC_TRUST_LABEL[execTrust] ?? EXEC_TRUST_LABEL.ask ?? { icon: "🛡", short: "询问", full: "每次询问" };
-  el.textContent = `${t.icon} ${t.short}`;
-  el.title =
-    `执行权限档位：${t.full}（点击切换）\n` +
-    "🛡 每次询问：命令/MCP 都弹卡\n" +
-    "⚡ 智能放行：低中风险免问，高风险仍弹卡\n" +
-    "🔓 完全访问：全部免问（危险命令仍硬阻断）\n" +
-    "文件权限申请不受此开关影响";
-  el.dataset.mode = execTrust;
+// 历史：执行位置 / Agent 模式 / 执行权限三组控制曾以 chip 形式住在输入行
+// （先三颗、后合并成一颗）。2026-10 用户拍板「不要设置我这个页面有设置的啊」，
+// 于是**整个搬进「设置 › 行为」页**，输入行只留一颗行为 logo（🎛）。
+// 那三颗 chip 的刷新函数已随之删除 —— 状态由 `renderBehaviorView` 现算，
+// 不再需要"状态变了刷新 chip"的钩子。
+// ⚠️ **不要**重新往输入行塞设置类控件 —— 那正是被否掉的做法。
+
+/** 切换「后台执行」到指定状态（设置页的复选框用） */
+async function setBgDesk(on: boolean): Promise<void> {
+  try {
+    await invoke<boolean>("bg_desk_set", { enabled: on });
+    bgDeskEnabled = on;
+    await loadBgDesk();
+    showToast(on ? "已切到后台执行（隐形桌面）" : "已切回前台执行", "ok", 2600);
+  } catch (err) {
+    showToast(`切换失败：${err}`, "error");
+    await loadBgDesk();
+  }
 }
 
-/** 执行权限档位切换菜单（形态复用 showNewMenu 的 ctx-menu） */
-function showTrustMenu(x: number, y: number): void {
-  document.getElementById("trust-ctx")?.remove();
-  const menu = document.createElement("div");
-  menu.id = "trust-ctx";
-  menu.className = "ctx-menu";
-  const item = (mode: string, desc: string): string =>
-    `<div class="ctx-item${execTrust === mode ? " checked" : ""}" data-mode="${mode}">${
-      EXEC_TRUST_LABEL[mode].icon
-    } ${EXEC_TRUST_LABEL[mode].full}<div class="ctx-sub">${desc}</div></div>`;
-  menu.innerHTML = `
-    <div class="ctx-title">执行权限（命令 / MCP）</div>
-    ${item("ask", "每条命令都弹卡让你拍板")}
-    ${item("smart", "低/中风险自动执行，高风险才问")}
-    ${item("full", "全部自动执行；危险命令仍被硬阻断")}`;
-  menu.style.left = `${Math.min(x, window.innerWidth - 220)}px`;
-  menu.style.top = `${Math.min(y, window.innerHeight - 200)}px`;
-  document.body.appendChild(menu);
-  const close = (): void => menu.remove();
-  menu.addEventListener("click", async (e) => {
-    const t = (e.target as HTMLElement).closest<HTMLElement>(".ctx-item");
-    if (!t?.dataset.mode) return;
-    close();
-    const next = t.dataset.mode as typeof execTrust;
-    try {
-      const saved = await invoke<string>("set_exec_trust", { mode: next });
-      execTrust = (saved as typeof execTrust) || next;
-      updateTrustChip();
-      showToast(`执行权限：${EXEC_TRUST_LABEL[execTrust].full}`, "ok");
-    } catch (err) {
-      showToast(`切换执行权限失败：${err}`, "error");
-    }
-  });
-  closeOnOutsideClick(close);
+/** 切换模式：调后端 → 刷新缓存。失败要说出来（不能静默留在旧模式）。 */
+async function applyModeChange(id: string): Promise<void> {
+  if (id === activeModeId) return;
+  try {
+    const saved = await invoke<string>("modes_set", { id });
+    activeModeId = saved || id;
+    const m = modesCache.find((x) => x.id === activeModeId);
+    showToast(`已切到 ${m?.name ?? activeModeId}`, "ok", 2400);
+    // 切模式会改活跃组 → MCP 页/权限卡上显示的组状态跟着变
+    await loadModes();
+  } catch (err) {
+    showToast(`切换模式失败：${err}`, "error");
+  }
+}
+
+/** 拉一次模式表（启动、切模式后、打开菜单前都调） */
+async function loadModes(): Promise<void> {
+  try {
+    const r = await invoke<{ activeMode: string; modes: ModeView[] }>("modes_get");
+    activeModeId = r?.activeMode ?? activeModeId;
+    modesCache = Array.isArray(r?.modes) ? r.modes : [];
+  } catch (err) {
+    // 读不到不是致命错误：chip 退回显示 id，模式本身仍在后端生效
+    console.warn("[orbcat] 读模式失败:", err);
+  }
+}
+
+/** 拉一次「后台执行」状态（启动、开关后、面板展开时调） */
+async function loadBgDesk(): Promise<void> {
+  try {
+    const r = await invoke<{
+      enabled: boolean;
+      available: boolean;
+      error: string | null;
+      windows: { title: string; width: number; height: number; pid: number }[];
+    }>("bg_desk_status");
+    bgDeskEnabled = !!r?.enabled;
+    bgDeskError = r?.error ?? null;
+    bgDeskWindows = Array.isArray(r?.windows) ? r.windows : [];
+  } catch (err) {
+    console.warn("[orbcat] 读后台执行状态失败:", err);
+  }
 }
 
 /** 会话右键：挂靠 / 重命名会话 / 删除（打开用左键） */
@@ -1618,6 +1524,26 @@ const ORB_TITLE: Record<OrbState, string> = {
   error: "orbcat — 出错了，点开看看",
 };
 
+/**
+ * 睡眠中的球标题。
+ *
+ * ⚠️ 2026-09-30 语义变更后这句**基本看不到**了 —— 睡眠时窗口被隐藏，
+ * 没有可悬停的元素。保留它是因为 `orbSleeping` 仍会同步过来（例如
+ * 后端在另一条路径上改了状态、而窗口还没来得及隐藏的那一瞬），
+ * 措辞也改成描述**事实**（睡着的唤醒入口在托盘），不再说"点一下唤醒"
+ * —— 隐藏的球点不到，那样写是在骗用户。
+ */
+const ORB_SLEEP_TITLE = "orbcat — 睡眠中（球已隐藏；唤醒：托盘图标右键 → 唤醒，或再启动一次）";
+
+/**
+ * 球是否处于睡眠。
+ *
+ * **后端才是权威**：托盘菜单、球的右键菜单、再启动一次 exe 三条路都能改它，
+ * 前端自己记必然不同步，所以由 `orb-ui` 事件回灌。这里同时做一次乐观更新，
+ * 让点了菜单立刻看到变化（不等 IPC 往返）。
+ */
+let orbSleeping = false;
+
 function currentOrbState(): OrbState {
   if (unseenError) return "error";
   if (pendingPermCount > 0) return "pending"; // 权限=被挡住，最急
@@ -1630,41 +1556,50 @@ const app = document.getElementById("app")!;
 
 let models: ModelView[] = [];
 let selectedModel: string | null = null;
+
+/**
+ * 模型**分组显示名**（键 = Base URL）—— `settings.modelGroupNames`。
+ *
+ * 面板的模型卡片要显示「组别 + 模型名」（2026-10 用户明确要求：
+ * "这个是让你放模型的部分啊，组别+模型名"）。取不到时回退到 host。
+ */
+let modelGroupNames: Record<string, string> = {};
+
+/** 当前模型所属分组的显示名（用户改过用改过的，否则用 host） */
+function modelGroupLabel(url: string | undefined): string {
+  if (!url) return "";
+  return modelGroupNames[url]?.trim() || shortHost(url);
+}
 /** 项目索引（pmem.sqlite）；activeProjectId=null = 主对话 */
 let projects: ProjectRow[] = [];
 let activeProjectId: number | null = null;
 let entries: ChatEntry[] = [];
 
-/** 远端模型列表拉取结果（设置 › 模型） */
-let remoteFetch: RemoteFetchState | null = null;
-/** 添加/编辑表单状态（统一一张表，不再拆「拉取 / 手动」） */
-let modelForm: ModelFormState = emptyModelForm();
-let modelSearch = "";
+/**
+ * MCP「默认全给」开关（settings.mcpAllGroups）。
+ *
+ * 决策背景：以前外部工具要模型自己 `list_tool_groups` → `load_tool_group`
+ * 两步才用得上，多一道仪式还常忘。现在默认**直接全给**，这个开关只是保底
+ * （工具集特别大、小窗口模型塞不下时才关掉）。
+ */
+let mcpAllGroups = true;
 
-function emptyModelForm(): ModelFormState {
-  return {
-    editId: null,
-    name: "",
-    id: "",
-    url: "",
-    apiKey: "",
-    clearKey: false,
-    tool: true,
-    img: true,
-    headersText: "",
-    maxIn: "",
-    maxOut: "",
-    preset: "custom",
-  };
-}
+/**
+ * 顶栏模型下拉（▾）是否展开 —— **纯模型名列表，只选不管**。
+ * 管理入口在卡片本体（点卡片 = 弹独立「模型管理」窗口）。
+ */
+let modelsDropdownOpen = false;
 
 /** 待发送的图片（data URL） */
 let pendingImages: string[] = [];
 
 /**
- * 内容区视图（两级导航）：
- *   settings ─┬─ models    模型管理
- *             ├─ mcp       MCP 工具组
+ * 内容区视图（两级导航）。
+ *
+ * 「模型管理」不再是面板内子页 —— 它是独立窗口（models.html，见 models.ts），
+ * 入口：点顶栏模型卡片本体 / 设置菜单「模型」。面板只负责选模型（▾ 下拉）。
+ *
+ *   settings ─┬─ mcp       MCP 工具组
  *             ├─ perm      文件权限
  *             ├─ mem       记忆
  *             └─ usage     Token 用量（按天 × 模型）
@@ -1672,13 +1607,14 @@ let pendingImages: string[] = [];
 type View =
   | "chat"
   | "settings"
-  | "models"
   | "mcp"
   | "perm"
   | "cmdpolicy"
   | "mem"
   | "sessions"
   | "usage"
+  | "recovery"
+  | "behavior"
   | "search";
 
 let view: View = "chat";
@@ -1709,6 +1645,48 @@ const EXEC_TRUST_LABEL: Record<string, { icon: string; short: string; full: stri
   full: { icon: "🔓", short: "全放", full: "允许完全访问" },
 };
 
+/**
+ * Agent 模式（`agent-data/modes.json`）—— 只决定**哪些 MCP 外部工具组对模型可见**。
+ *
+ * 与执行权限（`execTrust`）是两层互不干涉的闸门：
+ *   模式 = 哪些工具存在   /   权限 = 用它们时问不问
+ * 所以模式**不碰** `run_command` 的弹卡，`execTrust` 也**不碰**工具可见性。
+ */
+let activeModeId = "standard";
+let modesCache: ModeView[] = [];
+
+interface ModeView {
+  id: string;
+  name: string;
+  description: string;
+  /** `"all"` 或组名数组 —— 原样来自 Rust（`modes::GroupSel`） */
+  mcpGroupsPreload: string | string[];
+  /** 允许的组数；`null` = 全给（含未来新增的组） */
+  allowedCount: number | null;
+  /** 模式里写了、但当前 MCP 里不存在的组 → 菜单里标灰 */
+  unknownGroups: string[];
+}
+
+/** 每个内置模式的图标。模式是 JSON 自定义的，认不出来就用通用图标。 */
+const MODE_ICON: Record<string, string> = {
+  standard: "🎯",
+  ptc: "🚀",
+  minimal: "🪶",
+  creator: "🛠",
+};
+
+/**
+ * 「后台执行」状态（进程级，不落盘）。
+ *
+ * 开 = 命令跑在**隐形桌面**上：应用自己弹的窗口不会闪到你屏幕上、不抢焦点。
+ *
+ * ⚠️ 它**不是**一个 agent 模式：模式管"哪些 MCP 工具组可见"，
+ * 这个管"在哪儿执行" —— 两个正交维度（用户拍板）。
+ */
+let bgDeskEnabled = false;
+let bgDeskError: string | null = null;
+let bgDeskWindows: { title: string; width: number; height: number; pid: number }[] = [];
+
 /** 面板刚展开的时间戳 —— 展开瞬间可能收到 blur，忽略掉防抖 */
 let panelOpenedAt = 0;
 
@@ -1730,23 +1708,7 @@ function fileToDataUrl(file: File | Blob): Promise<string> {
   });
 }
 
-function esc(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
 
-/** token 数紧凑显示：1234 → 1.2k，12345 → 12k，1234567 → 1.2M */
-function fmtTokens(n: number): string {
-  if (n < 1000) return String(n);
-  if (n < 1_000_000) {
-    const k = n / 1000;
-    return (k >= 10 ? k.toFixed(0) : k.toFixed(1)) + "k";
-  }
-  return (n / 1_000_000).toFixed(1) + "M";
-}
 
 // ---------------- 复制到剪贴板 ----------------
 
@@ -1917,6 +1879,12 @@ function attachDrag(el: HTMLElement, onClick: () => void): void {
 // ---------------- 渲染：胶囊态 ----------------
 
 function renderOrb(): void {
+  // 环境已经拆掉了就直接放弃重绘。
+  // 单元测试 teardown 之后，仍可能有 late 的事件/定时回调打进来
+  // （例如 window resize、setTimeout）：那时 document 已经不在了，
+  // 硬画下去会抛 ReferenceError，被 vitest 记成 unhandled error 并让
+  // 整个 run 退出码为 1 —— 明明 50 个测试全绿却判失败。
+  if (typeof document === "undefined") return;
   // 猫球六帧，同一时刻只露一帧，由 .orb--<state> 决定：
   //   idle    绿壳睡猫  待命（静态）              ← 常驻态，99% 的时间是这个
   //   awake   靛蓝壳醒猫 工作中（A/B 交替=摇尾）
@@ -1930,7 +1898,7 @@ function renderOrb(): void {
   // 角标放最后，保证盖在球上面。
   const s = currentOrbState();
   app.innerHTML = `
-    <div class="orb orb--${s}" id="orb" title="${ORB_TITLE[s]}">
+    <div class="orb orb--${s}${orbSleeping ? " orb--sleeping" : ""}" id="orb" title="${orbSleeping ? ORB_SLEEP_TITLE : ORB_TITLE[s]}">
       <img class="orb-frame orb-frame-idle"    src="orb/orb-state-green.png"  alt="" draggable="false" />
       <img class="orb-frame orb-frame-pending" src="orb/orb-state-yellow.png" alt="" draggable="false" />
       <img class="orb-frame orb-frame-error"   src="orb/orb-state-red.png"    alt="" draggable="false" />
@@ -1942,8 +1910,16 @@ function renderOrb(): void {
       <img class="orb-badge orb-badge-mem"   src="orb/badge-mem.png"   alt="" draggable="false" />
     </div>
   `;
-  const orb = document.getElementById("orb")!;
-  attachDrag(orb, () => void expand());
+  const orb = document.getElementById("orb");
+  if (!orb) return; // 同上：DOM 已经不在了（被清空/换页），别再往上挂监听
+  attachDrag(orb, () => {
+    // 左键点球 → 展开面板。
+    // ⚠️ 这里**不再有"睡着的球点一下唤醒"的分支**（2026-09-30 语义变更）：
+    // 睡眠时窗口是隐藏的，隐藏的窗口收不到点击 —— 那段代码永远走不到，
+    // 留着只会让人以为睡眠仍是"留在屏幕上"。唤醒入口改到托盘菜单与
+    // 「再启动一次 exe」（后者会直接展开面板）。
+    void expand();
+  });
 }
 
 /**
@@ -1958,7 +1934,122 @@ function applyOrbState(): void {
   const s = currentOrbState();
   el.classList.remove("orb--idle", "orb--thinking", "orb--pending", "orb--mem", "orb--error");
   el.classList.add(`orb--${s}`);
-  el.title = ORB_TITLE[s];
+  el.classList.toggle("orb--sleeping", orbSleeping);
+  el.title = orbSleeping ? ORB_SLEEP_TITLE : ORB_TITLE[s];
+}
+
+// ---------------- 球的睡眠 / 唤醒 ----------------
+
+/**
+ * 睡眠：**把球从屏幕上藏起来**（后端 `win.hide()`），任务照跑。
+ *
+ * ## 语义（2026-09-30 用户重新定义）
+ *
+ * *"睡眠是球从页面上消失但是任务不停止"* —— 所以这里：
+ * 1. 先切回球态（窗口还是"球"这个形状，只是马上要被隐藏）；
+ * 2. 调后端 `sleep` → 窗口隐藏；
+ * 3. **完全不碰任务**：不取消、不清空、不重置任何在跑的一轮。
+ *
+ * `orbSleeping` 只是本地状态标记（用于 title 与菜单措辞）——球已经不可见了，
+ * 所以**没有"睡眠视觉"这回事**，见 `styles.css` 里那条空声明。
+ */
+async function sleepOrb(): Promise<void> {
+  orbSleeping = true;
+  if (mode !== "orb") {
+    await applyMode("orb");
+  } else {
+    applyOrbState();
+  }
+  await invoke("orb_ui_action", { action: "sleep" }).catch((e) =>
+    console.error("[orbcat] 睡眠失败:", e),
+  );
+}
+
+/**
+ * 唤醒：**让球重新出现**（后端 `show()`）。
+ *
+ * 三条入口共用：托盘菜单「唤醒」、「再启动一次 exe」、以及任何显式调用。
+ * ⚠️ 球睡着时窗口是隐藏的，所以**点不到球** —— 早期"点睡着的球唤醒"那条
+ * 交互随语义变更失效（不可见的元素收不到点击），注释保留在此以免被误当回归。
+ *
+ * 同样**不碰任务**：只是把承载它的窗口显示回来。
+ */
+async function wakeOrb(): Promise<void> {
+  orbSleeping = false;
+  applyOrbState();
+  await invoke("orb_ui_action", { action: "wake" }).catch((e) =>
+    console.error("[orbcat] 唤醒失败:", e),
+  );
+}
+
+/**
+ * 订阅后端的球状态广播。
+ *
+ * ⚠️ 必须订阅而不是只信本地变量：托盘菜单（Rust 侧）和「再启动一次 exe」
+ * 都能改这个状态，前端不知道就会画出错的球（睡着却显示醒着）。
+ */
+function installOrbUiListener(): void {
+  void listen<{ sleeping: boolean }>("orb-ui", (e) => {
+    orbSleeping = !!e.payload.sleeping;
+    applyOrbState();
+  });
+  // 启动补拉：前端重载后同步一次（后端状态是内存态，重启后恒为清醒）
+  void invoke<{ sleeping: boolean }>("orb_ui_state")
+    .then((s) => {
+      orbSleeping = !!s?.sleeping;
+      applyOrbState();
+    })
+    .catch(() => {});
+}
+
+/**
+ * 「用户又启动了一次 exe」→ 展开面板。
+ *
+ * ## 为什么需要两条通道（2026-09-30 修「睡眠态点击应用图标无效」）
+ *
+ * 后端收到第二实例信号时会 `emit("orb-open-panel")`，但**事件可能赶在前端
+ * 就绪之前**（WebView 还在加载），那一次 emit 就丢了 —— 而第二实例已经退出，
+ * 用户看到的就是完全没反应。所以后端同时留了一个 `take_open_panel_request`
+ * 标记：前端 `boot` 时拉一次，迟到的信号照样生效。
+ *
+ * ⚠️ `take` 语义（后端 `swap(false)`）：标记只生效一次，不会每次刷新都弹面板。
+ */
+function installOpenPanelListener(): void {
+  void listen("orb-open-panel", () => {
+    void openPanelFromOutside();
+  });
+  // 兜底：启动时问一次"刚才有没有人让我打开面板"
+  void invoke<boolean>("take_open_panel_request")
+    .then((pending) => {
+      if (pending) void openPanelFromOutside();
+    })
+    .catch(() => {});
+}
+
+/**
+ * 把面板打开到可用状态（供「又启动了一次」与「程序已睡着」使用）。
+ *
+ * 与球上点击展开的区别：
+ * 1. **先退出睡眠** —— 睡着时窗口是**隐藏**的（2026-09-30 语义变更），
+ *    后端 `wake` 会把它重新显示出来；前端这份 `orbSleeping` 也要跟上，
+ *    否则球回来了、状态还写着"睡着"。
+ * 2. **要等一轮事件循环** —— 后端刚 `apply_mode("panel")` 改完窗口 bounds，
+ *    立刻切 DOM 会闪一帧错位（见第四十四阶段 bug 3 的同源教训：
+ *    `set_window_mode` 之后到 DOM 切换之间不能有 await，但这里反过来，
+ *    是后端先动窗口、前端后动 DOM，所以要给它落地的时间）。
+ *
+ * ⚠️ 全程**不碰任务**：不取消、不重启任何正在跑的一轮，只是把界面弄出来。
+ */
+async function openPanelFromOutside(): Promise<void> {
+  if (orbSleeping) {
+    await wakeOrb();
+  }
+  await new Promise((r) => setTimeout(r, 30));
+  await expand();
+  // 告诉后端"这次开面板我接住了" —— 它在等这个确认来决定要不要自愈退回球态
+  // （不确认 = 前端不在场/启动失败 → 后端把窗口退回球状，免得留一个
+  //  面板大小、里面画着球的坏窗口）
+  void invoke("confirm_panel_opened").catch(() => {});
 }
 
 // ---------------- 图片缩略图缓存 ----------------
@@ -2153,23 +2244,6 @@ function renderItem(s: AgentStep, live: boolean, idx = -1): string {
   }
 }
 
-/**
- * 工具参数摘要：优先取最有信息量的字段，取不到就原样截断。
- *
- * ⚠️ 落盘时 detail 可能被后端截断（不再保证是合法 JSON），所以解析失败要
- * 安静地退回原串 —— 中文路径 + 截断很容易把 JSON 切断。
- */
-function summarizeArgs(detail: string): string {
-  try {
-    const o = JSON.parse(detail);
-    const picked = o.path || o.file_path || o.pattern || o.query || o.command || o.url;
-    if (typeof picked === "string" && picked) return picked.slice(0, 90);
-    if (o && typeof o === "object" && Object.keys(o).length) return detail.slice(0, 90);
-    return "—";
-  } catch {
-    return detail.slice(0, 90);
-  }
-}
 
 /**
  * 图片缩略图。`src` 有两种形态：
@@ -2239,7 +2313,10 @@ function paintMessages(el: HTMLElement): void {
   });
   el.querySelectorAll<HTMLButtonElement>("button[data-continue]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      const ta = document.querySelector<HTMLTextAreaElement>("#prompt-input");
+      // ⚠️ 输入框的真实 id 是 `input`（renderPanel 里写死的）。
+      //    曾写成 `#prompt-input`（不存在）→ 填字落空 → send() 读到空值
+      //    撞 `if (!text) return` 静默退出 → 按钮"点了没反应"（2026-09-27 用户截图报过）。
+      const ta = document.getElementById("input") as HTMLTextAreaElement | null;
       if (ta) {
         ta.value = "继续";
         draftInput = "继续";
@@ -2512,7 +2589,7 @@ function renderMessagesInner(): string {
         </div>
         <button class="init-go" id="init-go">建出目录结构</button>
         <div class="init-hint">
-          点一下就行，这一步**不需要模型**。<br>
+          点一下就行，这一步<b>不需要模型</b>。<br>
           建完再去 <b>设置</b> 里添加一个模型，就能开始对话了。
         </div>
       </div>`;
@@ -2687,12 +2764,6 @@ const CMD_TIER_LABEL: Record<string, string> = {
   task: "永久",
 };
 
-/** 取路径最后一段（卡片按钮上要短，不能糊一长串路径） */
-function leafName(p: string): string {
-  const s = p.replace(/[\\/]+$/, "");
-  const i = Math.max(s.lastIndexOf("\\"), s.lastIndexOf("/"));
-  return i >= 0 ? s.slice(i + 1) : s;
-}
 
 const PERM_RISK_LABEL: Record<string, string> = {
   low: "低风险",
@@ -2940,11 +3011,6 @@ async function decidePerm(id: string, act: string, reason = ""): Promise<void> {
   refreshPermCards();
 }
 
-/** 当前焦点在输入框里吗？在的话键盘不接管卡片（防"打字回车"误批权限） */
-function isTypingInInput(): boolean {
-  const a = document.activeElement;
-  return a instanceof HTMLTextAreaElement || a instanceof HTMLInputElement;
-}
 
 function installPermHandlers(): void {
   // 按钮的绑定在 `bindPermButtons()`（渲染后直接绑），这里只装事件通道。
@@ -3053,17 +3119,112 @@ async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T
   }
 }
 
+/**
+ * 只刷新顶栏的模型体现区（切模型后调）。
+ *
+ * 为什么不直接 renderPanel()：那会重建整块 DOM —— 对话流全部重绘、滚动位置丢失、
+ * 输入框内容也没了。切个模型代价太大，所以只改 chip 那几个文本节点。
+ */
+function renderPanelRefreshChip(): void {
+  const chip = document.getElementById("model-chip");
+  if (!chip) return;
+  const cur = models.find((m) => m.name === selectedModel);
+  const nameEl = chip.querySelector(".mc-name");
+  if (nameEl) nameEl.textContent = cur ? cur.name : selectedModel || "（未选模型）";
+  // 上下文 / host / 功能标签都不占版面，只更新 tooltip（chip 已是单行小控件）
+  const ctx = cur?.maxInputTokens ? `${Math.round(cur.maxInputTokens / 1000)}K` : "";
+  const host = cur?.url ? shortHost(cur.url) : "";
+  const tags = `${cur?.supportsToolCall ? "工具" : ""}${
+    cur?.supportsImages ? (cur?.supportsToolCall ? " / 视觉" : "视觉") : ""
+  }`;
+  chip.title = `模型：${cur ? cur.name : "（未选模型）"}${host ? ` · ${host}` : ""}${
+    ctx ? ` · 上下文 ${ctx}` : ""
+  }${tags ? ` · ${tags}` : ""} —— 点卡片管理（${models.length} 个）· 点 ▾ 切换`;
+  // 下拉开着的话，✓ 的位置可能变了
+  paintModelsDropdown();
+}
+
+/**
+ * 打开「模型管理」独立窗口 —— **唯一入口**（卡片本体 / 设置菜单 / 空态按钮都走它）。
+ *
+ * 失败时既弹 toast 给用户看，也落盘到 `agent-data/diag.log`：
+ * 排查时截图可能拿不到，日志文件是可靠通道。
+ */
+function openModelsWindow(): void {
+  void invoke("models_window_open").catch((err) => {
+    const msg = `打开模型管理失败：${err}`;
+    showToast(msg, "error");
+    void invoke("diag_log", { msg: `main.ts ${msg}` }).catch(() => {});
+  });
+}
+
+/**
+ * ▾ 纯模型名下拉：**只选不管** —— 点谁切谁，不出现任何管理按钮。
+ *
+ * 分工（2026-09-29 定稿）：选择留在面板（轻、快），管理弹到独立窗口
+ * （大、全）—— 管理入口是卡片本体，不是这个列表。
+ */
+function paintModelsDropdown(): void {
+  document.getElementById("models-dropdown")?.remove();
+  if (!modelsDropdownOpen) return;
+  const chip = document.getElementById("model-chip");
+  if (!chip) return;
+  const dd = document.createElement("div");
+  dd.className = "mc-menu";
+  dd.id = "models-dropdown";
+  dd.innerHTML =
+    models.length === 0
+      ? '<div class="mc-mi-empty">（还没有模型）</div>'
+      : models
+          .map(
+            (m) => `
+        <button class="mc-mi${m.name === selectedModel ? " cur" : ""}" data-name="${esc(m.name)}" title="${esc(m.id)}">
+          <span class="mc-mi-name">${esc(m.name)}</span>
+          ${m.name === selectedModel ? '<span class="mc-mi-check">✓</span>' : ""}
+        </button>`,
+          )
+          .join("");
+  chip.appendChild(dd);
+  dd.querySelectorAll<HTMLButtonElement>(".mc-mi").forEach((b) =>
+    b.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      selectedModel = b.dataset.name!;
+      modelsDropdownOpen = false;
+      paintModelsDropdown();
+      renderPanelRefreshChip();
+      renderImageHint(); // 换模型可能改变「支不支持图片」
+      await invoke("set_selected_model", { id: selectedModel }).catch((err) =>
+        pushEntry("error", `保存模型选择失败：${err}`),
+      );
+    }),
+  );
+}
+
 function renderPanel(): void {
-  const opts = models
-    .map(
-      (m) =>
-        `<option value="${esc(m.name)}"${m.name === selectedModel ? " selected" : ""}>${esc(
-          m.name,
-        )}${m.vendor && m.vendor !== "Custom" ? ` · ${esc(m.vendor)}` : ""}${
-          m.supportsImages ? " 🖼" : ""
-        }${m.supportsToolCall ? " 🔧" : ""}</option>`,
-    )
-    .join("");
+  // 当前模型 —— 主界面上的「大号体现区」。
+  // 卡片本体 = 管理入口（弹出独立「模型管理」窗口）；▾ = 纯名称下拉只选不管。
+  const cur = models.find((m) => m.name === selectedModel);
+  const curName = cur ? cur.name : selectedModel || "（未选模型）";
+  const curCtx = cur?.maxInputTokens ? `${Math.round(cur.maxInputTokens / 1000)}K` : "";
+  // 分组显示名（用户可在模型管理里给每个 Base URL 起名；取不到回退 host）
+  const curGroup = modelGroupLabel(cur?.url);
+  const curTags = `${cur?.supportsToolCall ? "工具" : ""}${
+    cur?.supportsImages ? (cur?.supportsToolCall ? " / 视觉" : "视觉") : ""
+  }`;
+  // chip 显示「组别 + 模型名」（2026-10 用户要求）：
+  //   组别在上、模型名在下（两行紧凑排），或者空间不够时省略组别。
+  //   上下文 / host / 功能标签仍全在 title tooltip 里。
+  const modelTip = `模型：${curName}${curGroup ? ` · 组别 ${curGroup}` : ""}${
+    curCtx ? ` · 上下文 ${curCtx}` : ""
+  }${curTags ? ` · ${curTags}` : ""} —— 点卡片管理（${
+    models.length
+  } 个）· 点 ▾ 切换`;
+  const modelBtn = `
+    <button class="model-chip" id="model-chip" title="${esc(modelTip)}">
+      ${curGroup ? `<span class="mc-group">${esc(curGroup)}</span>` : ""}
+      <span class="mc-name">${esc(curName)}</span>
+      <span class="mc-caret">▾</span>
+    </button>`;
 
   // 主对话 / 项目（新建走独立「项+」，select 只显示真实项目，永远选中当前）
   const projOpts = [
@@ -3088,16 +3249,16 @@ function renderPanel(): void {
         <button class="panel-btn" id="btn-close" title="收起">—</button>
       </div>
 
+      <!-- 工具栏 = 单行（2026-09-29 二次压缩）：项目 / 截 / ＋ / 史 + 右侧模型 chip。
+           模型原来独占上面一整行，现在压到这一行最右，工具栏两行 → 一行。 -->
       <div class="panel-toolbar">
-        <select id="model-select" ${models.length ? "" : "disabled"}>
-          ${opts || '<option>（没有可用模型）</option>'}
-        </select>
         <select id="project-select" title="当前：${esc(projTitle)} · 切项目看该项目会话">
           ${projOpts}
         </select>
         <button class="mini-btn" id="btn-grab" title="截取当前屏幕">截</button>
         <button class="mini-btn" id="btn-new" title="新建会话 / 项目">＋</button>
         <button class="mini-btn" id="btn-sess" title="会话（主聊天 / 任务）">史</button>
+        ${modelBtn}
       </div>
 
       <div class="fg-ctx" id="fg-ctx" title="用户当前前台应用（点击复制路径）" style="display:none"></div>
@@ -3111,8 +3272,13 @@ function renderPanel(): void {
       <div class="img-hint" id="img-hint" style="display:none"></div>
 
       <div class="panel-input">
-        <button id="btn-trust" class="trust-chip" title="执行权限档位：控制 run_command / MCP 还问不问你（文件权限不受影响）">🛡 询问</button>
-        <textarea id="input" rows="1" placeholder="问点什么…（Enter 发送 / Shift+Enter 换行 / Ctrl+V 贴图）"></textarea>
+        <!-- 「行为」入口：**一颗**小 logo，不是三颗 chip。
+             2026-10 用户拍板：执行位置/模式/权限是设置，不该占输入行；
+             但行为本身是高频入口，所以留一颗图标当门，点开进设置 › 行为页。
+             与之前"三颗 chip 挤掉输入框宽度"是两回事：一颗图标约 30px。 -->
+        <button id="btn-behavior" class="mini-btn behavior-btn" title="行为：执行位置 / Agent 模式 / 执行权限">🎛</button>
+        <textarea id="input" rows="1" placeholder="问点什么…"
+          title="Enter 发送 / Shift+Enter 换行 / Ctrl+V 贴图"></textarea>
         <button id="btn-stop" title="停止生成" hidden>■</button>
         <button id="btn-send" title="发送">↵</button>
       </div>
@@ -3129,8 +3295,8 @@ function renderPanel(): void {
 
   document.getElementById("btn-close")!.addEventListener("click", () => void collapse());
   document.getElementById("btn-grab")!.addEventListener("click", () => void grabScreen());
-  // 「测」「忆」的工具栏入口已删（与设置页重复）：
-  //   测试连通性 → 设置 › 模型（每个模型一行一颗）
+  // 「测」「忆」的工具栏入口已删：
+  //   测试连通性 → 模型管理窗口（点顶栏模型卡片弹出，每行一颗「测」）
   //   记忆审批   → 设置入口页「🧠 记忆」
   document.getElementById("btn-new")!.addEventListener("click", (e) => {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -3147,14 +3313,23 @@ function renderPanel(): void {
   }
   document.getElementById("btn-gear")!.addEventListener("click", () => void switchView("settings"));
 
-  const sel = document.getElementById("model-select") as HTMLSelectElement;
-  sel?.addEventListener("change", async () => {
-    selectedModel = sel.value;
-    renderImageHint(); // 换模型可能改变"支不支持图片"，提示条要跟着变
-    await invoke("set_selected_model", { id: selectedModel }).catch((e) =>
-      pushEntry("error", `保存模型选择失败：${e}`),
-    );
+  // 模型卡片分两区（2026-09-29 定稿）：
+  //   卡片本体 → 弹出独立的「模型管理」窗口（增删改/分组/测试都在那边）
+  //   ▾        → 纯模型名下拉，只选不管
+  const chip = document.getElementById("model-chip");
+  chip?.addEventListener("click", (e) => {
+    const t = e.target as HTMLElement;
+    if (t.closest(".mc-caret")) return; // ▾ 自己处理
+    openModelsWindow();
   });
+  chip?.querySelector(".mc-caret")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    modelsDropdownOpen = !modelsDropdownOpen;
+    paintModelsDropdown();
+  });
+  if (modelsDropdownOpen) {
+    paintModelsDropdown();
+  }
 
   // 顶栏项目：只切换；新建入口在「＋」菜单里（与新建会话合并）
   const psel = document.getElementById("project-select") as HTMLSelectElement | null;
@@ -3199,13 +3374,12 @@ function renderPanel(): void {
   document.getElementById("btn-send")!.addEventListener("click", () => void send());
   document.getElementById("btn-stop")!.addEventListener("click", () => void stopRun());
 
-  // 执行权限档位：chip 显示当前档，点击弹三档菜单（对齐 WorkBuddy 权限选择器形态）
-  const trustBtn = document.getElementById("btn-trust");
-  updateTrustChip();
-  trustBtn?.addEventListener("click", (e) => {
-    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    showTrustMenu(r.left, r.bottom + 4);
-  });
+  // 注：执行位置 / Agent 模式 / 执行权限三组控制**已移出输入行**（见 renderBehaviorView）。
+  // 它们曾以 chip 形式占掉输入行 110~165px，把输入框压到放不下一行提示。
+  // 输入行左侧只留一颗 🎛 当门 —— 高频入口要一眼能找到，但不能占宽度。
+  document
+    .getElementById("btn-behavior")!
+    .addEventListener("click", () => void switchView("behavior"));
 
   renderPreview();
   renderBody();
@@ -3375,8 +3549,9 @@ function renderBody(): void {
       bd(invoke<{ blurCollapse?: boolean }>("get_settings").catch(() => null), null),
       bd(invoke<UsageRecord[]>("usage_report").catch(() => [] as UsageRecord[]), [] as UsageRecord[]),
       bd(invoke<SearchStatus | null>("search_status").catch(() => null), null),
+      bd(invoke<RecoveryState>("recovery_state").catch(() => null), null),
     ])
-      .then(([mcp, pending, autoOn, rules, settings, usage, search]) => {
+      .then(([mcp, pending, autoOn, rules, settings, usage, search, recovery]) => {
         if (view !== "settings") return;
         autostartOn = autoOn;
         blurCollapse = settings?.blurCollapse ?? true;
@@ -3384,7 +3559,7 @@ function renderBody(): void {
         searchInfo = search;
         const tSum = todayTokenTotal(usage);
         const summary = usage.length ? `今日 ${fmtTokens(tSum)} · 共 ${usage.length} 次问答` : "暂无记录";
-        b.innerHTML = renderSettingsMenu(mcp, pending.length, summary);
+        b.innerHTML = renderSettingsMenu(mcp, pending.length, summary, recoverySummaryText(recovery));
         b.scrollTop = keep;
         bindSettingsMenu(b);
       })
@@ -3394,12 +3569,6 @@ function renderBody(): void {
         b.innerHTML = `<div class="mem-head">设置</div>
           <div class="mem-empty">设置页渲染失败：${esc(String(e))}<br>请把这句话反馈给开发者</div>`;
       });
-    return;
-  }
-
-  if (view === "models") {
-    b.innerHTML = renderModelsView();
-    bindModelsView(b);
     return;
   }
 
@@ -3455,6 +3624,17 @@ function renderBody(): void {
     return;
   }
 
+  if (view === "behavior") {
+    const keep = b.scrollTop;
+    void loadModes().then(() => loadBgDesk()).then(() => {
+      if (view !== "behavior") return;
+      b.innerHTML = renderBehaviorView();
+      b.scrollTop = keep;
+      bindBehaviorView(b);
+    });
+    return;
+  }
+
   if (view === "mcp") {
     const keep = b.scrollTop;
     b.innerHTML = `<div class="mem-loading">加载中…</div>`;
@@ -3462,9 +3642,13 @@ function renderBody(): void {
       invoke<McpStatus>("mcp_status").catch(() => null),
       invoke<McpServerCfg[]>("mcp_servers_list").catch(() => [] as McpServerCfg[]),
       invoke<string[]>("mcp_grants_list").catch(() => [] as string[]),
+      invoke<Record<string, boolean>>("mcp_group_settings").catch(() => ({})),
     ])
-      .then(([st, servers, grants]) => {
+      .then(([st, servers, grants, grpSettings]) => {
         if (view !== "mcp") return;
+        // 全局"直接全给"开关（保留键 __all__），组开关本身由后端决定 g.active
+        const gs: Record<string, boolean> = grpSettings ?? {};
+        mcpAllGroups = gs["__all__"] ?? true;
         b.innerHTML = renderMcpView(st, servers ?? [], grants ?? []);
         b.scrollTop = keep;
         bindMcpView(b);
@@ -3474,6 +3658,24 @@ function renderBody(): void {
         b.innerHTML = renderMcpView(null, [], []);
         b.scrollTop = keep;
         bindMcpView(b);
+      });
+    return;
+  }
+
+  if (view === "recovery") {
+    const keep = b.scrollTop;
+    b.innerHTML = `<div class="mem-loading">加载中…</div>`;
+    void invoke<RecoveryState>("recovery_state")
+      .then((st) => {
+        if (view !== "recovery") return;
+        b.innerHTML = renderRecoveryView(st, subHeader("备份与回收站"));
+        b.scrollTop = keep;
+        bindRecoveryView(b, () => renderBody(), () => void switchView("settings"));
+      })
+      .catch((e) => {
+        if (view !== "recovery") return;
+        b.innerHTML = `<div class="mem-head">备份与回收站</div>
+          <div class="mem-empty">读取失败：${esc(String(e))}</div>`;
       });
     return;
   }
@@ -3518,10 +3720,9 @@ function bindInitPrompt(root: HTMLElement): void {
   if (!btn) return;
 
   if (!needsInit) {
-    // 形态二：没模型 → 直接跳"模型"设置页
+    // 形态二：没模型 → 直接弹「模型管理」独立窗口（加模型就在那边）
     btn.addEventListener("click", () => {
-      view = "chat"; // 保证 switchView 的 toggle 不把 models 又切回 chat
-      void switchView("models");
+      openModelsWindow();
     });
     return;
   }
@@ -3550,8 +3751,8 @@ function bindInitPrompt(root: HTMLElement): void {
       view = "chat";
       renderBody();
 
-      // 顺手把人带到模型页，省得他去找设置入口
-      void switchView("models");
+      // 顺手弹出模型管理窗口，省得他去找入口
+      openModelsWindow();
     } catch (e) {
       console.error("[orbcat] 初始化失败:", e);
       btn.disabled = false;
@@ -3729,11 +3930,11 @@ function bindMemButtons(root: HTMLElement): void {
 async function switchView(v: View): Promise<void> {
   // 再点同一个非 chat 视图 → 退回对话（toggle 手感）
   const next = v === view && v !== "chat" ? "chat" : v;
-  // 离开模型页时丢掉表单草稿，避免下次进来卡在「编辑模式 + 空字段」
-  if (view === "models" && next !== "models") {
-    modelForm = emptyModelForm();
-    remoteFetch = null;
-  }
+  // 进子页从顶部看起：面板体是**同一个**滚动容器，不重置的话从聊天流
+  // 中间点进「行为」会直接落在页面中段 —— 用户看到的是半截卡片，
+  // 还以为页面坏了（2026-10 截图复现）。回 chat 不动，那边有自己的保滚动。
+  const b = document.getElementById("panel-body");
+  if (next !== view && next !== "chat" && b) b.scrollTop = 0;
   view = next;
   renderBody();
 }
@@ -3748,6 +3949,7 @@ function renderSettingsMenu(
   mcp: McpStatus | null,
   pendingCount: number,
   usageSummary: string,
+  recoverySummary: string,
 ): string {
   const curModel =
     models.find((m) => m.id === selectedModel)?.name ?? "（未选）";
@@ -3764,7 +3966,7 @@ function renderSettingsMenu(
     : "未配置（模型无 web_search）";
 
   const item = (
-    act: View,
+    act: string, // "models" 不是 View（它弹独立窗口），所以这里放宽成 string
     icon: string,
     title: string,
     summary: string,
@@ -3782,13 +3984,17 @@ function renderSettingsMenu(
 
   return `
     <div class="mem-head">设置<button class="mem-back" id="set-back">返回对话</button></div>
-    ${item("models", "🧩", "模型", `当前 ${curModel} · 共 ${models.length} 个`)}
+    ${item("models", "🧩", "模型", `当前 ${curModel} · 共 ${models.length} 个（独立窗口管理）`)}
     ${item("search", "🌐", "搜索 web_search", searchSummary)}
     ${item("usage", "📊", "Token 用量", usageSummary)}
+    ${item("recovery", "♻️", "备份与回收站", recoverySummary)}
     ${item("mcp", "🔌", "MCP 外部工具", mcpSummary)}
     ${item("perm", "📁", "文件权限", `已配置 ${permCount} 条规则`)}
     ${item("cmdpolicy", "⌨️", "命令策略", "白名单 / 硬阻断 / 审计（run_command）")}
     ${item("mem", "🧠", "记忆", "待审批、记忆文件族与项目绑定", pendingCount > 0 ? String(pendingCount) : undefined)}
+
+    <div class="mem-head">行为</div>
+    ${item("behavior", "🎛", "执行位置 / 模式 / 权限", behaviorSummary())}
 
     <div class="mem-head">启动与退出</div>
     <label class="set-check set-check-row">
@@ -3808,9 +4014,16 @@ function renderSettingsMenu(
 
 function bindSettingsMenu(root: HTMLElement): void {
   document.getElementById("set-back")?.addEventListener("click", () => void switchView("chat"));
-  root.querySelectorAll<HTMLButtonElement>(".set-entry").forEach((b) =>
-    b.addEventListener("click", () => void switchView(b.dataset.act as View)),
-  );
+  root.querySelectorAll<HTMLButtonElement>(".set-entry").forEach((b) => {
+    // 「模型」不再是面板内子页 —— 弹独立窗口（编辑住在外面，面板只管选）
+    if (b.dataset.act === "models") {
+      b.addEventListener("click", () => {
+        openModelsWindow();
+      });
+      return;
+    }
+    b.addEventListener("click", () => void switchView(b.dataset.act as View));
+  });
 
   // --- 开机自启 ---
   const chk = document.getElementById("auto-start") as HTMLInputElement | null;
@@ -3851,6 +4064,144 @@ function bindSettingsMenu(root: HTMLElement): void {
 /** 子页顶部的返回条（统一回设置入口页） */
 function subHeader(title: string): string {
   return `<div class="mem-head">${title}<button class="mem-back" id="sub-back">‹ 设置</button></div>`;
+}
+
+// ---------------- 设置 › 行为（执行位置 / 模式 / 权限） ----------------
+//
+// 为什么这三样住在这里、而不是输入行：
+//   它们是**设置**（改一次管很久），不是每次发消息都要碰的东西。
+//   2026-10 用户原话："不要设置我这个页面有设置的啊" ——
+//   它们曾以三颗 chip 的形式挤在输入行，占掉约 110~165px，
+//   把输入框压到连一行 placeholder 都放不下。
+
+/** 设置入口页上那一行摘要 */
+function behaviorSummary(): string {
+  const m = modesCache.find((x) => x.id === activeModeId);
+  const trust = EXEC_TRUST_LABEL[execTrust] ?? EXEC_TRUST_LABEL.ask;
+  return (
+    `${bgDeskEnabled ? "后台" : "前台"}执行 · ${m?.name ?? activeModeId} · ${trust.full}`
+  );
+}
+
+function renderBehaviorView(): string {
+  const m = modesCache.find((x) => x.id === activeModeId);
+  const trust = EXEC_TRUST_LABEL[execTrust] ?? EXEC_TRUST_LABEL.ask;
+
+  // ── 执行位置 ──
+  const bgRows = `
+    <label class="set-check set-check-row">
+      <input type="checkbox" id="bh-bgdesk" ${bgDeskEnabled ? "checked" : ""}>
+      后台执行（命令跑在隐形桌面上）
+    </label>
+    <div class="set-hint">
+      开着：命令与 GUI 程序跑在一张<b>用户看不见的桌面</b>上 —— 不闪窗口、不抢焦点。<br>
+      ⚠️ 隐形桌面上<b>没有合成键鼠</b>，所以只能驱动有自动化接口（COM / 命令行）的程序；
+      要「点界面」的老软件请关掉它。<br>
+      这是<b>进程级</b>开关，不落盘，重启回到前台。
+      ${bgDeskError ? `<br><span style="color:#ff9d8e">⚠️ ${esc(bgDeskError)}</span>` : ""}
+    </div>
+    ${
+      bgDeskEnabled && bgDeskWindows.length
+        ? `<div class="set-hint">隐形桌面上正在跑（${bgDeskWindows.length}）：<br>${bgDeskWindows
+            .slice(0, 6)
+            .map((w) => `· ${esc(w.title)}（${w.width}×${w.height}）`)
+            .join("<br>")}</div>`
+        : ""
+    }`;
+
+  // ── Agent 模式 ──
+  const modeRows = modesCache.length
+    ? modesCache
+        .map((x) => {
+          const groups =
+            x.allowedCount === null
+              ? `<span class="mg-ok">全部组</span>`
+              : x.allowedCount === 0
+                ? `<span class="mg-off">不预载外部工具组</span>`
+                : `<span class="mg-ok">${x.allowedCount} 组可见</span>`;
+          const unknown = x.unknownGroups.length
+            ? ` · ` +
+              x.unknownGroups
+                .map((u) => `<span class="mg-unknown">${esc(u)}（不存在）</span>`)
+                .join(" · ")
+            : "";
+          return `
+        <label class="set-check set-check-row bh-row">
+          <input type="radio" name="bh-mode" value="${esc(x.id)}" ${
+            x.id === activeModeId ? "checked" : ""
+          }>
+          <b>${MODE_ICON[x.id] ?? "🧩"} ${esc(x.name)}</b>
+          <div class="ctx-sub">${escMd(x.description)}</div>
+          <div class="mg-line"><span class="mg-label">工具组</span>${groups}${unknown}</div>
+        </label>`;
+        })
+        .join("")
+    : `<div class="mem-empty">读不到模式定义（agent-data/modes.json）。</div>`;
+
+  // ── 执行权限 ──
+  const trustRows = (
+    [
+      ["ask", "每条命令 / MCP 调用都弹卡让你拍板"],
+      ["smart", "低/中风险自动执行，高风险才问"],
+      ["full", "全部自动执行；危险命令仍被硬阻断"],
+    ] as const
+  )
+    .map(
+      ([id, desc]) => `
+      <label class="set-check set-check-row bh-row">
+        <input type="radio" name="bh-trust" value="${id}" ${id === execTrust ? "checked" : ""}>
+        <b>${EXEC_TRUST_LABEL[id].icon} ${EXEC_TRUST_LABEL[id].full}</b>
+        <div class="ctx-sub">${desc}</div>
+      </label>`,
+    )
+    .join("");
+
+  return (
+    subHeader("行为") +
+    `<div class="set-hint" style="margin-bottom:8px">
+       三个维度互不干涉：<b>执行位置</b>管窗口开在哪张桌面、<b>Agent 模式</b>管哪些 MCP
+       工具组对模型可见、<b>执行权限</b>管用它们时问不问。
+     </div>` +
+    `<div class="mem-head">🖥 执行位置</div>${bgRows}` +
+    `<div class="mem-head">🎯 Agent 模式（当前：${esc(m?.name ?? activeModeId)}）</div>${modeRows}` +
+    `<div class="set-hint">模式只能<b>收窄</b>：你在设置 › MCP 里关掉的组，任何模式都开不回来。
+       要加自己的模式：改 <code>agent-data/modes.json</code>，不用重新编译。</div>` +
+    `<div class="mem-head">${trust.icon} 执行权限（当前：${esc(trust.full)}）</div>${trustRows}` +
+    `<div class="set-hint">文件权限申请不受这一档影响（那是 permissions.json 三层闸门）。</div>`
+  );
+}
+
+function bindBehaviorView(root: HTMLElement): void {
+  document.getElementById("sub-back")?.addEventListener("click", () => void switchView("settings"));
+
+  root.querySelector<HTMLInputElement>("#bh-bgdesk")?.addEventListener("change", async (e) => {
+    const on = (e.currentTarget as HTMLInputElement).checked;
+    await setBgDesk(on);
+    renderBody(); // 重绘：要刷新摘要行与"正在跑什么"列表
+  });
+
+  root.querySelectorAll<HTMLInputElement>('input[name="bh-mode"]').forEach((el) =>
+    el.addEventListener("change", async () => {
+      if (!el.checked) return;
+      await applyModeChange(el.value);
+      renderBody();
+    }),
+  );
+
+  root.querySelectorAll<HTMLInputElement>('input[name="bh-trust"]').forEach((el) =>
+    el.addEventListener("change", async () => {
+      if (!el.checked) return;
+      try {
+        const saved = await invoke<string>("set_exec_trust", { mode: el.value });
+        execTrust = (saved as typeof execTrust) || (el.value as typeof execTrust);
+        showToast(`执行权限：${EXEC_TRUST_LABEL[execTrust].full}`, "ok");
+        renderBody();
+      } catch (err) {
+        showToast(`切换执行权限失败：${err}`, "error");
+        renderBody();
+      }
+    }),
+  );
 }
 
 // ---------------- 设置 › 搜索（web_search） ----------------
@@ -3949,565 +4300,6 @@ function bindSearchView(_root: HTMLElement): void {
       btn.textContent = old;
     }
   });
-}
-
-// ---------------- 设置 › 模型 ----------------
-function renderModelsView(): string {
-  const q = (modelSearch || "").trim().toLowerCase();
-  const filtered = q
-    ? models.filter(
-        (m) =>
-          m.id.toLowerCase().includes(q) ||
-          m.name.toLowerCase().includes(q) ||
-          m.url.toLowerCase().includes(q),
-      )
-    : models;
-
-  const rows = filtered
-    .map((m) => {
-      const cur = m.name === selectedModel;
-      const ctx = m.maxInputTokens ? ` · ${Math.round(m.maxInputTokens / 1000)}k` : "";
-      return `
-      <div class="set-row${cur ? " cur" : ""}" data-id="${esc(m.name)}">
-        <div class="set-name">${esc(m.name)}${cur ? ' <span class="set-cur">当前</span>' : ""}</div>
-        <div class="set-url">${
-          m.name !== m.id ? `<span class="set-id">model=${esc(m.id)}</span> · ` : ""
-        }${esc(m.url)}${ctx} · ${m.hasKey === false ? "🔓无Key " : ""}${m.supportsImages ? "🖼" : ""}${
-        m.supportsToolCall ? "🔧" : ""
-      }</div>
-        <div class="set-actions">
-          ${cur ? "" : `<button class="set-btn use" data-id="${esc(m.name)}">使用</button>`}
-          <button class="set-btn edit" data-id="${esc(m.name)}">改</button>
-          <button class="set-btn test" data-id="${esc(m.name)}">测</button>
-          <button class="set-btn del" data-id="${esc(m.name)}">删</button>
-        </div>
-        <div class="set-test-msg" hidden></div>
-      </div>`;
-    })
-    .join("");
-
-  const f = modelForm;
-  const editing = f.editId !== null;
-  const presetOpts = [
-    `<option value="custom"${f.preset === "custom" ? " selected" : ""}>自定义</option>`,
-    ...PROVIDER_PRESETS.map(
-      (p) =>
-        `<option value="${esc(p.key)}"${f.preset === p.key ? " selected" : ""}>${esc(p.name)} · ${esc(
-          shortHost(p.url),
-        )}</option>`,
-    ),
-  ].join("");
-
-  // 「从提供商获取模型 ID」的弹出列表
-  const picker = remoteFetch
-    ? `
-    <div class="id-picker">
-      <div class="id-picker-head">
-        <span>从 <code>${esc(remoteFetch.lastEndpoint ?? remoteFetch.sourceUrl)}</code> 选择模型 ID</span>
-        <button type="button" class="set-btn" id="picker-close">关闭</button>
-      </div>
-      ${remoteFetch.error ? `<div class="form-err">${esc(remoteFetch.error)}</div>` : ""}
-      <div class="id-picker-list">
-        ${
-          remoteFetch.items.length === 0
-            ? '<div class="mem-empty">没有返回模型。</div>'
-            : remoteFetch.items
-                .map((it) => {
-                  const already = remoteFetch!.localIds.has(it.id);
-                  return `<button type="button" class="id-pick${already ? " already" : ""}" data-id="${esc(
-                    it.id,
-                  )}" data-ctx="${it.contextLength ?? ""}">
-                    <span class="remote-id">${esc(it.id)}</span>
-                    <span class="remote-meta">${already ? "已配置" : it.ownedBy ? esc(it.ownedBy) : ""}</span>
-                  </button>`;
-                })
-                .join("")
-        }
-      </div>
-      <div class="remote-actions">
-        <button type="button" class="set-btn add" id="picker-batch">批量导入未配置的全部</button>
-        <div class="set-hint">点一行 = 填入上方「接口模型 ID」；批量导入会共用当前 URL / Key。</div>
-      </div>
-    </div>`
-    : "";
-
-  return `
-    ${subHeader("模型")}
-    <div class="set-form" style="margin-bottom:8px">
-      <input id="model-search" placeholder="筛选名称 / ID / URL" value="${esc(modelSearch)}" />
-    </div>
-    <div class="set-list">${rows || '<div class="mem-empty">还没有模型。点下方表单添加。</div>'}</div>
-
-    <div class="mem-head">${editing ? "✏️ 编辑模型" : "➕ 添加模型"}</div>
-    <div class="set-form" id="model-form">
-      ${f.error ? `<div class="form-err">${esc(f.error)}</div>` : ""}
-      ${
-        editing
-          ? `<div class="set-hint">正在编辑 <code>${esc(f.editId!)}</code> · <b>接口模型 ID</b> 才会发给提供商（request 的 <code>model</code>）</div>`
-          : ""
-      }
-      <select id="f-preset">
-        ${presetOpts}
-      </select>
-      <label class="fld"><span>Base URL</span>
-        <input id="f-url" placeholder="提供商 Base URL（含 /v1 等）" value="${esc(f.url)}" />
-      </label>
-      <label class="fld"><span>API Key</span>
-        <input id="f-key" type="password" placeholder="${
-          editing
-            ? f.clearKey
-              ? "保存后将清空 Key"
-              : "留空保持原 Key"
-            : "本地 / Ollama 可留空"
-        }" value="${esc(f.clearKey ? "" : f.apiKey)}" />
-      </label>
-      ${
-        editing
-          ? `<label class="set-check"><input type="checkbox" id="f-clear-key"${
-              f.clearKey ? " checked" : ""
-            } /> 清空 Key（不需要鉴权的本地模型）</label>`
-          : ""
-      }
-      <div class="form-row-2">
-        <label class="fld grow"><span>接口模型 ID（发给提供商的 model）</span>
-          <input id="f-id" placeholder="deepseek-v4.1-flash" value="${esc(f.id)}" />
-        </label>
-        <button type="button" class="set-btn fetch-id" id="f-fetch-ids" title="GET ${esc(
-          f.url.trim() ? modelsEndpointPreview(f.url.trim()) : "{Base URL}/models",
-        )}">获取 ID</button>
-      </div>
-      <label class="fld"><span>显示名（可空，默认同 ID）</span>
-        <input id="f-name" placeholder="火山agent" value="${esc(f.name)}" />
-      </label>
-      <div class="form-row-2 even">
-        <label class="fld"><span>上下文窗口</span>
-          <input id="f-max-in" placeholder="128000" value="${esc(f.maxIn)}" inputmode="numeric" />
-        </label>
-        <label class="fld"><span>最大输出</span>
-          <input id="f-max-out" placeholder="8192" value="${esc(f.maxOut)}" inputmode="numeric" />
-        </label>
-      </div>
-      <div class="form-row-2 even">
-        <label class="set-check"><input type="checkbox" id="f-tool"${f.tool ? " checked" : ""} /> 工具调用</label>
-        <label class="set-check"><input type="checkbox" id="f-img"${f.img ? " checked" : ""} /> 图片</label>
-      </div>
-      <details class="adv-box"${f.headersText ? " open" : ""}>
-        <summary>额外请求头（可选）</summary>
-        <textarea id="f-headers" rows="3" placeholder="每行一个 Key: Value">${esc(f.headersText)}</textarea>
-        <div class="set-hint">OpenCode Zen 的 <code>x-opencode-session</code> 会自动补，不用手填。</div>
-      </details>
-      <div class="set-form-row">
-        <button class="set-btn add" id="f-add">${editing ? "保存修改" : "添加"}</button>
-        ${editing ? `<button class="set-btn" id="f-cancel-edit">取消</button>` : ""}
-      </div>
-      <div class="set-hint">Key 只存本地 <code>agent-data/models.json</code>（已 gitignore）。本地模型可不填 Key。</div>
-      ${picker}
-    </div>`;
-}
-
-/** 把当前 DOM 表单读进 modelForm（保存 / 重绘前都要调，避免丢输入） */
-function readModelForm(): void {
-  const f = modelForm;
-  const val = (sel: string): string => {
-    const el = document.querySelector(sel) as HTMLInputElement | HTMLTextAreaElement | null;
-    return el?.value ?? "";
-  };
-  const chk = (sel: string, dflt: boolean): boolean => {
-    const el = document.querySelector(sel) as HTMLInputElement | null;
-    return el ? el.checked : dflt;
-  };
-  f.name = val("#f-name");
-  f.id = val("#f-id");
-  f.url = val("#f-url");
-  f.apiKey = val("#f-key");
-  f.clearKey = chk("#f-clear-key", f.clearKey);
-  f.tool = chk("#f-tool", f.tool);
-  f.img = chk("#f-img", f.img);
-  f.headersText = val("#f-headers");
-  f.maxIn = val("#f-max-in");
-  f.maxOut = val("#f-max-out");
-  const ps = document.getElementById("f-preset") as HTMLSelectElement | null;
-  if (ps) f.preset = ps.value || "custom";
-}
-
-function setModelFormError(msg: string | undefined): void {
-  modelForm.error = msg;
-  renderBody();
-}
-
-/** token 数：支持 `128000` / `128k` / `1m`（1m=1000k=1000000） */
-function parseTok(v: string): number | null {
-  const t = v.trim().toLowerCase();
-  if (!t) return null;
-  const m = /^(\d+(?:\.\d+)?)([km]?)$/.exec(t);
-  if (!m) {
-    throw new Error(`「${v}」不是合法 token 数（可用 128000 / 128k / 1m）`);
-  }
-  const n = Number(m[1]);
-  const unit = m[2];
-  const mul = unit === "m" ? 1000_000 : unit === "k" ? 1000 : 1;
-  const out = Math.round(n * mul);
-  if (!Number.isFinite(out) || out < 0) {
-    throw new Error(`「${v}」不是合法 token 数`);
-  }
-  return out;
-}
-
-function bindModelsView(root: HTMLElement): void {
-  document.getElementById("sub-back")?.addEventListener("click", () => {
-    readModelForm();
-    void switchView("settings");
-  });
-
-  document.getElementById("model-search")?.addEventListener("input", (e) => {
-    modelSearch = (e.target as HTMLInputElement).value;
-    readModelForm();
-    renderBody();
-    const s = document.getElementById("model-search") as HTMLInputElement | null;
-    if (s) {
-      s.focus();
-      s.setSelectionRange(s.value.length, s.value.length);
-    }
-  });
-
-  // —— 预设切换：只填 URL ——
-  document.getElementById("f-preset")?.addEventListener("change", (e) => {
-    readModelForm();
-    const key = (e.target as HTMLSelectElement).value;
-    modelForm.preset = key;
-    const p = providerPreset(key);
-    if (p) modelForm.url = p.url;
-    modelForm.error = undefined;
-    renderBody();
-  });
-
-  // —— 从提供商获取模型 ID（填表辅助，不是另一套流程） ——
-  document.getElementById("f-fetch-ids")?.addEventListener("click", async () => {
-    readModelForm();
-    const f = modelForm;
-    const url = f.url.trim();
-    const key = f.apiKey.trim();
-    if (!url) {
-      setModelFormError("先填 Base URL，再获取模型 ID");
-      return;
-    }
-    // 本地网关允许无 Key；远程建议有 Key（没有也先试一次）
-    try {
-      const list = await invoke<RemoteModelInfo[]>("models_fetch_remote", {
-        url,
-        apiKey: key,
-        headers: f.headersText.trim() ? f.headersText : null,
-      });
-      const localIds = new Set(models.map((m) => m.id));
-      remoteFetch = {
-        items: list,
-        source: "custom",
-        sourceUrl: url,
-        apiKey: key,
-        headersText: f.headersText,
-        tool: f.tool,
-        img: f.img,
-        localIds,
-        checked: new Set(),
-        lastEndpoint: modelsEndpointPreview(url),
-        error: undefined,
-      };
-      f.error = undefined;
-      if (list.length === 0) {
-        f.error = "提供商返回 0 个模型（接口可能不支持 /models）";
-      }
-    } catch (e) {
-      remoteFetch = {
-        items: [],
-        source: "custom",
-        sourceUrl: url,
-        apiKey: key,
-        headersText: f.headersText,
-        tool: f.tool,
-        img: f.img,
-        localIds: new Set(models.map((m) => m.id)),
-        checked: new Set(),
-        error: String(e),
-      };
-      f.error = undefined;
-    }
-    renderBody();
-  });
-
-  document.getElementById("picker-close")?.addEventListener("click", () => {
-    readModelForm();
-    remoteFetch = null;
-    renderBody();
-  });
-
-  root.querySelectorAll<HTMLButtonElement>(".id-pick").forEach((b) =>
-    b.addEventListener("click", async () => {
-      readModelForm();
-      const id = b.dataset.id ?? "";
-      const ctx = Number(b.dataset.ctx || 0);
-      remoteFetch = null;
-      // 已配置 → 直接进编辑（选中的就是这个 ID）
-      if (models.some((m) => m.id === id)) {
-        try {
-          const ev = await invoke<ModelEditView>("models_get_edit", { id });
-          modelForm = {
-            editId: id,
-            name: ev.name && ev.name !== id ? ev.name : "",
-            id: ev.id,
-            url: ev.url,
-            apiKey: "",
-            clearKey: false,
-            tool: ev.supportsToolCall,
-            img: ev.supportsImages,
-            headersText: ev.headersText,
-            maxIn: ev.maxInputTokens != null ? String(ev.maxInputTokens) : "",
-            maxOut: ev.maxOutputTokens != null ? String(ev.maxOutputTokens) : "",
-            preset: "custom",
-            error: undefined,
-          };
-          renderBody();
-          showToast(`「${id}」已在列表中，已进入编辑`, "info", 2500);
-        } catch (e) {
-          showToast(`读取失败：${e}`, "error");
-        }
-        return;
-      }
-      modelForm.id = id;
-      if (ctx > 0) modelForm.maxIn = String(ctx);
-      modelForm.error = undefined;
-      renderBody();
-      showToast(`已填入模型 ID：${id}`, "ok", 2500);
-    }),
-  );
-
-  document.getElementById("picker-batch")?.addEventListener("click", async () => {
-    readModelForm();
-    const rf = remoteFetch;
-    const f = modelForm;
-    if (!rf) return;
-    const ids = rf.items.map((x) => x.id).filter((id) => !rf.localIds.has(id));
-    if (ids.length === 0) {
-      showToast("没有可导入的模型（都已配置）", "info");
-      return;
-    }
-    const contextLengths: Record<string, number> = {};
-    for (const it of rf.items) {
-      if (typeof it.contextLength === "number" && it.contextLength > 0) {
-        contextLengths[it.id] = it.contextLength;
-      }
-    }
-    try {
-      const result = await invoke<{ added: string[]; skipped: string[] }>("models_import_remote", {
-        ids,
-        sourceId: null,
-        url: f.url,
-        apiKey: f.apiKey || null,
-        headers: f.headersText.trim() ? f.headersText : null,
-        supportsToolCall: f.tool,
-        supportsImages: f.img,
-        contextLengths,
-      });
-      await loadModels();
-      remoteFetch = null;
-      showToast(
-        `已导入 ${result.added.length} 个` +
-          (result.skipped.length ? `（跳过 ${result.skipped.length}）` : ""),
-        "ok",
-      );
-    } catch (e) {
-      showToast(`批量导入失败：${e}`, "error");
-    }
-    renderBody();
-  });
-
-  // —— 列表操作 ——
-  root.querySelectorAll<HTMLButtonElement>(".set-btn.use").forEach((b) =>
-    b.addEventListener("click", async () => {
-      selectedModel = b.dataset.id!;
-      await invoke("set_selected_model", { id: selectedModel }).catch((e) =>
-        showToast(`保存失败：${e}`, "error"),
-      );
-      renderBody();
-    }),
-  );
-
-  root.querySelectorAll<HTMLButtonElement>(".set-btn.del").forEach((b) =>
-    b.addEventListener("click", async () => {
-      const id = b.dataset.id!;
-      const ok = await askConfirm("删除模型", `确定删除「${id}」？`, "删除");
-      if (!ok) return;
-      await invoke("models_remove", { id }).catch((e) => showToast(`删除失败：${e}`, "error"));
-      if (modelForm.editId === id) modelForm = emptyModelForm();
-      await loadModels();
-      renderBody();
-      showToast(`已删除 ${id}`, "ok", 2500);
-    }),
-  );
-
-  root.querySelectorAll<HTMLButtonElement>(".set-btn.edit").forEach((b) =>
-    b.addEventListener("click", async () => {
-      const id = b.dataset.id!;
-      try {
-        const ev = await invoke<ModelEditView>("models_get_edit", { id });
-        modelForm = {
-          editId: id,
-          name: ev.name && ev.name !== id ? ev.name : "",
-          id: ev.id,
-          url: ev.url,
-          apiKey: "",
-          clearKey: false,
-          tool: ev.supportsToolCall,
-          img: ev.supportsImages,
-          headersText: ev.headersText,
-          maxIn: ev.maxInputTokens != null ? String(ev.maxInputTokens) : "",
-          maxOut: ev.maxOutputTokens != null ? String(ev.maxOutputTokens) : "",
-          preset: "custom",
-          error: undefined,
-        };
-        remoteFetch = null;
-        renderBody();
-        const hint = document.getElementById("f-key") as HTMLInputElement | null;
-        if (hint && ev.hasKey) {
-          hint.placeholder = `Key ${ev.keyPreview}（留空保持不变）`;
-        }
-      } catch (e) {
-        showToast(`读取模型配置失败：${e}`, "error");
-      }
-    }),
-  );
-
-  document.getElementById("f-cancel-edit")?.addEventListener("click", () => {
-    modelForm = emptyModelForm();
-    remoteFetch = null;
-    renderBody();
-  });
-
-  root.querySelectorAll<HTMLButtonElement>(".set-btn.test").forEach((b) =>
-    b.addEventListener("click", async () => {
-      const id = b.dataset.id!;
-      const row = [...root.querySelectorAll<HTMLElement>(".set-row")].find(
-        (r) => r.dataset.id === id,
-      );
-      const msg = row?.querySelector<HTMLElement>(".set-test-msg");
-
-      const say = (text: string, cls: "run" | "ok" | "bad"): void => {
-        if (!msg) return;
-        msg.hidden = false;
-        msg.className = `set-test-msg ${cls}`;
-        msg.textContent = text;
-      };
-
-      b.disabled = true;
-      const oldLabel = b.textContent;
-      b.textContent = "测…";
-      say(`正在测试 ${id} …`, "run");
-
-      try {
-        const reply = await invoke<string>("test_model", { id });
-        say(`✅ 连通正常：${reply.slice(0, 150)}`, "ok");
-        showToast(`✅ ${id} 连通正常`, "ok");
-      } catch (e) {
-        say(`❌ 测试失败：${e}`, "bad");
-        showToast(`❌ ${id} 测试失败：${e}`, "error");
-      } finally {
-        b.disabled = false;
-        b.textContent = oldLabel;
-      }
-    }),
-  );
-
-  // —— 保存（添加 / 编辑同一入口） ——
-  // 唯一键 = 显示名；接口 model（f.id）允许重复（官方/火山可同 model）
-  document.getElementById("f-add")?.addEventListener("click", async () => {
-    readModelForm();
-    const f = modelForm;
-    const editing = f.editId !== null;
-    const newId = f.id.trim();
-    const url = f.url.trim();
-    const name = f.name.trim();
-    const key = f.apiKey.trim();
-    const display = name || newId;
-
-    const fail = (m: string): void => {
-      f.error = m;
-      renderBody();
-    };
-
-    if (!newId) return fail("接口模型 ID 不能为空（点「获取 ID」可从提供商选）");
-    if (!url) return fail("Base URL 不能为空");
-    if (/\s/.test(newId)) return fail("接口模型 ID 不能含空格");
-    if (!display) return fail("显示名不能为空");
-
-    let maxIn: number | null;
-    let maxOut: number | null;
-    try {
-      maxIn = parseTok(f.maxIn);
-      maxOut = parseTok(f.maxOut);
-    } catch (e) {
-      return fail(String(e instanceof Error ? e.message : e));
-    }
-
-    const headers = f.headersText.trim() ? f.headersText : null;
-
-    try {
-      if (editing) {
-        await invoke("models_edit", {
-          id: f.editId,
-          newId, // 接口 model 可与其它条目相同
-          name: display,
-          url,
-          apiKey: key || null,
-          clearKey: f.clearKey,
-          supportsToolCall: f.tool,
-          supportsImages: f.img,
-          headers,
-          maxInputTokens: maxIn,
-          maxOutputTokens: maxOut,
-        });
-        showToast(`已保存 ${display}`, "ok");
-        if (selectedModel === f.editId) selectedModel = display;
-        modelForm = emptyModelForm();
-      } else {
-        await invokeModelsAdd({
-          id: newId,
-          name: display,
-          url,
-          apiKey: key,
-          supportsToolCall: f.tool,
-          supportsImages: f.img,
-          headers,
-          maxInputTokens: maxIn,
-          maxOutputTokens: maxOut,
-          overwrite: true,
-        });
-        selectedModel = display;
-        await invoke("set_selected_model", { id: display }).catch(() => {});
-        modelForm = emptyModelForm();
-        showToast(`已保存 ${display}`, "ok");
-      }
-      await loadModels();
-      remoteFetch = null;
-      renderBody();
-    } catch (e) {
-      fail(`保存失败：${e}`);
-    }
-  });
-}
-
-/** models_add 的参数打包（含 overwrite） */
-async function invokeModelsAdd(args: {
-  id: string;
-  name: string;
-  url: string;
-  apiKey: string;
-  supportsToolCall: boolean;
-  supportsImages: boolean;
-  headers: string | null;
-  maxInputTokens: number | null;
-  maxOutputTokens: number | null;
-  overwrite: boolean;
-}): Promise<string> {
-  return await invoke<string>("models_add", args);
 }
 
 // ---------------- 设置 › 文件权限 ----------------
@@ -4629,14 +4421,6 @@ function bindPermView(root: HTMLElement): void {
 
 // ---------------- 设置 › 命令策略 ----------------
 
-function fmtAuditTime(ts: number): string {
-  const ms = ts > 1e12 ? ts : ts * 1000;
-  try {
-    return new Date(ms).toLocaleString();
-  } catch {
-    return String(ts);
-  }
-}
 
 function renderCmdPolicyView(
   policy: CmdPolicy,
@@ -4864,35 +4648,40 @@ function renderMcpView(
         : "还没配可用的 server。"
     }${mcp.url ? "<br>检查 MCP 进程是否在运行。" : ""}</div>`;
   } else {
+    const onCount = mcp.groups.filter((g) => g.active).length;
     const bar = `
       <div class="mcp-budget">
-        <span>已加载工具占用 ~${mcp.activeTokens} tokens</span>
+        <span>已启用 ${onCount}/${mcp.groups.length} 组 · 占用 ~${mcp.activeTokens} tokens</span>
       </div>`;
     const rows = mcp.groups
       .map(
         (g) => `
         <div class="set-row${g.active ? " cur" : ""}">
           <div class="set-name">${esc(g.name)}${
-          g.active ? ' <span class="set-cur">已加载</span>' : ""
-        }${g.hasDestructive ? ' <span class="set-warn">含危险操作</span>' : ""}</div>
+          g.hasDestructive ? ' <span class="set-warn">含危险操作</span>' : ""
+        }</div>
           <div class="set-url">${esc(g.summary)}</div>
           <div class="set-url">${g.toolCount} 个工具 · 约 ${g.tokens} tokens</div>
           <div class="set-actions">
-            ${
-              g.active
-                ? `<button class="set-btn unload" data-group="${esc(g.name)}">卸载</button>`
-                : `<button class="set-btn use" data-group="${esc(g.name)}">加载</button>`
-            }
+            <label class="set-check mcp-group-on">
+              <input type="checkbox" class="mcp-grp-cb" data-group="${esc(g.name)}" ${
+                g.active ? "checked" : ""
+              }> 给模型
+            </label>
           </div>
         </div>`,
       )
       .join("");
     statusBlock =
       `<div class="set-url" style="margin-bottom:8px">已连接 ${esc(mcp.url)}</div>` +
+      `<label class="set-check set-check-row">
+         <input type="checkbox" id="mcp-all-cb" ${mcpAllGroups ? "checked" : ""}>
+         直接全给模型（默认开）—— 不再让模型自己"先查再加载"
+       </label>` +
       bar +
       `<div class="set-hint" style="margin-bottom:8px">
-        这些工具**不会默认塞进模型上下文**（全量约 14k tokens）。
-        模型会按需自己加载；你也可以在这里手动加载/卸载。
+        开着的时候所有组<b>默认全部进模型上下文</b>；下面每组的开关会<b>记住</b>
+        （落 <code>settings.json</code>，重启后仍生效）。关掉全局开关才回到老式的按需加载。
        </div>` +
       `<div class="set-list">${rows}</div>`;
   }
@@ -5018,15 +4807,29 @@ function bindMcpView(root: HTMLElement): void {
     }
   });
 
-  // 工具组加载/卸载（沿用）
-  root.querySelectorAll<HTMLButtonElement>(".set-btn[data-group]").forEach((b) =>
-    b.addEventListener("click", async () => {
-      const name = b.dataset.group!;
-      const isActive = b.classList.contains("unload");
+  // 全局「直接全给」
+  document.getElementById("mcp-all-cb")?.addEventListener("change", async (e) => {
+    const on = (e.target as HTMLInputElement).checked;
+    mcpAllGroups = on;
+    try {
+      await invoke("mcp_set_all_groups", { all: on });
+      showToast(on ? "已设为「直接全给模型」" : "已切回按需加载", "ok");
+    } catch (err) {
+      showToast(`设置失败：${err}`, "error");
+    }
+    renderBody();
+  });
+
+  // 每组的「给模型」开关 —— **落盘记忆**，重启后仍生效
+  root.querySelectorAll<HTMLInputElement>(".mcp-grp-cb").forEach((cb) =>
+    cb.addEventListener("change", async () => {
+      const name = cb.dataset.group!;
+      const on = cb.checked;
       try {
-        await invoke(isActive ? "mcp_unload_group" : "mcp_load_group", { name });
+        await invoke("mcp_set_group_enabled", { name, enabled: on });
+        showToast(`${on ? "已启用" : "已停用"}「${name}」`, "ok", 2000);
       } catch (e) {
-        pushEntry("error", `${isActive ? "卸载" : "加载"}「${name}」失败：${e}`);
+        pushEntry("error", `${on ? "启用" : "停用"}「${name}」失败：${e}`);
       }
       renderBody();
     }),
@@ -5060,62 +4863,12 @@ function bindMcpView(root: HTMLElement): void {
 
 // ---------------- 设置 › Token 用量 ----------------
 
-/** 用量记录（后端 `sessions::UsageRecord`） */
-interface UsageRecord {
-  at: number;
-  model: string;
-  session: string;
-  usage: TokenUsage;
-}
-
-/** epoch ms → 本地日期 `YYYY-MM-DD`。时区只有前端知道，所以分组在前端做 */
-function localDateKey(ms: number): string {
-  const d = new Date(ms);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
-
-interface DayAgg {
-  date: string;
-  total: number;
-  prompt: number;
-  completion: number;
-  /** 模型 id → 当天小计 */
-  models: Map<string, { total: number; prompt: number; completion: number }>;
-}
-
-/** 扁平记录 → 「本地日期 → 模型」聚合；日期倒序（最近在最上面） */
-function aggregateUsage(records: UsageRecord[]): DayAgg[] {
-  const byDay = new Map<string, DayAgg>();
-  for (const r of records) {
-    const date = localDateKey(r.at);
-    let day = byDay.get(date);
-    if (!day) {
-      day = { date, total: 0, prompt: 0, completion: 0, models: new Map() };
-      byDay.set(date, day);
-    }
-    day.total += r.usage.total;
-    day.prompt += r.usage.prompt;
-    day.completion += r.usage.completion;
-    const mid = r.model || "（未知模型）";
-    const m = day.models.get(mid) ?? { total: 0, prompt: 0, completion: 0 };
-    m.total += r.usage.total;
-    m.prompt += r.usage.prompt;
-    m.completion += r.usage.completion;
-    day.models.set(mid, m);
-  }
-  return [...byDay.values()].sort((a, b) => (a.date < b.date ? 1 : -1));
-}
-
-/** 今日消耗合计（设置入口页摘要用） */
-function todayTokenTotal(records: UsageRecord[]): number {
-  const key = localDateKey(Date.now());
-  let n = 0;
-  for (const r of records) if (localDateKey(r.at) === key) n += r.usage.total;
-  return n;
-}
-
-/** 模型 id → 展示名（模型可能已删，那就退回 id） */
+/**
+ * 模型 id → 展示名（模型可能已删，那就退回 id）。
+ *
+ * ⚠️ 留在 main.ts 而不是搬进 `usage.ts`：它要读 `models` 这个**模块级状态**
+ * （当前模型列表）。纯聚合逻辑才搬得走 —— 判定标准就是"是否引用模块级绑定"。
+ */
 function modelName(id: string): string {
   return models.find((m) => m.id === id)?.name ?? id;
 }
@@ -5142,32 +4895,77 @@ function renderUsageView(records: UsageRecord[]): string {
   const tTotal = todayTokenTotal(records);
   const maxDay = Math.max(...days.map((d) => d.total), 1);
 
+  // 全局缓存命中率（2026-09-30）：prompt token 的大头是命中价，
+  // 全价部分 = 输入 − 命中。命中率掉下来时成本会成倍上涨而总量看不出变化，
+  // 所以这里必须**单独成一张卡**，而不是塞进「全部」的 tooltip。
+  const allPrompt = records.reduce((a, r) => a + r.usage.prompt, 0);
+  const allHit = records.reduce((a, r) => a + (r.usage.cacheHit ?? 0), 0);
+  const allRate = cacheHitRate(allPrompt, allHit);
+  const allMiss = Math.max(0, allPrompt - allHit);
+  const verdict = allRate === null ? null : cacheVerdict(allRate);
+
   const cards = `
     <div class="usage-cards">
       <div class="usage-card"><b>${fmtTokens(tTotal)}</b><i>今日</i></div>
       <div class="usage-card"><b>${fmtTokens(weekTotal)}</b><i>近 7 天</i></div>
       <div class="usage-card"><b>${fmtTokens(allTotal)}</b><i>全部</i></div>
-    </div>`;
+    </div>
+    ${
+      verdict === null
+        ? ""
+        : `<div class="usage-cache${verdict.warn ? " usage-cache--warn" : ""}">
+             <div class="usage-cache-head">
+               <span>缓存命中率 <b>${verdict.label}</b></span>
+               <span class="usage-cache-miss" title="按全价计费的那部分输入">全价输入 ${fmtTokens(
+                 allMiss,
+               )}</span>
+             </div>
+             <div class="usage-cache-hint">${
+               verdict.warn
+                 ? "命中率偏低 —— 上下文前缀可能在变（换模型/改配置/技能或 MCP 组变化都会让缓存失效）。"
+                 : "输入的大头走缓存命中价，全价只占一小截。"
+             }</div>
+           </div>`
+    }`;
 
   const rows = days
     .map((d) => {
       const pct = Math.max(2, Math.round((d.total / maxDay) * 100));
+      const dayRate = cacheHitRate(d.prompt, d.cacheHit);
+      const dayVerdict = dayRate === null ? null : cacheVerdict(dayRate);
       const modelRows = [...d.models.entries()]
         .sort((a, b) => b[1].total - a[1].total)
-        .map(
-          ([id, m]) =>
-            `<div class="usage-model"><span>${esc(modelName(id))}</span><b>${fmtTokens(
-              m.total,
-            )}</b></div>`,
-        )
+        .map(([id, m]) => {
+          const r = cacheHitRate(m.prompt, m.cacheHit);
+          const v = r === null ? null : cacheVerdict(r);
+          const badge =
+            v === null
+              ? ""
+              : `<i class="usage-cache-badge${v.warn ? " is-warn" : ""}" title="命中 ${
+                  m.cacheHit
+                } / 输入 ${m.prompt}，全价部分 ${Math.max(
+                  0,
+                  m.prompt - m.cacheHit,
+                )}">缓存 ${v.label}</i>`;
+          return `<div class="usage-model"><span>${esc(modelName(id))}</span>${badge}<b>${fmtTokens(
+            m.total,
+          )}</b></div>`;
+        })
         .join("");
       return `
         <div class="usage-day">
           <div class="usage-day-head">
             <span class="usage-date">${d.date}</span>
-            <span class="usage-total" title="输入 ${d.prompt} · 输出 ${d.completion}">${fmtTokens(
-              d.total,
-            )} tok</span>
+            ${
+              dayVerdict === null
+                ? ""
+                : `<span class="usage-cache-day${
+                    dayVerdict.warn ? " is-warn" : ""
+                  }">缓存 ${dayVerdict.label}</span>`
+            }
+            <span class="usage-total" title="输入 ${d.prompt} · 输出 ${
+              d.completion
+            } · 缓存命中 ${d.cacheHit}">${fmtTokens(d.total)} tok</span>
           </div>
           <div class="usage-bar"><i style="width:${pct}%"></i></div>
           ${modelRows}
@@ -5696,13 +5494,30 @@ async function loadModels(): Promise<void> {
     models = await invoke<ModelView[]>("list_models");
     selectedModel = await invoke<string | null>("get_selected_model");
     if (!selectedModel && models.length > 0) {
-      selectedModel = models[0].id;
+      // 唯一键是**显示名**（name），不是接口 id —— 兜底也必须是 name，
+      // 否则 chip / 列表的「当前」高亮永远匹配不上。
+      selectedModel = models[0].name;
       await invoke("set_selected_model", { id: selectedModel }).catch(() => {});
     }
+    // 分组显示名：面板的模型卡片要显示「组别 + 模型名」
+    // （2026-10 用户："这个是让你放模型的部分啊，组别+模型名"）。
+    // 以前只在独立窗口（models.ts）读，所以面板上永远只看到裸模型名。
+    modelGroupNames = await invoke<Record<string, string>>("model_group_names").catch(
+      () => ({}),
+    );
   } catch (e) {
     models = [];
     entries.push({ role: "error", text: `加载模型列表失败：${e}` });
   }
+}
+
+/** 模型管理窗口里增删改/切模型后，后端会广播 —— 面板把卡片和下拉刷一遍 */
+function installModelsListener(): void {
+  void listen("models-changed", () => {
+    void loadModels().then(() => {
+      if (mode === "panel") renderPanelRefreshChip();
+    });
+  });
 }
 
 async function loadProjects(): Promise<void> {
@@ -5962,9 +5777,14 @@ function setBusyUi(on: boolean): void {
     sendBtn.title = on ? "插话（排队，当前轮结束后送达）" : "发送";
   }
   if (input) {
-    input.placeholder = on
-      ? "插话…（会排队，当前轮结束后送达；Enter 发送 / Shift+Enter 换行）"
-      : "问点什么…（Enter 发送 / Shift+Enter 换行 / Ctrl+V 贴图）";
+    // ⚠️ 这两句是 placeholder 的**真正来源**（运行时覆盖 HTML 里那份）。
+    //    刻意保持极短：老文案 38~44 字（约 470px @13px）在输入框里会折成两行、
+    //    把输入框撑高 —— 那正是 2026-10 用户截图报"太挤"的直接症状。
+    //    快捷键说明在 `title` 里（悬停可看），不占输入框宽度。
+    input.placeholder = on ? "插话…（会排队）" : "问点什么…";
+    input.title = on
+      ? "当前轮进行中：发出去会排队，等本轮结束后送达。Enter 发送 / Shift+Enter 换行"
+      : "Enter 发送 / Shift+Enter 换行 / Ctrl+V 贴图";
   }
 }
 
@@ -6024,33 +5844,53 @@ async function applyMode(next: Mode): Promise<void> {
   //    （早先这里 `if (busy) return` 导致"请求中收不起面板"）
   if (next === mode) return;
 
+  // ⚠️ 顺序铁律（收起/切菜单）：必须**先换 DOM，再缩窗口**。
+  //    `set_window_mode` 是一次 IPC 往返 —— 窗口在 Rust 侧当场就缩好了，
+  //    而 renderOrb 要等 promise 回来才执行。复杂任务刚跑完时主线程正忙
+  //    （paintMessages 重绘大消息列表），这个空档能拉长到几十毫秒，
+  //    合成器就会画出"小窗口里残留着面板"的帧：用户看到一个深色圆角块，
+  //    里面是被裁掉的面板标题/图表（2026-09-27 用户截图报过，且只在
+  //    复杂任务后出现 —— 就是这个竞态被主线程繁忙放大了）。
+  //    球/菜单的 DOM 都是同步就绪的：先换 DOM 再缩窗，窗口缩的时候
+  //    球已经在了，没有空档。过渡期 visibility:hidden 兜底 ——
+  //    orb→menu 是反向放大，先换 DOM 会闪一帧"被裁的菜单"，藏一下就没有。
+  if (next === "orb" || next === "menu") {
+    app.style.visibility = "hidden";
+    try {
+      if (next === "menu") {
+        renderMenu();
+      } else {
+        // 收起时把视图重置回对话：
+        // 否则下次左键展开会停在上次的「设置」或「记忆」页 ——
+        // 左键的语义就是「进来聊天」，要视图选择请走右键菜单。
+        view = "chat";
+        renderOrb();
+      }
+      mode = next;
+      await invoke("set_window_mode", { mode: next });
+    } catch (e) {
+      console.error("[orbcat] 切换窗口形态失败:", e);
+    } finally {
+      app.style.visibility = "";
+    }
+    if (next === "orb") void refreshPendingApprovals(); // 异步补正金色，不等它
+    return;
+  }
+
+  // 展开成面板：窗口先放大再拉数据 —— renderPanel 依赖会话/模型数据，
+  // 换不成"DOM 先行"；旧 DOM 是球，窗口透明，放大空档无残影。
   await invoke("set_window_mode", { mode: next });
   mode = next;
 
-  if (next === "panel") {
-    // 打开面板 = 必然看到对话流 → 红球使命结束
-    unseenError = false;
-    panelOpenedAt = Date.now();
-    await ensureSessionLoaded(); // 会话从磁盘恢复（只做一次）
-    await loadModels();
-    await loadProjects();
-    // ⚠️ 不要 bindCurrentSession —— 切/开面板改挂靠是主聊天被塞进 redis 的根因
-    await refreshSessionProjectTags();
-    renderPanel();
-  } else if (next === "menu") {
-    renderMenu();
-  } else {
-    // 收起时把视图重置回对话：
-    // 否则下次左键展开会停在上次的「设置」或「记忆」页 ——
-    // 左键的语义就是「进来聊天」，要视图选择请走右键菜单。
-    view = "chat";
-    // ⚠️ 顺序铁律：必须**先换 DOM，再拉数据**。
-    //    `set_window_mode` 上一行已经把窗口缩到 56x56 了 —— 中间插任何 await，
-    //    都会出现"小窗口里还残留着面板"的一帧：用户看到的就是一个深色圆角块，
-    //    里面是被裁掉的「float-…」（面板标题栏）。这个残影曾被用户截图报过。
-    renderOrb();
-    void refreshPendingApprovals(); // 异步补正金色，不等它
-  }
+  // 打开面板 = 必然看到对话流 → 红球使命结束
+  unseenError = false;
+  panelOpenedAt = Date.now();
+  await ensureSessionLoaded(); // 会话从磁盘恢复（只做一次）
+  await loadModels();
+  await loadProjects();
+  // ⚠️ 不要 bindCurrentSession —— 切/开面板改挂靠是主聊天被塞进 redis 的根因
+  await refreshSessionProjectTags();
+  renderPanel();
 }
 
 /** 左键点球：进对话（不管上次停在哪一页） */
@@ -6082,6 +5922,7 @@ function renderMenu(): void {
       <button data-act="settings"><span>⚙</span>设置 / 模型</button>
       <button data-act="mem"><span>🧠</span>记忆</button>
       <button data-act="chat"><span>💬</span>对话</button>
+      <button data-act="sleep"><span>💤</span>睡眠</button>
       <button data-act="quit" class="danger"><span>⏻</span>退出</button>
     </div>
   `;
@@ -6095,6 +5936,13 @@ function renderMenu(): void {
       // 否则用户只能去任务管理器杀进程
       if (act === "quit") {
         await invoke("app_quit").catch(() => {});
+        return;
+      }
+
+      // 睡眠：先置位再收起 —— `sleepOrb()` 里的 renderOrb() 就会
+      // 直接画出睡眠态，不会闪一帧"醒着的球"再变暗
+      if (act === "sleep") {
+        await sleepOrb();
         return;
       }
 
@@ -6160,6 +6008,19 @@ function boot(): void {
   mode = "orb";
   renderOrb();
 
+  // 诊断打点：主窗口前端启动 + 未捕获异常都落盘（排查窗口问题时唯一的可靠通道）
+  void invoke("diag_log", { msg: "main.ts boot: 开始" }).catch(() => {});
+  window.addEventListener("error", (e) => {
+    void invoke("diag_log", {
+      msg: `main.ts window.onerror: ${e.message} @ ${e.filename}:${e.lineno}`,
+    }).catch(() => {});
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    void invoke("diag_log", { msg: `main.ts unhandledrejection: ${String(e.reason)}` }).catch(
+      () => {},
+    );
+  });
+
   // 双保险：Rust 侧 setup 已经应用过一次，这里再确认一次
   void invoke("set_window_mode", { mode: "orb" }).catch((e) =>
     console.error("[orbcat] 初始化形态失败:", e),
@@ -6174,7 +6035,19 @@ function boot(): void {
   installDeleteHandlers();
   installRegenHandlers();
   installProgressListener();
+  installModelsListener();
+
+  // 点面板空白处收起 ▾ 模型下拉（点下拉内部或 ▾ 本身不收）
+  document.addEventListener("mousedown", (e) => {
+    if (!modelsDropdownOpen) return;
+    const t = e.target as HTMLElement;
+    if (t.closest("#models-dropdown") || t.closest(".mc-caret")) return;
+    modelsDropdownOpen = false;
+    paintModelsDropdown();
+  });
   installPermHandlers();
+  installOrbUiListener();
+  installOpenPanelListener();
   startPermTimer();
 
   // 待拍板条数（记忆候选 / 权限申请）：启动拉一次 + 每 5s 轮询。
@@ -6187,10 +6060,14 @@ function boot(): void {
     .then((s) => {
       if (s?.execTrust) {
         execTrust = s.execTrust as typeof execTrust;
-        updateTrustChip();
       }
     })
     .catch(() => {});
+
+  // Agent 模式：启动拉一次（chip 默认「标准」，拉到什么显什么）
+  void loadModes();
+  // 后台执行状态：启动拉一次
+  void loadBgDesk();
 
   // 启动自检要先于会话预热：needsInit 决定了对话空态渲染成"引导语"还是"初始化提示"
   void checkBoot().then(() => ensureSessionLoaded());
@@ -6222,6 +6099,13 @@ function boot(): void {
     }
 
     if (e.key !== "Escape") return;
+    // ▾ 模型下拉优先吃掉 Esc（管理弹窗都搬去独立窗口了，这里只剩它一层）
+    if (modelsDropdownOpen) {
+      e.preventDefault();
+      modelsDropdownOpen = false;
+      paintModelsDropdown();
+      return;
+    }
     if (copyMenuEl) {
       closeCopyMenu();
       return;
@@ -6230,7 +6114,7 @@ function boot(): void {
       void applyMode("orb");
     } else if (mode === "panel" && !busy) {
       // 逐级返回：子页 → 设置入口 → 对话 → 收起面板
-      if (view === "models" || view === "mcp" || view === "perm" || view === "cmdpolicy" || view === "search") {
+      if (view === "mcp" || view === "perm" || view === "cmdpolicy" || view === "search") {
         void switchView("settings");
       } else if (view === "sessions") {
         void switchView("chat");

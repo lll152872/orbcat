@@ -38,9 +38,32 @@ type MockState = {
   currentSessionId: string;
   memPending: { id: string; content: string; source: string; created_at: string }[];
   permPending: unknown[];
+  /** 当前 agent 模式（`modes_set` 会改它，`modes_get` 读它） */
+  activeMode: string;
+  /** 切换模式时后端**拒绝**的 id（测"失败要报出来，不能静默留在旧模式"） */
+  modeSetError: string | null;
+  /** 后台执行（隐形桌面）是否开着 */
+  bgDeskEnabled: boolean;
+  /** 开后台失败时的报错（测"建不出桌面要立刻报错"） */
+  bgDeskSetError: string | null;
   bootNeedsInit: boolean;
   bootHasModels: boolean;
   windowModes: string[];
+  /**
+   * 逐命令覆盖返回值（2026-09-30 加）。
+   *
+   * ## 为什么必须走 `MockState` 而不是直接改 `emptyOk`
+   *
+   * `helpers.bootApp()` 会 `vi.resetModules()` 再动态 `import("../../src/main")`
+   * —— 前端拿到的是一份**新的** mock 模块实例。测试文件若是**静态** import
+   * `setMock`，改的是**另一个实例**的表，前端根本看不到（这个坑在写
+   * `flow.recovery.test.ts` 时真踩到了：改了数据、视图还是空态）。
+   *
+   * 放进 `MockState` 就没这个问题：state 存在 `globalThis` 单例上
+   * （见下面的 `g.__orbcatMock`），两边共享同一份；而且 `resetMock()`
+   * 每个用例都会重置它，**不会**把上一个用例的覆盖带进下一个。
+   */
+  invokeOverrides: Record<string, unknown>;
 };
 
 type MockBag = {
@@ -55,7 +78,9 @@ function defaultState(): MockState {
     chatReply: "这是 mock 回复 MOCK_OK。",
     chatError: null,
     chatDelayMs: 0,
-    selectedModel: "mock-1",
+    // settings.selected_model 实际存的是「显示名」（find_model 显示名优先，
+    // 前端 set_selected_model 全传 name）—— 存 id 会让面板 ✓ 勾选对不上
+    selectedModel: "Mock 模型",
     models: [
       {
         id: "mock-1",
@@ -71,9 +96,14 @@ function defaultState(): MockState {
     currentSessionId: "sess-main",
     memPending: [],
     permPending: [],
+    activeMode: "standard",
+    modeSetError: null,
+    bgDeskEnabled: false,
+    bgDeskSetError: null,
     bootNeedsInit: false,
     bootHasModels: true,
     windowModes: [],
+    invokeOverrides: {},
   };
 }
 
@@ -120,8 +150,7 @@ function sessionStatePayload() {
   };
 }
 
-const emptyOk: Record<string, unknown> = {
-  set_window_mode: null,
+const emptyOk: Record<string, unknown> = {  set_window_mode: null,
   set_selected_model: null,
   set_blur_collapse: null,
   autostart_set: null,
@@ -157,6 +186,17 @@ const emptyOk: Record<string, unknown> = {
   mcp_set_url: null,
   mcp_load_group: "ok",
   mcp_unload_group: "ok",
+  mcp_set_group_enabled: null,
+  mcp_set_all_groups: null,
+  mcp_group_settings: { __all__: true },
+  // 组名映射：默认空 = 组头回落到 host（与真实后端一致）
+  model_group_names: {},
+  model_group_rename: null,
+  models_set_group_key: 1,
+  models_remove_group: 1,
+  // 独立「模型管理」窗口（2026-09-29 定稿）：编辑弹窗外、选择留面板
+  models_window_open: null,
+  models_window_close: null,
   perm_add_rule: null,
   perm_remove_rule: null,
   perm_request_decide: null,
@@ -186,6 +226,21 @@ const emptyOk: Record<string, unknown> = {
   perm_cmd_grants_list: [],
   perm_cmd_audit_tail: [],
   usage_report: [],
+  // 备份与回收站（2026-09-30）：默认给空态，专门测这个视图的用例自己覆盖
+  recovery_state: {
+    stats: { backupsCount: 0, backupsBytes: 0, trashCount: 0, trashBytes: 0, staleRecords: 0 },
+    backups: [],
+    trash: [],
+    defaultKeepDays: 90,
+    defaultKeepItems: 500,
+  },
+  recovery_restore_backup: "已还原（mock）",
+  recovery_restore_trash: "已还原（mock）",
+  recovery_prune: { backupsRemoved: 0, trashRemoved: 0, bytesFreed: 0 },
+  // 「又启动了一次 exe」的兜底标记：mock 下默认没有待办
+  take_open_panel_request: false,
+  confirm_panel_opened: null,
+  recovery_diagnostic: "C:\\\\mock\\\\agent-data\\\\diagnostics\\\\diag-mock.txt",
   mcp_status: null,
   get_settings: { selectedModel: "mock-1", lastSession: null, blurCollapse: false },
   search_status: {
@@ -220,8 +275,25 @@ const emptyOk: Record<string, unknown> = {
   pmem_session_map: {},
 };
 
+/**
+ * 测试用：改一条命令的返回值。等价于 `resetMock({ invokeOverrides: { [cmd]: v } })`，
+ * 但可以连着调多次。
+ *
+ * ⚠️ 必须在 `resetMock()` **之后**调用（`beforeEach` 里的 `resetMock` 会清掉覆盖）。
+ * 别在测试文件顶层静态 import 后再指望它影响前端 —— 原因见
+ * `MockState.invokeOverrides` 的注释（模块双实例坑）。
+ */
+export function setMock(cmd: string, value: unknown): void {
+  state.invokeOverrides[cmd] = value;
+}
+
 export async function invoke<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   bag.calls.push({ cmd, args });
+
+  // 逐命令覆盖优先（见 `MockState.invokeOverrides` 的说明）
+  if (cmd in state.invokeOverrides) {
+    return state.invokeOverrides[cmd] as T;
+  }
 
   switch (cmd) {
     case "set_window_mode": {
@@ -249,6 +321,80 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
       return state.memPending as T;
     case "perm_requests_list":
       return state.permPending as T;
+    // agent 模式：返回**与真实后端同形**的四模式结构。
+    // 为什么不塞进 emptyOk：模式菜单要按 id 找当前项、要标灰 unknownGroups，
+    // 一份静态假数据测不出"切换后 chip 变了 / 未知组标灰"这两件事。
+    case "modes_get":
+      return {
+        activeMode: state.activeMode,
+        modes: [
+          {
+            id: "standard",
+            name: "标准模式",
+            description: "处理代码、文件和资料，适合大多数任务。",
+            mcpGroupsPreload: [],
+            allowedCount: 0,
+            unknownGroups: [],
+          },
+          {
+            id: "ptc",
+            name: "PTC 模式",
+            description: "全部 MCP 外部工具组直接给模型。",
+            mcpGroupsPreload: "all",
+            allowedCount: null,
+            unknownGroups: [],
+          },
+          {
+            id: "minimal",
+            name: "极简模式",
+            description: "外部工具组一个都不给。",
+            mcpGroupsPreload: [],
+            allowedCount: 0,
+            unknownGroups: [],
+          },
+          {
+            id: "creator",
+            name: "创造模式",
+            description: "改自己 / 造新东西。",
+            // 故意放一个不存在的组：UI 必须把它标灰（用户写错组名的唯一提示）
+            mcpGroupsPreload: ["github", "打错的组名"],
+            allowedCount: 1,
+            unknownGroups: ["打错的组名"],
+          },
+        ],
+        groups: [
+          { name: "github", state: "allowed" },
+          { name: "ssh", state: "denied" },
+        ],
+        unknownGroups: [],
+        mcpConnected: true,
+      } as T;
+    case "modes_set": {
+      if (state.modeSetError) {
+        throw state.modeSetError;
+      }
+      state.activeMode = String(args?.id ?? "standard");
+      return state.activeMode as T;
+    }
+    // 后台执行（隐形桌面）：开着时返回一个"跑在隐形桌面上的窗口"，
+    // 让 UI 能测出"chip 变紫 + 提示里列出正在跑什么"
+    case "bg_desk_status":
+      return {
+        enabled: state.bgDeskEnabled,
+        available: true,
+        error: null,
+        deskName: state.bgDeskEnabled ? "orbcat_bg" : "",
+        windows: state.bgDeskEnabled
+          ? [{ title: "报告.docx - Word", width: 1200, height: 800, pid: 4242 }]
+          : [],
+      } as T;
+    case "bg_desk_set": {
+      if (state.bgDeskSetError) {
+        throw state.bgDeskSetError;
+      }
+      state.bgDeskEnabled = !!args?.enabled;
+      return state.bgDeskEnabled as T;
+    }
     case "chat": {
       if (state.chatDelayMs > 0) {
         await new Promise((r) => setTimeout(r, state.chatDelayMs));
@@ -335,5 +481,12 @@ export function getCurrentWindow() {
     hide: async () => {},
     setAlwaysOnTop: async () => {},
     close: async () => {},
+    /**
+     * 手动拖动窗口（models 窗口整窗拖动用，见 src/models.ts bindWindowDrag）。
+     * 记进 calls 里，供测试断言「哪些区域该拖 / 不该拖」。
+     */
+    startDragging: async () => {
+      bag.calls.push({ cmd: "window:start_dragging", args: undefined });
+    },
   };
 }

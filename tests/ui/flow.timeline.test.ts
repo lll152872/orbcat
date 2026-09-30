@@ -42,6 +42,23 @@ describe("流式时间线", () => {
     )}]`;
   }
 
+  /**
+   * 推一条 agent 进度事件。
+   *
+   * ⚠️ **必须走 `{sessionId, p}` 信封**（2026-09-30 修）：
+   * 后端早已把进度事件改成带会话 id 的信封（`lib.rs::chat` 的
+   * `json!({ "sessionId": sid, "p": p })`），目的是多会话并行 run 时前端能分清
+   * 这条进度属于谁。而本文件原先直接发 `{kind: ...}` —— 前端里 `p` 就是
+   * `undefined`，于是**三个用例长期红着**（报 `Cannot read properties of
+   * undefined (reading 'kind')`）。
+   *
+   * 红测试比没有测试更糟：它掩盖了真实回归，也让人习惯性忽略 `vitest run` 的失败。
+   * 修法不是放宽断言，而是让测试按**真实线上形态**发事件。
+   */
+  function emitProgress(p: Record<string, unknown>): void {
+    emitEvent("agent-progress", { sessionId: state.currentSessionId, p });
+  }
+
   it("思考与工具按发生顺序交错，不再堆成一块", async () => {
     // chat 不立刻返回，让「进行中气泡」留有机会接收进度事件
     state.chatDelayMs = 400;
@@ -52,23 +69,23 @@ describe("流式时间线", () => {
     await waitFor(() => !!document.querySelector(".msg.running"), 2000, "running bubble");
 
     // 第 1 轮：思考 → 调工具
-    emitEvent("agent-progress", { kind: "thinking", iteration: 1 });
-    emitEvent("agent-progress", { kind: "delta", reasoning: "先看 sessions 结构" });
-    emitEvent("agent-progress", {
+    emitProgress({ kind: "thinking", iteration: 1 });
+    emitProgress({ kind: "delta", reasoning: "先看 sessions 结构" });
+    emitProgress({
       kind: "toolCall",
       name: "read_file",
       args: '{"path":"sessions.rs"}',
     });
-    emitEvent("agent-progress", {
+    emitProgress({
       kind: "toolResult",
       name: "read_file",
       preview: "pub struct Session {",
     });
 
     // 第 2 轮：再思考 → 再调工具
-    emitEvent("agent-progress", { kind: "thinking", iteration: 2 });
-    emitEvent("agent-progress", { kind: "delta", reasoning: "摘要必须持久化" });
-    emitEvent("agent-progress", {
+    emitProgress({ kind: "thinking", iteration: 2 });
+    emitProgress({ kind: "delta", reasoning: "摘要必须持久化" });
+    emitProgress({
       kind: "toolCall",
       name: "edit_file",
       args: '{"path":"sessions.rs"}',
@@ -106,10 +123,10 @@ describe("流式时间线", () => {
     await sendText("会限流的请求");
     await waitFor(() => !!document.querySelector(".msg.running"), 2000, "running bubble");
 
-    emitEvent("agent-progress", { kind: "thinking", iteration: 1 });
+    emitProgress({ kind: "thinking", iteration: 1 });
 
     // 过场（retry 未置位）→ 只刷标题，不入时间线
-    emitEvent("agent-progress", { kind: "status", text: "正在请求 mock 模型…" });
+    emitProgress({ kind: "status", text: "正在请求 mock 模型…" });
     await waitFor(
       () => document.querySelector(".run-head-text")?.textContent?.includes("正在请求") ?? false,
       2000,
@@ -118,7 +135,7 @@ describe("流式时间线", () => {
     expect(timelineKinds()).toEqual([]);
 
     // 限流退避 → 留在时间线里；标题跟着换成最新状态
-    emitEvent("agent-progress", {
+    emitProgress({
       kind: "status",
       text: "接口限流/临时故障（HTTP 429），4s 后自动重试（第 1/4 次）…",
       retry: true,
@@ -177,9 +194,9 @@ describe("流式时间线", () => {
     await sendText("慢慢想");
     await waitFor(() => !!document.querySelector(".msg.running"), 2000, "running bubble");
 
-    emitEvent("agent-progress", { kind: "thinking", iteration: 1 });
+    emitProgress({ kind: "thinking", iteration: 1 });
     for (const chunk of ["第一段", "，继续说", "，还在说"]) {
-      emitEvent("agent-progress", { kind: "delta", reasoning: chunk });
+      emitProgress({ kind: "delta", reasoning: chunk });
       await sleep(30);
     }
 
@@ -188,8 +205,8 @@ describe("流式时间线", () => {
     expect(pre?.textContent).toBe("第一段，继续说，还在说");
 
     // 第 2 轮思考必须**另起一块**，而不是并进上一块
-    emitEvent("agent-progress", { kind: "thinking", iteration: 2 });
-    emitEvent("agent-progress", { kind: "delta", reasoning: "换个思路" });
+    emitProgress({ kind: "thinking", iteration: 2 });
+    emitProgress({ kind: "delta", reasoning: "换个思路" });
     await waitFor(
       () => reasonBlocks() === 2 || timelineState(),
       3000,
