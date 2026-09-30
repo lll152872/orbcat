@@ -1,8 +1,8 @@
 [package]
 name = "orbcat"
-version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+version = "0.2.0"
+description = "悬浮球形态的私人 agent（Windows 桌面）"
+authors = ["lll152"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -71,3 +71,32 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+# --- 开发期编译加速（2026-09-29 新增）---
+# 只影响 dev profile，不动 release 产物。
+# 背景：debug target 已膨胀到 12G，"改一行 Rust 就猛猛编译"。
+[profile.dev]
+# 默认 debug=2 会生成完整调试信息，是 dev 编译慢 + target 膨胀的主因；
+# 降到 1（行号级）足够定位 panic 栈，日常开发不需要 gdb 级变量查看。
+debug = 1
+# 显式开启增量编译（默认已是 true，写明防被上层 config 覆盖）
+incremental = true
+
+# 依赖永远用 O3 编一次就缓存住，之后只重编自己那点代码。
+# 首次全量编译会慢一点（一次性成本），之后每次增量显著变快，
+# 且 Tauri 依赖在 O0 下运行时也慢得离谱 —— 这是官方推荐配置。
+[profile.dev.package."*"]
+opt-level = 3
+
+# --- 日常/测试档（2026-09-29 实测落地）---
+# 与 release 完全隔离：产物在 target/release-fast/，切换档位不影响 release 缓存。
+# 实测稳态只重编 orbcat 自己（24.5k 行）：**55s**（fat LTO 同场景 5m17s）。
+#
+# ⚠️ 不要用 CARGO_PROFILE_RELEASE_* 环境变量覆盖 release 来做这件事 ——
+#    实测 env 覆盖会污染 fingerprint，切换参数触发 294 个依赖全量重编（5m15s）。
+#    独立 profile 有各自的 target 子目录，互不干扰。
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 256
+debug = false

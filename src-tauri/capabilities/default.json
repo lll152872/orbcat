@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "悬浮球窗口（orb）的权限集",
-  "windows": ["orb"],
+  "description": "悬浮球窗口（orb）与模型管理窗口（models）的权限集",
+  "windows": ["orb", "models"],
   "permissions": [
     "core:default",
     "core:window:allow-set-size",

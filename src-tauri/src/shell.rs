@@ -73,15 +73,21 @@ impl CmdOutput {
     }
 }
 
-/// 解析要用的 PowerShell 解释器。返回 `(可执行名, 是否 pwsh 7+)`。
+/// 解析要用的 PowerShell 解释器。返回 `(可执行文件路径, 是否 pwsh 7+)`。
 ///
 /// 不做版本探测（起子进程问版本太慢，每条命令都付一次代价没意义）——
 /// 只要 `pwsh` 在 PATH 上就认为它是 7+（`pwsh` 这个名字本身就是 PS7 的标记；
 /// 5.1 的可执行名是 `powershell`）。
+///
+/// ⚠️ **返回的是全路径，不是裸名**（2026-10 修）：
+/// 裸 API `CreateProcessW` **不做 PATH 搜索**，传 `"pwsh"` 会直接
+/// `GetLastError=2（找不到文件）`。而 `std::process::Command::new("pwsh")`
+/// 会自动解析 PATH —— 这个差异让"隐形桌面跑命令"一上手就失败，
+/// 却看不出是路径问题（普通路径明明好好的）。
 pub fn resolve_interpreter() -> (String, bool) {
-    if find_in_path("pwsh.exe").is_some() || find_in_path("pwsh").is_some() {
-        ("pwsh".to_string(), true)
-    } else {
+    if let Some(p) = find_in_path("pwsh.exe").or_else(|| find_in_path("pwsh")) {
+        (p.to_string_lossy().to_string(), true)
+    } else if let Some(p) = find_in_path("powershell.exe").or_else(|| find_in_path("powershell")) {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
             eprintln!(
@@ -89,6 +95,9 @@ pub fn resolve_interpreter() -> (String, bool) {
                  回退 Windows PowerShell 5.1。建议安装 PS7 以获得更稳的解析。"
             );
         });
+        (p.to_string_lossy().to_string(), false)
+    } else {
+        // 连 powershell 都找不到：只能交回裸名，让错误信息里带上原始名字
         ("powershell".to_string(), false)
     }
 }
@@ -108,10 +117,72 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// 跑一条 PowerShell 命令。
+/// 在**隐形桌面**上跑一条命令（用户看不见、不抢焦点）。
+///
+/// 与 [`run_powershell_tick`] 的关系：
+///
+/// | | 普通路径 | 本函数 |
+/// |---|---|---|
+/// | 子进程跑在哪 | 用户桌面（`CREATE_NO_WINDOW`，无控制台窗口） | **隐形桌面**（`CreateDesktop`） |
+/// | 会不会闪 GUI 窗口 | 会（应用自己弹的窗口就弹在用户屏幕上） | **不会** |
+/// | 会不会抢焦点 | 会 | **不会** |
+/// | 心跳 / 取消 | 有（tick + cancel） | **暂无**（走阻塞线程，取消是后续项） |
+///
+/// 用 `spawn_blocking` 包住 `win32desk::run_blocking`：那条路是阻塞式
+/// `CreateProcessW + ReadFile`，直接在 async 上下文里跑会占死一个 worker 线程。
+///
+/// ⚠️ 拿不到画面/输入的边界见 `win32desk` 模块头：**没有合成键鼠**，
+/// 需要点界面的程序在这个模式下驱动不了。
+#[cfg(windows)]
+pub async fn run_on_desktop(
+    cmd: &str,
+    cwd: &Path,
+    timeout_secs: u64,
+) -> Result<CmdOutput, String> {
+    let (exe, _is7) = resolve_interpreter();
+    // 注意：`cmd` 原样传进去。**不要**在这里拼 `-Command "…"` ——
+    // `win32desk::run_blocking` 会把它落成临时 `.ps1` 再 `-File` 执行，
+    // 正是为了绕开 `CreateProcessW` 吃嵌套双引号那个坑（见那个模块的注释）。
+    let cwd_s = cwd.to_string_lossy().to_string();
+    let timeout = Duration::from_secs(timeout_secs.clamp(1, 3600));
+
+    let started = std::time::Instant::now();
+    // `exe` 要 move 进闭包，但返回的 `interpreter` 字段还要用它的名字 → 先留一份
+    let exe_label = exe.clone();
+    let cmd_owned = cmd.to_string();
+    let out = tokio::task::spawn_blocking(move || {
+        crate::win32desk::run_blocking(&exe, &cmd_owned, Some(&cwd_s), timeout)
+    })
+    .await
+    .map_err(|e| format!("后台桌面任务 panic：{e}"))??;
+
+    eprintln!(
+        "[orbcat] 后台桌面命令完成 pid={} 用时 {:?} 超时={}",
+        out.pid,
+        started.elapsed(),
+        out.timed_out
+    );
+
+    Ok(CmdOutput {
+        stdout: out.stdout,
+        stderr: out.stderr,
+        exit_code: out.exit_code,
+        timed_out: out.timed_out,
+        cancelled: false,
+        interpreter: format!("{exe_label}（隐形桌面 pid {}）", out.pid),
+    })
+}
+
+/// 跑一条 PowerShell 命令（无心跳、无取消通道）。
 ///
 /// `timeout_secs` 会被夹到 `1..=600`。超时**不算失败** —— 返回
 /// `timed_out = true` 的结果，由上层决定怎么告诉模型。
+///
+/// ⚠️ **仅供测试**（2026-09-30 标注）：生产路径一律走
+/// [`run_powershell_tick`]，因为它要挂心跳（长命令每 2s 推一次输出尾巴）
+/// 与取消探针（用户点「停止」要能掐断整棵进程树）。这个无参版本留着是为了
+/// 让单测不必构造两个 `None` 回调 —— 它不是"忘了接线的回退壳"。
+#[cfg(test)]
 pub async fn run_powershell(cmd: &str, cwd: &Path, timeout_secs: u64) -> Result<CmdOutput, String> {
     run_powershell_tick(cmd, cwd, timeout_secs, None, None).await
 }
@@ -510,9 +581,24 @@ mod tests {
         assert!(s.contains("中间省略"), "要有省略说明: {}", s.chars().rev().take(60).collect::<String>());
     }
 
+    /// 解释器必须解析成**可用路径**。
+    ///
+    /// ⚠️ 2026-10 修：以前这里断言 `exe == "pwsh" || exe == "powershell"`（裸名）。
+    /// 裸名对 `std::process::Command` 够用（它会搜 PATH），但对
+    /// `CreateProcessW` **不够** —— 那个 API 不搜 PATH，传裸名直接
+    /// `GetLastError=2`。隐形桌面这条路走的正是 `CreateProcessW`，
+    /// 所以现在断言"是个存在的文件"。
     #[test]
     fn interpreter_is_resolvable() {
         let (exe, _) = resolve_interpreter();
-        assert!(exe == "pwsh" || exe == "powershell", "未知解释器: {exe}");
+        assert!(
+            std::path::Path::new(&exe).is_file(),
+            "解释器必须是可用的绝对路径（裸名会让 CreateProcessW 报 error 2）: {exe}"
+        );
+        let lower = exe.to_ascii_lowercase();
+        assert!(
+            lower.ends_with("pwsh.exe") || lower.ends_with("powershell.exe"),
+            "未知解释器: {exe}"
+        );
     }
 }

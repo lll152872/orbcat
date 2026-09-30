@@ -15,7 +15,6 @@
 //! 我们这个功能要的正是「看看屏幕上是什么」→ 全屏截图正好合适。
 
 use std::ffi::c_void;
-use std::io::Cursor;
 
 use base64::Engine;
 
@@ -93,24 +92,29 @@ const MAX_DIM: u32 = 1568;
 /// JPEG 质量。85 在「截图 + 代码文字」场景下肉眼无损，体积约为 PNG 的 1/6。
 const JPEG_QUALITY: u8 = 85;
 
-/// 截图编码格式
+/// 截图编码格式。
+///
+/// ⚠️ 目前**只有 JPEG 一种**（2026-09-30 清 dead-code 时删掉了 `Png` 变体）。
+/// 理由：整个项目没有任何地方构造过 Png —— 它只在 match 臂里出现，
+/// 属于"看着像可选项、实际走不到"的死分支。截图一律走 JPEG，
+/// 因为 2560x1440 的原始 PNG 是数 MB 级，base64 再涨 33%，而 JPEG(q85)
+/// 在「截图 + 代码文字」场景下肉眼无损、体积约为 PNG 的 1/6（见 JPEG_QUALITY）。
+///
+/// 保留 enum 而不是直接换成常量，是为了让"将来要加 WebP/PNG"时改一处就够。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShotFormat {
     Jpeg,
-    Png,
 }
 
 impl ShotFormat {
     pub fn mime(&self) -> &'static str {
         match self {
             ShotFormat::Jpeg => "image/jpeg",
-            ShotFormat::Png => "image/png",
         }
     }
     pub fn ext(&self) -> &'static str {
         match self {
             ShotFormat::Jpeg => "jpg",
-            ShotFormat::Png => "png",
         }
     }
 }
@@ -223,25 +227,20 @@ fn fit_within(w: u32, h: u32, max: u32) -> (u32, u32) {
 }
 
 /// 把图像编码成字节
+///
+/// ⚠️ 匹配臂只剩 `Jpeg`（`Png` 分支已删，理由见 [`ShotFormat`]）。
+/// `match` 保留单臂写法，是为了将来加格式时不必改调用方。
 pub fn encode(img: &image::RgbaImage, fmt: ShotFormat) -> Result<Vec<u8>, String> {
-    // JPEG 不支持 alpha，先转 RGB
-    let rgb = image::DynamicImage::ImageRgba8(img.clone()).to_rgb8();
-
     match fmt {
         ShotFormat::Jpeg => {
+            // JPEG 不支持 alpha，先转 RGB
+            let rgb = image::DynamicImage::ImageRgba8(img.clone()).to_rgb8();
             use image::codecs::jpeg::JpegEncoder;
             let mut buf = Vec::with_capacity(256 * 1024);
             let mut enc = JpegEncoder::new_with_quality(&mut buf, JPEG_QUALITY);
             enc.encode_image(&rgb)
                 .map_err(|e| format!("JPEG 编码失败：{e}"))?;
             Ok(buf)
-        }
-        ShotFormat::Png => {
-            let mut cursor = Cursor::new(Vec::<u8>::new());
-            image::DynamicImage::ImageRgb8(rgb)
-                .write_to(&mut cursor, image::ImageFormat::Png)
-                .map_err(|e| format!("PNG 编码失败：{e}"))?;
-            Ok(cursor.into_inner())
         }
     }
 }
