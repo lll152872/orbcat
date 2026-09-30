@@ -21,9 +21,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# 假模型让 agent 去读的那个文件：仓库根的 README。
+# 按脚本位置（tests/e2e/）上溯三级推导，换机器/换克隆目录都不用改。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT_README = os.path.join(_HERE, "..", "..", "README.md")
 
 
 def extract_last_user(messages: list) -> str:
@@ -74,9 +80,8 @@ def pick_tool_call(tools: list, last_user: str) -> tuple[str | None, dict]:
             cmd = "git --version"
         return "run_command", {"command": cmd}
     if re.search(r"USE_TOOL|调用工具|read_file", last_user, re.I):
-        return "read_file", {
-            "path": r"D:\workplace\悬浮小agent\orbcat\README.md"
-        }
+        # 指向仓库根 README；由调用方传 --repo-root 覆盖，默认按脚本位置上溯
+        return "read_file", {"path": REPO_ROOT_README}
     return None, {}
 
 

@@ -24,7 +24,7 @@
 #
 #   正确跑法（三选一）：
 #     1. Git Bash 窗口里：      bash tools/build-release.sh --fast
-#     2. PowerShell / cmd：    "C:\Program Files\Git\bin\bash.exe" -lc 'cd "/d/workplace/悬浮小agent/orbcat" && bash tools/build-release.sh --fast'
+#     2. PowerShell / cmd：    "C:\Program Files\Git\bin\bash.exe" -lc 'cd "/d/<你的仓库路径>/orbcat" && bash tools/build-release.sh --fast'
 #     3. 双击/命令行：          tools\build-release.cmd --fast   （同目录的包装脚本）
 #
 #   一个线索：脚本里 `pwd` 若是 `/mnt/d/...` 就是 WSL（错）；
@@ -60,7 +60,7 @@ case "$(uname -s)" in
       echo "   正确跑法（三选一）："
       echo "    1) Git Bash 窗口：   bash tools/build-release.sh --fast"
       echo "    2) PowerShell：      \"C:\\Program Files\\Git\\bin\\bash.exe\" -lc \\"
-      echo "                          'cd \"/d/workplace/悬浮小agent/orbcat\" && bash tools/build-release.sh --fast'"
+      echo "                          'cd \"/d/<你的仓库路径>/orbcat\" && bash tools/build-release.sh --fast'"
       echo "    3) 只跑 Rust 那半：  cargo build --profile release-fast  （前端单独 npm run build）"
       echo "============================================================"
       exit 1

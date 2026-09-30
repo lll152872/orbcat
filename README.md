@@ -78,7 +78,7 @@ bash tools/build-release.sh --fast   # 快速档（约 55s），给人真机测�
 >
 > 或者直接用 PowerShell：
 > ```
-> "C:\Program Files\Git\bin\bash.exe" -lc 'cd "/d/workplace/悬浮小agent/orbcat" && bash tools/build-release.sh'
+> "C:\Program Files\Git\bin\bash.exe" -lc 'cd "/d/<你的仓库路径>/orbcat" && bash tools/build-release.sh'
 > ```
 
 ---

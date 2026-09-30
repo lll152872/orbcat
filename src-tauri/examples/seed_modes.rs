@@ -1,6 +1,6 @@
 //! 一次性工具：把内置模式定义落到指定的 `agent-data/modes.json`。
 //!
-//! 用法：`cargo run --example seed_modes -- "D:\\workplace\\悬浮小agent\\orbcat\\agent-data"`
+//! 用法：`cargo run --example seed_modes -- "<仓库根>/agent-data"`
 //!
 //! 为什么需要它：`modes.json` 正常由「初始化」写（`bootstrap::bootstrap_agent_data`），
 //! 但**已经初始化过的**数据目录不会重跑初始化 —— 于是升级后用户看不到这份文件，

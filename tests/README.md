@@ -16,7 +16,7 @@
 ## 快速开始
 
 ```powershell
-cd D:\workplace\悬浮小agent\orbcat
+cd <仓库根>          # orbcat/ 目录
 npm install
 npm run test:ui          # 点击→发送黄金路径
 npm run test:rust        # 后端

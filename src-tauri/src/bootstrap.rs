@@ -224,8 +224,8 @@ pub fn bootstrap_agent_data(data_dir: &Path) -> Result<BootstrapReport, String> 
 
 /// 把内置模板里的占位符换成本机真实路径。
 ///
-/// 为什么不在模板里写死路径：那台机器是 `D:\workplace\悬浮小agent\...`，
-/// 换台机器（或换个数据目录）就全错。释放时按实际 `data_dir` 渲染才通用。
+/// 为什么不在模板里写死路径：开发机上的绝对路径换台机器（或换个数据目录）
+/// 就全错。释放时按实际 `data_dir` 渲染才通用。
 fn render_bundled(tpl: &str, data_dir: &Path, skill_dir: &Path) -> String {
     tpl.replace("{{DATA_DIR}}", &data_dir.display().to_string())
         .replace("{{SKILL_DIR}}", &skill_dir.display().to_string())
