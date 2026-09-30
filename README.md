@@ -20,7 +20,7 @@ agent。它和通用 AI 助手的区别在于两件事：**它记得你是谁**�
 | **面板** | 聊天、流式时间线、模型切换、Token 用量、记忆与技能、设置 |
 | **前台感知** | 记录你当前在看什么窗口，作为上下文喂给模型（睡眠时也不停） |
 
-**核心目标**（来自 `docs/00-CONCEPT.md` 锁定的设计决策）：
+**核心目标**（源自项目立项时锁定的设计决策）：
 
 - **懂「人」** —— 记得你的说话方式、偏好、正在忙什么
 - **懂「路子」** —— 偏好要**驱动行为**，编译进系统提示词，不是摆设
@@ -163,8 +163,8 @@ orbcat 能读写你的文件、跑命令，所以权限是分层的，**默认�
 
 | 限制 | 说明 |
 |---|---|
-| **隐形桌面没有合成键鼠** | 「后台模式」能建一张你看不见的桌面并真跑 GUI 程序（实测 WPS 打开 docx 导出 PDF），但**跨桌面注入键鼠被内核拒绝**。因此后台模式的输入通道必须是应用自身的自动化接口（COM / CLI / UIA Pattern / HTTP）。详见 `docs/02-BACKGROUND-MODE-FINDINGS.md` |
-| **UIA 选区对 Electron 不可靠** | VSCode 需 `--force-renderer-accessibility` 启动且不稳定；Typora 本机为改造版。Win32/WinUI 完全可用。详见 `docs/01-UIA-FINDINGS.md` |
+| **隐形桌面没有合成键鼠** | 「后台模式」能建一张你看不见的桌面并真跑 GUI 程序（实测 WPS 打开 docx 导出 PDF），但**跨桌面注入键鼠被内核拒绝**。因此后台模式的输入通道必须是应用自身的自动化接口（COM / CLI / UIA Pattern / HTTP） |
+| **UIA 选区对 Electron 不可靠** | VSCode 需 `--force-renderer-accessibility` 启动且不稳定；Typora 本机为改造版。Win32/WinUI 完全可用 |
 | **命令策略编辑器未接 UI** | 后端 `perm_cmd_policy` / `perm_path` / `perm_grants_list` 命令已就绪，设置页界面待接 |
 | **deny 时不隐藏工具** | 策略为 deny 的工具仍会出现在工具列表里（尚未做可见性过滤） |
 | **仅 Windows** | 大量 Win32 FFI（`capture.rs` / `win32.rs` / `win32desk.rs`），无跨平台计划 |

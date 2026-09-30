@@ -118,8 +118,8 @@
 
 ### 未包含（明确不在本版范围）
 
-- **可组合项目包**（`docs/compose/spec/composable-project-bundle.md`，T1–T7 未开工）
-- **生活信号与提醒**（`docs/compose/spec/life-signals-reminders.md`，未实现）
+- **可组合项目包**（T1–T7 未开工）
+- **生活信号与提醒**（未实现）
 
 ### 分发说明
 
