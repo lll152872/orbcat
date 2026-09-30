@@ -15,30 +15,44 @@
     python gen_dual_dashboard.py --projects <目录>      # WorkBuddy 日志目录
     python gen_dual_dashboard.py --agent-data <目录>    # 小 agent 数据目录
 """
-import argparse, json, glob, os, sys, datetime, re
+import argparse
+import datetime
+import glob
+import json
+import os
+import re
+import sys
 
-# Windows 控制台 GBK 环境下防止中文 print 报错
-try:
+# Windows 控制台默认 GBK，直接 print 中文会抛 UnicodeEncodeError
+if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
 
-_ap = argparse.ArgumentParser(description="双数据源 Token 用量驾驶舱生成器（WorkBuddy + 小 agent）")
-_ap.add_argument("--projects", default=os.path.join(os.path.expanduser("~"), ".workbuddy", "projects"),
-                 help="WorkBuddy 会话日志目录（默认 ~/.workbuddy/projects）")
-_ap.add_argument("--agent-data", default=None,
-                 help="orbcat 数据目录（默认自动探测 orbcat/agent-data）")
-_ap.add_argument("--out", default="dual-token-dashboard.html", help="输出 HTML 路径")
-_ap.add_argument("--summary-out", default=None,
-                 help="AI 可读摘要 JSON 路径（默认与 --out 同目录 dual-token-dashboard.summary.json）")
-_args = _ap.parse_args()
+DEFAULT_WORKBUDDY_PROJECTS = os.path.join(
+    os.path.expanduser("~"), ".workbuddy", "projects")
+DEFAULT_HTML_NAME = "dual-token-dashboard.html"
+DEFAULT_SUMMARY_NAME = "dual-token-dashboard.summary.json"
+
+
+def _parse_args():
+    ap = argparse.ArgumentParser(
+        description="双数据源 Token 用量驾驶舱生成器（WorkBuddy + 小 agent）")
+    ap.add_argument("--projects", default=DEFAULT_WORKBUDDY_PROJECTS,
+                    help="WorkBuddy 会话日志目录（默认 ~/.workbuddy/projects）")
+    ap.add_argument("--agent-data", default=None,
+                    help="orbcat 数据目录（默认自动探测 orbcat/agent-data）")
+    ap.add_argument("--out", default=DEFAULT_HTML_NAME, help="输出 HTML 路径")
+    ap.add_argument("--summary-out", default=None,
+                    help="AI 可读摘要 JSON 路径（默认与 --out 同目录）")
+    return ap.parse_args()
+
+
+_args = _parse_args()
 
 PROJECTS = _args.projects
 OUT = _args.out
-SUMMARY_OUT = _args.summary_out or (
-    os.path.join(os.path.dirname(os.path.abspath(OUT)) or ".",
-                 "dual-token-dashboard.summary.json")
-)
+# 摘要默认与 HTML 同目录同名，方便成对搬运
+SUMMARY_OUT = _args.summary_out or os.path.join(
+    os.path.dirname(os.path.abspath(OUT)), DEFAULT_SUMMARY_NAME)
 
 
 def _find_agent_data(explicit):
@@ -67,67 +81,160 @@ def _find_agent_data(explicit):
 AGENT_DATA = _find_agent_data(_args.agent_data)
 
 
-def parse_ts(v):
-    if isinstance(v, (int, float)):
-        if v > 1e12: return v / 1000.0
-        if v > 1e9: return float(v)
-    if isinstance(v, str):
-        s = v.strip()
-        for fmt_ in ('%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%dT%H:%M:%SZ',
-                     '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f'):
-            try:
-                import calendar
-                return calendar.timegm(datetime.datetime.strptime(s, fmt_).timetuple())
-            except Exception:
-                pass
-        try: return float(s) / 1000.0
-        except Exception: return None
+# ===========================================================================
+# 字段归一化层
+#   各家日志的字段名/单位都不一样，差异全部收敛在这一层，
+#   扫描层只面对内部口径。
+# ===========================================================================
+
+_UTC = datetime.timezone.utc
+_EPOCH_MS = 1_000_000_000_000   # 13 位：毫秒时间戳的量级下限
+_EPOCH_S = 1_000_000_000        # 10 位：秒时间戳的量级下限
+_TS_FORMATS = (
+    '%Y-%m-%dT%H:%M:%S.%fZ',
+    '%Y-%m-%dT%H:%M:%SZ',
+    '%Y-%m-%d %H:%M:%S',
+    '%Y-%m-%dT%H:%M:%S.%f',
+)
+
+
+def _pick(*vals):
+    """按 `or` 语义取第一个真值。
+
+    为什么不写成 `next(v for v in vals if v is not None)`：这些日志里 0 与
+    「字段缺失」在语义上等价（写了 0 通常就是没记），所以沿用 or 语义。
+    """
+    for v in vals:
+        if v:
+            return v
     return None
 
 
-def grab(o):
-    pd = o.get('providerData')
-    if not isinstance(pd, dict): return None
-    ru = pd.get('rawUsage') or {}; u = pd.get('usage') or {}
-    tt = ru.get('total_tokens') or u.get('totalTokens')
-    if not tt: return None
-    model = pd.get('model') or pd.get('requestModelId') or pd.get('requestModelName') or 'unknown'
-    ptd = ru.get('prompt_tokens_details') or {}
-    ch = ru.get('prompt_cache_hit_tokens')
-    if ch is None: ch = ptd.get('cached_tokens') or 0
-    cw = ptd.get('cached_creation_tokens') or ptd.get('cache_write_tokens') or 0
-    return dict(tt=int(tt), it=int(ru.get('prompt_tokens') or u.get('inputTokens') or 0),
-                ot=int(ru.get('completion_tokens') or u.get('outputTokens') or 0),
-                ch=int(ch or 0), cw=int(cw or 0), model=model)
+def _as_int(v):
+    """转 int；转不动（None / 非数字字符串）当 0。"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
 
 
-def session_title(o, fallback):
-    """取首条非 system-reminder 的用户消息前 42 字作为任务标题"""
-    if o.get('role') != 'user': return None
-    c = o.get('content')
-    if isinstance(c, str):
-        t = ' '.join(c.split())
-        if t and not t.startswith('<'):
-            return t[:42]
+def to_epoch_seconds(v):
+    """时间戳 → Unix 秒（float）。无法识别返回 None。
+
+    · 数字：按量级判断毫秒还是秒（>1e12 毫秒；>1e9 秒；更小的量级不认，
+      避免把 5 之类的脏值当成 1970 年）
+    · 字符串：先按已知格式解析，**一律按 UTC 解读** —— 日志写入方就是这么
+      约定的，按本地时区解读会让「跨零点」的日统计整体偏移一天。
+      已知格式都不匹配时，再当作毫秒数字字符串试一次。
+    """
+    if isinstance(v, bool):          # bool 是 int 子类，先挡掉
         return None
-    if not isinstance(c, list): return None
-    for seg in c:
-        if isinstance(seg, dict) and seg.get('type') in ('input_text', 'text'):
-            t = (seg.get('text') or '').strip()
-            if not t: continue
-            if t.startswith('<'): return None
-            t = ' '.join(t.split())
-            return t[:42]
+    if isinstance(v, (int, float)):
+        if v > _EPOCH_MS:
+            return v / 1000.0
+        if v > _EPOCH_S:
+            return float(v)
+        return None
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    if not s:
+        return None
+    for fmt_ in _TS_FORMATS:
+        try:
+            dt = datetime.datetime.strptime(s, fmt_).replace(tzinfo=_UTC)
+        except ValueError:
+            continue
+        return float(int(dt.timestamp()))   # 截到整秒，与上游日志精度一致
+    try:
+        return float(s) / 1000.0
+    except ValueError:
+        return None
+
+
+def read_usage(o):
+    """从 WorkBuddy 的一条日志对象里取用量；不是计费记录则返回 None。
+
+    取值优先级：`rawUsage`（原始口径，带缓存明细）> `usage`（归一化口径）。
+    拿不到 total 就认为这条与计费无关（工具调用、系统事件等）。
+    """
+    pd = o.get('providerData')
+    if not isinstance(pd, dict):
+        return None
+    raw = pd.get('rawUsage') or {}
+    norm = pd.get('usage') or {}
+    total = _pick(raw.get('total_tokens'), norm.get('totalTokens'))
+    if not total:
+        return None
+
+    details = raw.get('prompt_tokens_details') or {}
+    # 缓存命中优先信 rawUsage 的顶层字段；它缺失（None）才回落到明细里。
+    # 注意这里必须区分「None」和「0」：顶层显式写了 0 就是 0，不该被明细覆盖。
+    hit = details.get('cached_tokens') or 0
+    raw_hit = raw.get('prompt_cache_hit_tokens')
+    if raw_hit is not None:
+        hit = raw_hit
+
+    return {
+        'tt': int(total),
+        'it': _as_int(_pick(raw.get('prompt_tokens'), norm.get('inputTokens'))),
+        'ot': _as_int(_pick(raw.get('completion_tokens'), norm.get('outputTokens'))),
+        'ch': _as_int(hit),
+        'cw': _as_int(_pick(details.get('cached_creation_tokens'),
+                            details.get('cache_write_tokens'))),
+        'model': _pick(pd.get('model'), pd.get('requestModelId'),
+                       pd.get('requestModelName'), 'unknown'),
+    }
+
+
+TITLE_MAX = 42            # 面板标题列的可用宽度
+_INTERNAL_PREFIX = '<'    # system-reminder 之类内部消息的起始字符
+
+
+def _first_text_segment(content):
+    """从消息 content 里取第一段可用文本；str 直接用，list 找 text 段。"""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    for seg in content:
+        if not isinstance(seg, dict):
+            continue
+        if seg.get('type') not in ('input_text', 'text'):
+            continue
+        txt = (seg.get('text') or '').strip()
+        if txt:
+            return txt
     return None
+
+
+def extract_title(o, fallback):
+    """用首条「真人发的」用户消息当会话标题；内部标签消息跳过。
+
+    `fallback` 仅为调用方签名稳定而保留，本函数取不到标题时返回 None，
+    由上层决定兜底文案。
+    """
+    if o.get('role') != 'user':
+        return None
+    txt = _first_text_segment(o.get('content'))
+    if not txt:
+        return None
+    flat = ' '.join(txt.split())          # 折叠换行/连续空白，标题要单行
+    if not flat or flat.startswith(_INTERNAL_PREFIX):
+        return None
+    return flat[:TITLE_MAX]
 
 
 MODEL_MERGE = {'glm-5.2-x': 'glm-5.2'}
 
+_WS_MARKER = '-WorkBuddy-'
 
-def short_ws(name):
-    i = name.rfind('-WorkBuddy-')
-    if i >= 0 and name[i + 11:]:
-        return name[i + 11:]
+
+def workspace_short_name(name):
+    """工作区目录名取 `-WorkBuddy-` 之后那段作短名；没有标记就原样返回。"""
+    _head, sep, tail = name.rpartition(_WS_MARKER)
+    if sep and tail:
+        return tail
     return name
 
 
@@ -137,93 +244,178 @@ def short_ws(name):
 #   r 元组：(分钟戳, 模型下标, total, input, output, 缓存命中, 缓存写入)
 # ===========================================================================
 
+_SESSION_ID_SHOWN = 8          # 面板只显示会话 id 前 8 位
+_NO_TITLE = '(无标题会话)'
+_MS_PER_MIN = 60_000
+
+
+class _Registry:
+    """首次出现即登记，返回稳定下标。
+
+    前端用下标引用模型/工作区（省带宽），所以登记顺序必须与扫描顺序一致。
+    `render` 用于「登记键」与「显示名」不同的场合（工作区目录名 → 短名）。
+    """
+
+    def __init__(self, render=None):
+        self._render = render or (lambda key: key)
+        self._idx = {}
+        self.names = []
+
+    def index(self, key):
+        if key not in self._idx:
+            self._idx[key] = len(self.names)
+            self.names.append(self._render(key))
+        return self._idx[key]
+
+
 def _build_sess_list(sessions):
-    out = []
-    for sid, d in sessions.items():
-        if not d['r']:
-            continue
-        out.append({'w': d['w'], 'id': sid[:8], 't': d['t'] or '(无标题会话)',
-                    'st': d['r'][0][0], 'r': d['r']})
-    out.sort(key=lambda s: s['st'])
-    return out
+    """内部会话字典 → 前端列表，按首个请求时间升序。
+
+    丢掉没有任何记录的会话：面板上那会是一条没意义的空行。
+    """
+    rows = [
+        {'w': rec['w'], 'id': sid[:_SESSION_ID_SHOWN],
+         't': rec['t'] or _NO_TITLE, 'st': rec['r'][0][0], 'r': rec['r']}
+        for sid, rec in sessions.items() if rec['r']
+    ]
+    rows.sort(key=lambda row: row['st'])
+    return rows
+
+
+def _iter_jsonl(path):
+    """逐行读 JSONL，坏行跳过（日志被中断时最后一行常是残的）。"""
+    with open(path, encoding='utf-8', errors='ignore') as fh:
+        for line in fh:
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+
+def _split_rel(rel):
+    """相对路径 → (工作区分组名, 会话 id)。
+
+    实测存在两种形态：
+      `<工作区>/<会话id>.jsonl`                        主会话
+      `<工作区>/<会话id>/subagents/agent-<x>.jsonl`    子 agent 日志
+
+    两种都要归到同一个会话 id 上 —— 子 agent 的消耗属于它所属的那次会话，
+    单独拆成会话会把一个任务的花费摊成好几条。
+    所以会话 id 取**第 2 段**，不是最后一段。
+    """
+    parts = rel.split(os.sep)
+    if len(parts) < 2 or not parts[0]:
+        return None, None
+    folder = parts[0]
+    return folder, os.path.splitext(parts[1])[0]
 
 
 def scan_workbuddy(projects=PROJECTS):
-    ws_names, ws_idx = {}, {}
-    models, model_idx = [], {}
+    """扫 WorkBuddy 的 `~/.workbuddy/projects/**/*.jsonl`。"""
+    ws_reg = _Registry(workspace_short_name)
+    model_reg = _Registry()
     sessions = {}
+
     for fp in glob.glob(os.path.join(projects, '**', '*.jsonl'), recursive=True):
         rel = os.path.relpath(fp, projects)
-        parts = rel.split(os.sep)
-        if not parts:
+        folder, sid = _split_rel(rel)
+        if folder is None:
             continue
-        folder = parts[0]
-        sid = os.path.splitext(parts[1])[0] if len(parts) == 2 else parts[1]
-        if folder not in ws_idx:
-            ws_names[folder] = short_ws(folder)
-            ws_idx[folder] = len(ws_idx)
+        ws_slot = ws_reg.index(folder)      # 先登记工作区，空文件也占位
+        # 只有主会话日志（层级 2）才用文件里的 sessionId 覆盖文件名推导的 id；
+        # 子 agent 日志的 sessionId 是它自己的，用它会把子 agent 拆成独立会话。
+        is_main_session = rel.count(os.sep) == 1
         recs, title = [], None
-        with open(fp, encoding='utf-8', errors='ignore') as fh:
-            for line in fh:
-                try: o = json.loads(line)
-                except Exception: continue
-                if not isinstance(o, dict): continue
-                sid_r = o.get('sessionId')
-                if sid_r and len(parts) == 2: sid = sid_r
-                if title is None:
-                    t = session_title(o, sid)
-                    if t: title = t
-                r = grab(o)
-                if not r: continue
-                r['model'] = MODEL_MERGE.get(r['model'], r['model'])
-                ts = parse_ts(o.get('timestamp'))
-                if not ts: continue
-                if r['model'] not in model_idx:
-                    model_idx[r['model']] = len(models); models.append(r['model'])
-                recs.append((int(ts // 60), model_idx[r['model']], r['tt'], r['it'], r['ot'], r['ch'], r['cw']))
-        if not recs: continue
-        recs.sort(key=lambda x: x[0])
-        d = sessions.setdefault(sid, {'w': ws_idx[folder], 'id': sid, 't': title, 'r': []})
-        d['r'].extend(recs)
+
+        for obj in _iter_jsonl(fp):
+            inner_id = obj.get('sessionId')
+            if inner_id and is_main_session:
+                sid = inner_id
+            if title is None:
+                title = extract_title(obj, sid) or None
+            usage = read_usage(obj)
+            if not usage:
+                continue
+            ts = to_epoch_seconds(obj.get('timestamp'))
+            if not ts:
+                continue
+            model = MODEL_MERGE.get(usage['model'], usage['model'])
+            recs.append((
+                int(ts // 60), model_reg.index(model),
+                usage['tt'], usage['it'], usage['ot'], usage['ch'], usage['cw'],
+            ))
+
+        if not recs:
+            continue
+        recs.sort(key=lambda r: r[0])
+        slot = sessions.setdefault(sid, {'w': ws_slot, 'id': sid, 't': title, 'r': []})
+        slot['r'].extend(recs)
+
     return {'key': 'workbuddy', 'name': 'WorkBuddy',
-            'ws': list(ws_names.values()), 'models': models,
+            'ws': list(ws_reg.names), 'models': list(model_reg.names),
             'sess': _build_sess_list(sessions)}
 
 
+def _agent_usage(msg):
+    """orbcat 一条 assistant 消息 → 归一化用量字典；不可用返回 None。
+
+    字段是 `TokenUsage` 的 camelCase 序列化：`cacheHit` / `cacheWrite`。
+    更早的会话没有这两个字段，按 0 计。
+    """
+    if not isinstance(msg, dict) or msg.get('role') != 'assistant':
+        return None
+    usage = msg.get('usage')
+    if not isinstance(usage, dict):
+        return None
+    total = _as_int(usage.get('total'))
+    at = msg.get('at')
+    if not total or not at:
+        return None
+    return {
+        'at': int(at),
+        'model': msg.get('model') or 'unknown',
+        'total': total,
+        'prompt': _as_int(usage.get('prompt')),
+        'completion': _as_int(usage.get('completion')),
+        'hit': _as_int(_pick(usage.get('cacheHit'), usage.get('cache_hit'))),
+        'write': _as_int(_pick(usage.get('cacheWrite'), usage.get('cache_write'))),
+    }
+
+
 def scan_agent(agent_data=AGENT_DATA):
-    sessions = {}
-    models, model_idx = [], {}
+    """扫 orbcat 的 `agent-data/sessions/*.json`。"""
     if not agent_data:
         return {'key': 'agent', 'name': '小 agent', 'ws': [], 'models': [], 'sess': []}
+
+    model_reg = _Registry()
+    sessions = {}
     for fp in sorted(glob.glob(os.path.join(agent_data, 'sessions', '*.json'))):
         try:
             with open(fp, encoding='utf-8') as fh:
-                o = json.load(fh)
+                doc = json.load(fh)
         except Exception:
             continue
-        if not isinstance(o, dict): continue
-        sid = o.get('id') or os.path.splitext(os.path.basename(fp))[0]
+        if not isinstance(doc, dict):
+            continue
+        sid = doc.get('id') or os.path.splitext(os.path.basename(fp))[0]
         recs = []
-        for m in o.get('messages', []):
-            if not isinstance(m, dict) or m.get('role') != 'assistant': continue
-            u = m.get('usage')
-            if not isinstance(u, dict): continue
-            tt = int(u.get('total') or 0)
-            ts = m.get('at')
-            if not tt or not ts: continue
-            mid = m.get('model') or 'unknown'
-            if mid not in model_idx:
-                model_idx[mid] = len(models); models.append(mid)
-            # TokenUsage 序列化是 camelCase：cacheHit / cacheWrite（新）；旧数据无此字段 → 0
-            ch = int(u.get('cacheHit') or u.get('cache_hit') or 0)
-            cw = int(u.get('cacheWrite') or u.get('cache_write') or 0)
-            recs.append((int(int(ts) // 60000), model_idx[mid], tt,
-                         int(u.get('prompt') or 0), int(u.get('completion') or 0), ch, cw))
-        if not recs: continue
-        recs.sort(key=lambda x: x[0])
-        sessions[sid] = {'w': 0, 'id': sid, 't': o.get('title'), 'r': recs}
+        for msg in doc.get('messages', []):
+            u = _agent_usage(msg)
+            if not u:
+                continue
+            recs.append((
+                u['at'] // _MS_PER_MIN, model_reg.index(u['model']),
+                u['total'], u['prompt'], u['completion'], u['hit'], u['write'],
+            ))
+        if not recs:
+            continue
+        recs.sort(key=lambda r: r[0])
+        sessions[sid] = {'w': 0, 'id': sid, 't': doc.get('title'), 'r': recs}
+
     return {'key': 'agent', 'name': '小 agent',
-            'ws': ['小 agent'] if sessions else [], 'models': models,
+            'ws': ['小 agent'] if sessions else [], 'models': list(model_reg.names),
             'sess': _build_sess_list(sessions)}
 
 
