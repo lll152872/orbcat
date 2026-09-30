@@ -310,10 +310,67 @@ fn fold_steps_to_line(steps: &[sessions::StoredStep]) -> String {
 pub struct Hit {
     /// `user` | `assistant`
     pub role: String,
-    /// 人类可读时间（本地时间 `MM-DD HH:MM`）
+    /// 人类可读时间（本地时间 `YYYY-MM-DD HH:MM`）
     pub when: String,
+    /// 同一份口径的**数值**时间（epoch 毫秒）。
+    ///
+    /// 留着它是因为跨会话合并结果时必须**按真实时间排序**：`when` 是给人看的
+    /// `YYYY-MM-DD HH:MM` 字符串，拿它比大小得先解析回时间，绕一圈还容易出错。
+    pub at: u64,
     pub text: String,
 }
+
+/// 跨会话搜索里「一条命中 + 它出自哪个会话」。
+///
+/// 为什么要带来源：[`crate::tools::recall_turns`] 的 `scope=all` 会把**别的**
+/// 会话的内容灌进当前上下文。不给来源，模型分不清"这是当前会话里说过的"
+/// 还是"另一个会话里说过的"，会把别的上下文误当成当前上下文（那是真的会做错事）。
+pub struct SessionHit {
+    /// 会话 id（全量）。给模型看的是 [`Self::source`]，这个留给调用方做去重/调试。
+    pub session_id: String,
+    /// 结果行前缀里的**来源标识**：`标题 · 时间`，标题为空/超长时退回 id 片段。
+    ///
+    /// 为什么不用纯 id：`s<毫秒>-<序号>` 对模型和用户都没有信息量，
+    /// 而标题（首条用户消息的前若干字）本身就是"这条会话在聊什么"的摘要。
+    pub source: String,
+    pub hit: Hit,
+}
+
+/// 跨会话扫描的**单次调用**上限（`scope=all` 用）。
+///
+/// ## 为什么必须有上限
+///
+/// `scope=all` 要遍历 `sessions/*.json`，而那是**每天都在长**的目录：写这个上限时
+/// 实测 31 个文件 / 10.2 MB（最大单个 3.2 MB，中位数仅 21 KB —— 大小极不均匀）。
+/// `recall_turns` 是个会被模型随手调用、甚至在一轮里调好几次的工具，
+/// 而它整体是**同步**执行的（`tools::execute` 里直接调、不 await）——
+/// 在 tokio 工作线程上同步做几十 MB 的读盘 + JSON 解析，会卡住整条 agent 循环
+/// （心跳、取消探针、别的前端请求全在那时没得跑）。所以宁可**少查几个文件**，
+/// 也不能让"顺手查一下历史"变成一次秒级卡顿。
+///
+/// 两道闸的分工：
+/// - [`CROSS_SESSION_MAX_FILES`]：兜住"文件多但都很小"的情况；
+/// - [`CROSS_SESSION_MAX_BYTES`]：兜住"文件不多但单个巨大"的情况 —— 3.2 MB 那一个
+///   文件就吃掉三分之一的字节预算，而按文件数限流它只算"一个"。
+///
+/// 两道闸都作用在**真正要解析的文件**上：
+/// ① 先用 `fs::metadata` 拿大小，超预算就停（**不读进内存**）；
+/// ② 无关键词时（"翻翻最近聊过什么"）再用一次 `read_to_string` 的字节数兜底 ——
+///    metadata 与实际读到的大小理论上可能不一致（文件正在被写）。
+///
+/// 达到上限时**不会静默截断**：返回文本里会明说"只扫了最近 N 个会话"，
+/// 让模型知道"没找到"≠"不存在"，可以引导用户换个更具体的关键词再查。
+///
+/// ## 为什么按"最近更新"顺序扫、超限就停
+///
+/// 会话是**按时间追加**的，正在聊的会话就在最近更新的一头；按 `updated_at`
+/// 倒序扫，预算花在"最可能相关"的文件上（也正好让 `query` 留空时的结果天然有序）。
+/// "更早的会话查不到"是这个策略的**已知代价**，用更具体的关键词可以绕开
+/// ——因为关键词非空时 `limit` 是按时间**取最近**的，先扫近的会话不损失正确性。
+pub const CROSS_SESSION_MAX_FILES: usize = 40;
+/// 见 [`CROSS_SESSION_MAX_FILES`] 的说明。60 MB ≈ 当前全库的 6 倍，
+/// 正常使用下**不会**摸到这道闸；它防的是"目录被日志/快照式的大会话撑爆"。
+pub const CROSS_SESSION_MAX_BYTES: u64 = 60 * 1024 * 1024;
 
 /// 在当前会话里搜历史原文（**带 steps 的完整记录**，不是折叠版）。
 ///
@@ -331,7 +388,21 @@ pub fn search(
     let Some(s) = sessions::load(data_dir, session_id) else {
         return Vec::new();
     };
+    search_in(&s, query, limit, hours, now_ms)
+}
 
+/// 在**已经读出来的**会话里搜（[`search`] 与跨会话扫描共用的那层）。
+///
+/// 拆出来的理由：跨会话扫描要先把一批 `sessions/*.json` 读进内存再统一搜，
+/// 不能每个文件都走一遍 `sessions::load`（读盘 + 解析）—— 那样扫描上限
+/// 会按"每个文件读两次"来花钱，也会让"先粗筛后退化"的策略无处落脚。
+pub fn search_in(
+    s: &sessions::Session,
+    query: &str,
+    limit: usize,
+    hours: Option<u64>,
+    now_ms: u64,
+) -> Vec<Hit> {
     let cutoff = hours.map(|h| now_ms.saturating_sub(h * 60 * 60 * 1000));
     let needle = query.trim().to_lowercase();
 
@@ -352,6 +423,7 @@ pub fn search(
         .map(|m| Hit {
             role: m.role.clone(),
             when: fmt_local(m.at),
+            at: m.at,
             // 单条结果仍然截断 —— 模型缺的是线索，不是全文；
             // 真要全文它有 read_file（但会话 JSON 不建议直接读）
             text: m.text.chars().take(600).collect(),
@@ -366,23 +438,190 @@ pub fn search(
     hits
 }
 
-/// epoch 毫秒 → 本地 `MM-DD HH:MM`
+// ---------------------------------------------------------------------------
+// recall_turns 的跨会话检索（scope=all）
+// ---------------------------------------------------------------------------
+
+/// 一次跨会话扫描的结果。
+///
+/// 为什么不只返回命中列表：工具层要如实告诉模型**这次查了多少、查全了没有**。
+/// "没找到"和"没查完"对模型是两种完全不同的结论 —— 前者可以换个关键词再查，
+/// 后者只说明预算用完了；混成一句话它就会对着用户打包票说"没这回事"。
+pub struct CrossSessionScan {
+    pub hits: Vec<SessionHit>,
+    /// 实际读过的会话数
+    pub scanned: usize,
+    /// 是否因为到达上限而**提前停**（还有更早的会话没查）
+    pub truncated: bool,
+}
+
+/// 在**所有会话**里搜，按时间倒序返回命中（每条都带来源）。
+///
+/// 与 [`search`] 的差别不只是"多读几个文件"：
+/// 1. 先按 `updated_at` 倒序扫（近的会话更可能相关），**读盘前**先用文件大小
+///    卡预算（见 [`CROSS_SESSION_MAX_FILES`] 的说明）；
+/// 2. 每条结果都要能回答"这是**哪个**会话里说的" —— 否则模型会把别的会话的
+///    上下文误当成当前上下文（见 [`SessionHit`]）；
+/// 3. 关键词非空时会先拿**原始 JSON 文本**做一次大小写不敏感的子串粗筛，
+///    命不中就跳过，省掉一次 JSON 解析（10 MB 全库全解析是秒级）。
+///    这个粗筛**只可能漏掉**"文本在 JSON 里被转义成 `\uXXXX`"的极少数命中，
+///    而那类文本本来就没法可靠地当关键词用；粗筛通过后仍会按消息文本**精确**匹配，
+///    所以它不会带出假命中。
+///
+pub fn search_all_sessions(
+    data_dir: &std::path::Path,
+    query: &str,
+    limit: usize,
+    hours: Option<u64>,
+    now_ms: u64,
+    max_files: usize,
+    max_bytes: u64,
+) -> CrossSessionScan {
+    let mut hits: Vec<SessionHit> = Vec::new();
+    let needle = query.trim().to_lowercase();
+    let cutoff = hours.map(|h| now_ms.saturating_sub(h * 60 * 60 * 1000));
+
+    // `sessions::list()` 已经把 `current.txt`、`*.grants.json` 这些非会话文件
+    // 挡在外面了（见 `is_grants_file`）。这里**不自己 read_dir + 解析 JSON**：
+    // "什么算一个会话"的判断只该有一份实现，多一份就多一处会漂移的规则。
+    // 代价是 `list()` 会把每个会话完整解析一遍（拿不到大小），所以下面还要
+    // 用 `metadata` 复查一次大小才能卡住字节预算。
+    let mut metas = sessions::list(data_dir);
+    metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    let mut scanned = 0usize;
+    let mut bytes = 0u64;
+    // 「还有没查的会话吗」：目录里的会话数超过文件上限，或循环中途因预算 break。
+    // 先记下总数，break 之后才判断得出来。
+    let total = metas.len();
+    let mut truncated = total > max_files;
+
+    for meta in metas.iter().take(max_files) {
+        let path = crate::sessions::session_path(data_dir, &meta.id);
+        // 先看大小再决定要不要读：超预算的文件**根本不读进内存**。
+        // （`list()` 已经读过它们了 —— 那个开销躲不掉，除非再写一套
+        //   "只读头部"的解析器；这里防的是额外再读一份几十 MB 的文本。）
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if bytes.saturating_add(size) > max_bytes {
+            truncated = true;
+            break;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // metadata 与实际读到的长度可能不一致（会话正在被这一轮写），
+        // 所以按**真正读到的**字节记账。
+        let got = raw.len() as u64;
+        if bytes.saturating_add(got) > max_bytes {
+            truncated = true;
+            break;
+        }
+
+        scanned += 1;
+        bytes = bytes.saturating_add(got);
+
+        // 粗筛：关键词不在原文里就不用解析 JSON 了。
+        if !needle.is_empty() && !raw.to_lowercase().contains(&needle) {
+            continue;
+        }
+        let Some(s) = sessions::load(data_dir, &meta.id) else {
+            continue;
+        };
+        // 每个会话只取 `limit` 条就够了（后面还要在全局按时间截断一次）。
+        // 多取只会撑大内存，不会改变最终结果。
+        for h in search_in(&s, query, limit, hours, now_ms) {
+            if let Some(c) = cutoff {
+                if h.at < c {
+                    continue;
+                }
+            }
+            hits.push(SessionHit {
+                session_id: meta.id.clone(),
+                source: source_label(meta),
+                hit: h,
+            });
+        }
+    }
+
+    // 最近的在最前：跨会话的结果读起来必须是一条时间线，否则模型会按
+    // "工具返回顺序"理解先后关系，而那是按文件扫出来的顺序。
+    // 同一时间戳（同一条 `append_run` 落的问答）用 id/正文兜底定序，
+    // 让结果**可复现**（排序不稳定会让同一问题两次得到不同排列）。
+    hits.sort_by(|a, b| {
+        b.hit
+            .at
+            .cmp(&a.hit.at)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+            .then_with(|| a.hit.text.cmp(&b.hit.text))
+    });
+    hits.truncate(limit);
+
+    CrossSessionScan {
+        hits,
+        scanned,
+        truncated,
+    }
+}
+
+/// 结果行的来源标识：`标题 · 时间`。
+///
+/// 标题是首条用户消息的前若干字，本来就是"这条会话在聊什么"的摘要，
+/// 对模型认话题比 id 有用得多；但标题可能为空（异常/老数据）或特别长
+/// （用户第一句就是一大段），所以空的退回 id 片段、长的截断。
+fn source_label(meta: &sessions::SessionMeta) -> String {
+    let title: String = meta.title.trim().chars().take(24).collect();
+    if title.is_empty() {
+        return format!("会话 {} · {}", short_id(&meta.id), fmt_local(meta.updated_at));
+    }
+    format!("{title} · {}", fmt_local(meta.updated_at))
+}
+
+/// 会话 id 取尾部片段。
+///
+/// 为什么取尾不取头：id 形如 `s1790501250410-0`，头部的 `s<毫秒>` 是同一批创建时
+/// 最像的部分，尾部的序号才区分得开；而且截断后仍能一眼认出是会话 id。
+fn short_id(id: &str) -> String {
+    let n = id.chars().count();
+    if n <= 12 {
+        return id.to_string();
+    }
+    id.chars().skip(n - 12).collect()
+}
+
+/// epoch 毫秒 → 本地 `YYYY-MM-DD HH:MM`
 ///
 /// 手写而不用 chrono：只为格式化一个时间戳引一个 crate 不划算，
 /// 且 `libc::localtime_r` 在 Windows 上不可用。这里走 `std::time` 的
 /// 「UTC 秒 + 固定偏移」近似 —— 精确到分钟对"回忆昨天聊了什么"足够。
-fn fmt_local(ms: u64) -> String {
-    // 从 epoch 天数算年月日（不引第三方库的民用历法算法）
-    let secs = ms / 1000;
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
+///
+/// ⚠️ **2026-09-30 修跨日 bug**：旧实现是 `let h = (h + 8) % 24;` ——
+/// 小时回绕了但**日期没跟着进位**，于是 UTC 16:00 之后（本地 00:00 起）
+/// 会算出"昨天 00:xx"。它对历史回灌（昨天/今天的消息）和当前时间注入
+/// 都是错的日期，必须按**总小时数**整体加偏移后再拆日与时。
+pub fn fmt_local(ms: u64) -> String {
+    let total_min = ms / 60_000;
+    // 本机为 UTC+8；不追求跨时区正确性，但日/时必须自洽
+    let total_min = total_min + 8 * 60;
+    let days = (total_min / (24 * 60)) as i64;
+    let rem_min = total_min % (24 * 60);
 
     let (y, mo, d) = civil_from_days(days);
-    let h = rem / 3600;
-    let mi = (rem % 3600) / 60;
-    // 本机为 UTC+8；不追求跨时区正确性，显式标注避免误读
-    let h = (h + 8) % 24;
+    let h = rem_min / 60;
+    let mi = rem_min % 60;
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
+}
+
+/// epoch 毫秒 → 本地星期几（中文单字，`周一`…`周日`）。
+///
+/// ⚠️ **必须先按本地时区平移再取天数**（2026-09-30 被测试抓到）：
+/// 本地 2026-09-22 00:00 对应 UTC 2026-09-21 16:00 —— 直接拿 UTC 天算
+/// 会得到"周一"，而用户眼里的那天是周二。星期错一天，比没有星期更糟。
+///
+/// 平移后 1970-01-01（本地 08:00，周四）为第 0 天，故 day 0 → 周四。
+pub fn weekday_cn(ms: u64) -> &'static str {
+    const NAMES: [&str; 7] = ["周四", "周五", "周六", "周日", "周一", "周二", "周三"];
+    let local_days = ((ms + 8 * 3_600_000) / 86_400_000) as i64;
+    NAMES[local_days.rem_euclid(7) as usize]
 }
 
 /// Howard Hinnant 的 `civil_from_days`（days since 1970-01-01 → 年月日）
@@ -890,6 +1129,35 @@ mod tests {
     fn fmt_local_epoch_zero_is_utc_plus_8() {
         // 0 ms = 1970-01-01 00:00 UTC = 1970-01-01 08:00 本地
         assert_eq!(fmt_local(0), "1970-01-01 08:00");
+    }
+
+    /// 🔴 跨日进位（2026-09-30 修的 bug）
+    ///
+    /// 旧实现 `(h + 8) % 24` 只回绕小时、不推进日期，于是 UTC 16:00 之后
+    /// （本地已过零点）会算出"**昨天** 00:xx"。日期错会让模型把日记写到前一天，
+    /// 也会让「今天/昨天」的判断整段反掉。
+    #[test]
+    fn fmt_local_carries_over_midnight() {
+        // 2026-09-21 16:00 UTC → 本地 2026-09-22 00:00（必须进位到 22 号）
+        assert_eq!(fmt_local(1_790_006_400_000), "2026-09-22 00:00");
+        // 2026-09-21 15:59 UTC → 本地 2026-09-21 23:59（不进位）
+        assert_eq!(fmt_local(1_790_006_340_000), "2026-09-21 23:59");
+        // 跨日前后相差一分钟，日期必须差一天 —— 这是旧实现最明显的破绽
+        assert_ne!(
+            &fmt_local(1_790_006_340_000)[..10],
+            &fmt_local(1_790_006_400_000)[..10],
+            "跨零点两侧的日期必须不同"
+        );
+    }
+
+    #[test]
+    fn weekday_cn_matches_known_dates() {
+        // 1970-01-01 是星期四
+        assert_eq!(weekday_cn(0), "周四");
+        // 2026-09-21 是星期一（同日 08:28 那条断言已核对过该时间戳）
+        assert_eq!(weekday_cn(1_789_950_480_000), "周一");
+        // 2026-09-22 是星期二
+        assert_eq!(weekday_cn(1_790_006_400_000), "周二");
     }
 
     // ---- compact 相关 ----

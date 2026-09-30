@@ -611,6 +611,9 @@ impl GrantStore {
         &self.grants
     }
 
+    /// 是否没有任何授权。**仅供测试** —— 生产侧读 [`grants`](Self::grants)
+    /// 自己判空即可，不必多一个包装。
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.grants.is_empty()
     }

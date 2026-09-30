@@ -29,6 +29,11 @@ use std::path::{Path, PathBuf};
 const MAX_MESSAGES: usize = 400;
 
 /// 折叠后单条工具结果的展示上限（字符）
+///
+/// ⚠️ **仅供测试**（2026-09-30 标注）：它只被 [`fold_steps`] 用，而那个函数
+/// 现在也只服务单测（折叠已下沉到落盘 `cap_steps`）。生产落盘的上限看
+/// `STEP_DETAIL_LIMIT`。
+#[cfg(test)]
 const FOLDED_DETAIL_LIMIT: usize = 120;
 
 /// 时间线条目单条的落盘上限（字符）。
@@ -174,6 +179,25 @@ pub struct Session {
     /// `messages[0..n]` 已被 `summary` 概括，回灌时从 `messages[n..]` 取。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_upto: Option<usize>,
+    /// **上一轮最后一个模型调用实际发出的 prompt token 数**（服务端 `usage.prompt`）。
+    ///
+    /// ## 为什么必须落盘（2026-09-30 加）
+    ///
+    /// 上下文预算此前全靠本地估算，而实测**低估 5~144 倍**（缘由：工具 schema、
+    /// MCP 已加载组、reasoning 原文都没进估算），后果是自动 compact
+    /// **在 30 个真实会话里一次都没触发过** —— 阈值永远够不着。
+    ///
+    /// 服务端返回的 `prompt` 是**真实值**，它才是"我上一轮到底发了多大上下文"
+    /// 的唯一可信来源。落盘后下一轮读回来，预算就有了真锚点。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt_tokens: Option<u32>,
+    /// 上一轮的「真实 prompt ÷ 本地估算」倍率。
+    ///
+    /// 有了它，**没配 `maxInputTokens` 的模型也能有自校准的预算**：
+    /// 估算 × 倍率 ≈ 真实量级。倍率落盘而不是内存，是为了跨进程重启也有效。
+    /// 只在两端都拿到时写入，缺失即 None（表示"未校准"，按 1.0 处理）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_scale: Option<f64>,
 }
 
 fn default_kind() -> String {
@@ -223,6 +247,15 @@ fn session_file(data_dir: &Path, id: &str) -> PathBuf {
     sessions_dir(data_dir).join(format!("{id}.json"))
 }
 
+/// 某会话的落盘路径（`sessions/<id>.json`）。
+///
+/// 对外开一个口子，是为了让「按 id 找会话文件」这件事**只有一处实现**：
+/// 跨会话检索（`history::search_all_sessions`）要先用 `fs::metadata` 看大小
+/// 再决定读不读，自己拼一遍路径迟早会跟这里的命名规则漂移。
+pub fn session_path(data_dir: &Path, id: &str) -> PathBuf {
+    session_file(data_dir, id)
+}
+
 /// 某会话的临时授权文件：`sessions/<id>.grants.json`
 ///
 /// 与 `<id>.json` **平级**（不是子目录）—— 会话本来就是扁平存储，
@@ -259,6 +292,13 @@ fn new_id() -> String {
 // ---------------------------------------------------------------------------
 
 fn read_session(path: &Path) -> Option<Session> {
+    // 授权文件（`<id>.grants.json`）与会话**平级存放**，形状完全不同。
+    // 它会走到这里（`unique_main` 等路径按目录遍历），直接跳过 ——
+    // 否则每次启动都刷一屏 `解析失败: missing field 'id'` 的假警告
+    // （2026-09-30 实测：启动一次 6 行），把真问题淹掉。
+    if is_grants_file(path) {
+        return None;
+    }
     let txt = std::fs::read_to_string(path).ok()?;
     let mut s = match serde_json::from_str::<Session>(&txt) {
         Ok(s) => s,
@@ -333,6 +373,8 @@ pub fn new_session(data_dir: &Path) -> Session {
         fork_at: None,
         summary: None,
         summary_upto: None,
+        last_prompt_tokens: None,
+        token_scale: None,
     };
     let _ = write_session(data_dir, &s);
     set_current(data_dir, &s.id);
@@ -416,6 +458,8 @@ fn create_main(data_dir: &Path) -> Session {
         fork_at: None,
         summary: None,
         summary_upto: None,
+        last_prompt_tokens: None,
+        token_scale: None,
     };
     let _ = write_session(data_dir, &s);
     s
@@ -697,6 +741,10 @@ pub fn fork(data_dir: &Path, src: &Session, upto: usize) -> Result<Session, Stri
         // 在新会话里对不上，直接不带（新会话从头开始积累自己的摘要）。
         summary: None,
         summary_upto: None,
+        // 同理：原会话的 prompt 实测量与校准倍率都是"那个上下文"的属性，
+        // 新窗口的构成不同，带过来会把预算算错。让新会话自己重新校准。
+        last_prompt_tokens: None,
+        token_scale: None,
     };
     write_session(data_dir, &s)?;
     set_current(data_dir, &s.id);
@@ -722,6 +770,14 @@ pub struct TurnRecord<'a> {
     pub model: &'a str,
     /// 本轮问答的 token 用量合计（全 0 则落盘时不写）
     pub usage: crate::llm::TokenUsage,
+    /// 本轮**最后一个模型调用**实际发出的 prompt token（服务端 `usage.prompt`）。
+    ///
+    /// 与 `usage` 的区别：`usage.prompt` 是整个 run 各轮**求和**（几百万很常见），
+    /// 而这里只要**最后一轮**那一个数 —— 它才代表"这个会话此刻的上下文有多大"，
+    /// 是下一轮预算的真锚点。服务端没给 usage 时是 None。
+    pub last_prompt_tokens: Option<u32>,
+    /// 本轮「真实 prompt ÷ 本地估算」倍率，用于下一轮校准预算。None = 未校准。
+    pub token_scale: Option<f64>,
 }
 
 /// 一轮**开跑时**立刻落盘：用户提问 + 一条 `partial` 助手占位。
@@ -737,6 +793,12 @@ pub struct TurnRecord<'a> {
 /// 现在改成：开跑先落提问与占位 → 轮内 [`checkpoint_turn`] 增量更新 →
 /// 结束 [`append_run`] 定稿。哪怕进程被杀，磁盘上至少留下"问了什么 +
 /// 已经产出到哪一步"。
+///
+/// ⚠️ **仅供测试**（2026-09-30 标注）：生产路径一律用 [`begin_turn_in`]，
+/// 因为它要**显式带上开跑时的会话 id** —— 用户中途切走会话时 `current.txt`
+/// 已经变了，再按"当前会话"落盘会把这一轮写进**另一个**会话。
+/// 这个不带 id 的版本只给单测省一个参数。
+#[cfg(test)]
 pub fn begin_turn(data_dir: &Path, user_text: &str, images: &[String]) -> Result<(), String> {
     begin_turn_in(data_dir, None, user_text, images)
 }
@@ -808,6 +870,10 @@ pub fn begin_turn_in(
 ///
 /// 由 agent 循环在轮边界 / 每个工具跑完后回调触发。找不到占位就静默返回 ——
 /// 说明这轮没走 `begin_turn`（老路径 / 分叉会话），不要在这里硬造一条消息。
+///
+/// ⚠️ **仅供测试**（2026-09-30 标注）：生产路径用 [`checkpoint_turn_in`]，
+/// 理由同 [`begin_turn`] —— 必须显式指定会话 id，否则后台继续跑的轮会写错会话。
+#[cfg(test)]
 pub fn checkpoint_turn(
     data_dir: &Path,
     steps: &[StoredStep],
@@ -961,13 +1027,40 @@ pub fn append_run_in(
         }
         s.messages.drain(..cut);
     }
+    // 上下文预算的**真锚点**（2026-09-30）：只有本轮真拿到了服务端 usage 才更新，
+    // 拿不到就保留上一轮的值 —— 抹成 None 等于把已经校准好的会话退回瞎估。
+    if let Some(p) = rec.last_prompt_tokens.filter(|p| *p > 0) {
+        s.last_prompt_tokens = Some(p);
+        if let Some(sc) = rec.token_scale.filter(|s| s.is_finite() && *s > 0.0) {
+            s.token_scale = Some(sc);
+        }
+    }
     s.updated_at = now;
     write_session(data_dir, &s)
+}
+
+/// 读一个会话的上下文预算校准数据：`(上一轮真实 prompt token, 估算倍率)`。
+///
+/// 给 `agent::run` 在开跑前取用：有真值就用真值定 compact 水位与裁剪预算，
+/// 没有（新会话 / 服务端不给 usage）就退回本地估算。
+///
+/// 为什么不直接 `load()` 整个会话：调用方只要这两个数，不该顺带把
+/// 几 MB 的消息体反序列化一遍（agent loop 每一轮都要问一次）。
+pub fn context_calibration(data_dir: &Path, session_id: &str) -> (Option<u32>, Option<f64>) {
+    let id = session_id.trim();
+    if id.is_empty() {
+        return (None, None);
+    }
+    match load(data_dir, id) {
+        Some(s) => (s.last_prompt_tokens, s.token_scale),
+        None => (None, None),
+    }
 }
 
 /// 往当前会话追加一轮对话（用户消息 + 助手回答）。
 ///
 /// ## 工具结果在这里就折叠掉（用户 2026-09-19 定案）
+///
 /// assistant 消息的 `steps` 体积最大（一轮 grep 可能几 KB），落盘前就压成
 /// 一行摘要。为什么放在**落盘**而不是每轮组装时折：
 ///
@@ -1006,6 +1099,9 @@ pub fn append_turn(
             // 旧壳不记用量（usage 全 0 时不落盘），模型留空
             model: "",
             usage: crate::llm::TokenUsage::default(),
+            // 旧壳也不参与上下文校准（调用方给不出真值）
+            last_prompt_tokens: None,
+            token_scale: None,
         },
     )
 }
@@ -1209,6 +1305,11 @@ fn is_keep_always(kind: &str) -> bool {
 ///
 /// 全部非 `tool_call`（例如只有 `thought`）→ 返回空 vec：这些步骤
 /// 在历史上没有回灌价值，模型正文里已经说了它想了什么。
+///
+/// ⚠️ **仅供测试**（2026-09-30 标注）：`history.rs` 读历史时走的是
+/// `fold_steps_to_line`（把 steps 折成一行文本），**不是**这个函数 ——
+/// 折叠已下沉到落盘（`cap_steps`）。这里留着是给"折叠规则本身"留单测入口。
+#[cfg(test)]
 pub fn fold_steps(steps: &[StoredStep]) -> Vec<StoredStep> {
     let calls: Vec<&str> = steps
         .iter()
@@ -1403,6 +1504,9 @@ mod tests {
                 interrupted: false,
                 model: "test-model",
                 usage: crate::llm::TokenUsage::default(),
+            
+                last_prompt_tokens: None,
+                token_scale: None,
             },
         )
         .unwrap();
@@ -1438,6 +1542,9 @@ mod tests {
                 interrupted: false,
                 model: "m",
                 usage: crate::llm::TokenUsage::default(),
+            
+                last_prompt_tokens: None,
+                token_scale: None,
             },
         )
         .unwrap();
@@ -1476,6 +1583,9 @@ mod tests {
                 interrupted: false,
                 model: "m",
                 usage: crate::llm::TokenUsage::default(),
+            
+                last_prompt_tokens: None,
+                token_scale: None,
             },
         )
         .unwrap();
@@ -1516,6 +1626,9 @@ mod tests {
                 interrupted: false,
                 model: "m",
                 usage: crate::llm::TokenUsage::default(),
+            
+                last_prompt_tokens: None,
+                token_scale: None,
             },
         )
         .unwrap();
@@ -1538,6 +1651,9 @@ mod tests {
                 interrupted: false,
                 model: "m",
                 usage: crate::llm::TokenUsage::default(),
+            
+                last_prompt_tokens: None,
+                token_scale: None,
             },
         )
         .unwrap();

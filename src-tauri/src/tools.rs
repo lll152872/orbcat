@@ -310,6 +310,15 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
             json!({ "type": "object", "properties": {}, "required": [] }),
         ),
         ToolSpec::new(
+            "current_time",
+            "获取**精确的当前时间**（到秒，含星期与 UTC 偏移）。\
+             适用：要给文件/日记/文档写日期、要算「几小时前 / 上周 / 还有几天」、\
+             要判断是否跨零点。system prompt 里已有一行「当前时间」（到分钟），\
+             需要秒级精度或想确认它没过期时用本工具。\
+             **不要**为了看时间跑 `run_command` 执行 Get-Date —— 那是绕路。",
+            json!({ "type": "object", "properties": {}, "required": [] }),
+        ),
+        ToolSpec::new(
             "ask_user",
             "向用户**提一个问题并等待回答**（弹出问题卡，用户打字/点选项后你才能继续）。\
              适用：需要用户做选择、提供你无法从环境推断的信息（偏好、口令、确认方向）时。\
@@ -375,11 +384,31 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
             }),
         ),
         ToolSpec::new(
+            "search_tools",
+            "按**意图**检索外部工具（MCP）：给一个关键词，返回命中的工具名 + 一句话用途，\
+             **不含参数 schema**，所以很便宜，可以放心多调几次。\
+             当你要做一件事、但不确定有没有现成的外部工具时，**先搜这里**\
+             （例：query=\"提交 issue\" 会命中 github 组的 create_issue）。\
+             搜到后对**未加载**的组调 `load_tool_group` 拿参数细节。\
+             留空 query = 返回全部外部工具索引（按组列出名字与用途）。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "意图关键词，如「提交 issue」「截图」「数据库查询」「上传文件」。留空则列出完整索引"
+                    }
+                },
+                "required": []
+            }),
+        ),
+        ToolSpec::new(
             "list_tool_groups",
             "列出可用的 MCP 外部工具组（浏览器自动化、远程 SSH、数据库、桌面操作等）。\
              MCP 工具**不会默认加载**（为了省上下文），你需要先看这里有哪些组，\
              再用 load_tool_group 把需要的组装载进来。\
-             当任务涉及网页、远程服务器、数据库、桌面应用操作时，先调用这个。",
+             当任务涉及网页、远程服务器、数据库、桌面应用操作时，先调用这个。\
+             ⚠️ 只知道「要做什么」、不知道工具叫什么时，用 `search_tools` 按意图搜更准。",
             json!({ "type": "object", "properties": {}, "required": [] }),
         ),
         ToolSpec::new(
@@ -409,10 +438,14 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "recall_turns",
-            "查找本会话**更早**的对话原文（不在你当前上下文里的部分）。\
+            "查找**更早**的对话原文（不在你当前上下文里的部分）。\
              当你看到用户说「上次 / 之前 / 刚才那个 / 我们之前定的」\
              而你找不到依据时，**先调这个再回答**，不要猜也不要反问用户。\
-             留空 query 可用来「翻一下最近聊过什么」。",
+             留空 query 可用来「翻一下最近聊过什么」。\n\
+             默认**只查当前会话**（scope=session）。当用户说的是「以前/上次我们搞过\
+             某个同类问题」而当前会话里查不到时，用 scope=all 跨会话再查一次\
+             —— 它的结果会带「标题 · 时间」的来源标识，那些内容**不属于当前会话**，\
+             引用时要说明是从哪个会话找到的，不要当成当前上下文。",
             json!({
                 "type": "object",
                 "properties": {
@@ -427,6 +460,13 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
                     "limit": {
                         "type": "number",
                         "description": "最多返回几条，默认 10"
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["session", "all"],
+                        "description": "检索范围：session=只查当前会话（默认）；\
+                                        all=连同其他历史会话一起查（结果带来源标识）。\
+                                        只在当前会话里查不到、且用户指的是别处聊过的事时才用 all"
                     }
                 },
                 "required": []
@@ -574,8 +614,9 @@ pub struct ToolCtx<'a> {
     pub gate: &'a PermissionGate,
     pub data_dir: &'a Path,
     pub mcp: &'a tokio::sync::Mutex<crate::mcp::ToolRegistry>,
-    /// 当前会话 id。`recall_turns` 只在本会话范围内检索 ——
-    /// 跨会话检索是独立功能（"从主聊天起任务"才需要），暂不做。
+    /// 当前会话 id。`recall_turns` **默认**只在本会话范围内检索；
+    /// `scope=all` 时才跨会话扫 `sessions/*.json`（见 [`recall_turns`] 的注释：
+    /// 默认保守是因为跨会话要遍历整个会话目录、且会引入别的会话的上下文）。
     pub session_id: &'a str,
     /// 「申请权限」的授权表 + 待办通道。
     /// 打包成**一个引用**，避免以后每加一项能力就改一次 `agent::run` 的签名。
@@ -704,6 +745,20 @@ pub async fn execute(
             };
             Ok(ToolOutput::text(out))
         }
+        "current_time" => {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let secs = (ms / 1000) % 60;
+            Ok(ToolOutput::text(format!(
+                "{}:{:02}（{}），UTC+8，epoch 毫秒 {}",
+                crate::history::fmt_local(ms),
+                secs,
+                crate::history::weekday_cn(ms),
+                ms
+            )))
+        }
         "remember" => remember(args, ctx.data_dir),
         "ask_user" => ask_user(args, ctx).await,
         "recall_turns" => recall_turns(args, ctx),
@@ -725,6 +780,20 @@ pub async fn execute(
             let overwrite = args.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
             let msg = crate::skills::save(ctx.data_dir, &name, &desc, &content, overwrite)?;
             Ok(ToolOutput::text(msg))
+        }
+        "search_tools" => {
+            // query 是可选参数：缺失 = 列全部（"我到底有什么工具"）。
+            // 这是**能力发现**入口，故意不产生任何副作用：不改活跃集、不弹权限卡，
+            // 模型可以放心多调几次 —— 一次 search 只回几十行文本，比
+            // load_tool_group 试探便宜两个数量级。
+            let q = args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let reg = ctx.mcp.lock().await;
+            eprintln!("[orbcat] search_tools: {q:?}");
+            Ok(ToolOutput::text(reg.search_tools(&q)))
         }
         "list_tool_groups" => {
             let reg = ctx.mcp.lock().await;
@@ -752,9 +821,12 @@ pub async fn execute(
                     .iter()
                     .any(|t| t.name.ends_with(&tool));
                 if !loaded {
+                    // 默认配置下所有组都直接给模型，走到这里通常意味着：
+                    // 用户把这组关掉了（MCP 设置页的「给模型」开关），或组名对不上。
                     return Err(format!(
-                        "工具「{other}」所属的组尚未加载，请先用 list_tool_groups 查看、\
-                         再用 load_tool_group 加载对应组。"
+                        "工具「{other}」所属的组当前**未启用**。\
+                         去设置 › MCP 外部工具 把该组的「给模型」打开（或用 load_tool_group 加载），\
+                         再重试；也可以用 list_tool_groups 看当前有哪些组可用。"
                     ));
                 }
                 drop(reg);
@@ -800,13 +872,28 @@ fn tool_with_server(full: &str) -> String {
 // recall_turns
 // ---------------------------------------------------------------------------
 
-/// 查本会话更早的对话原文。
+/// 查更早的对话原文。
 ///
 /// 为什么需要它：`history.rs` 只回灌「最近 6h ∪ 最近 10 条」，
 /// 更早的内容不在上下文里。没有这个工具，模型遇到"上次那个方案"
 /// 只能瞎编或反问用户。原文**永久**留在 `sessions/<id>.json`，这里负责捞回来。
 ///
-/// 范围**只限当前会话**：跨会话检索是独立功能（"从主聊天起任务"才需要）。
+/// ## 范围：默认只查当前会话（`scope=session`）
+///
+/// 跨会话检索（`scope=all`）**必须由模型显式要求**，理由有两条：
+///   1. **成本**：单会话只读一个文件；跨会话要遍历 `sessions/*.json`
+///      （实测 31 个 / 10.2 MB），而本函数是同步执行的，会占住 tokio 工作线程；
+///   2. **上下文污染**：别的会话聊的是别的事，把它们灌进当前上下文会让模型
+///      把两个话题搅在一起 —— 那是"答错"而不是"答慢"，代价更高。
+/// 所以默认值是保守的一侧，激进的一侧要模型自己开口（见 system prompt 的
+/// 「# 对话历史」段：加了能力不回写提示词，工具就等于摆设）。
+///
+/// ## 为什么要走权限网关
+///
+/// `sessions/` 在 `agent-data/` 内，读它跟读技能目录、读普通文件是同一种行为，
+/// 所以走同一个出口（同 `load_skill` 的纪律）。理由不只是"守规矩"：
+/// 用户可能在设置里把 `agent-data` 从权限规则里删掉（比如把数据目录挪到别处），
+/// 那时**所有**文件工具都该一致地拒绝，而不是这里留一个不检查的裸读后门。
 fn recall_turns(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     if ctx.session_id.is_empty() {
         return Ok(ToolOutput::text("当前没有会话上下文，无法查找历史。"));
@@ -823,18 +910,113 @@ fn recall_turns(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
         .map(|n| n.clamp(1, 50) as usize)
         .unwrap_or(10);
     let hours = args.get("hours").and_then(Value::as_u64);
+    // 只认字面量 "all"：写错、写成大写、留空都落回默认的当前会话。
+    // 保守方向是对的 —— 认错了最多是"没查到，再调一次"，认反了就是污染上下文。
+    let all = matches!(
+        args.get("scope").and_then(Value::as_str).map(str::trim),
+        Some("all")
+    );
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    let hits = crate::history::search(ctx.data_dir, ctx.session_id, &query, limit, hours, now);
+    if !all {
+        return recall_in_session(ctx, &query, limit, hours, now);
+    }
+
+    // 跨会话：先过权限网关再读目录，与 `load_skill` 同一写法。
+    if let Err(e) = authorize(ctx, crate::sessions::sessions_dir(ctx.data_dir), Access::Read) {
+        return Err(format!("会话目录无读取权限，无法跨会话检索：{e}"));
+    }
+
+    let scan = crate::history::search_all_sessions(
+        ctx.data_dir,
+        &query,
+        limit,
+        hours,
+        now,
+        crate::history::CROSS_SESSION_MAX_FILES,
+        crate::history::CROSS_SESSION_MAX_BYTES,
+    );
+    let hits = &scan.hits;
+
+    let scope_desc = if query.is_empty() {
+        "最近聊过的".to_string()
+    } else {
+        format!("含「{query}」的")
+    };
+
+    if hits.is_empty() {
+        // 「没找到」和「没查完」是两回事：前者可以让模型换个关键词，
+        // 后者只说明预算用完了 —— 不说清楚，模型会把"扫描被截断"
+        // 当成"库里确实没有"，然后对着用户打包票说"没这回事"。
+        return Ok(ToolOutput::text(format!(
+            "在所有会话里都没找到{what}记录（本次扫了 {n} 个会话{extra}）。\n{hint}",
+            what = if query.is_empty() {
+                String::new()
+            } else {
+                format!("含「{query}」的")
+            },
+            n = scan.scanned,
+            extra = if scan.truncated { "，已达扫描上限" } else { "" },
+            hint = if scan.truncated {
+                "注意：**还有更早的会话没查**（本次扫描到达上限）—— 这不等于「没有」。\
+                 请换更具体的关键词（人名 / 项目名 / 报错原文）再试，\
+                 或让用户说清大概是哪一次。"
+            } else {
+                "可能原因：关键词不对，或确实没聊过这个话题。\
+                 可以试着换个关键词，或不传 query 翻一下最近的记录。"
+            }
+        )));
+    }
+
+    let mut out = format!(
+        "在**所有会话**（含当前会话）里找到 {} 条{}记录，按时间倒序：\n",
+        hits.len(),
+        scope_desc
+    );
+    for (i, sh) in hits.iter().enumerate() {
+        let who = if sh.hit.role == "user" { "用户" } else { "你" };
+        // 来源标识挨着说话人放；时间已经含在来源里，不再重复第二遍时间。
+        out.push_str(&format!(
+            // 序号用命名参数 `{n}`：写成 `{}.` + `i + 1` 时，若同时把别的参数
+            // 写成 `idx = ...` 形式，rustc 会警告 `named argument idx is not
+            // used by name`（名字没在格式串里用到）—— 命名与位置参数不要混用。
+            "\n{n}. [{who} · {src}] {text}\n",
+            n = i + 1,
+            src = sh.source,
+            text = sh.hit.text
+        ));
+    }
+    out.push_str(&format!(
+        "\n（以上是历史记录的节选，工具输出已在落盘时折叠成一行。\
+         本次扫了 {scanned} 个会话{extra}。\
+         **注意：这些内容来自其他会话，不是你当前上下文的一部分** —— \
+         引用时要说明「这是在会话《…》里做的」，不要把它当成当前会话里说过的话。）",
+        scanned = scan.scanned,
+        extra = if scan.truncated { "（已达上限，更早的没查）" } else { "" },
+    ));
+
+    Ok(ToolOutput::text(out))
+}
+
+/// `scope=session`（默认）：只查当前会话。行为与加 `scope` 参数之前**完全一致**。
+fn recall_in_session(
+    ctx: &ToolCtx<'_>,
+    query: &str,
+    limit: usize,
+    hours: Option<u64>,
+    now: u64,
+) -> Result<ToolOutput, String> {
+    let hits = crate::history::search(ctx.data_dir, ctx.session_id, query, limit, hours, now);
 
     if hits.is_empty() {
         return Ok(ToolOutput::text(format!(
             "没找到匹配的对话记录{}。\n可能原因：关键词不对，或本会话确实没聊过这个话题。\n\
-             可以试着换个关键词，或不传 query 翻一下最近的记录。",
+             可以试着换个关键词，或不传 query 翻一下最近的记录。\n\
+             （如果这是**别处**（其他会话）聊过的事，用 scope=all 跨会话再查一次。）",
             if query.is_empty() {
                 String::new()
             } else {
@@ -1308,20 +1490,19 @@ fn now_ms() -> u128 {
 }
 
 /// 写/改前备份到 `agent-data/backups/`。原文件不存在则不备份，返回空说明。
+///
+/// ⚠️ 2026-09-30 起实现搬到 [`crate::recovery`]：原来的版本只把副本命名为
+/// `{时间戳}__{文件名}`，**不记原路径** —— 于是 210 个备份都还原不回去
+/// （谁知道那个 `README.md` 原来在哪个目录）。现在每次都写
+/// `backups.jsonl`（原路径 / 时间 / 大小），设置页也能列出并一键还原。
 fn backup_file(data_dir: &Path, path: &Path) -> Result<String, String> {
-    if !path.exists() {
-        return Ok(String::new());
+    match crate::recovery::backup_file(data_dir, path)? {
+        Some(rec) => Ok(format!(
+            "\n（原文件已备份到 {}，可从设置 › 备份与回收站还原）",
+            rec.backup
+        )),
+        None => Ok(String::new()),
     }
-    let backup_dir = data_dir.join("backups");
-    std::fs::create_dir_all(&backup_dir).map_err(|e| format!("建备份目录失败: {e}"))?;
-
-    let stem = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".into());
-    let backup = backup_dir.join(format!("{}__{stem}", now_ms()));
-    std::fs::copy(path, &backup).map_err(|e| format!("备份失败: {e}"))?;
-    Ok(format!("\n（原文件已备份到 {}）", backup.display()))
 }
 
 fn write_file(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
@@ -1780,7 +1961,7 @@ fn delete_file(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
         "已归档（**非硬删除**）→ {}\n\
          原路径：{}\n\
          受影响文件约 {} 个：\n{listing}\
-         还原：把归档路径 move 回原路径即可（记录见 {}）。\n\
+         还原：设置 › 备份与回收站 → 回收站，点「还原」即可（记录见 {}）。\n\
          ⚠️ agent 永远只归档到 .trash/，不会硬删除。若需物理删除，请用户自行执行。",
         dest.display(),
         safe_path.display(),
@@ -2197,14 +2378,36 @@ async fn run_command(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Stri
     }
 
     // ---- 执行 ----
-    let tick = ctx.tick.clone();
-    let cancel = ctx.cancel.clone();
-    let out = match crate::shell::run_powershell_tick(&cmd, &cwd, timeout_secs, tick, cancel).await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            audit_cmd(ctx, &cmd, &norm, &cwd, "error", &source, risk, None);
-            return Err(format!("执行失败：{e}"));
+    //
+    // 两条路，取决于「后台桌面」开关（`win32desk::is_enabled`）：
+    //   · 普通：用户桌面上跑，有心跳 + 取消（默认，行为与以前完全一致）
+    //   · 后台：隐形桌面上跑 —— 应用自己弹的窗口不会闪到用户屏幕上、不抢焦点
+    //
+    // 为什么用进程级开关而不是 agent 模式：后台执行管的是"在哪儿跑"，
+    // 与模式管的"哪些工具可见"是正交的两个维度（用户拍板）。
+    #[cfg(windows)]
+    let use_bg_desk = crate::win32desk::is_enabled();
+    #[cfg(not(windows))]
+    let use_bg_desk = false;
+
+    let out = if use_bg_desk {
+        eprintln!("[orbcat] run_command 走隐形桌面：{}", cmd.chars().take(80).collect::<String>());
+        match crate::shell::run_on_desktop(&cmd, &cwd, timeout_secs).await {
+            Ok(o) => o,
+            Err(e) => {
+                audit_cmd(ctx, &cmd, &norm, &cwd, "error", &source, risk, None);
+                return Err(format!("后台桌面执行失败：{e}"));
+            }
+        }
+    } else {
+        let tick = ctx.tick.clone();
+        let cancel = ctx.cancel.clone();
+        match crate::shell::run_powershell_tick(&cmd, &cwd, timeout_secs, tick, cancel).await {
+            Ok(o) => o,
+            Err(e) => {
+                audit_cmd(ctx, &cmd, &norm, &cwd, "error", &source, risk, None);
+                return Err(format!("执行失败：{e}"));
+            }
         }
     };
 
@@ -2346,7 +2549,7 @@ fn format_command_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::ToolRegistry;
+    use crate::mcp::{McpTool, ToolRegistry};
     use crate::permission::PermissionGate;
 
     fn gate_for(dir: &Path) -> PermissionGate {
@@ -2410,6 +2613,8 @@ mod tests {
         assert!(names.contains(&"list_tool_groups"));
         assert!(names.contains(&"load_tool_group"));
         assert!(names.contains(&"unload_tool_group"));
+        // 能力发现入口：必须在（否则模型只能靠猜组名做发现，见 mcp.rs 的索引注释）
+        assert!(names.contains(&"search_tools"), "缺 search_tools：能力发现不能退化回猜测");
     }
 
     #[test]
@@ -2523,8 +2728,8 @@ mod tests {
         .await;
         assert!(r.is_err());
         assert!(
-            r.unwrap_err().contains("尚未加载"),
-            "应提示先加载组"
+            r.unwrap_err().contains("未启用"),
+            "应提示该组未启用（默认全给后，未启用=用户关掉了）"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2602,6 +2807,325 @@ mod tests {
         );
     }
 
+    // ---------------- recall_turns：跨会话（scope=all） ----------------
+
+    /// 造一条**可控时间戳**的会话并落盘。
+    ///
+    /// 为什么要手搓时间戳而不用 `append_turn`（它只用"现在"）：跨会话检索的
+    /// 核心是**按时间合并多个会话**，没有可控的时间就没法断言"倒序"这件事。
+    fn write_session_at(
+        dir: &Path,
+        id: &str,
+        title: &str,
+        updated_at: u64,
+        msgs: &[(&str, &str, u64)],
+    ) {
+        let s = crate::sessions::Session {
+            id: id.to_string(),
+            title: title.to_string(),
+            created_at: updated_at,
+            updated_at,
+            messages: msgs
+                .iter()
+                .map(|(role, text, at)| crate::sessions::StoredMessage {
+                    role: role.to_string(),
+                    text: text.to_string(),
+                    images: Vec::new(),
+                    steps: Vec::new(),
+                    reasoning: None,
+                    interrupted: false,
+                    partial: false,
+                    steer_id: None,
+                    model: None,
+                    usage: None,
+                    at: *at,
+                })
+                .collect(),
+            kind: crate::sessions::kind::TASK.to_string(),
+            forked_from: None,
+            fork_at: None,
+            summary: None,
+            summary_upto: None,
+            last_prompt_tokens: None,
+            token_scale: None,
+        };
+        crate::sessions::save(dir, &s).unwrap();
+    }
+
+    /// 跨会话检索的**主不变量**：默认不跨、显式才跨，跨了必须带来源。
+    ///
+    /// 守住三件事，每一件都是"默认只查当前会话"这条设计决策的一部分：
+    ///   ① 不传 scope 时，别的会话聊过的东西**一个字都不能带出来**
+    ///      （否则等于默认就把别的话题灌进上下文）；
+    ///   ② `scope=all` 时要能查到，且必须标出**是哪个会话**说的
+    ///      （不标来源，模型会把别的会话的内容当成当前上下文）；
+    ///   ③ 判定用**精确匹配**：文件名里带有 `scope=all` 只是为了让"误把
+    ///      grants 文件当会话读"这类错误一眼可见，不代表断言依赖文件名。
+    #[tokio::test]
+    async fn recall_turns_scope_all_searches_other_sessions() {
+        let tmp = fresh_tmp("recall_scope_all");
+        let gate = gate_for(&tmp);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let now = crate::sessions::now_ms();
+
+        write_session_at(
+            &tmp,
+            "cur1",
+            "当前会话",
+            now,
+            &[("user", "今天聊聊天气", now - 60_000)],
+        );
+        write_session_at(
+            &tmp,
+            "old2",
+            "编译加速那次的会话",
+            now - 3_600_000,
+            &[
+                ("user", "cargo 构建要 8 分钟太慢了", now - 3_600_000),
+                (
+                    "assistant",
+                    "真相在这里：开了 sccache 之后构建降到 90 秒",
+                    now - 3_590_000,
+                ),
+            ],
+        );
+
+        // ① 默认（scope=session）：别的会话的内容一个字都不该出现。
+        //
+        // ⚠️ 断言盯的是**别的会话正文里的那句话**，不是关键词本身：
+        //    `recall_in_session` 的"没找到"提示会把关键词原样回显
+        //    （`（关键词：sccache）`），拿关键词当"泄漏探测器"会误报。
+        let out = execute(
+            "recall_turns",
+            &json!({ "query": "sccache" }),
+            &ctx_with_session!(gate, &tmp, mcp, "cur1"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !out.text.contains("真相在这里"),
+            "默认不该跨会话（别的会话的正文泄漏了）: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("scope=all"),
+            "当前会话没命中时要提示还能跨会话查（否则模型不知道有这个能力）: {}",
+            out.text
+        );
+
+        // ② scope=all：能查到，且带来源标识。
+        //    断言盯的是**别的会话正文里的那句话**（不是关键词 —— 关键词在查询里
+        //    本来就出现过，拿它当命中证据等于什么都没测）。
+        let out = execute(
+            "recall_turns",
+            &json!({ "query": "sccache", "scope": "all" }),
+            &ctx_with_session!(gate, &tmp, mcp, "cur1"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.text.contains("真相在这里"),
+            "scope=all 应跨会话命中别的会话的正文: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("编译加速那次的会话"),
+            "必须标出来自哪个会话: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("来自其他会话"),
+            "必须提醒模型那些内容不属于当前上下文: {}",
+            out.text
+        );
+        // 命中只在别的会话里 —— 当前会话的"天气"不该被无关地捎带出来
+        assert!(!out.text.contains("天气"), "不该带出无关内容: {}", out.text);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 跨会话结果必须按**时间倒序**（跨会话合并后最容易被写成"按文件顺序"）。
+    #[tokio::test]
+    async fn recall_turns_scope_all_orders_hits_by_time_desc() {
+        let tmp = fresh_tmp("recall_scope_order");
+        let gate = gate_for(&tmp);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let now = crate::sessions::now_ms();
+
+        write_session_at(
+            &tmp,
+            "newA",
+            "最近的会话",
+            now - 60_000,
+            &[("user", "锚点词 新", now - 60_000)],
+        );
+        write_session_at(
+            &tmp,
+            "oldB",
+            "很久以前的会话",
+            now - 86_400_000,
+            &[("user", "锚点词 旧", now - 86_400_000)],
+        );
+
+        let out = execute(
+            "recall_turns",
+            &json!({ "query": "锚点词", "scope": "all" }),
+            &ctx_with_session!(gate, &tmp, mcp, "newA"),
+        )
+        .await
+        .unwrap();
+        let new_at = out.text.find("锚点词 新").expect("应命中新会话");
+        let old_at = out.text.find("锚点词 旧").expect("应命中旧会话");
+        assert!(
+            new_at < old_at,
+            "跨会话结果必须按时间倒序（新的在前）: {}",
+            out.text
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 扫描上限：字节预算耗尽时**如实说"没查完"**，不能报成"没这回事"。
+    ///
+    /// 这是上限存在的意义所在：宁可说"还有更早的会话没查"，
+    /// 也不能让模型拿着半截扫描结果对用户打包票。
+    #[test]
+    fn cross_session_scan_reports_truncation_when_budget_exhausted() {
+        let tmp = fresh_tmp("recall_scan_budget");
+        let now = crate::sessions::now_ms();
+        write_session_at(&tmp, "s1", "会话一", now, &[("user", "内容", now - 1000)]);
+
+        // 预算给 0 字节 → 一个会话都读不了，且必须标成 truncated
+        let scan = crate::history::search_all_sessions(&tmp, "内容", 10, None, now, 40, 0);
+        assert!(scan.hits.is_empty(), "预算为 0 时不该有命中");
+        assert_eq!(scan.scanned, 0, "预算为 0 时一个文件都不该读");
+        assert!(scan.truncated, "预算耗尽必须标成 truncated（还有没查的）");
+
+        // 文件数上限为 1、但有 2 个会话 → 同样算 truncated
+        write_session_at(&tmp, "s2", "会话二", now, &[("user", "内容", now - 1000)]);
+        let scan =
+            crate::history::search_all_sessions(&tmp, "内容", 10, None, now, 1, u64::MAX);
+        assert_eq!(scan.scanned, 1, "文件数上限应生效");
+        assert!(scan.truncated, "目录里还有会话没扫，必须标成 truncated");
+
+        // 上限足够时不该谎报 truncated
+        let scan =
+            crate::history::search_all_sessions(&tmp, "内容", 10, None, now, 40, u64::MAX);
+        assert_eq!(scan.scanned, 2, "上限足够时应扫完全部会话");
+        assert!(!scan.truncated, "没超限不该标 truncated");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 跨会话扫描**不能把 `*.grants.json` 当会话读**。
+    ///
+    /// `sessions/<id>.grants.json` 与会话平级存放，里面是临时授权。
+    /// 复用 `sessions::list()` 就自动躲开了这个坑（见 `is_grants_file`）；
+    /// 这个测试是钉住那份复用的 —— 以后谁改成自己 read_dir，
+    /// grants 文件会混进来（最多是解析失败被跳过，于是错误悄无声息）。
+    #[test]
+    fn cross_session_scan_skips_grants_files() {
+        let tmp = fresh_tmp("recall_scan_grants");
+        let now = crate::sessions::now_ms();
+        write_session_at(&tmp, "s1", "真会话", now, &[("user", "独特词zzz", now - 1000)]);
+
+        // 平级放一个 grants 文件（名字与会话同构，只有后缀不同）
+        let g = crate::sessions::sessions_dir(&tmp).join("s1.grants.json");
+        std::fs::write(&g, "{\"grants\":[]}").unwrap();
+
+        let scan = crate::history::search_all_sessions(&tmp, "", 10, None, now, 40, u64::MAX);
+        assert_eq!(scan.scanned, 1, "grants 文件不该被当成会话扫描");
+        assert_eq!(scan.hits.len(), 1, "只该有真会话里的那一条");
+        assert!(scan.hits[0].hit.text.contains("独特词zzz"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 跨会话检索必须走**文件权限网关** —— 没权限时要拒绝，而不是裸读。
+    ///
+    /// 同 `load_skill` 的纪律：`sessions/` 在 `agent-data/` 内，读它和读别处
+    /// 是同一种行为，不能因为"是程序自己的目录"就留一个不检查的后门
+    /// （用户可能把数据目录挪走、或从权限规则里删掉它）。
+    #[tokio::test]
+    async fn recall_turns_scope_all_needs_read_permission() {
+        // ⚠️ 这里**不用** `gate_for(&tmp)`：那条规则把 tmp 整个授了 Full，
+        //    连它的父目录都够不着，测不出"没权限"的情形。
+        let tmp = fresh_tmp("recall_scope_perm");
+        let data = tmp.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+
+        // ① data 目录**没有任何规则** → 必须被拒
+        let gate = PermissionGate::new();
+        let r = execute(
+            "recall_turns",
+            &json!({ "query": "x", "scope": "all" }),
+            &ctx_with_session!(gate, &data, mcp, "sid"),
+        )
+        .await;
+        let err = r.expect_err("无权限时必须拒绝跨会话检索");
+        assert!(
+            err.contains("无读取权限"),
+            "拒绝理由要能读懂（还要能引导模型申请权限）: {err}"
+        );
+
+        // ② 只给 data 目录 Read → 放行（scope=all 只需要读）
+        let mut gate2 = PermissionGate::new();
+        gate2.add_rule(&data, Access::Read, "test");
+        let out = execute(
+            "recall_turns",
+            &json!({ "query": "x", "scope": "all" }),
+            &ctx_with_session!(gate2, &data, mcp, "sid"),
+        )
+        .await
+        .expect("只读权限足够跨会话检索");
+        assert!(out.text.contains("没找到"), "空库应友好提示: {}", out.text);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 工具 schema 里 `scope` 必须存在、默认值必须是 `session`、且向模型说清了要显式选 all。
+    ///
+    /// 为什么把"默认"当不变量测：`scope` 的默认值是**安全属性**而不是功能属性 ——
+    /// 默认翻成 `all` 会让每次 recall_turns 都去遍历整个会话目录并把别的话题
+    /// 灌进上下文。schema 是模型唯一的说明书，写错了就等于默认值错了。
+    #[test]
+    fn recall_turns_spec_exposes_scope_with_session_default() {
+        let spec = builtin_specs()
+            .into_iter()
+            .find(|s| s.name == "recall_turns")
+            .expect("缺 recall_turns");
+        let props = &spec.parameters["properties"];
+        let scope = &props["scope"];
+        assert!(!scope.is_null(), "schema 必须暴露 scope: {}", spec.parameters);
+        let enums: Vec<&str> = scope["enum"]
+            .as_array()
+            .expect("scope 应是枚举")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(enums, vec!["session", "all"], "scope 取值只能是这两个");
+        assert!(
+            scope["description"]
+                .as_str()
+                .unwrap_or("")
+                .contains("默认"),
+            "schema 必须说明默认值（否则模型不知道不传 scope 是什么行为）"
+        );
+        assert!(
+            spec.description.contains("scope=all"),
+            "工具描述里必须提到跨会话能力，否则工具等于摆设: {}",
+            spec.description
+        );
+        // scope 不能是必填 —— 必填会破坏"旧调用照样能用"
+        let required = spec.parameters["required"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !required.iter().any(|v| v.as_str() == Some("scope")),
+            "scope 必须可选（保持向后兼容）"
+        );
+    }
+
     #[test]
     fn edit_and_delete_are_in_builtin_specs() {
         let names: Vec<String> = builtin_specs().into_iter().map(|s| s.name).collect();
@@ -2623,6 +3147,7 @@ mod tests {
     fn builtin_specs_contains_core_tools() {
         let names: Vec<String> = builtin_specs().into_iter().map(|s| s.name).collect();
         assert!(names.contains(&"load_skill".to_string()), "缺 load_skill");
+        assert!(names.contains(&"search_tools".to_string()), "缺 search_tools");
     }
 
     fn fresh_tmp(tag: &str) -> PathBuf {
@@ -2633,6 +3158,79 @@ mod tests {
         let d = std::env::temp_dir().join(format!("orbcat_{tag}_{stamp}"));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// `search_tools` 是**能力发现**入口，必须端到端可用：
+    /// 模型给一个意图词 → 拿到工具全名 + 一句话用途，且**不该**顺带塞进 schema。
+    ///
+    /// 同时断言它是**只读**的：搜完活跃集不能变（否则模型会拿它当 load 用，
+    /// 一次搜索就把整组 schema 拉进上下文，正好把懒加载的意义抵消掉）。
+    #[tokio::test]
+    async fn search_tools_finds_tool_by_intent_without_loading_group() {
+        let tmp = fresh_tmp("search_tools");
+        let gate = gate_for(&tmp);
+
+        let reg = ToolRegistry::from_tools_for_test(vec![
+            McpTool {
+                name: "github_1mcp_create_issue".into(),
+                description: "Create a new issue in a GitHub repository".into(),
+                input_schema: json!({"type":"object","properties":{"title":{"type":"string"}}}),
+                annotations: None,
+            },
+            McpTool {
+                name: "ssh_1mcp_run-command".into(),
+                description: "在远程主机上执行命令".into(),
+                input_schema: json!({"type":"object","properties":{}}),
+                annotations: None,
+            },
+        ]);
+        let mcp = tokio::sync::Mutex::new(reg);
+
+        // 命中：意图词 `issue` → 那条工具的全名与用途都在结果里
+        let hit = execute("search_tools", &json!({ "query": "issue" }), &ctx_for!(gate, &tmp, mcp))
+            .await
+            .unwrap();
+        assert!(hit.text.contains("mcp__github__create_issue"), "{}", hit.text);
+        assert!(hit.text.contains("Create a new issue"), "{}", hit.text);
+        // 🔴 名字必须是**能调通的**那个：1MCP 网关的原始名是
+        // `github_1mcp_create_issue`，直接拼会得到 `mcp__github__github_1mcp_create_issue`
+        // —— 一个不存在的工具名。模型照着它调只会拿到"未启用"错误，
+        // 而这是**搜索功能本身的失败**（搜了却调不动），最难被发现的那种。
+        assert!(
+            !hit.text.contains("github_1mcp_"),
+            "搜索必须剥离网关前缀，给出与 tools 列表一致的可调名: {}",
+            hit.text
+        );
+        // 不相干的那条不该被捞出来充数
+        assert!(!hit.text.contains("run-command"), "{}", hit.text);
+
+        // 空 query = 完整索引（模型在问"我到底有什么工具"）
+        let all = execute("search_tools", &json!({}), &ctx_for!(gate, &tmp, mcp))
+            .await
+            .unwrap();
+        assert!(all.text.contains("create_issue"));
+        assert!(all.text.contains("run-command"));
+        // 索引绝不含 schema —— 那是 load_tool_group 之后才该付的钱
+        assert!(!all.text.contains("input_schema"), "索引不得携带 schema");
+        assert!(!all.text.contains("\"properties\""), "索引不得携带 schema");
+
+        // 只读：搜完活跃集不变（未加载的组仍未加载）
+        assert!(
+            !mcp.lock().await.is_active("github"),
+            "search_tools 不许有加载副作用"
+        );
+
+        // 搜不到时给出可行动信息（可用组名），而不是干巴巴一句"没有"
+        let miss = execute(
+            "search_tools",
+            &json!({ "query": "zzzz-not-a-tool" }),
+            &ctx_for!(gate, &tmp, mcp),
+        )
+        .await
+        .unwrap();
+        assert!(miss.text.contains("github") && miss.text.contains("ssh"), "{}", miss.text);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]

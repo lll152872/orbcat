@@ -82,14 +82,6 @@ impl Risk {
             Risk::High => "high",
         }
     }
-
-    pub fn from_str(s: &str) -> Risk {
-        match s.to_ascii_lowercase().as_str() {
-            "high" | "高" => Risk::High,
-            "medium" | "中" => Risk::Medium,
-            _ => Risk::Low,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -209,14 +201,16 @@ const SHELL_SPAWNERS: &[&str] = &[
 const MAX_SHELL_DEPTH: usize = 4;
 
 /// 一段（复合命令拆出来的一个子命令）。
+///
+/// ⚠️ 2026-09-30 删掉了 `raw: String` 字段（原始片段"展示用"）：
+/// 它每次归一化都要多分配一次字符串，却**从没有任何读取点**。
+/// 判定与审计用的都是归一化结果（`exe` / `args`）与 `Normalized.raw` 之外的信息。
 #[derive(Debug, Clone)]
 pub struct Segment {
     /// 归一化后的命令名（别名已展开、小写）
     pub exe: String,
     /// 归一化后的参数（小写、缩写已展开）
     pub args: Vec<String>,
-    /// 原始片段（展示用）
-    pub raw: String,
 }
 
 impl Segment {
@@ -259,9 +253,13 @@ fn looks_like_path(s: &str) -> bool {
 }
 
 /// 归一化结果。
+///
+/// ⚠️ 2026-09-30 删掉了 `raw: String`：它保存整条原始命令，每次归一化都
+/// 复制一遍，却**没有任何读取点**（判定只看 `segments` / `obfuscated` /
+/// `encoded`）。原始命令在调用方本来就还在手上，要展示直接用它，
+/// 不必在这里留第二份。
 #[derive(Debug, Clone)]
 pub struct Normalized {
-    pub raw: String,
     pub segments: Vec<Segment>,
     /// 归一化是否**不可信**（检测到混淆/动态解析）→ 必须降级为确认
     pub obfuscated: bool,
@@ -296,7 +294,6 @@ pub fn normalize(raw: &str) -> Normalized {
     // ① `-EncodedCommand` —— base64 UTF-16LE，文本匹配完全失效 → 直接标记硬阻断
     if contains_encoded_command(raw_trim) {
         return Normalized {
-            raw: raw.to_string(),
             segments: Vec::new(),
             obfuscated: true,
             obfuscation: Some("EncodedCommand（base64 编码命令，无法审查）".into()),
@@ -317,7 +314,6 @@ pub fn normalize(raw: &str) -> Normalized {
     }
 
     Normalized {
-        raw: raw.to_string(),
         segments,
         obfuscated: obfuscation.is_some(),
         obfuscation,
@@ -474,7 +470,6 @@ fn parse_segment(part: &str) -> Option<Segment> {
         return None;
     }
 
-    let raw = part.to_string();
     let mut it = tokens.into_iter();
 
     let mut exe = it.next().unwrap_or_default().to_ascii_lowercase();
@@ -490,7 +485,7 @@ fn parse_segment(part: &str) -> Option<Segment> {
         args.push(expand_param(&lower));
     }
 
-    Some(Segment { exe, args, raw })
+    Some(Segment { exe, args })
 }
 
 fn expand_alias(name: &str) -> String {
@@ -1024,6 +1019,9 @@ impl CmdGrantStore {
         &self.grants
     }
 
+    /// 是否没有任何授权。**仅供测试** —— 生产侧读 [`grants`](Self::grants)
+    /// 自己判空即可，不必多一个包装。
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.grants.is_empty()
     }

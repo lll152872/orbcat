@@ -141,6 +141,19 @@ pub fn bootstrap_agent_data(data_dir: &Path) -> Result<BootstrapReport, String> 
         created_files.push("settings.json".into());
     }
 
+    // ── 三之二、modes.json（agent 模式定义）──────────────────────
+    // 为什么要落盘而不是"不存在就用内置"：文件不存在时用户**看不见**有这么个东西，
+    // 也就不会想到可以改它。落一份带说明的模板，才是"可发现、可改"。
+    // 与其它文件同一条铁律：**已存在一律不覆盖**（用户改过的东西不能被升级冲掉）。
+    let modes_file = data_dir.join(crate::modes::MODES_FILE);
+    if modes_file.exists() {
+        skipped.push(crate::modes::MODES_FILE.into());
+    } else {
+        std::fs::write(&modes_file, crate::modes::default_file_text())
+            .map_err(|e| format!("写入 {} 失败: {e}", modes_file.display()))?;
+        created_files.push(crate::modes::MODES_FILE.into());
+    }
+
     // ── 四、说明性文件（骨架，不覆盖）────────────────────────────
     // 这几个是「给未来的 agent 和用户看的格式说明」，不是人格文件。
     // 人格文件（RULES/SOUL/IDENTITY/USER）故意**不在这里建**：
@@ -440,8 +453,14 @@ mod tests {
         assert!(r.created_files.is_empty(), "不该重复写文件");
         assert_eq!(
             r.skipped.len(),
-            20,
-            "8 目录 + 6 骨架文件 + 6 内置技能文件 应全跳过: {:?}",
+            21,
+            "8 目录 + 7 骨架/配置文件 + 6 内置技能文件 应全跳过: {:?}",
+            r.skipped
+        );
+        // 用户改过的模式定义同样不能被覆盖（与 settings.json 同一条铁律）
+        assert!(
+            r.skipped.iter().any(|s| s == "modes.json"),
+            "modes.json 应进跳过列表: {:?}",
             r.skipped
         );
 
@@ -455,6 +474,33 @@ mod tests {
             "{\"selectedModel\":\"x\"}",
             "已有设置不能被覆盖"
         );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 初始化要落一份**可发现、可改**的 `modes.json`。
+    ///
+    /// 为什么这条必须有：模式定义如果只活在二进制里，用户根本不知道有这回事，
+    /// 也就永远不会想到"我可以加一个自己的模式"。
+    #[test]
+    fn creates_modes_json_with_four_builtin_modes() {
+        let d = tmp("modes");
+        bootstrap_agent_data(&d).expect("初始化应成功");
+
+        let p = d.join("modes.json");
+        assert!(p.exists(), "初始化应写出 modes.json");
+        let modes = crate::modes::load(&d);
+        let ids: Vec<&str> = modes.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["standard", "ptc", "minimal", "creator"]);
+        // 写出来的文件必须是**能解析回来**的（注释块不能把它弄坏）
+        assert!(modes.iter().any(|m| m.id == "ptc" && m.allows_all()));
+
+        // 用户改过之后，二次初始化不许覆盖
+        std::fs::write(&p, r#"{"modes":[{"id":"mine","name":"我的","description":"x","mcpGroupsPreload":[]}]}"#)
+            .unwrap();
+        let r = bootstrap_agent_data(&d).expect("二次初始化应成功");
+        assert!(r.skipped.iter().any(|s| s == "modes.json"));
+        assert_eq!(crate::modes::load(&d).len(), 1, "用户改过的模式定义不能被覆盖");
 
         let _ = std::fs::remove_dir_all(&d);
     }

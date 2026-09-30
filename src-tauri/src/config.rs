@@ -310,8 +310,12 @@ pub fn load_models(data_dir: &Path) -> Result<Vec<ModelConfig>, String> {
 
 /// 批量导入远端模型列表里的若干 id。
 ///
-/// 共用 `source` 的 url / apiKey / headers。**显示名冲突时跳过**（不覆盖）。
-/// 返回 `(added, skipped)`。
+/// 共用 `source` 的 url / apiKey / headers。
+///
+/// **身份 = (Base URL, 接口 id)**：同源同 id 才算「已配置」→ 跳过；
+/// 不同源的同一个 `model`（官方 vs 火山 vs 本地网关）**各自独立入库**。
+/// 显示名（唯一键）被别的来源占用时自动加主机后缀，避免覆盖。
+/// 返回 `(added, skipped)` —— 均为最终**显示名**。
 pub fn import_models_from_source(
     data_dir: &Path,
     source: &ModelConfig,
@@ -321,7 +325,8 @@ pub fn import_models_from_source(
     context_lengths: &std::collections::HashMap<String, u64>,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let mut all = load_models(data_dir)?;
-    let existing: std::collections::HashSet<String> = all.iter().map(|m| m.name.clone()).collect();
+    let src_url = url_key(&source.url);
+    let src_host = short_host(&source.url);
     let mut added = Vec::new();
     let mut skipped = Vec::new();
 
@@ -330,10 +335,23 @@ pub fn import_models_from_source(
         if id.is_empty() {
             continue;
         }
-        // 显示名默认 = 接口 id；已占用则跳过（要两条同接口 id 请手动改显示名）
-        if existing.contains(id) {
+        // 身份 = (Base URL, 接口 id)：同源同 id 才跳过
+        if all
+            .iter()
+            .any(|m| m.id == id && url_key(&m.url) == src_url)
+        {
             skipped.push(id.to_string());
             continue;
+        }
+        // 显示名默认 = 接口 id；被**其它来源**占用则加主机后缀（同名不同源 = 两条）
+        let mut display = id.to_string();
+        if all.iter().any(|m| m.name == display) {
+            display = format!("{id} · {src_host}");
+            let mut n = 2;
+            while all.iter().any(|m| m.name == display) {
+                display = format!("{id} · {src_host} #{n}");
+                n += 1;
+            }
         }
         let vendor = if source.vendor.trim().is_empty() {
             "Custom".to_string()
@@ -343,7 +361,7 @@ pub fn import_models_from_source(
         let max_input = context_lengths.get(id).copied().or(source.max_input_tokens);
         all.push(ModelConfig {
             id: id.to_string(),
-            name: id.to_string(),
+            name: display.clone(),
             vendor,
             url: source.url.clone(),
             api_key: source.api_key.clone(),
@@ -353,7 +371,7 @@ pub fn import_models_from_source(
             max_output_tokens: source.max_output_tokens,
             headers: source.headers.clone(),
         });
-        added.push(id.to_string());
+        added.push(display);
     }
 
     if !added.is_empty() {
@@ -498,13 +516,56 @@ impl From<&ModelConfig> for ModelEditView {
     }
 }
 
-/// 按 **显示名** 找模型（显示名唯一；接口 id 可重复）
-pub fn find_model(data_dir: &Path, name: &str) -> Result<ModelConfig, String> {
+/// 按 **显示名优先、接口 id 兜底** 找模型。
+///
+/// 为什么要分两轮：接口 `id` 允许多条重复（同一个 `model` 经不同 Base URL
+/// 是两条独立配置）。若用 `name == key || id == key` 一次遍历，命中的是
+/// **第一条**，于是「点选手列表里的 `glm-5.3-flash`」会误开另一个同 id
+/// 条目的编辑表单。显示名是唯一键，必须先精确匹配显示名。
+pub fn find_model(data_dir: &Path, key: &str) -> Result<ModelConfig, String> {
     let models = load_models(data_dir)?;
+    if let Some(m) = models.iter().find(|m| m.name == key) {
+        return Ok(m.clone());
+    }
     models
         .into_iter()
-        .find(|m| m.name == name || (m.name.is_empty() && m.id == name))
-        .ok_or_else(|| format!("找不到模型「{name}」"))
+        .find(|m| m.id == key)
+        .ok_or_else(|| format!("找不到模型「{key}」"))
+}
+
+/// URL 归一化比较键：去空白、去尾斜杠、转小写。
+/// **只用于比较**，不写回配置（原值保留用户的写法）。
+pub fn url_key(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_lowercase()
+}
+
+/// 只取主机名（分组展示 / 显示名去重用）。
+pub fn short_host(url: &str) -> String {
+    let u = url.trim();
+    let rest = u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"))
+        .unwrap_or(u);
+    let host = rest.split('/').next().unwrap_or(rest);
+    host.rsplit('@').next().unwrap_or(host).to_string()
+}
+
+/// 按 **Base URL + 接口 id** 找模型 —— 这才是「已配置」的真正身份。
+///
+/// 显示名只是展示用；同一个 `model` 从不同 Base URL 拉进来应当**共存**。
+///
+/// ⚠️ **仅供测试**（2026-09-30 标注）：目前 UI 的"当前模型"身份键是
+/// **显示名**（`settings.selectedModel` 存的是 name，见 `find_model`），
+/// 所以生产路径不按 url+id 找。这个函数留在这是为了给"同 id 不同 url 应当共存"
+/// 这条不变量留一个可断言的入口 —— 它是设计意图的记录，不是遗漏的接线。
+#[cfg(test)]
+pub fn find_model_by_url_id(data_dir: &Path, url: &str, id: &str) -> Option<ModelConfig> {
+    let want_url = url_key(url);
+    let want_id = id.trim();
+    load_models(data_dir)
+        .ok()?
+        .into_iter()
+        .find(|m| m.id == want_id && url_key(&m.url) == want_url)
 }
 
 impl Default for ModelConfig {
@@ -611,6 +672,56 @@ pub struct AgentSettings {
     /// 参考 WorkBuddy 的 permission modes，但收窄到「命令执行」这一层。
     #[serde(default)]
     pub exec_trust: ExecTrust,
+    /// **MCP 工具组默认全体加载**（决策：不再按需注入）。
+    ///
+    /// 为什么改成默认全给：懒加载要求模型自己先 `list_tool_groups` 再
+    /// `load_tool_group`，多两步、还经常忘了——用户观感就是"工具明明配了却用不上"。
+    /// 现在改为直接全量塞进上下文，省掉这套仪式。
+    /// 设 false 才回到按需加载（保底开关，避免超大工具集撑爆小窗口模型）。
+    #[serde(default = "default_true")]
+    pub mcp_all_groups: bool,
+    /// MCP 组开关的**持久化记忆**（组名 → 是否启用）。
+    ///
+    /// 只有显式关过的组才会出现在这里（键存在且 false）；没记录的组按
+    /// [`mcp_all_groups`] 决定 —— 默认全开。
+    #[serde(default)]
+    pub mcp_group_enabled: std::collections::BTreeMap<String, bool>,
+    /// 模型分组的**显示名**（键 = Base URL）。默认取 host，用户可改。
+    #[serde(default)]
+    pub model_group_names: std::collections::BTreeMap<String, String>,
+    /// 「模型管理」独立窗口的尺寸（逻辑像素）。用户拖拽缩放后记回来，
+    /// 下次打开按这个尺寸弹 —— 改尺寸不需要重新编译。
+    #[serde(default)]
+    pub models_window: ModelsWindowCfg,
+    /// 当前 agent 模式 id（见 `modes.rs`）。**只决定哪些 MCP 组对模型可见**，
+    /// 不管内置工具集、也不管执行权限档位。
+    ///
+    /// 存 id 而不是显示名：`modes.json` 的名字是给用户看的、随时能改，
+    /// 存名字的话用户改个名就把当前模式改没了（`find_model` 存显示名那套
+    /// 是历史包袱，别照抄到这里）。
+    #[serde(default = "default_mode_id")]
+    pub active_mode: String,
+}
+
+/// 旧 `settings.json` 里没有 `activeMode` 时的默认值。
+/// 用函数而不是 `String::new()`：空串要靠 `modes::resolve` 兜底，
+/// 而"存的就是空"在 UI 上会显示成"没选模式"，不如直接写标准。
+fn default_mode_id() -> String {
+    crate::modes::DEFAULT_MODE_ID.to_string()
+}
+
+/// 「模型管理」独立窗口尺寸。默认 720×640；拖边缩放后写回 settings.json。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ModelsWindowCfg {
+    pub w: f64,
+    pub h: f64,
+}
+
+impl Default for ModelsWindowCfg {
+    fn default() -> Self {
+        Self { w: 720.0, h: 640.0 }
+    }
 }
 
 impl Default for AgentSettings {
@@ -622,6 +733,11 @@ impl Default for AgentSettings {
             quick_mode: false,
             active_project_id: None,
             exec_trust: ExecTrust::Ask,
+            mcp_all_groups: true,
+            mcp_group_enabled: Default::default(),
+            model_group_names: Default::default(),
+            models_window: Default::default(),
+            active_mode: default_mode_id(),
         }
     }
 }
@@ -739,14 +855,6 @@ pub fn save_mcp_servers(data_dir: &Path, servers: &[McpServerCfg]) -> Result<(),
     std::fs::write(&p, txt).map_err(|e| format!("写入 {} 失败: {e}", p.display()))
 }
 
-/// 兼容旧接口：解析「主」网关地址（第一个启用的）。
-pub fn resolve_mcp_url(data_dir: &Path) -> Option<String> {
-    resolve_mcp_servers(data_dir)
-        .into_iter()
-        .next()
-        .map(|s| s.url)
-}
-
 /// 兼容旧接口：设置单条 URL（覆盖成仅此一条）。
 pub fn save_mcp_url(data_dir: &Path, url: Option<&str>) -> Result<(), String> {
     let servers = match url {
@@ -788,6 +896,36 @@ pub fn save_settings(data_dir: &Path, s: &AgentSettings) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 老的 `settings.json`（没有 `activeMode`）必须能读，且默认落到标准模式。
+    ///
+    /// 为什么单独立一条：`agent-data/settings.json` 是用户手改过的文件，
+    /// 加了新字段后**绝不能**因为反序列化失败而整体退回默认值 ——
+    /// 那会把用户配好的模型/项目/权限全丢掉（`load_settings` 用的是
+    /// `.unwrap_or_default()`，解析失败是**静默**的，最容易出事的写法）。
+    #[test]
+    fn legacy_settings_without_active_mode_defaults_to_standard() {
+        let d = std::env::temp_dir().join(format!(
+            "orbcat_cfg_mode_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|x| x.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        // 模拟"上一个版本写出来的 settings.json"：有 selectedModel，没有 activeMode
+        std::fs::write(
+            settings_path(&d),
+            r#"{"selectedModel":"火山agent","execTrust":"full","mcpAllGroups":true}"#,
+        )
+        .unwrap();
+
+        let s = load_settings(&d);
+        assert_eq!(s.selected_model.as_deref(), Some("火山agent"), "老字段不能被丢掉");
+        assert_eq!(s.exec_trust, ExecTrust::Full);
+        assert_eq!(s.active_mode, "standard", "缺 activeMode 应默认标准模式");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn redact_hides_middle() {
@@ -1059,17 +1197,18 @@ mod tests {
         add_model(&dir, src.clone()).unwrap();
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("alpha".to_string(), 262_144u64);
+        // `src-model` 与来源**同 URL 同 id** → 已配置，跳过
         let (added, skipped) = import_models_from_source(
             &dir,
             &src,
-            &["alpha".into(), "Source".into(), "beta".into()],
+            &["alpha".into(), "src-model".into(), "beta".into()],
             true,
             true,
             &ctx,
         )
         .unwrap();
         assert_eq!(added, vec!["alpha", "beta"]);
-        assert_eq!(skipped, vec!["Source"], "已存在的显示名不得覆盖");
+        assert_eq!(skipped, vec!["src-model"], "同源同 id 不得重复入库");
         let a = find_model(&dir, "alpha").unwrap();
         assert_eq!(a.url, src.url);
         assert_eq!(a.api_key, src.api_key);
@@ -1083,6 +1222,116 @@ mod tests {
         // 没上报窗口的模型 → 回退来源配置（此处为 None）
         let b = find_model(&dir, "beta").unwrap();
         assert_eq!(b.max_input_tokens, None, "无 context_length 时保持来源值");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_api_id_from_different_urls_coexist() {
+        // 身份 = (Base URL, 接口 id)：官方 / 火山 / 本地反代可同时存在同一个 model
+        let dir = std::env::temp_dir().join(format!("fa-crossurl-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("models.json"), "[]").unwrap();
+        let ark = ModelConfig {
+            id: "glm-5.3-flash".into(),
+            name: "火山coding".into(),
+            url: "https://ark.cn-beijing.volces.com/api/coding/v3".into(),
+            api_key: "ark-x".into(),
+            ..Default::default()
+        };
+        add_model(&dir, ark.clone()).unwrap();
+
+        // 同源同 id → 跳过
+        let (added, skipped) = import_models_from_source(
+            &dir,
+            &ark,
+            &["glm-5.3-flash".into()],
+            true,
+            true,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        assert!(added.is_empty());
+        assert_eq!(skipped, vec!["glm-5.3-flash"]);
+
+        // 换来源（本地 trae 反代）同 id → **允许入库**
+        let trae = ModelConfig {
+            id: "__probe__".into(),
+            name: String::new(),
+            url: "http://127.0.0.1:8790/v1".into(),
+            ..Default::default()
+        };
+        let (added, skipped) = import_models_from_source(
+            &dir,
+            &trae,
+            &["glm-5.3-flash".into()],
+            true,
+            true,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "不同来源不算已配置：{skipped:?}");
+        assert_eq!(added, vec!["glm-5.3-flash"]);
+        assert_eq!(load_models(&dir).unwrap().len(), 2, "同 model 不同 URL 应共存");
+        let t = find_model_by_url_id(&dir, "http://127.0.0.1:8790/v1", "glm-5.3-flash").unwrap();
+        assert_eq!(t.url, "http://127.0.0.1:8790/v1");
+
+        // 第三个来源同 id 且显示名已被占用 → 自动加主机后缀，不覆盖
+        let cline = ModelConfig {
+            id: "__probe__".into(),
+            name: String::new(),
+            url: "http://127.0.0.1:8789/v1".into(),
+            ..Default::default()
+        };
+        let (added, skipped) = import_models_from_source(
+            &dir,
+            &cline,
+            &["glm-5.3-flash".into()],
+            true,
+            true,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        assert!(skipped.is_empty());
+        assert_eq!(added, vec!["glm-5.3-flash · 127.0.0.1:8789"]);
+        assert_eq!(load_models(&dir).unwrap().len(), 3);
+        // 旧条目显示名未被冲掉
+        assert!(find_model(&dir, "火山coding").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_model_prefers_display_name_over_api_id() {
+        // 显示名唯一 → 必须先精确匹配显示名，否则点列表会误开同 id 的另一条
+        let dir = std::env::temp_dir().join(format!("fa-findname-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("models.json"), "[]").unwrap();
+        add_model(
+            &dir,
+            ModelConfig {
+                id: "glm-5.3-flash".into(),
+                name: "火山coding".into(),
+                url: "https://ark.cn-beijing.volces.com/api/coding/v3".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        add_model(
+            &dir,
+            ModelConfig {
+                id: "glm-5.3-flash".into(),
+                name: "glm-5.3-flash".into(),
+                url: "http://127.0.0.1:8788/v1".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let got = find_model(&dir, "glm-5.3-flash").unwrap();
+        assert_eq!(
+            got.url, "http://127.0.0.1:8788/v1",
+            "按显示名查找不得落到同 id 的第一条"
+        );
+        let by_name = find_model(&dir, "火山coding").unwrap();
+        assert_eq!(by_name.url, "https://ark.cn-beijing.volces.com/api/coding/v3");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

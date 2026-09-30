@@ -345,12 +345,20 @@ struct Choice {
 }
 
 /// 一次调用的结果
+///
+/// ⚠️ 2026-09-30 删掉了 `reasoning: Option<String>` 字段。
+/// 原因不是"没人用"，而是**它有第二份来源且那份才是真的**：
+/// 思维链在流式路径上由 `on_delta` 回调**逐块累加**，agent loop 拿它拼
+/// `round_reason`（再经 `absorb_reason` 进步骤时间线）。这里再存一份，
+/// 只会让读代码的人以为"agent 用这个字段"，从而在排查思维链丢失时看错地方。
+/// `chat()`（非流式）以前会返回它，但 agent 只走流式路径。
+///
+/// 流式内部的局部 `reasoning` 变量仍在用（见"流提前中断"错误信息里的字数统计），
+/// 只是不再往结构体里塞。
 #[derive(Debug, Clone)]
 pub struct ChatOutcome {
     pub message: ChatMessage,
     pub finish_reason: Option<String>,
-    /// 思维链（部分模型会给；流式下逐块累加）
-    pub reasoning: Option<String>,
     /// 本次调用的 token 用量（服务端没给就是 None）
     pub usage: Option<TokenUsage>,
 }
@@ -852,11 +860,6 @@ async fn chat_stream_once(
             tool_call_id: None,
         },
         finish_reason,
-        reasoning: if reasoning.is_empty() {
-            None
-        } else {
-            Some(reasoning)
-        },
         usage,
     })
 }
@@ -998,7 +1001,6 @@ async fn chat_once(
     Ok(ChatOutcome {
         message: choice.message,
         finish_reason: choice.finish_reason,
-        reasoning: None,
         usage,
     })
 }
@@ -1428,7 +1430,6 @@ mod tests {
         let out = ChatOutcome {
             message: parsed.choices[0].message.clone(),
             finish_reason: parsed.choices[0].finish_reason.clone(),
-            reasoning: None,
             usage: parsed.usage.as_ref().and_then(RawUsage::to_usage),
         };
         assert_eq!(out.tool_calls().len(), 1);
@@ -1522,6 +1523,12 @@ mod tests {
         assert_eq!(cu.cache_write, 15);
     }
 
+    /// 解析 OpenAI 标准 `/v1/models` 响应，并按 id 排序。
+    ///
+    /// ⚠️ 2026-09-30：这个函数**一直漏写 `#[test]`**，于是它躺在测试模块里
+    /// 从来没被执行过（rustc 的 `dead_code` 警告把它暴露出来了）。
+    /// 补上属性后它才真正开始守住"标准响应能被解析"这条不变量。
+    #[test]
     fn parse_models_openai_standard() {
         let v: Value = serde_json::from_str(
             r#"{"object":"list","data":[

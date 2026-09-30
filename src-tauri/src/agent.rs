@@ -463,11 +463,6 @@ impl RunRegistry {
 /// 进度回调。用 Arc<dyn Fn> 而不是泛型，避免把泛型参数污染到整个 agent loop。
 pub type ProgressFn = std::sync::Arc<dyn Fn(Progress) + Send + Sync>;
 
-/// 什么都不做的回调（测试用）
-pub fn no_progress() -> ProgressFn {
-    std::sync::Arc::new(|_| {})
-}
-
 /// **轮内增量落盘**的回调（2026-09-26 加，治「退出后整轮蒸发」）。
 ///
 /// 参数：`(目前已产出的步骤, 目前流出的正文, 目前的思考过程)`。
@@ -489,6 +484,57 @@ fn checkpoint(cb: &Option<CheckpointFn>, steps: &[AgentStep], answer: &str, reas
     if let Some(f) = cb.as_ref() {
         f(steps, answer, reasoning);
     }
+}
+
+/// 流式正文的落盘节流间隔（毫秒）。
+///
+/// ## 为什么需要"流式落盘"（2026-09-30 补的缺口）
+///
+/// 已有的 [`checkpoint`] 只在**轮边界**与**工具跑完后**触发。但一轮模型调用
+/// 可能流式吐几十秒到几分钟（长思考 + 长输出实测很常见），这段时间里
+/// **正文一个字都没落盘** —— 分片只进了内存累加器 `round_text`。
+/// 用户在这期间关掉进程（或进程崩溃），那段正文就真的没了：
+/// 磁盘上只有一条空的 `partial` 占位。
+///
+/// ## 为什么是节流而不是每个分片都写
+///
+/// 分片来得很密（几十毫秒一片），每片都 `write_session` 就是**每秒钟重写
+/// 整个会话 JSON 好几次** —— 会话文件可达几百 KB，那是拿磁盘寿命和 UI 卡顿
+/// 换"最多少丢半秒的字"。3 秒是个折中：最坏丢 3 秒的打字量，代价可忽略。
+const CHECKPOINT_THROTTLE_MS: u64 = 3_000;
+
+/// 从流式回调里做节流落盘。
+///
+/// 抽成独立函数是为了让"回调里的落盘"只有一处 —— 回调会被 `llm.rs` 在
+/// `.await` 内部调用，逻辑越少越不容易踩到跨 await 持锁那类坑。
+///
+/// `last` 是上次落盘的时刻（epoch 毫秒），`0` 表示"本轮还没落过"。
+fn checkpoint_from_stream(
+    cb: &Option<CheckpointFn>,
+    last: &std::sync::atomic::AtomicU64,
+    steps: &[AgentStep],
+    text: &str,
+    reasoning: &str,
+) {
+    use std::sync::atomic::Ordering;
+    if cb.is_none() {
+        return;
+    }
+    // 空文本不写：那只是"思考分片来了"，没有新增正文可保
+    if text.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let prev = last.load(Ordering::Relaxed);
+    if prev != 0 && now.saturating_sub(prev) < CHECKPOINT_THROTTLE_MS {
+        return;
+    }
+    // 先记时刻再落盘：落盘慢（写整个会话文件）时不让回调排队等
+    last.store(now, Ordering::Relaxed);
+    checkpoint(cb, steps, text, reasoning);
 }
 
 /// 取本轮已流出正文的**副本**（不清空累加器 —— 后面还要用它当半截正文返回）。
@@ -597,6 +643,76 @@ pub struct AgentRun {
     /// 拆开报反而失真。全 0（服务端没返回 usage）时前端不显示角标。
     #[serde(default)]
     pub usage: TokenUsage,
+    /// **最后一轮**模型调用实际发出的 prompt token（服务端 `usage.prompt`）。
+    ///
+    /// 与 `usage.prompt`（整个 run 求和，几百万很常见）不是一回事：
+    /// 这一个数代表"此刻上下文有多大"，是下一轮预算与 compact 水位的真锚点。
+    /// 服务端不给 usage → None（调用方保留上一轮的值）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt_tokens: Option<u32>,
+    /// 本轮「真实 prompt ÷ 本地估算」倍率，供下一轮自校准。None = 未校准。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_scale: Option<f64>,
+}
+
+/// 一轮对话的**校准累加器**：把"本地估算 vs 服务端真实值"的偏差记下来，
+/// 供下一轮（乃至下一次进程启动）把预算算准。
+///
+/// ## 为什么必须有这个（2026-09-30）
+///
+/// 上下文预算此前只靠 `estimate_messages_tokens`，而实测**低估 5~144 倍**
+/// （工具 schema、MCP 已加载组、reasoning 原文都没进估算）。后果：
+/// 配了 `maxInputTokens: 1000000` 的模型水位是 60 万，而估算值永远够不着
+/// —— 实测 30 个真实会话里自动 compact **一次都没触发过**。
+///
+/// 现在用服务端返回的 `usage.prompt`（真值）反推一个倍率：
+/// `倍率 = 真实 prompt ÷ 本地估算`。下一轮把估算乘以它，量级就对了。
+#[derive(Debug, Clone, Copy, Default)]
+struct Calibration {
+    /// 最后一个模型调用实际发出的 prompt token
+    last_prompt: Option<u32>,
+    /// 本轮最后一次可用的「真实 ÷ 估算」倍率
+    scale: Option<f64>,
+}
+
+/// 倍率的允许区间。
+///
+/// 为什么要有上下界：单次调用的估算误差可能极端（比如历史几乎全是
+/// JSON 工具输出时，`char/4` 的经验公式会偏得离谱）。倍率是要**存进会话
+/// 文件、长期复用**的，一个荒谬值会让后续所有轮次的预算全错 ——
+/// 与其相信离群点，不如夹到保守区间里。
+const TOKEN_SCALE_MIN: f64 = 1.0;
+const TOKEN_SCALE_MAX: f64 = 20.0;
+
+impl Calibration {
+    /// 用一次模型调用的结果更新校准。
+    ///
+    /// `estimated` = 发出这次请求**之前**本地估算的 messages token 数
+    /// （不含 system prompt / 工具 schema —— 那部分由调用方从真实值里减掉）。
+    fn observe(&mut self, real_prompt: u32, estimated_overhead: usize, estimated_msgs: usize) {
+        if real_prompt == 0 {
+            return;
+        }
+        self.last_prompt = Some(real_prompt);
+        // 只有"真实值明显大于固定开销"时倍率才有意义 —— 否则分母趋零，
+        // 算出来的倍率会被 system prompt 那点固定成本主导（虚高）。
+        let real_msgs = real_prompt as f64 - estimated_overhead as f64;
+        if real_msgs <= 0.0 || estimated_msgs < 256 {
+            return;
+        }
+        let s = real_msgs / estimated_msgs as f64;
+        if s.is_finite() && s > 0.0 {
+            self.scale = Some(s.clamp(TOKEN_SCALE_MIN, TOKEN_SCALE_MAX));
+        }
+    }
+
+    /// 把估算值按已校准的倍率放大（未校准时原样返回）。
+    fn apply(&self, est: usize) -> usize {
+        match self.scale {
+            Some(s) if s.is_finite() && s > 1.0 => ((est as f64) * s) as usize,
+            _ => est,
+        }
+    }
 }
 
 /// 一轮对话**失败**时带出的结果：错误文案 + 已经产出的部分结果。
@@ -697,21 +813,60 @@ pub async fn run(
         crate::history::build_history(data_dir, session_id, now_ms())
     };
 
+    // ---- 上下文预算：拿"真值优先"的口径定水位 ----
+    //
+    // ⚠️ 2026-09-30 重做（旧实现让 compact 永远触发不了）：
+    //
+    // 旧口径 = `估算(history)` vs `窗口 × 60%`。两个致命问题：
+    //   ① 估算只算 history，**不含** system prompt 与工具 schema，
+    //      而这两样本来就在每次请求里（56 个 MCP 工具约 14k token）；
+    //   ② 本地 `char/4` 估算对 JSON / 工具输出 / 英文代码严重低估
+    //      （实测对服务端真实 prompt 低估 5~144 倍）。
+    // 结果：配 1M 窗口的模型水位是 60 万，而估算值几千到几万，
+    // **永远够不着** —— 实测 30 个真实会话里带 summary 的是 0 个。
+    //
+    // 新口径 = 「上一轮服务端返回的真实 prompt」优先，估算只作兜底。
+    //   真值存在会话里（`last_prompt_tokens` / `token_scale`），跨轮、跨重启都有效。
+    let context_window = cfg
+        .max_input_tokens
+        .map(|n| n as usize)
+        .unwrap_or(FALLBACK_CONTEXT_WINDOW);
+    let (real_last_prompt, token_scale) = if session_id.is_empty() {
+        (None, None)
+    } else {
+        crate::sessions::context_calibration(data_dir, session_id)
+    };
+    let mut calib = Calibration {
+        last_prompt: real_last_prompt,
+        scale: token_scale,
+    };
+    if let Some(p) = real_last_prompt {
+        eprintln!(
+            "[orbcat] 上下文真值: 上一轮实际 prompt {p} tok（本地倍率 {:?}），窗口 {context_window}",
+            token_scale
+        );
+    }
+
     // ---- 自动 compact：历史太大先压缩，再回灌 ----
     //
     // 为什么在"发请求前"而不是"撞到上限时"：撞上限意味着这次请求已经废了
     // （413 / context_length_exceeded），而压缩要额外发一次模型请求 —— 必须在
     // 还有余量时做。摘要**落盘**，所以只在真正超水位时压一次，之后每轮直接读。
-    let context_window = cfg
-        .max_input_tokens
-        .map(|n| n as usize)
-        .unwrap_or(FALLBACK_CONTEXT_WINDOW);
+    let compact_trigger = ((context_window as f64) * crate::history::COMPACT_TRIGGER_RATIO) as usize;
     if !session_id.is_empty() {
-        let est = estimate_messages_tokens(&history);
-        let trigger = ((context_window as f64) * crate::history::COMPACT_TRIGGER_RATIO) as usize;
-        if est > trigger {
+        // 判定量 = 上一轮**真实** prompt（有的话）。它就是"现在上下文有多大"，
+        // 比任何本地估算都可信；没有真值（新会话 / 网关不透传 usage）才退回估算，
+        // 且此时按已校准的倍率放大，避免再次系统性低估。
+        let (measured, source) = match real_last_prompt {
+            Some(p) => (p as usize, "服务端实测"),
+            None => (
+                calib.apply(estimate_messages_tokens(&history)),
+                "本地估算（未校准）",
+            ),
+        };
+        if measured > compact_trigger {
             eprintln!(
-                "[orbcat] 历史估算 {est} tok 超过 compact 水位 {trigger}，触发自动压缩"
+                "[orbcat] 上下文 {measured} tok（{source}）超过 compact 水位 {compact_trigger}，触发自动压缩"
             );
             match crate::history::compact(
                 cfg,
@@ -729,6 +884,10 @@ pub async fn run(
                         o.summarized, o.summary_chars, o.kept
                     );
                     history = crate::history::build_history(data_dir, session_id, now_ms());
+                    // 压完上下文变小了，**真值立刻失效** —— 但拿不到新的真值
+                    // （这一轮还没发），所以退回估算并保留倍率，别让旧真值
+                    // 在下一轮又把水位判超、反复压缩。
+                    calib.last_prompt = None;
                 }
                 Err(e) => {
                     // 压缩失败不该挡住对话 —— 后面还有循环内的裁剪兜底
@@ -739,7 +898,10 @@ pub async fn run(
     }
     let history_len = history.len();
 
-    let mut messages = vec![ChatMessage::system(system_prompt)];
+    // 注意 `clone()`：`system_prompt` 在循环里还要用来算**每轮**的固定开销
+    // （工具组会被模型 `load_tool_group` 动态改变，开销不是常量），所以不能把它
+    // move 进 messages。一轮一次 clone 的代价可以忽略（这是纯内存拷贝）。
+    let mut messages = vec![ChatMessage::system(system_prompt.clone())];
     messages.extend(history);
     messages.push(first_user);
 
@@ -770,6 +932,9 @@ pub async fn run(
     // 服务端不给 usage（未开 include_usage / 网关不透传）时保持全 0。
     let mut usage_total = TokenUsage::default();
 
+    // 注：上下文预算的校准累加器 `calib` 已在上面（compact 判定处）初始化 ——
+    // 它同时是"上一轮真值"的载体与"本轮新真值"的收集器，只有一份。
+
     // 软预算：初始 max_iterations()，每消费一批插话 +STEER_BONUS，最多到 hard_iterations()。
     // 为什么不做成"插话不占轮数"：那等于取消上限。
     let max_iters = max_iterations();
@@ -783,6 +948,10 @@ pub async fn run(
 
     // 上下文预算：模型配了就用，没配走保守兜底。乘安全水位。
     // （`context_window` 已在自动 compact 那一段算过，这里直接复用）
+    //
+    // ⚠️ 与 compact 水位的关系（2026-09-30 统一口径）：`COMPACT_TRIGGER_RATIO`（0.6）
+    // 低于这里的 `CONTEXT_SAFE_RATIO`（0.75）是**刻意**的 —— compact 在 60% 就把
+    // 历史压掉，循环内的硬裁剪（75%）只是压缩失败时的最后一道闸，正常轮不到它。
     let context_budget = ((context_window as f64) * CONTEXT_SAFE_RATIO) as usize;
     // 裁剪时至少保留最近这么多条工具结果原文（它们是模型当前最可能依赖的）
     const KEEP_RECENT_TOOL_RESULTS: usize = 4;
@@ -806,7 +975,7 @@ pub async fn run(
         //    不是"这一轮凭空消失"，而是"停在这儿，我看到的东西留下"。返回 Err 会让
         //    `lib.rs` 提前 `?` 掉，用户连自己那条提问都看不到。
         if cancel.load(Ordering::Relaxed) {
-            return Ok(interrupted_run(steps, steers, reason_total, String::new(), iter, usage_total));
+            return Ok(interrupted_run(steps, steers, reason_total, String::new(), iter, usage_total, calib));
         }
         iter += 1;
 
@@ -834,40 +1003,6 @@ pub async fn run(
             budget = (budget + STEER_BONUS).min(hard_iters);
         }
 
-        // ---- 上下文预算检查（每轮 LLM 调用前）----
-        //
-        // 为什么必须有这一步：`messages` 在循环里**只增不减**（每轮 push
-        // assistant + N 条 tool 结果）。轮数上限拉到 100/250 后，不检查就会
-        // 一路顶穿模型窗口 → 413 / context_length_exceeded → 整轮报废。
-        //
-        // 策略是**渐进裁剪**而不是直接中止：
-        //   1) 先裁最旧的工具结果为占位串（信息密度最低、最可替代）
-        //   2) 裁完还超 → 说明不是工具结果撑的（可能是超长对话骨架），
-        //      此时才降级返回部分结果，别硬发一个必然失败的请求
-        let est = estimate_messages_tokens(&messages);
-        if est > context_budget {
-            let trimmed = trim_old_tool_results(&mut messages, KEEP_RECENT_TOOL_RESULTS);
-            let after = estimate_messages_tokens(&messages);
-            eprintln!(
-                "[orbcat] 上下文预算超限（第 {iter} 轮）：估算 {est} > 预算 {context_budget}，\
-                 裁掉 {trimmed} 条旧工具结果 → {after} tok"
-            );
-            if after > context_budget {
-                // 裁剪救不回来 → 降级返回部分结果（不硬发必然失败的请求）
-                eprintln!(
-                    "[orbcat] 裁剪后仍超预算（{after} > {context_budget}），降级返回部分结果"
-                );
-                let mut r =
-                    interrupted_run(steps, steers, reason_total, String::new(), iter, usage_total);
-                r.stop_reason = Some(format!(
-                    "上下文已接近模型上限（估算 {after} / 预算 {context_budget} tok），\
-                     继续执行会被模型拒绝。以下是已产出的部分结果；\
-                     可清空部分历史或换更大窗口的模型后重试"
-                ));
-                return Ok(r);
-            }
-        }
-
         // 每轮重建工具列表 —— 模型可能刚 load 了新组
         let tools_arg = if cfg.supports_tool_call {
             let specs = {
@@ -879,6 +1014,71 @@ pub async fn run(
         } else {
             None
         };
+        // 工具 schema 的文本形态，**只用于估算开销**（不参与请求）。
+        // 为什么单独留一份：工具列表每轮都可能变（模型刚 load 了新组），
+        // 而它是固定开销里最大的一块（56 个 MCP 工具约 14k token）。
+        let tools_arg_text = tools_arg
+            .as_ref()
+            .map(|t| serde_json::to_string(t).unwrap_or_default())
+            .unwrap_or_default();
+
+        // ---- 上下文预算检查（每轮 LLM 调用前）----
+        //
+        // 为什么必须有这一步：`messages` 在循环里**只增不减**（每轮 push
+        // assistant + N 条 tool 结果）。轮数上限拉到 100/250 后，不检查就会
+        // 一路顶穿模型窗口 → 413 / context_length_exceeded → 整轮报废。
+        //
+        // ⚠️ 2026-09-30 三处修正（此前这条闸门形同虚设）：
+        //   1. **算上固定开销**：system prompt 与工具 schema 此前完全没进估算，
+        //      而它们本来就在每次请求里（56 个 MCP 工具约 14k token）。
+        //   2. **乘校准倍率**：本地 `char/4` 估算实测低估 5~144 倍，
+        //      用服务端返回的真实 prompt 反推倍率后，估算才有量级意义。
+        //   3. **与 compact 同一口径**：`context_budget` 现在取
+        //      「预算 − 开销」而不是整个窗口的 75%，否则历史把预算吃满时
+        //      循环还认为"没超"。与开跑前的 auto-compact 水位同源。
+        let est_msgs = estimate_messages_tokens(&messages);
+        // 固定开销 = system prompt（已含前台段与项目记忆段）+ 工具 schema。
+        // 这两样**本来就在每次请求里**，却完全没进过预算估算 —— 正是它们
+        // 让本地估算与服务端真实 prompt 差了 5~144 倍。
+        let est_overhead =
+            llm::estimate_tokens(&system_prompt) + llm::estimate_tokens(&tools_arg_text);
+        let est_msgs_scaled = calib.apply(est_msgs);
+        let est = est_msgs_scaled + est_overhead;
+        if est > context_budget {
+            let trimmed = trim_old_tool_results(&mut messages, KEEP_RECENT_TOOL_RESULTS);
+            let after = calib.apply(estimate_messages_tokens(&messages)) + est_overhead;
+            eprintln!(
+                "[orbcat] 上下文预算超限（第 {iter} 轮）：估算 {est}（消息 {est_msgs}×{:?} + 开销 \
+                 {est_overhead}）> 预算 {context_budget}，裁掉 {trimmed} 条旧工具结果 → {after} tok",
+                calib.scale
+            );
+            if after > context_budget {
+                // 裁剪救不回来 → 降级返回部分结果（不硬发必然失败的请求）
+                eprintln!(
+                    "[orbcat] 裁剪后仍超预算（{after} > {context_budget}），降级返回部分结果"
+                );
+                let mut r = interrupted_run(
+                    steps,
+                    steers,
+                    reason_total,
+                    String::new(),
+                    iter,
+                    usage_total,
+                    calib,
+                );
+                r.stop_reason = Some(format!(
+                    "上下文已接近模型上限（估算 {after} / 预算 {context_budget} tok），\
+                     继续执行会被模型拒绝。以下是已产出的部分结果；\
+                     可清空部分历史或换更大窗口的模型后重试"
+                ));
+                return Ok(r);
+            }
+        }
+
+        // 校准要用的「发出这次请求之前，本地估了多少」快照。
+        // ⚠️ 必须在 push 了本轮的 assistant / tool 结果**之前**取 ——
+        //    服务端返回的 prompt 对应的正是"发出去时的那份 messages"。
+        let est_msgs_before_round = est_msgs;
 
         on_progress(Progress::Thinking { iteration: iter });
 
@@ -890,11 +1090,24 @@ pub async fn run(
         // 被中断那轮的正文与思考就丢了；而中断恰恰是用户最想回看的时候。
         let round_reason = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let round_text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
+        // 流式落盘的三件套（2026-09-30）：
+        //   - `steps_so_far`：回调里不能碰 `steps`（它在本轮后面还会被可变借用），
+        //     所以每轮开头 take 一份只读快照；
+        //   - `ckpt_cb`：checkpoint 回调本身（`Option<Arc<dyn Fn>>`，clone 即共享）；
+        //   - `last_ckpt_ms`：节流时钟，原子量让回调无需加锁。
+        let steps_so_far = steps.clone();
+        let ckpt_cb = on_checkpoint.clone();
+        let last_ckpt_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         let delta_cb = {
             let cb = on_progress.clone();
             let flag = streamed_this_round.clone();
             let acc_r = round_reason.clone();
             let acc_t = round_text.clone();
+            let steps_for_ckpt = steps_so_far;
+            let cb_ckpt = ckpt_cb;
+            let ckpt_clock = last_ckpt_ms;
             move |text: Option<String>, reasoning: Option<String>| {
                 if let Some(t) = text.as_deref() {
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -913,6 +1126,17 @@ pub async fn run(
                         }
                     }
                 }
+
+                // 流式落盘（节流）：正文边收边存，进程被杀不至于丢掉整段回答。
+                // 用 `peek` 而不是 `take` —— 累加器后面还要用（作半截正文返回）。
+                checkpoint_from_stream(
+                    &cb_ckpt,
+                    &ckpt_clock,
+                    &steps_for_ckpt,
+                    &peek_text(&acc_t),
+                    &peek_text(&acc_r),
+                );
+
                 cb(Progress::Delta { text, reasoning });
             }
         };
@@ -973,7 +1197,7 @@ pub async fn run(
                 // 被「停止」打断 → 把这一轮已经流出来的半截正文带上
                 if cancel.load(Ordering::Relaxed) {
                     let half = take_text(&round_text);
-                    return Ok(interrupted_run(steps, steers, reason_total, half, iter, usage_total));
+                    return Ok(interrupted_run(steps, steers, reason_total, half, iter, usage_total, calib));
                 }
                 // ---- 真错误：**带部分结果**返回，而不是把整轮丢掉 ----
                 //
@@ -987,6 +1211,7 @@ pub async fn run(
                     take_text(&round_text),
                     iter,
                     usage_total,
+                    calib,
                 );
                 run.stop_reason = Some(e.clone());
                 run.steps.push(AgentStep {
@@ -1011,6 +1236,28 @@ pub async fn run(
         // 本轮的 token 用量并入合计（无论这轮是出答案还是调工具）
         if let Some(u) = out.usage {
             usage_total.add(&u);
+            // ⚠️ 与上面的求和**不同口径**（2026-09-30）：
+            //   `usage_total.prompt` 是整个 run 各轮求和（几百万很正常），
+            //   而 `u.prompt` 是**这一轮**实际发出去的上下文大小 ——
+            //   只有它代表"现在上下文有多大"，是预算与 compact 水位的真锚点。
+            //   所以校准吃的是这一个数，不是求和。
+            calib.observe(u.prompt, est_overhead, est_msgs_before_round);
+
+            // 每轮 cache 命中率（2026-09-30）：prompt 的大头走命中价，
+            // **全价部分 = prompt − cache_hit**。命中率掉下来时成本成倍上涨
+            // 而总量看不出变化，所以必须**逐轮留痕**才追得到回归点。
+            // 定位手段：这条日志配合"改了前缀稳定性 / 换了模型 / 动了技能与
+            // MCP 组"的时间点，能直接指出是哪次改动打掉了缓存。
+            if u.prompt > 0 {
+                let hit = u.cache_hit.min(u.prompt);
+                let rate = (hit as f64) / (u.prompt as f64) * 100.0;
+                eprintln!(
+                    "[orbcat] 第 {iter} 轮 cache: {rate:.1}% 命中（命中 {hit} / 输入 {}，\
+                     全价 {} tok）",
+                    u.prompt,
+                    u.prompt - hit
+                );
+            }
         }
         let mut calls: Vec<llm::ToolCall> = out.tool_calls().to_vec();
 
@@ -1082,6 +1329,7 @@ pub async fn run(
                     text,
                     iter,
                     usage_total,
+                    calib,
                 );
                 r.stop_reason = Some(
                     "输出连续被长度上限截断（已自动续写多次仍被截）。\
@@ -1110,6 +1358,8 @@ pub async fn run(
                     pending_steers: Vec::new(),
                     stop_reason: None,
                     usage: usage_total,
+                    last_prompt_tokens: calib.last_prompt,
+                    token_scale: calib.scale,
                 });
             }
         }
@@ -1233,6 +1483,7 @@ pub async fn run(
                     half,
                     iter,
                     usage_total,
+                    calib,
                 ));
             }
         }
@@ -1250,7 +1501,7 @@ pub async fn run(
         // 取消检查点 ②：工具都执行完、还没发下一轮 LLM 请求 —— 在这里停最省。
         // 同上：返回**部分结果**而不是 Err，让已完成的工具调用留在会话里。
         if cancel.load(Ordering::Relaxed) {
-            return Ok(interrupted_run(steps, steers, reason_total, String::new(), iter, usage_total));
+            return Ok(interrupted_run(steps, steers, reason_total, String::new(), iter, usage_total, calib));
         }
     }
 
@@ -1266,7 +1517,7 @@ pub async fn run(
     eprintln!(
         "[orbcat] 已连续调用工具 {iter} 轮仍未给出结论，降级返回部分结果（预算 {budget}，硬顶 {hard_iters}）"
     );
-    let mut r = interrupted_run(steps, steers, reason_total, String::new(), iter, usage_total);
+    let mut r = interrupted_run(steps, steers, reason_total, String::new(), iter, usage_total, calib);
     // 借用 stop_reason 说明是"轮数用尽"而非"用户停止"，前端据此显示不同提示
     r.stop_reason = Some(format!(
         "已达轮数上限（{iter} 轮），以下是已产出的部分结果。可能是任务过大或模型陷入循环。\
@@ -1291,6 +1542,8 @@ fn interrupted_run(
     answer: String,
     iterations: usize,
     usage: TokenUsage,
+    // 本轮拿到的校准值（真实 prompt / 倍率）。`Copy`，各条返回路径各拿一份。
+    calib: Calibration,
 ) -> AgentRun {
     AgentRun {
         answer,
@@ -1302,6 +1555,8 @@ fn interrupted_run(
         pending_steers: Vec::new(),
         stop_reason: Some("已停止".into()),
         usage,
+        last_prompt_tokens: calib.last_prompt,
+        token_scale: calib.scale,
     }
 }
 
@@ -1486,9 +1741,10 @@ pub fn summarize_args_pub(raw: &str) -> String {
 ///   USER.md         用户画像
 ///   MEMORY.md       长期记忆
 ///   运行环境（纯规则文字，不含工作目录值）
-///   MCP 机制（纯规则文字，不含组状态）
+///   MCP 机制（纯规则文字，不含组状态、不含工具清单）
 ///   对话历史机制（纯规则文字，不含任何动态值）
 /// ── 动态尾部（按变化频率递增）──────────────
+///   外部工具索引     拉到新工具清单才变 → 动态区里最不易变，排最前
 ///   技能清单        加技能才变
 ///   MCP 已加载组     加载/卸载组才变
 ///   工作目录        进程内恒定，但仍是"求值"得来，放最后
@@ -1496,8 +1752,27 @@ pub fn summarize_args_pub(raw: &str) -> String {
 ///   （前台上下文由 agent::run 追加，每轮都变 → 绝对最尾）
 /// ```
 ///
+/// ⚠️ **外部工具索引（能力索引）为什么必须排在动态区最前**（2026-10 加）：
+/// 它列的是"当前 MCP 有哪些工具、各能干什么"，改一次 server 配置或拉一次
+/// 快照就会变 —— 所以它**不能**进稳定前缀：那样每次配置变动都会让它后面的
+/// 全部内容（对话历史规则、技能清单…）按未命中价重付。
+/// 但在动态区里它又是**最不易变**的（时间每分钟变、自动加载技能每轮变），
+/// 于是它排动态区第一位、其余动态内容跟在它后面：
+/// 索引变了只失效它自己那一小段，别的一律继续吃缓存。
+///
+/// 索引内容**只有工具名 + 一句话用途**，绝不含 schema —— 56 个工具的 schema
+/// 约 14.4k tokens，常驻它等于把懒加载整个取消掉。实现见
+/// `mcp::ToolRegistry::capability_index`。
+///
 /// 组装 prompt（不含本轮用户消息）—— 等价于 `build_system_prompt_for(dir, "")`。
 /// 保留此签名给不关心技能自动加载的调用方（测试等）。
+/// 组装 system prompt（不带本轮用户输入）。
+///
+/// ⚠️ **仅供测试**（2026-09-30 标注）：生产路径走 [`build_system_prompt_for`]，
+/// 因为它要把本轮用户消息传进去做**技能自动命中**（命中的技能正文会拼到动态区
+/// 最尾）。这个不带消息的版本只给"前缀稳定性"那批单测用 —— 它们只关心
+/// 稳定区/动态区的切分，不关心技能命中。
+#[cfg(test)]
 pub fn build_system_prompt(data_dir: &Path) -> String {
     build_system_prompt_for(data_dir, "")
 }
@@ -1677,6 +1952,8 @@ pub fn build_system_prompt_for(data_dir: &Path, user_message: &str) -> String {
          写新文件/全文重写才用 `write_file`（写前会备份）；追加用 `append_file`。\n\
          - **复制 / 移动 / 建目录** → `copy_file` / `move_file` / `mkdir`，不要 `Copy-Item`/`Move-Item`/`New-Item`。\n\
          - **git 只读**（status/diff/log/show/branch）→ 用 `git` 工具。\n\
+         - **看时间** → 用 `current_time` 工具（或直接用下方动态信息里的「当前时间」），\
+         **禁止**为了看时间跑 `Get-Date`。\n\
          - `run_command` **只用于**编译器、包管理器、自定义脚本、或确实没有对应内置工具的场景。\n\
          `delete_file` = **永远归档**到 `agent-data/.trash/`（需 full 权限），\
          **不会硬删**；用户点名硬删也只归档，物理删除请用户自行执行。\n\
@@ -1692,23 +1969,32 @@ pub fn build_system_prompt_for(data_dir: &Path, user_message: &str) -> String {
             .to_string(),
     );
 
-    // ── 稳定区：MCP 机制（**纯规则文字**，组状态挪到尾部）──────────────
+    // ── 稳定区：MCP 机制（**纯规则文字**，组状态与工具清单挪到尾部）────
     // 关键：56 个外部工具的 schema 有 ~14k tokens，全量注入会让 prompt 变得又长又慢，
     // 还会让模型挑错工具。所以只常驻内置工具，外部工具按组懒加载。
+    //
+    // 注意这段是**纯规则**：一行都不含"当前有哪些组 / 哪些工具"——
+    // 那些是运行时数据，在动态尾部（外部工具索引 + 组状态）。
     stable.push(
         "# 外部工具（MCP）的用法\n\n\
-         你还能用一批**外部工具**（操作网页、远程服务器、数据库、桌面应用等），\
-         但它们**不会默认出现在你的工具列表里** —— 因为全部装载会占用大量上下文。\n\n\
-         正确用法是**两步**：\n\
-         1. 先调用 `list_tool_groups`，看看有哪些工具组、各自是干什么的、多少工具。\n\
-         2. 再对你需要的那一组调用 `load_tool_group`，加载后该组的工具会在**下一轮**可用。\n\n\
+         你还能用一批**外部工具**（操作网页、远程服务器、数据库、桌面应用等）。\n\n\
+         **默认情况下这些工具已经直接给你了** —— 它们就写在你的工具列表里，\
+         名字形如 `mcp__<组名>__<工具名>`，**直接调用即可，不需要先加载**。\n\n\
+         只有在两种情况下才需要走「先查再加载」：\n\
+         1. 你要用的工具**不在**当前工具列表里（用户没勾选该组 / 被停用了）。\n\
+         2. 用户明确让你去看有哪些组可用。\n\
+         这时：`search_tools` 或 `list_tool_groups` 定位到组，再 `load_tool_group` 加载，\
+         该组工具会在**下一轮**出现，然后直接调用。\n\n\
          规则：\n\
-         - 一次只加载**当前任务真正需要**的组，不要图省事全加载（会超预算被拒）。\n\
-         - 任务做完后可以用 `unload_tool_group` 释放空间。\n\
          - 当用户的需求涉及「打开网页 / 抓取某站 / 连服务器 / 查数据库 / 操作某个桌面软件」时，\
-         先走上面两步。\n\
-         - 加载组只拿到工具**名字**；具体参数看下一轮的工具定义。\n\
-         已加载的组在下方「动态信息」区给出。"
+         先在你现有的工具列表里找对应的 `mcp__*` 工具直接用。\n\
+         - **不确定有没有某个能力时，先查、不要猜、也不要直接说「我做不到」**：\
+         用 `search_tools` 按意图搜（关键词如「提交 issue」「截图」「数据库查询」），\
+         它只返回名字 + 一句话用途、不返回参数 schema，所以很便宜，可以放心多搜几次。\
+         下方「外部工具索引」段列着全部工具的名字与用途，也可以直接看那里。\n\
+         - **不要在没查过的情况下断言「没有这个工具」**；查完确实没有，\
+         再向用户说明缺什么（需要哪个组 / 哪个 MCP server）。\n\
+         - `unload_tool_group` 只在你确认某组确实拖慢上下文、且用户不再需要时才用。"
             .to_string(),
     );
 
@@ -1717,6 +2003,13 @@ pub fn build_system_prompt_for(data_dir: &Path, user_message: &str) -> String {
     // 更早的内容不在上下文里。如果模型不知道"有东西可查"，它会：
     //   ① 对着"上次那个方案"瞎编  ② 反问用户"哪个方案？"
     // 所以必须显式告知 —— 否则 recall_turns 工具等于摆设。
+    // 跨会话检索（scope=all）同理：**不说它就不知道能跨会话**，会直接回
+    // "本会话没聊过"。而这个用户每天都在多个会话里解决同类问题
+    // （编译加速、代理配置、MCP 绑定这些坑都踩过不止一次），
+    // 不说清楚就等于让他把同一个坑再踩一遍。
+    // ⚠️ 下面只有 {window} / {turns} 两个**编译期常量**插值（见 history.rs 顶部），
+    //    不得引入任何运行时值（会话数、扫描上限、当前时间…）——
+    //    这段在稳定前缀里，一个每轮都变的值会让其后全部 token 按未命中价重付。
     stable.push(format!(
         "# 对话历史\n\n\
          你能看到本会话**最近**的对话（最近 {window} 小时内，或最近 {turns} 条），\
@@ -1726,13 +2019,65 @@ pub fn build_system_prompt_for(data_dir: &Path, user_message: &str) -> String {
          `recall_turns` 用法：\n\
          - `query`：关键词（如「跳页」「构建报错」）。留空则返回最近的记录。\n\
          - `hours`：只看最近 N 小时（可选）。\n\
-         - `limit`：最多返回几条，默认 10。\n\n\
-         查完基于结果回答，并说明「这是从更早的对话里找到的」。",
+         - `limit`：最多返回几条，默认 10。\n\
+         - `scope`：检索范围。默认 `session` = 只查当前会话；\
+         `all` = **连同其他历史会话一起查**。\n\n\
+         ## 什么时候必须用 `scope=all`\n\
+         用户说的是「以前搞过 / 上次（不一定是这个会话）怎么解决的 / 之前配过」\
+         这类**跨会话**的事，而当前会话里查不到时 —— 用 `scope=all` 再查一次。\n\
+         你经常在多个会话里解同类问题（编译加速、代理配置、MCP 绑定这类坑\
+         不止踩过一次），换个会话就不知道上次怎么解，等于让用户重新付一遍学费。\n\n\
+         `scope=all` 的结果每条都带**来源标识**（会话标题 · 时间）。\
+         那些内容**不属于当前会话**：\n\
+         - 引用时要说明「这是在会话《某标题》里做的」，不要当成当前会话里说过的话；\n\
+         - 也不要把它当成既定事实 —— 别的会话的背景可能不同，\
+           必要时说明差异或跟用户确认。\n\n\
+         查完基于结果回答，并说明「这是从更早的对话里找到的」\
+         （跨会话时再补一句是**哪个**会话）。",
         window = crate::history::WINDOW_HOURS,
         turns = crate::history::FALLBACK_TURNS,
     ));
 
-    // ── 动态尾部 ①：技能清单（加技能才变）──────────────────────────────
+    // ── 动态尾部 ①：外部工具索引（**能力发现**，拉到新工具清单才变）──────
+    //
+    // 为什么在这里、而不是稳定前缀：这段列的是"当前 MCP 有哪些工具"，
+    // 换一次 server 配置 / 拉一次快照就变 —— 属运行时数据。放稳定区会让
+    // 它**后面**的全部内容（对话历史规则、技能清单…）跟着失效。
+    //
+    // 为什么排在动态区**最前**：在"会变的内容"里它变的最少（拉快照才变，
+    // 而当前时间每分钟变、自动加载技能每轮变）。按变化频率从低到高排，
+    // 它变了只失效自己那一段 + 它后面的（本来就要重算），代价最小。
+    //
+    // 为什么不是"照旧只给组名"：见 mcp.rs 顶部「能力发现索引」——
+    // 只给组名时模型无法知道 56 个工具叫什么，只能猜组名 + load 试探。
+    // 这份索引是"名字 + 一句话用途"：实测 56 工具 / 4 组时索引本体约 826 tokens，
+    // 连同本段规则文字共给 system prompt 增加约 1056 tokens —— 完整 schema 是
+    // ~14.4k，也就是 **7% 的价钱换来"知道有什么工具"**。
+    // （数字由 `tool_index_constant_cost_stays_small` 与 `index_stays_compact`
+    //   两条测试钉住，谁把它写肥了会当场炸。）
+    //
+    // 读的是落盘缓存：组装 prompt 不该去抢 MCP 注册表的异步锁（`build_system_prompt`
+    // 是同步函数、被大量单测直接调用），缓存由 `apply_snapshot` 在拉取后刷新。
+    {
+        let index = crate::mcp::ToolRegistry::read_cached_index(data_dir);
+        if !index.is_empty() {
+            dynamic.push(format!(
+                "# 外部工具索引（能力发现）\n\n\
+                 下面是当前可用的**全部外部工具**：组名 → 工具名（短名）+ 一句话用途。\
+                 这里**只有名字和用途，没有参数细节**，所以它很便宜 —— \
+                 拿它判断「该用哪一组、有没有这个能力」，别凭印象猜。\n\n\
+                 用法：\n\
+                 - 要做事但不确定有没有现成工具 → 先 `search_tools`（给意图关键词，如\
+                 `提交 issue`、`截图`、`数据库查询`）。它只回几十行、无副作用，可以放心多搜几次。\n\
+                 - 确定用哪一组 → `load_tool_group` 加载该组，拿到参数 schema 后直接调用。\n\
+                 - 想知道各组的 token 成本 → `list_tool_groups`。\n\
+                 - 工具名形如 `mcp__<组名>__<工具名>`（下表的短名要配上组名前缀）。\n\n\
+                 {index}"
+            ));
+        }
+    }
+
+    // ── 动态尾部 ②：技能清单（加技能才变）──────────────────────────────
     dynamic.push(format!(
         "# 技能（Skills）\n\n\
          你有一个本地技能库，存放用户或你自己沉淀的**可复用操作流程**。\n\
@@ -1749,20 +2094,31 @@ pub fn build_system_prompt_for(data_dir: &Path, user_message: &str) -> String {
         crate::skills::catalog(data_dir)
     ));
 
-    // ── 动态尾部 ②：MCP 已加载组状态（加载/卸载组才变）─────────────────
+    // ── 动态尾部 ③：MCP 已加载组状态（加载/卸载组才变）─────────────────
     // 注：组状态本身由 `tool_specs()` 每轮实时反映在工具定义里，
     // 这里只是一个文字提示，告诉模型"当前手上有什么"。
+    //
+    // ⚠️ **当前时间必须在动态区**（2026-09-30 加）：放稳定前缀会让**整段
+    //    后续内容每分钟失效一次**（prompt cache 按前缀逐字节比对）——
+    //    那是拿"每轮最贵的成本项"去换一条时间。放尾部则只失效尾部这一小段。
+    //    这是有意的取舍：模型没有时间就无法给日记/文档打正确日期、无法做
+    //    「上周/三天前」的推理（此前它只能靠跑一次 Get-Date 猜，多数时候直接跳过）。
     dynamic.push(format!(
         "# 动态信息\n\n\
+         ## 当前时间\n{}\n\n\
          ## 当前工作目录\n{}\n\n\
-         ## 已加载的 MCP 工具组\n\
-         用 `list_tool_groups` 可查看全部可用组。",
+         ## MCP 工具组\n\
+         当前可用的组已直接反映在工具列表里（`mcp__*`），\
+         全部工具的名字与用途在上方「外部工具索引」段（含每组的已加载/未加载标记）。\
+         按意图找工具用 `search_tools`，看各组的 token 成本用 `list_tool_groups`。",
+        // 精确到分钟：够写字、算"几小时前"，也够判断跨没跨零点
+        clock_line(now_ms()),
         std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "?".into())
     ));
 
-    // ── 动态尾部 ③：本轮自动加载的技能（方案 B）─────────────────────────
+    // ── 动态尾部 ④：本轮自动加载的技能（方案 B）─────────────────────────
     // 按用户本轮消息的关键词自动命中 → 命中技能全文直接进 prompt，模型无需
     // 再调 `load_skill`。这是**每轮都可能变**的内容 → 必须排在所有低频内容之后。
     let autoloaded = crate::skills::autoload(data_dir, user_message);
@@ -1770,16 +2126,84 @@ pub fn build_system_prompt_for(data_dir: &Path, user_message: &str) -> String {
         dynamic.push(autoloaded);
     }
 
+    // ── 动态尾部 ⑤：当前模式的**行为指令**（切模式才变）─────────────────
+    //
+    // ⚠️ 为什么这一段必须有（2026-10 用户指出「PTC 不该是一次调用多个工具吗」）：
+    //
+    // agent loop **本来就支持**一轮发多个 tool_calls（`for call in calls` 逐个执行、
+    // 结果全部回灌），但 prompt 里从来没有一句话告诉模型"你可以一次发多个"。
+    // 于是模型永远一个工具一轮 —— 能力在，指令缺。
+    //
+    // 只把「全部组可见」当 PTC 的语义是不够的：那只是**看得见**，
+    // 而"批量调用工具、对结果筛选/整理/去重/统计"要的是**并发地干活**。
+    // 所以模式除了决定工具可见性，还要决定这段行为指令。
+    //
+    // 放动态区（不放稳定前缀）：切模式才变，而切模式是低频操作；
+    // 放稳定区会让**每次切模式**都把后面所有内容的前缀缓存打掉。
+    let mode = crate::modes::resolve(data_dir, Some(&load_active_mode(data_dir)));
+    if mode.allows_all() {
+        // PTC：明确要求"并行 + 汇总"
+        dynamic.push(
+            "# 当前模式：PTC（批量并行）\n\n\
+             这个模式下你要**一次发多个 tool_calls**，而不是一个一个来。\n\
+             规则：\n\
+             - 当多个调用之间**没有依赖**（结果互不用于对方的参数）时，\
+             必须在**同一条回复里**把它们一起发出去。系统会逐个执行、\
+             结果全部回灌给你。例：要读 8 个文件 → 一次发 8 个 read_file；\
+             要查 5 个表 → 一次发 5 个调用。\n\
+             - **有依赖**的（后一个要用前一个的结果）仍然要分轮：\
+             例如先 glob_files 找到路径、再 read_file 读它。\n\
+             - 拿到一批结果后，**在正文里做汇总**：筛选、去重、排序、统计、\
+             对比，给用户一个整理过的结论，而不是把原始结果原样倒出来。\n\
+             - 一轮里发多个调用不会更贵：它们共用同一次 prefill。\n\n\
+             判断口诀：**能同时做就同时做，必须先后才分轮。**"
+                .to_string(),
+        );
+    } else {
+        // 标准 / 极简 / 创造 / 用户自定义：也允许批量，但不强推
+        dynamic.push(
+            "# 当前模式：按需（逐个为主）\n\n\
+             默认一个工具一轮。但如果多个调用之间**确实没有依赖**，\
+             也可以在同一条回复里一次发多个（系统会逐个执行、结果全部回灌），\
+             能省轮次。有依赖时必须分轮。\n\
+             需要「批量并行 + 结果汇总」那种工作方式时，\
+             让用户切到 **PTC 模式**（设置 › 行为）。"
+                .to_string(),
+        );
+    }
+
     stable.extend(dynamic);
     stable.join("\n\n---\n\n")
 }
 
 /// 当前 epoch 毫秒。会话与历史模块共用同一口径。
+/// 读当前 agent 模式 id（`settings.json` 的 `activeMode`）。
+///
+/// 为什么不直接 `config::load_settings(data_dir).active_mode`：
+/// 那样要 import `config` 的整个结构体进来，而这里只需要一个字符串；
+/// 而且**读不到时必须有兜底**（老 settings.json 没有这个字段），
+/// 所以收成一个函数，语义集中在一处。
+fn load_active_mode(data_dir: &Path) -> String {
+    crate::config::load_settings(data_dir).active_mode
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// 给模型看的一行「现在是什么时候」，形如 `2026-09-30 14:05（周三）`。
+///
+/// 复用 `history::fmt_local` / `weekday_cn`，不另写一套时间格式化 ——
+/// 两处各写一份，迟早出现"历史里是 09-30、当前时间是 09-29"这种自相矛盾。
+fn clock_line(ms: u64) -> String {
+    format!(
+        "{}（{}）",
+        crate::history::fmt_local(ms),
+        crate::history::weekday_cn(ms)
+    )
 }
 
 #[cfg(test)]
@@ -2028,6 +2452,13 @@ mod tests {
         std::fs::write(tmp.join("RULES.md"), "RULES_BODY").unwrap();
         std::fs::write(tmp.join("SOUL.md"), "SOUL_BODY").unwrap();
         std::fs::write(tmp.join("USER.md"), "USER_BODY").unwrap();
+        // 造一份假的 MCP 能力索引缓存：这样"外部工具索引"段也会出现，
+        // 它必须同样落在动态区（拉快照就会变，不是规则文字）。
+        std::fs::write(
+            crate::mcp::ToolRegistry::index_cache_path_in(&tmp),
+            "**demo**（2 个，已加载）：\n- alpha — 做甲事\n- beta — 做乙事\n",
+        )
+        .unwrap();
 
         let p = build_system_prompt(&tmp);
 
@@ -2041,7 +2472,17 @@ mod tests {
             "# 对话历史", // 带 # —— 否则可能命中动态区里的指引句
         ];
         // 动态锚点：这些是"运行时数据"，会随用户操作变化
-        let dynamic_anchors = ["# 技能（Skills）", "# 动态信息"];
+        // （`## 当前时间` 也在动态区 —— 它每分钟都会变，放稳定区等于每分钟
+        //   让后面全部内容按未命中价重付，见 build_system_prompt 的注释）
+        //
+        // `# 外部工具索引` 必须在这里：它列的是"当前有哪些工具"，
+        // 改 server 配置 / 拉快照就变 —— 绝不能混进稳定前缀。
+        let dynamic_anchors = [
+            "# 外部工具索引",
+            "# 技能（Skills）",
+            "# 动态信息",
+            "## 当前时间",
+        ];
 
         let last_static = static_anchors
             .iter()
@@ -2079,11 +2520,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// 稳定前缀必须**逐字节稳定**：同一份输入调两次结果完全相同
+    /// 稳定前缀必须**逐字节稳定**：同一份输入调两次，**前缀**完全相同。
     ///
-    /// 注意 `current_dir()` 在进程内恒定，所以整个 prompt 两次应完全一致。
+    /// ⚠️ 2026-09-30 改口径：以前断言的是"整个 prompt 两次完全一致"，
+    /// 但动态区现在含「当前时间」（精确到分钟）。如果两次调用正好跨过一分钟
+    /// 边界，这条断言会**偶发失败** —— 那是测试本身不可靠，不是实现错了。
+    ///
+    /// 真正与 prompt cache 有关的只有**前缀**（缓存按前缀逐字节比对），
+    /// 所以这里只比较"第一个动态段之前"的部分：它必须完全稳定。
+    /// 动态区之后可以有变化（当前时间、已加载技能、MCP 组状态）。
     #[test]
-    fn system_prompt_is_byte_stable_across_calls() {
+    fn system_prompt_prefix_is_byte_stable_across_calls() {
         let tmp = std::env::temp_dir().join("orbcat_prompt_stable");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("memory")).unwrap();
@@ -2091,7 +2538,254 @@ mod tests {
 
         let a = build_system_prompt(&tmp);
         let b = build_system_prompt(&tmp);
-        assert_eq!(a, b, "同一份输入必须产出逐字节相同的 prompt");
+
+        // 第一个动态锚点：取三者的最早出现位置
+        let cut = ["# 技能（Skills）", "# 动态信息", "## 当前时间"]
+            .iter()
+            .filter_map(|x| a.find(x))
+            .min()
+            .expect("应有动态段");
+        assert!(cut > 0, "动态段不应在最开头");
+        assert_eq!(
+            &a[..cut],
+            &b[..cut],
+            "稳定前缀必须逐字节相同（缓存只认前缀）"
+        );
+
+        // 反向保证：动态区确实落在前缀之后，别把时间混进稳定区
+        let t = a.find("## 当前时间").expect("应有当前时间");
+        assert!(t >= cut, "当前时间必须在动态区");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 🔴 能力索引必须落在动态区，且**改动索引不能动到稳定前缀**。
+    ///
+    /// 这条是本任务加索引时最关键的回归：如果哪天有人图省事把索引拼进稳定区
+    /// （比如塞进「外部工具（MCP）的用法」那段），每次换 MCP 配置都会让它
+    /// 后面的对话历史规则、技能清单全部按未命中价重付 —— 而且**不会有任何报错**，
+    /// 只会慢慢变贵。所以这里直接对比"索引变了"前后两个 prompt 的前缀。
+    #[test]
+    fn tool_index_change_does_not_invalidate_stable_prefix() {
+        let tmp = std::env::temp_dir().join("orbcat_prompt_tool_index");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("memory")).unwrap();
+        std::fs::write(tmp.join("RULES.md"), "RULES_BODY_IDX").unwrap();
+        std::fs::write(tmp.join("SOUL.md"), "SOUL_BODY_IDX").unwrap();
+
+        // ① 没有索引（MCP 未配置）
+        let without = build_system_prompt(&tmp);
+        assert!(
+            !without.contains("# 外部工具索引"),
+            "没有索引缓存时不该凭空造一段"
+        );
+
+        // ② 有一份索引
+        std::fs::write(
+            crate::mcp::ToolRegistry::index_cache_path_in(&tmp),
+            "**ssh**（2 个，已加载）：\n- run-command — 在远程主机执行命令\n- upload-file — 上传文件\n",
+        )
+        .unwrap();
+        let with = build_system_prompt(&tmp);
+        assert!(with.contains("# 外部工具索引"));
+        assert!(with.contains("run-command"));
+
+        // ③ 换一份索引（模拟改了 MCP server 配置）
+        std::fs::write(
+            crate::mcp::ToolRegistry::index_cache_path_in(&tmp),
+            "**mysql**（1 个，未加载）：\n- execute_query — 执行只读 SQL\n",
+        )
+        .unwrap();
+        let changed = build_system_prompt(&tmp);
+        assert!(changed.contains("execute_query"));
+        assert!(!changed.contains("run-command"), "旧索引不该残留");
+
+        // 🔴 核心断言：三种情况下**第一个动态段之前**的部分逐字节相同。
+        // （改动索引只允许影响索引自己那一段及其之后 —— 绝不能前移。）
+        let cut = |s: &str| {
+            [
+                "# 外部工具索引",
+                "# 技能（Skills）",
+                "# 动态信息",
+                "## 当前时间",
+            ]
+            .iter()
+            .filter_map(|x| s.find(x))
+            .min()
+            .expect("应有动态段")
+        };
+        assert_eq!(
+            &without[..cut(&without)],
+            &with[..cut(&with)],
+            "加索引不能改变稳定前缀"
+        );
+        assert_eq!(
+            &with[..cut(&with)],
+            &changed[..cut(&changed)],
+            "换索引不能改变稳定前缀（否则后面全部缓存失效）"
+        );
+
+        // 顺序：索引是最早的动态段 → 它排在最前（比技能清单更不易变）
+        assert!(
+            with.find("# 外部工具索引").unwrap() < with.find("# 技能（Skills）").unwrap(),
+            "索引应排在技能清单之前（动态区按变化频率从低到高）"
+        );
+        // 但仍在静态区之后：稳定规则文字的锚点在它前面
+        assert!(
+            with.find("外部工具（MCP）的用法").unwrap() < with.find("# 外部工具索引").unwrap(),
+            "索引是运行时数据，必须在稳定规则文字之后"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 🔴 常驻成本必须可量化：端到端量一次"56 个工具 / 4 组"的真实索引
+    /// 会给 system prompt **增加多少 token**。
+    ///
+    /// 为什么这条测试重要：本任务的硬约束就是"可发现，但绝不把上下文顶爆"。
+    /// 索引是**每轮都常驻**的内容，所以它的成本必须被一个具体数字钉住 ——
+    /// 对照组是同一段 prompt 在有/无索引两种情况下的 `estimate_tokens` 之差，
+    /// 而不是估算某个片段的字数（那会把分隔符、标题、规则文字全漏掉）。
+    ///
+    /// 上限取 1.5k：真实测量约 1.1k，是完整 schema（~14.4k）的 ~8%。
+    /// 如果哪天有人往索引里塞 schema 或参数列表，这条会先炸。
+    /// PTC 模式必须给出**行为指令**（不只"全给工具"）。
+    ///
+    /// 背景（2026-10 用户指出）：agent loop 本来就支持一轮发多个 tool_calls
+    /// （`for call in calls` 逐个执行、结果全回灌），但 prompt 里从来没告诉模型
+    /// 这件事 —— 于是模型永远一个工具一轮，"PTC"退化成"看得见更多工具"而已。
+    ///
+    /// 这条测试钉住三件事：
+    ///   1. PTC 下 prompt 里明确要求**一次发多个**；
+    ///   2. 同时说清**有依赖时分轮**（否则模型会把有依赖的调用也硬塞一批 → 报错）；
+    ///   3. 非 PTC 模式下不出现这段强推文字（否则等于把 PTC 变成默认）。
+    #[test]
+    fn ptc_mode_asks_model_to_batch_tool_calls() {
+        let tmp = std::env::temp_dir().join(format!(
+            "orbcat_ptc_mode_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // 默认（标准模式）：不该出现 PTC 的强推文字
+        let standard = build_system_prompt(&tmp);
+        assert!(
+            !standard.contains("当前模式：PTC"),
+            "默认模式不该带 PTC 指令段"
+        );
+        assert!(
+            standard.contains("当前模式：按需"),
+            "非 PTC 也要有模式说明，否则模型不知道自己处于哪个模式"
+        );
+
+        // 切到 PTC：必须出现批量指令，且必须带"有依赖要分轮"的约束
+        let mut s = crate::config::load_settings(&tmp);
+        s.active_mode = "ptc".into();
+        crate::config::save_settings(&tmp, &s).unwrap();
+
+        let ptc = build_system_prompt(&tmp);
+        assert!(ptc.contains("当前模式：PTC"), "PTC 模式应注入批量指令段");
+        assert!(
+            ptc.contains("一次发多个 tool_calls"),
+            "PTC 的核心语义是「一轮多个调用」，这段文字丢了 PTC 就名不副实"
+        );
+        assert!(
+            ptc.contains("没有依赖"),
+            "必须给出「什么时候可以并行」的判据"
+        );
+        assert!(
+            ptc.contains("有依赖"),
+            "必须同时说明有依赖时分轮 —— 否则模型会把有依赖的调用硬塞一批，直接报错"
+        );
+        assert!(
+            ptc.contains("汇总"),
+            "PTC 的第二半是「对结果筛选/整理/去重/统计/汇总」，不能只要求并行"
+        );
+        assert!(
+            !ptc.contains("当前模式：按需"),
+            "两种模式的指令段不能同时出现"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 切换模式只影响**动态区**，不该把稳定前缀打掉（prompt cache 成本）。
+    #[test]
+    fn mode_switch_only_touches_dynamic_tail() {
+        let tmp = std::env::temp_dir().join(format!(
+            "orbcat_mode_prefix_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("RULES.md"), "RULES_STABLE_MARKER").unwrap();
+
+        let a = build_system_prompt(&tmp);
+        let mut s = crate::config::load_settings(&tmp);
+        s.active_mode = "ptc".into();
+        crate::config::save_settings(&tmp, &s).unwrap();
+        let b = build_system_prompt(&tmp);
+
+        assert_ne!(a, b, "切模式必须真的改变 prompt");
+        // 稳定段（红线）在两种模式下都必须原样在，且位置不变
+        let ia = a.find("RULES_STABLE_MARKER").unwrap();
+        let ib = b.find("RULES_STABLE_MARKER").unwrap();
+        assert_eq!(ia, ib, "切模式不该挪动稳定前缀（会打掉 prompt cache）");
+        assert_eq!(
+            &a[..ia],
+            &b[..ib],
+            "稳定前缀必须逐字节一致（前缀缓存按字节比对）"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tool_index_constant_cost_stays_small() {
+        let tmp = std::env::temp_dir().join("orbcat_prompt_tool_index_cost");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("memory")).unwrap();
+        std::fs::write(tmp.join("RULES.md"), "RULES_BODY_COST").unwrap();
+
+        // 对照组：没有索引
+        let without = build_system_prompt(&tmp);
+        let base = crate::llm::estimate_tokens(&without);
+
+        // 实验组：塞一份与真实网关同形的 56 工具索引
+        std::fs::write(
+            crate::mcp::ToolRegistry::index_cache_path_in(&tmp),
+            crate::mcp::ToolRegistry::test_fixture_index(),
+        )
+        .unwrap();
+        let with = build_system_prompt(&tmp);
+        let total = crate::llm::estimate_tokens(&with);
+        let cost = total - base;
+        eprintln!(
+            "[orbcat][test] 能力索引常驻成本：{cost} tokens\
+             （prompt {base} → {total}，完整 schema 约 14400）"
+        );
+
+        assert!(with.contains("# 外部工具索引"), "应注入索引段");
+        assert!(
+            (700..1500).contains(&cost),
+            "索引常驻成本应在 0.7k~1.5k tokens（真实约 1.1k，完整 schema 的 ~8%），\
+             实际 {cost} —— 太大就是变相全量注入，太小说明索引没真的进去"
+        );
+
+        // 上面那条断言的另一半：索引段本身**不含**任何 schema 字段名
+        let idx_at = with.find("# 外部工具索引").unwrap();
+        let skills_at = with.find("# 技能（Skills）").unwrap();
+        let section = &with[idx_at..skills_at];
+        assert!(!section.contains("properties"), "索引段不得携带 schema");
+        assert!(
+            !section.contains("inputSchema") && !section.contains("required"),
+            "索引段不得携带 schema 字段"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2231,5 +2925,186 @@ mod tests {
         let text = "这个函数会调用 read_file 来读取文件。";
         assert!(super::extract_pseudo_calls(text).is_none());
         assert!(!super::smells_like_pseudo(text));
+    }
+
+    // ---------------- 流式落盘节流（2026-09-30） ----------------
+
+    /// 数调用次数的 checkpoint 回调工厂
+    fn counting_ckpt() -> (
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        Option<CheckpointFn>,
+    ) {
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n2 = n.clone();
+        let cb: CheckpointFn = std::sync::Arc::new(move |_s: &[AgentStep], _a: &str, _r: &str| {
+            n2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        (n, Some(cb))
+    }
+
+    /// 空正文不落盘：思考分片来了但没有新正文时，写一次盘纯属浪费
+    #[test]
+    fn stream_checkpoint_skips_empty_text() {
+        let (calls, cb) = counting_ckpt();
+        let clock = std::sync::atomic::AtomicU64::new(0);
+        checkpoint_from_stream(&cb, &clock, &[], "", "想了一下");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// 节流：同一轮里连续多次调用只落一次盘（相邻两份会落两次）
+    ///
+    /// 为什么这条重要：`checkpoint` 会 `write_session` **整个会话 JSON**，
+    /// 而流式分片是几十毫秒一片 —— 不节流就是每秒重写会话好几次。
+    #[test]
+    fn stream_checkpoint_throttles_bursts() {
+        let (calls, cb) = counting_ckpt();
+        let clock = std::sync::atomic::AtomicU64::new(0);
+
+        // 第一片：`last == 0` 视为"本轮还没落过" → 立刻落
+        checkpoint_from_stream(&cb, &clock, &[], "第一段", "");
+        // 紧接着的三片会被节流挡掉（间隔远小于 CHECKPOINT_THROTTLE_MS）
+        checkpoint_from_stream(&cb, &clock, &[], "第二段", "");
+        checkpoint_from_stream(&cb, &clock, &[], "第三段", "");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "突发分片只该落一次盘"
+        );
+
+        // 把时钟拨回 0：等于"距上次落盘已经很久" → 又能落一次
+        clock.store(0, std::sync::atomic::Ordering::Relaxed);
+        checkpoint_from_stream(&cb, &clock, &[], "第四段", "");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "过了节流窗口应再落一次"
+        );
+    }
+
+    /// 没配回调（如单测里的 `run(..., None, ...)`）时不能 panic
+    #[test]
+    fn stream_checkpoint_noop_without_callback() {
+        let clock = std::sync::atomic::AtomicU64::new(0);
+        checkpoint_from_stream(&None, &clock, &[], "正文", "");
+        assert_eq!(clock.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    // ---------------- 校准（上下文预算的真锚点） ----------------
+
+    /// 校准倍率：真实 prompt 明显大于固定开销时，按「(真实−开销) ÷ 估算」算
+    #[test]
+    fn calibration_computes_scale_from_real_prompt() {
+        let mut c = Calibration::default();
+        // 真实 10000，其中 2000 是 system+工具 schema 的开销；本地估算消息 1000
+        // → 倍率 = (10000-2000)/1000 = 8
+        c.observe(10_000, 2_000, 1_000);
+        assert_eq!(c.last_prompt, Some(10_000));
+        assert_eq!(c.scale, Some(8.0));
+        assert_eq!(c.apply(1_000), 8_000, "估算应按倍率放大");
+    }
+
+    /// 真实值不比开销大时不更新倍率 —— 否则分母趋零会算出虚高的荒谬倍率
+    #[test]
+    fn calibration_skips_when_real_is_not_larger_than_overhead() {
+        let mut c = Calibration::default();
+        c.observe(500, 20_000, 1_000);
+        assert_eq!(c.last_prompt, Some(500), "真实值本身仍要记住");
+        assert_eq!(c.scale, None, "但倍率不该更新");
+    }
+
+    /// 倍率被夹在保守区间里：单次调用的离群值不该污染后面所有轮次
+    #[test]
+    fn calibration_clamps_extreme_scale() {
+        let mut c = Calibration::default();
+        // 算出 1000 倍的荒谬值
+        c.observe(1_000_000, 0, 1_000);
+        assert_eq!(c.scale, Some(TOKEN_SCALE_MAX));
+    }
+
+    /// 倍率为 1（或更小）时 `apply` 不该把估算**变小** —— 低估是我们要治的病
+    #[test]
+    fn apply_never_shrinks_estimate() {
+        let c = Calibration {
+            last_prompt: None,
+            scale: Some(0.5),
+        };
+        assert_eq!(c.apply(1_000), 1_000, "小于 1 的倍率不生效");
+    }
+
+    /// 服务端不给 usage（prompt = 0）时保持原状，不把已校准的会话抹掉
+    #[test]
+    fn calibration_ignores_zero_usage() {
+        let mut c = Calibration {
+            last_prompt: Some(123),
+            scale: Some(4.0),
+        };
+        c.observe(0, 0, 999);
+        assert_eq!(c.last_prompt, Some(123));
+        assert_eq!(c.scale, Some(4.0));
+    }
+
+    /// 🔴 回归：**旧闸门会放行一个已经超水位的上下文**（这是本项要修的 bug）
+    ///
+    /// 场景照着实测数据构造：模型配了 `maxInputTokens = 1_000_000`（水位 60 万），
+    /// 而本地估算对真实 prompt 低估约百倍 —— 实测某个会话的真实 prompt 求和
+    /// 2340 万、落盘消息才几百 KB，本地估算与服务端真实值差 4.9~144 倍。
+    ///
+    /// 旧实现只拿「历史估算」去比水位，估算值永远够不着 → 闸门形同虚设，
+    /// 上下文一路裸奔（这正是 30 个真实会话里 compact **一次都没触发**的原因）。
+    #[test]
+    fn calibrated_budget_catches_what_old_gate_missed() {
+        // 一条"看起来不大"的消息：36 万 ASCII 字符 ≈ 9 万 tok 的本地估算
+        let big = "x".repeat(360_000);
+        let messages = vec![ChatMessage::user(&big)];
+        let est_msgs = estimate_messages_tokens(&messages);
+        assert!(
+            (89_000..91_000).contains(&est_msgs),
+            "本地估算应在 9 万上下，实际 {est_msgs}"
+        );
+
+        let context_window = 1_000_000usize;
+        let compact_trigger =
+            ((context_window as f64) * crate::history::COMPACT_TRIGGER_RATIO) as usize;
+        assert_eq!(compact_trigger, 600_000);
+
+        // ① 旧口径（未校准）：估算 9 万 << 水位 60 万 → **判不超，闸门放行**
+        let uncalibrated = Calibration::default();
+        assert!(
+            uncalibrated.apply(est_msgs) < compact_trigger,
+            "这正是 bug 现场：未校准时估算远低于水位，所以 compact 从不触发"
+        );
+
+        // ② 新口径：服务端实测这个上下文其实是 95 万 tok、固定开销 5 万。
+        //    倍率 = (950000-50000)/90000 = 10 → 校准后判超，闸门拦下
+        let mut cal = Calibration::default();
+        let real = 950_000u32;
+        let overhead = 50_000usize;
+        cal.observe(real, overhead, est_msgs);
+        let scale = cal.scale.expect("应算出倍率");
+        assert!(
+            (9.8..10.2).contains(&scale),
+            "倍率应约为 (950000-50000)/估算 = 10，实际 {scale}"
+        );
+        let measured = cal.apply(est_msgs) + overhead;
+        assert!(
+            (940_000..960_000).contains(&measured),
+            "校准后应能反推出真实量级（约 95 万），实际 {measured}"
+        );
+        assert!(
+            measured > compact_trigger,
+            "真实 95 万 > 水位 60 万 → **必须判超**（旧实现这里会放行、上下文裸奔）"
+        );
+
+        // ③ 光有真值、倍率没算出来的情况（分母太小等）也得拦住：
+        //    `apply` 在倍率为 None 时原样返回，但上游用的是**真实 prompt**，
+        //    所以带真值的会话永远不依赖估算。
+        let mut real_only = Calibration::default();
+        real_only.observe(real, overhead, 0); // estimated_msgs = 0 → 不更新倍率
+        assert_eq!(real_only.last_prompt, Some(real));
+        assert_eq!(real_only.scale, None);
+        assert!(
+            real_only.last_prompt.unwrap() as usize > compact_trigger,
+            "真值在手时判定量就是它，与估算无关"
+        );
     }
 }

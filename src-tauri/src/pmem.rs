@@ -139,6 +139,12 @@ pub fn bind_session(data_dir: &Path, session_id: &str, project_id: Option<i64>) 
     Ok(())
 }
 
+/// 查一个会话绑定到哪个项目（`None` = 主对话/未绑定）。
+///
+/// ⚠️ **仅供测试**（2026-09-30 标注）：UI 展示走的是 [`session_map`]（一次性
+/// 拿全量映射，避免每行一次 SQLite 往返）。这个单条查询留着给单测断言绑定结果，
+/// 生产路径没有调用者。
+#[cfg(test)]
 pub fn session_project(data_dir: &Path, session_id: &str) -> Result<Option<i64>, String> {
     let conn = open(data_dir)?;
     let mut stmt = conn
