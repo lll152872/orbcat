@@ -231,6 +231,36 @@ fn ansi_cstr(b: &[u8]) -> String {
     decode_ansi(&b[..n])
 }
 
+/// 把一段字节按系统 ACP（中文机器 = GBK）解码 —— 供 `tools::grep_files`
+/// 读取 GBK 编码的 .md/.txt 用。
+///
+/// 与 [`decode_ansi`] 的区别：这里**不做 UTF-8 优先判断**（调用方已经确认
+/// 严格 UTF-8 解不开才来）。解不出来返回空串，调用方据此判为二进制。
+pub fn decode_acp(b: &[u8]) -> String {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    extern "system" {
+        fn MultiByteToWideChar(
+            cp: u32,
+            flags: u32,
+            mb: *const u8,
+            cb: i32,
+            wc: *mut u16,
+            cc: i32,
+        ) -> i32;
+    }
+    unsafe {
+        // CP_ACP = 0
+        let n = MultiByteToWideChar(0, 0, b.as_ptr(), b.len() as i32, std::ptr::null_mut(), 0);
+        if n <= 0 {
+            return String::new();
+        }
+        let mut wbuf = vec![0u16; n as usize];
+        MultiByteToWideChar(0, 0, b.as_ptr(), b.len() as i32, wbuf.as_mut_ptr(), n);
+        OsString::from_wide(&wbuf).to_string_lossy().into_owned()
+    }
+}
+
 /// 解码 lnk ANSI 段路径。
 ///
 /// 为什么不能无脑 CP_ACP：系统 ACP 是 GBK（中文机器），但**新式程序写 lnk 时

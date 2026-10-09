@@ -16,14 +16,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { MODELS_INTENT_KEY } from "./format";
 
 // ---------------------------------------------------------------------------
 // 类型（与 Rust 端 camelCase 序列化一一对应）
 // ---------------------------------------------------------------------------
 
+/** 模型身份 = (Base URL, 接口 id)；同 id 可跨组共存，显示名已废弃 */
 interface ModelView {
   id: string;
-  name: string;
   vendor: string;
   url: string;
   supportsToolCall: boolean;
@@ -44,7 +45,6 @@ interface RemoteModelInfo {
 /** 编辑表单回填（不含完整 Key） */
 interface ModelEditView {
   id: string;
-  name: string;
   vendor: string;
   url: string;
   supportsToolCall: boolean;
@@ -58,9 +58,10 @@ interface ModelEditView {
 
 /** 添加/编辑表单的会话内状态（re-render 时保住输入，错误也能回填） */
 interface ModelFormState {
-  /** null = 新建；否则为正在编辑的旧显示名 */
+  /** null = 新建；否则为正在编辑的旧接口 id */
   editId: string | null;
-  name: string;
+  /** 正在编辑的条目所属组（Base URL）；与 editId 配对精确定位 */
+  editUrl: string | null;
   id: string;
   url: string;
   apiKey: string;
@@ -97,7 +98,9 @@ interface RemoteFetchState {
 let app: HTMLElement;
 
 let models: ModelView[] = [];
+/** 当前选中的模型**接口 id**（身份 = (Base URL, id)，配 selectedModelUrl 消歧） */
 let selectedModel: string | null = null;
+let selectedModelUrl: string | null = null;
 /** 分组显示名（键 = Base URL），settings.modelGroupNames */
 let modelGroupNames: Record<string, string> = {};
 
@@ -128,7 +131,7 @@ function esc(s: string): string {
 function emptyModelForm(): ModelFormState {
   return {
     editId: null,
-    name: "",
+    editUrl: null,
     id: "",
     url: "",
     apiKey: "",
@@ -140,6 +143,19 @@ function emptyModelForm(): ModelFormState {
     maxOut: "",
     preset: "custom",
   };
+}
+
+/**
+ * 当前选中判定：**只认唯一那一条**。
+ *
+ * 原来是 `id 相同 &&（有 url 才比 url）` —— 设置里只有 id 没记 url 时，
+ * 所有同 id 的行都会命中（用户 2026-10-02 报的「两个 glm-5.3-flash 都画线」：
+ * `models.json` 里确实有两条 id 相同、Base URL 不同的 glm-5.3-flash）。
+ * 现在先解析出当前模型，再按 (id, url) 全等比对，最多标一个。
+ */
+function isCurrent(m: ModelView): boolean {
+  const cur = models.find((x) => x.id === selectedModel && (!selectedModelUrl || sameUrl(x.url, selectedModelUrl)));
+  return cur !== undefined && m.id === cur.id && sameUrl(m.url, cur.url);
 }
 
 function shortHost(url: string): string {
@@ -306,7 +322,15 @@ function askInput(title: string, body: string, initial = ""): Promise<string | n
 async function reloadModels(): Promise<void> {
   try {
     models = await invoke<ModelView[]>("list_models");
-    selectedModel = await invoke<string | null>("get_selected_model");
+    const sel = await invoke<{ id: string; url: string | null } | null>("get_selected_model");
+    selectedModel = sel?.id ?? null;
+    selectedModelUrl = sel?.url ?? null;
+    // 同 main.ts：旧设置只有 id 没 url 时按 (id, url) 全等判定会命中**所有**同 id 的行
+    // （两个 glm-5.3-flash 都带当前标记）。这里也定死成唯一一条。
+    if (selectedModel && !selectedModelUrl) {
+      const resolved = models.find((x) => x.id === selectedModel);
+      if (resolved) selectedModelUrl = resolved.url;
+    }
     modelGroupNames = await invoke<Record<string, string>>("model_group_names");
   } catch (e) {
     showToast(`加载模型列表失败：${e}`, "error");
@@ -323,7 +347,6 @@ function renderModelsBody(): string {
     ? models.filter(
         (m) =>
           m.id.toLowerCase().includes(q) ||
-          m.name.toLowerCase().includes(q) ||
           m.url.toLowerCase().includes(q),
       )
     : models;
@@ -342,31 +365,30 @@ function renderModelsBody(): string {
   const rows = [...groups.entries()]
     .map(([url, list]) => {
       const closed = modelGroupClosed.has(url);
-      const curInside = list.some((m) => m.name === selectedModel);
+      const curInside = list.some(isCurrent);
       const menuOpen = modelGroupMenu === url;
       const items = list
         .map((m) => {
-          const cur = m.name === selectedModel;
+          const cur = isCurrent(m);
           const ctx = m.maxInputTokens ? `${Math.round(m.maxInputTokens / 1000)}K` : "—";
           const tags = `${m.supportsToolCall ? '<span class="lm-tag">工具</span>' : ""}${
             m.supportsImages ? '<span class="lm-tag">视觉</span>' : ""
           }`;
           return `
-      <div class="lm-row${cur ? " cur" : ""}" data-id="${esc(m.name)}">
+      <div class="lm-row${cur ? " cur" : ""}" data-id="${esc(m.id)}" data-url="${esc(m.url)}">
         <div class="lm-name">
-          <button class="lm-eye${cur ? " on" : ""}" data-id="${esc(m.name)}" title="${
+          <button class="lm-eye${cur ? " on" : ""}" data-id="${esc(m.id)}" data-url="${esc(m.url)}" title="${
             cur ? "当前使用中" : "设为当前模型"
           }">◎</button>
-          <span class="lm-label" title="${esc(m.name)}">${esc(m.name)}</span>
-          ${m.name !== m.id ? `<span class="lm-api" title="model=${esc(m.id)}">${esc(m.id)}</span>` : ""}
+          <span class="lm-label" title="${esc(m.id)}">${esc(m.id)}</span>
           ${m.hasKey === false ? '<span class="lm-nokey">无Key</span>' : ""}
         </div>
         <div class="lm-ctx">${esc(ctx)}</div>
         <div class="lm-tags">${tags}</div>
         <div class="lm-ops">
-          <button class="set-btn edit" data-id="${esc(m.name)}">编辑</button>
-          <button class="set-btn test" data-id="${esc(m.name)}">测</button>
-          <button class="set-btn del" data-id="${esc(m.name)}">删</button>
+          <button class="set-btn edit" data-id="${esc(m.id)}" data-url="${esc(m.url)}">编辑</button>
+          <button class="set-btn test" data-id="${esc(m.id)}" data-url="${esc(m.url)}">测</button>
+          <button class="set-btn del" data-id="${esc(m.id)}" data-url="${esc(m.url)}">删</button>
         </div>
         <div class="set-test-msg" hidden></div>
       </div>`;
@@ -482,7 +504,7 @@ function renderModelsBody(): string {
       ${f.error ? `<div class="form-err">${esc(f.error)}</div>` : ""}
       ${
         editing
-          ? `<div class="set-hint">正在编辑 <code>${esc(f.editId!)}</code> · <b>接口模型 ID</b> 才会发给提供商（request 的 <code>model</code>）</div>`
+          ? `<div class="set-hint">正在编辑 <code>${esc(f.editId!)}</code>${f.editUrl ? ` @ <code>${esc(shortHost(f.editUrl))}</code>` : ""} · <b>接口模型 ID</b> 才会发给提供商（request 的 <code>model</code>）</div>`
           : ""
       }
       <label class="fld"><span>Base URL</span>
@@ -494,7 +516,7 @@ function renderModelsBody(): string {
             ? f.clearKey
               ? "保存后将清空 Key"
               : "留空保持原 Key"
-            : "本地 / Ollama 可留空"
+            : "本地 / Ollama 可留空；云端留空自动继承同组 Key"
         }" value="${esc(f.clearKey ? "" : f.apiKey)}" />
       </label>
       ${
@@ -512,9 +534,6 @@ function renderModelsBody(): string {
           f.url.trim() ? modelsEndpointPreview(f.url.trim()) : "{Base URL}/models",
         )}">获取 ID</button>
       </div>
-      <label class="fld"><span>显示名（可空，默认同 ID）</span>
-        <input id="f-name" placeholder="火山agent" value="${esc(f.name)}" />
-      </label>
       <div class="form-row-2 even">
         <label class="fld"><span>上下文窗口（可填 128000 / 128k / 1m）</span>
           <input id="f-max-in" placeholder="128000" value="${esc(f.maxIn)}" />
@@ -648,7 +667,6 @@ function readModelForm(): void {
     const el = document.querySelector(sel) as HTMLInputElement | null;
     return el ? el.checked : dflt;
   };
-  f.name = val("#f-name");
   f.id = val("#f-id");
   f.url = val("#f-url");
   f.apiKey = val("#f-key");
@@ -883,10 +901,10 @@ function bindApp(): void {
       const hit = models.find((m) => m.id === id && sameUrl(m.url, url0));
       if (hit) {
         try {
-          const ev = await invoke<ModelEditView>("models_get_edit", { id: hit.name });
+          const ev = await invoke<ModelEditView>("models_get_edit", { id: hit.id, url: hit.url });
           modelForm = {
-            editId: hit.name,
-            name: ev.name && ev.name !== hit.name ? ev.name : "",
+            editId: ev.id,
+            editUrl: ev.url,
             id: ev.id,
             url: ev.url,
             apiKey: "",
@@ -900,7 +918,7 @@ function bindApp(): void {
             error: undefined,
           };
           renderApp();
-          showToast(`「${hit.name}」已在列表中，已进入编辑`, "info");
+          showToast(`「${hit.id}」已在列表中，已进入编辑`, "info");
         } catch (e) {
           showToast(`读取失败：${e}`, "error");
         }
@@ -970,7 +988,8 @@ function bindApp(): void {
   app.querySelectorAll<HTMLButtonElement>(".lm-eye").forEach((b) =>
     b.addEventListener("click", async () => {
       selectedModel = b.dataset.id!;
-      await invoke("set_selected_model", { id: selectedModel }).catch((e) =>
+      selectedModelUrl = b.dataset.url ?? null;
+      await invoke("set_selected_model", { id: selectedModel, url: selectedModelUrl }).catch((e) =>
         showToast(`保存失败：${e}`, "error"),
       );
       renderApp();
@@ -982,10 +1001,13 @@ function bindApp(): void {
   app.querySelectorAll<HTMLButtonElement>(".set-btn.del").forEach((b) =>
     b.addEventListener("click", async () => {
       const id = b.dataset.id!;
+      const url = b.dataset.url!;
       const ok = await askConfirm("删除模型", `确定删除「${id}」？`);
       if (!ok) return;
-      await invoke("models_remove", { id }).catch((e) => showToast(`删除失败：${e}`, "error"));
-      if (modelForm.editId === id) {
+      await invoke("models_remove", { id, url }).catch((e) =>
+        showToast(`删除失败：${e}`, "error"),
+      );
+      if (modelForm.editId === id && modelForm.editUrl && sameUrl(modelForm.editUrl, url)) {
         modelForm = emptyModelForm();
         modelModalOpen = false;
       }
@@ -999,11 +1021,12 @@ function bindApp(): void {
   app.querySelectorAll<HTMLButtonElement>(".set-btn.edit").forEach((b) =>
     b.addEventListener("click", async () => {
       const id = b.dataset.id!;
+      const url = b.dataset.url!;
       try {
-        const ev = await invoke<ModelEditView>("models_get_edit", { id });
+        const ev = await invoke<ModelEditView>("models_get_edit", { id, url });
         modelForm = {
-          editId: id,
-          name: ev.name && ev.name !== id ? ev.name : "",
+          editId: ev.id,
+          editUrl: ev.url,
           id: ev.id,
           url: ev.url,
           apiKey: "",
@@ -1033,8 +1056,9 @@ function bindApp(): void {
   app.querySelectorAll<HTMLButtonElement>(".set-btn.test").forEach((b) =>
     b.addEventListener("click", async () => {
       const id = b.dataset.id!;
+      const url = b.dataset.url!;
       const row = [...app.querySelectorAll<HTMLElement>(".lm-row")].find(
-        (r) => r.dataset.id === id,
+        (r) => r.dataset.id === id && r.dataset.url === url,
       );
       const msg = row?.querySelector<HTMLElement>(".set-test-msg");
 
@@ -1051,7 +1075,7 @@ function bindApp(): void {
       say(`正在测试 ${id} …`, "run");
 
       try {
-        const reply = await invoke<string>("test_model", { id });
+        const reply = await invoke<string>("test_model", { id, url });
         say(`✅ 连通正常：${reply.slice(0, 150)}`, "ok");
         showToast(`✅ ${id} 连通正常`);
       } catch (e) {
@@ -1071,9 +1095,7 @@ function bindApp(): void {
     const editing = f.editId !== null;
     const newId = f.id.trim();
     const url = f.url.trim();
-    const name = f.name.trim();
     const key = f.apiKey.trim();
-    const display = name || newId;
 
     const fail = (m: string): void => {
       f.error = m;
@@ -1083,7 +1105,6 @@ function bindApp(): void {
     if (!newId) return fail("接口模型 ID 不能为空（点「获取 ID」可从提供商选）");
     if (!url) return fail("Base URL 不能为空");
     if (/\s/.test(newId)) return fail("接口模型 ID 不能含空格");
-    if (!display) return fail("显示名不能为空");
 
     let maxIn: number | null;
     let maxOut: number | null;
@@ -1098,11 +1119,11 @@ function bindApp(): void {
 
     try {
       if (editing) {
+        // 身份 = (Base URL, 接口 id)：编辑前条目按 editId + editUrl 精确定位
         await invoke("models_edit", {
           id: f.editId,
-          newId, // 接口 model 可与其它条目相同
-          name: display,
-          url,
+          url: f.editUrl,
+          newId,
           apiKey: key || null,
           clearKey: f.clearKey,
           supportsToolCall: f.tool,
@@ -1111,13 +1132,18 @@ function bindApp(): void {
           maxInputTokens: maxIn,
           maxOutputTokens: maxOut,
         });
-        showToast(`已保存 ${display}`);
-        if (selectedModel === f.editId) selectedModel = display;
+        showToast(`已保存 ${newId}`);
+        // 选中项就是这条（id+url 匹配）且改了 id → selected 跟随新 id
+        if (
+          selectedModel === f.editId &&
+          (!selectedModelUrl || sameUrl(f.editUrl ?? "", selectedModelUrl))
+        ) {
+          selectedModel = newId;
+        }
         modelForm = emptyModelForm();
       } else {
         await invoke<string>("models_add", {
           id: newId,
-          name: display,
           url,
           apiKey: key,
           supportsToolCall: f.tool,
@@ -1128,10 +1154,11 @@ function bindApp(): void {
           overwrite: true,
         });
         // 新加的模型设为当前（与旧版行为一致）；后端会广播事件刷新面板
-        selectedModel = display;
-        await invoke("set_selected_model", { id: display }).catch(() => {});
+        selectedModel = newId;
+        selectedModelUrl = url;
+        await invoke("set_selected_model", { id: newId, url }).catch(() => {});
         modelForm = emptyModelForm();
-        showToast(`已保存 ${display}`);
+        showToast(`已保存 ${newId}`);
       }
       await reloadModels();
       remoteFetch = null;
@@ -1187,6 +1214,39 @@ window.addEventListener("unhandledrejection", (e) => {
   diag(`models.ts unhandledrejection: ${String(e.reason)}`);
 });
 
+/**
+ * 消费面板留下的一次性意图位：`"add"` → **直接落到添加表单**上。
+ *
+ * 面板那颗「＋ 添加自定义模型」隔着一个 webview，手上没有"给对方发事件"的命令
+ * （后端只有 open/close 两个），但两个窗口同源 —— `localStorage` 共享，
+ * 拿它当一次性信使。键名与写入方共用 `format.ts::MODELS_INTENT_KEY`。
+ *
+ * 为什么除 boot 之外还要挂 `focus`：窗口是「✕ = 隐藏不销毁」，第二次打开
+ * **不会再跑一遍模块初始化**；`show()` 会把焦点还给窗口，focus 是唯一稳定信号。
+ * 另外「选类型」那一步只剩 Custom Endpoint 一种协议，这里直接跳过它。
+ */
+function consumeModelsIntent(): void {
+  let intent: string | null = null;
+  try {
+    intent = localStorage.getItem(MODELS_INTENT_KEY);
+    if (intent) localStorage.removeItem(MODELS_INTENT_KEY);
+  } catch {
+    return; // 拿不到 localStorage 就什么都不做，别把窗口搞崩
+  }
+  if (intent !== "add") return;
+  diag("models.ts: 收到「添加自定义模型」意图 → 直接落到添加表单");
+  modelSearch = "";
+  modelForm = emptyModelForm();
+  remoteFetch = null;
+  modelTypePickerOpen = false;
+  modelModalOpen = true;
+  if (app) renderApp();
+  setTimeout(() => {
+    const el = document.getElementById("f-url") as HTMLInputElement | null;
+    el?.focus();
+  }, 0);
+}
+
 async function boot(): Promise<void> {
   diag("models.ts boot: 开始");
   const el = document.getElementById("models-app");
@@ -1202,6 +1262,11 @@ async function boot(): Promise<void> {
   } catch (err) {
     diag(`models.ts boot: 失败 ${String(err)}`);
   }
+
+  // 面板点「＋ 添加自定义模型」留下的意图位 —— 首次加载时消费
+  consumeModelsIntent();
+  // 窗口隐藏不销毁：第二次打开走 focus，不再走 boot
+  window.addEventListener("focus", consumeModelsIntent);
 
   // 后端在任何增删改/切换后会广播 —— 数据悄悄更一遍；表单开着就不重绘（防丢输入）
   void listen("models-changed", () => {

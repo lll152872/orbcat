@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# orbcat 发布构建 + 同步桌面快捷方式的目标文件。
+# orbcat 发布构建。
 #
-# 为什么要这个脚本（2026-09-26 踩坑）：
-#   桌面 `orbcat.exe - 快捷方式.lnk` 是 **Windows 生成的**，它的 LinkTargetIDList 里
-#   写死了 `_old-pretrust-orbcat.exe` 这个文件名。手写的 .lnk 会被 Explorer 判成
-#   "没有与之关联的应用"（`SE_ERR_NOASSOC`）—— 试了三轮都不行，IDList 也没救回来。
-#   所以只能保留那份原生 .lnk，并**保证它指向的文件始终是最新构建**。
+# ## 构建与桌面快捷方式的关系（2026-10-01 起）
 #
-#   只跑 `cargo build --release` 的话，桌面图标会启动旧构建 —— 就是当天那个
-#   "权限 chip / 心跳消失"的根因。这个脚本把复制焊进流程，杜绝再犯。
+#   桌面快捷方式**不指向任何 exe**。调用链是：
+#     桌面 orbcat.lnk → wscript.exe → tools\orbcat-launch.vbs
+#       → tools\orbcat-launch.ps1 → 运行时挑出"当前能用的那份" exe
 #
-# 用法：
+#   所以本脚本**不再需要同步任何副本**。历史上那句
+#   `cp orbcat.exe _old-pretrust-orbcat.exe` 是因为桌面 .lnk 的
+#   LinkTargetIDList 写死了文件名（Windows 生成的 .lnk 改不动），
+#   只能靠"保证那个名字的文件始终是最新构建"来兜。现在启动器在运行时挑，
+#   改名 / 换档位 / 构建失败留残骸都不会把图标带偏，补丁随之删除。
+#
+#   仓库挪位置后需要重跑一次：pwsh -File tools\install-shortcut.ps1
+#
+# ## 用法
 #   bash tools/build-release.sh          # 正式版：fat LTO（lto=true, cgu=1）—— 最慢最小，发版用
 #   bash tools/build-release.sh --fast   # 快速版：release-fast profile（无 LTO + cgu=256）—— 实测稳态 55s，给人真机测试用
 #
@@ -74,7 +79,9 @@ npm run build
 
 MODE="${1:-}"
 
-# 旧 exe 归档进 _old_builds/，别在 release 根里改名成别的 .exe（会甩掉桌面快捷方式）
+# 旧 exe 归档进 _old_builds/（那里没有 dist/，启动器天然不会选它）。
+# 归档而不是就地改名，是为了让 release 根始终只有一个 orbcat.exe，
+# 不给"哪份才是新的"留下歧义。
 REL=src-tauri/target/release
 mkdir -p "$REL/_old_builds"
 if [ -f "$REL/orbcat.exe" ]; then
@@ -105,11 +112,23 @@ mkdir -p "$REL/dist"
 rm -rf "$REL/dist/assets" 2>/dev/null || true
 cp -rf dist/. "$REL/dist/"
 
-echo "==> 同步桌面快捷方式的目标文件"
-cp -f "$REL/orbcat.exe" "$REL/_old-pretrust-orbcat.exe"
+echo "==> 检查桌面快捷方式"
+# 2026-10-01 起，桌面快捷方式不再指向任何 exe：它指向 tools\orbcat-launch.vbs
+# → orbcat-launch.ps1，由启动器在每次双击时挑出"当前能用的那份"构建。
+# 所以**构建不再需要同步任何副本**（旧的 `cp orbcat.exe _old-pretrust-orbcat.exe`
+# 已删除 —— 那是快捷方式被迫写死文件名时的补丁，现在没有存在意义了）。
+#
+# 这里只做一次体检，确认链路还在。找不到启动器就提示装一次。
+if [ -f "tools/install-shortcut.ps1" ]; then
+  if command -v pwsh >/dev/null 2>&1; then
+    pwsh -NoProfile -File tools/install-shortcut.ps1 -Verify || true
+  fi
+else
+  echo "  ⚠ 没找到 tools/install-shortcut.ps1，桌面快捷方式无法体检。"
+fi
 
 echo
 echo "完成："
-ls -la "$REL/orbcat.exe" "$REL/_old-pretrust-orbcat.exe"
+ls -la "$REL/orbcat.exe"
 echo
-echo "桌面图标启动的是 _old-pretrust-orbcat.exe（已同步为本次构建）。"
+echo "桌面图标每次双击都会重新挑一次构建，本次无需同步任何副本。"

@@ -598,8 +598,7 @@ pub fn build_diagnostic(data_dir: &Path) -> String {
             for m in models {
                 let key = crate::config::redact_key_str(&m.api_key);
                 out.push_str(&format!(
-                    "- {} | id={} | url={} | key={} | maxIn={:?} | tool={} | img={}\n",
-                    if m.name.is_empty() { &m.id } else { &m.name },
+                    "- {} | url={} | key={} | maxIn={:?} | tool={} | img={}\n",
                     m.id,
                     m.url,
                     key,

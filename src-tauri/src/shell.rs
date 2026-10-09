@@ -173,6 +173,159 @@ pub async fn run_on_desktop(
     })
 }
 
+/// 等待结果：子进程结束 / 超时 / 用户取消
+enum Waited {
+    Done(std::io::Result<std::process::ExitStatus>),
+    Timeout,
+    Cancelled,
+}
+
+/// 跑一条**已展开成 argv 的**命令（不经任何 shell 解释器）。
+///
+/// ## 为什么需要它（而不是把 argv 拼成字符串交给 PowerShell）
+/// 拼成字符串再交给 pwsh = 把参数边界**重新交还给 shell 解析**。
+/// 那样 `permPreset` / 项目脚本里精心保持的"一个参数就是一个参数"的保证
+/// 会当场失效 —— 用户传 `a; rm -rf /` 就真的会被当两条命令跑。
+///
+/// 这里用 `Command::new(argv[0]).args(argv[1..])` 直接起进程：
+/// **argv 里每个元素都是一个字面参数**，`;` `|` `$()` 全是普通字符。
+///
+/// 与 [`run_powershell_tick`] 的关系：
+/// - 心跳 / 取消 / 超时杀进程树 / 输出留头留尾 —— **全部一致**（同一套实现）
+/// - 差别只在"怎么起进程"：这里不做 UTF-8 包裹（那是 PowerShell 的坑，
+///   非 PowerShell 程序不需要，乱加反而会污染 argv）
+pub async fn run_argv(
+    argv: &[String],
+    cwd: &Path,
+    timeout_secs: u64,
+    tick: Option<TickFn>,
+    cancel: Option<CancelFn>,
+) -> Result<CmdOutput, String> {
+    let Some((exe, rest)) = argv.split_first() else {
+        return Err("argv 为空".into());
+    };
+
+    let mut c = Command::new(exe);
+    c.args(rest)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        c.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    let mut child = c
+        .spawn()
+        .map_err(|e| format!("启动 {exe} 失败: {e}（argv={argv:?}）"))?;
+    let pid = child.id();
+
+    let out_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let err_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let mut out_task = tokio::spawn(read_into(stdout, out_buf.clone()));
+    let mut err_task = tokio::spawn(read_into(stderr, err_buf.clone()));
+
+    let timeout = Duration::from_secs(timeout_secs.clamp(1, 3600));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let started = std::time::Instant::now();
+
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+
+    let exe_label = exe.clone();
+
+    let waited = loop {
+        let cancel_probe = async {
+            match cancel.as_ref() {
+                Some(f) => loop {
+                    if f() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                },
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            r = child.wait() => break Waited::Done(r),
+            _ = interval.tick(), if tick.is_some() => {
+                if let Some(cb) = tick.as_ref() {
+                    cb(started.elapsed().as_secs(), tail_of(&out_buf, &err_buf));
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break Waited::Timeout,
+            _ = cancel_probe => break Waited::Cancelled,
+        }
+    };
+
+    match waited {
+        Waited::Done(Ok(status)) => {
+            drain_reader(&mut out_task).await;
+            drain_reader(&mut err_task).await;
+            let out_bytes = out_buf.lock().map(|g| g.clone()).unwrap_or_default();
+            let err_bytes = err_buf.lock().map(|g| g.clone()).unwrap_or_default();
+            Ok(CmdOutput {
+                stdout: truncate(&out_bytes),
+                stderr: truncate(&err_bytes),
+                exit_code: status.code(),
+                timed_out: false,
+                cancelled: false,
+                interpreter: exe_label,
+            })
+        }
+        Waited::Done(Err(e)) => {
+            let _ = child.start_kill();
+            Err(format!("等待 {exe_label} 结束失败: {e}"))
+        }
+        Waited::Timeout => {
+            if let Some(pid) = pid {
+                kill_tree(pid).await;
+            }
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            drain_reader(&mut out_task).await;
+            drain_reader(&mut err_task).await;
+            let out_bytes = out_buf.lock().map(|g| g.clone()).unwrap_or_default();
+            let err_bytes = err_buf.lock().map(|g| g.clone()).unwrap_or_default();
+            Ok(CmdOutput {
+                stdout: truncate(&out_bytes),
+                stderr: truncate(&err_bytes),
+                exit_code: None,
+                timed_out: true,
+                cancelled: false,
+                interpreter: exe_label,
+            })
+        }
+        Waited::Cancelled => {
+            if let Some(pid) = pid {
+                kill_tree(pid).await;
+            }
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            drain_reader(&mut out_task).await;
+            drain_reader(&mut err_task).await;
+            let out_bytes = out_buf.lock().map(|g| g.clone()).unwrap_or_default();
+            let err_bytes = err_buf.lock().map(|g| g.clone()).unwrap_or_default();
+            Ok(CmdOutput {
+                stdout: truncate(&out_bytes),
+                stderr: truncate(&err_bytes),
+                exit_code: None,
+                timed_out: false,
+                cancelled: true,
+                interpreter: exe_label,
+            })
+        }
+    }
+}
+
 /// 跑一条 PowerShell 命令（无心跳、无取消通道）。
 ///
 /// `timeout_secs` 会被夹到 `1..=600`。超时**不算失败** —— 返回

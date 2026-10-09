@@ -60,7 +60,18 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # --- 截图 / 图片 ---
 # 截图走 Win32 原生 API（见 capture.rs），不引入重型截图库；
 # 图片编码主用 JPEG（同等观感体积只有 PNG 的 1/6 左右，vision 请求快很多）
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+#
+# feature 面（2026-10-08 补）：gif / webp / bmp 是给「模型在回复里发图」加的。
+# 表情包大量是 GIF / WebP，只开 jpeg+png 时 `image::open` 会直接失败，
+# 用户看到的是"图（读不出来）"——`images::is_image_path` 早就认这些扩展名了，
+# 能认出却不能解码是自相矛盾的。
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "gif",
+    "webp",
+    "bmp",
+] }
 base64 = "0.22"
 
 

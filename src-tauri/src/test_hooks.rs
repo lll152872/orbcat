@@ -35,9 +35,11 @@ fn system_prompt_includes_approved_memory_marker() {
     assert!(p.contains("RULES_MARK_E2E"), "RULES 应注入");
     assert!(p.contains("MEM_MARK_E2E"), "已批准长期记忆应注入 system prompt");
     assert!(
-        p.contains("做完后提议记忆"),
-        "system prompt 应含「做完后提议记忆」规则"
+        p.contains("记忆怎么用") && p.contains("remember"),
+        "system prompt 应含记忆使用规则（含 remember 指引）"
     );
+    // 2026-10-07：全局候选「宁多勿漏」的取向必须写明（有审批兜底，别让模型憋着不提）
+    assert!(p.contains("宁多勿漏"), "应写明全局候选宁多勿漏的取向");
     // 批准记忆排在 RULES 之后
     let r = p.find("RULES_MARK_E2E").unwrap();
     let m = p.find("MEM_MARK_E2E").unwrap();

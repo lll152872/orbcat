@@ -54,6 +54,57 @@ impl ToolSpec {
     }
 }
 
+/// 内置工具的**全部**名字（含 `web_search` / `fetch_url`）。
+///
+/// 为什么要有这份清单（而不是每次去 `builtin_specs()` 里翻）：
+/// `project.rs` 校验 L1 脚本工具名时**必须**能问出"这个名字是不是内置的" ——
+/// 撞名的后果很具体：`execute` 的 `match` 先命中内置分支，
+/// 用户的脚本工具**永远不会被执行**，而模型看到的是"我调了但没反应"。
+///
+/// ⚠️ 新增内置工具时**必须**同步这里。有一条测试守着
+/// （`builtin_name_list_covers_every_spec`）会在漏掉时报错。
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "glob_files",
+    "grep_files",
+    "write_file",
+    "edit_file",
+    "delete_file",
+    "move_file",
+    "copy_file",
+    "mkdir",
+    "file_info",
+    "append_file",
+    "git",
+    "run_command",
+    "web_search",
+    "fetch_url",
+    "request_access",
+    "capture_screen",
+    "view_image",
+    "send_image",
+    "send_meme",
+    "foreground_context",
+    "current_time",
+    "remember",
+    "distill_move",
+    "life_items",
+    "ask_user",
+    "recall_turns",
+    "load_skill",
+    "save_skill",
+    "search_tools",
+    "list_tool_groups",
+    "load_tool_group",
+    "unload_tool_group",
+];
+
+/// 这个名字是不是内置工具（L1 脚本工具不得占用）。
+pub fn is_builtin_tool_name(name: &str) -> bool {
+    BUILTIN_TOOL_NAMES.contains(&name)
+}
+
 /// 内置工具（常驻，每轮都在 tools 里）。
 /// **不含** `web_search` —— 它只在配置了搜索后端时由 [`tool_specs`] 注入。
 pub fn builtin_specs() -> Vec<ToolSpec> {
@@ -101,16 +152,21 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "grep_files",
-            "在指定目录下递归搜索子串文本，返回 文件:行号:内容。\
-             **优先于** run_command 跑 Select-String/findstr。受文件权限网关管辖。",
+            "在指定路径下递归搜索子串文本，返回 文件:行号:内容。\
+             `path` **可以是目录，也可以直接是一个文件**（搜单个文件时直接传它，别传父目录）。\
+             **优先于** run_command 跑 Select-String/findstr。受文件权限网关管辖。\
+             ⚠️ 只做**字面量子串**匹配：不支持 `|`、`.*`、`\\d` 这类正则语法（传了会直接报错提示）。\
+             多个词请分开搜几次。默认**大小写不敏感**。\
+             若有文件因体积/编码/权限被跳过，返回里会**明确列出**——看到「无匹配」时先看有没有跳过项。",
             json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "要搜索的文本（子串匹配，大小写敏感）" },
-                    "path": { "type": "string", "description": "搜索根目录（绝对路径）" },
+                    "pattern": { "type": "string", "description": "要搜索的文本（**字面量子串**，不是正则；默认大小写不敏感）" },
+                    "path": { "type": "string", "description": "搜索根目录（绝对路径），或要搜索的单个文件" },
                     "ext": { "type": "string", "description": "只搜这些扩展名，如 'rs,md'（可选）" },
                     "regex": { "type": "boolean", "description": "未启用；传 true 会报错。只用子串 pattern" },
-                    "context": { "type": "integer", "description": "命中行前后各显示几行（默认 0，最大 3）" }
+                    "caseSensitive": { "type": "boolean", "description": "是否区分大小写（默认 false，不区分）" },
+                    "context": { "type": "integer", "description": "命中行前后各显示几行（默认 0，最大 3）。注意「命中 N 行」只数真正的命中行" }
                 },
                 "required": ["pattern", "path"]
             }),
@@ -353,6 +409,26 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
             }),
         ),
         ToolSpec::new(
+            "life_items",
+            "读取本机**数据源**的明细（生活/学习信号：学习通作业、教务、邮件、\
+             或用户自己接的任何东西）。system prompt 里每个源只有一行摘要\
+             （条数 + 新鲜度），**细节要调这个工具才拿得到**。\
+             适用：用户问「我有什么作业」「还有什么没交」「最近的安排」\
+             「帮我规划一下」时，先看 prompt 里的数据源摘要，再来这里取明细。\
+             不传 source = 列出有哪些源；传 source = 取那个源的明细。\
+             只读：不登录平台、不修改任何数据。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "数据源 id（如 xuexitong）。留空则列出所有已启用的源"
+                    }
+                },
+                "required": []
+            }),
+        ),
+        ToolSpec::new(
             "load_skill",
             "加载一个技能的完整操作手册（SKILL.md 全文 + 附属文件清单）。\
              当任务与 system prompt 技能清单里的某条匹配时，先加载再照做 —— \
@@ -502,6 +578,9 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
                 "required": ["path", "access", "tier", "reason"]
             }),
         ),
+        // 发图：**常驻**内置工具（所有模式都有）—— 工作模式也要能贴截图 / 图表。
+        // 只有"发表情包"那一半（`send_meme`）按模式闸住，见 `all_tool_specs`。
+        send_image_spec(),
     ]
 }
 
@@ -545,18 +624,87 @@ pub fn web_search_spec() -> ToolSpec {
 }
 
 /// 完整工具列表 = 内置 + （可选）web_search + **已加载的** MCP 工具
+/// + **当前项目的 L1 脚本工具**
 ///
 /// `web_search_ready` = 设置里已配置搜索后端且 key 非空。
 /// **未配置时不要暴露该工具**，避免模型徒劳调用。
 ///
 /// ⚠️ 这个函数每轮都会被调用（因为模型可能中途 load 了新组），
 /// 所以它必须只做拼接、不产生副作用（早先用 Box::leak 会反复泄漏）。
-pub fn tool_specs(mcp: Option<&crate::mcp::ToolRegistry>, web_search_ready: bool) -> Vec<ToolSpec> {
+/// 项目工具也是每轮现算 —— 用户改完 `project.json` 下一轮就生效，不用重启
+/// （与 skills 的热加载同一口径）。
+///
+/// ## PTC 模式的「坍缩」
+///
+/// 当前模式是 PTC 时，这里**只返回 `run_code`**：其余工具不作为独立 schema
+/// 给模型，而是以**程序内 SDK 绑定**的形式出现在 system prompt 里
+/// （见 [`ptc_sdk_tools`]）。这是"通告面与可调用面保持一致" ——
+/// 公告了什么就能调什么，不会出现"prompt 里列了却调不动"。
+pub fn tool_specs(
+    mcp: Option<&crate::mcp::ToolRegistry>,
+    web_search_ready: bool,
+    data_dir: &Path,
+    session_id: Option<&str>,
+) -> Vec<ToolSpec> {
+    if crate::ptc::mode_active(data_dir, session_id) {
+        return vec![run_code_spec()];
+    }
+    all_tool_specs(mcp, web_search_ready, data_dir, session_id)
+}
+
+/// 「记忆蒸馏」会话专用工具集：标准工具 + `distill_move`。
+///
+/// 为什么要单独一份（2026-10-03）：`distill_move` 只在蒸馏会话里有意义
+/// （把条目从中转站迁进 USER/SOUL/IDENTITY）。普通聊天里摆着它只会让模型
+/// 误用 —— 所以按会话注入，而不是全局注册。
+pub fn tool_specs_for_distill(
+    mcp: Option<&crate::mcp::ToolRegistry>,
+    web_search_ready: bool,
+    data_dir: &Path,
+    session_id: Option<&str>,
+) -> Vec<ToolSpec> {
+    let mut specs = tool_specs(mcp, web_search_ready, data_dir, session_id);
+    specs.push(distill_move_spec());
+    specs
+}
+
+/// **未坍缩**的完整工具列表（PTC 的 SDK 声明就是从这份生成的）。
+///
+/// 为什么单独留一个函数：PTC 下"模型能调什么"与"程序里能调什么"是**同一份**
+/// 工具集，只是呈现形态不同。若 SDK 用另一份来源生成，两边迟早对不上
+/// （典型症状：SDK 里声明了某工具，实际调用却报"没有这个工具"）。
+pub fn all_tool_specs(
+    mcp: Option<&crate::mcp::ToolRegistry>,
+    web_search_ready: bool,
+    data_dir: &Path,
+    session_id: Option<&str>,
+) -> Vec<ToolSpec> {
     let mut specs = builtin_specs();
+
+    // ── 发图：只有"发表情包"那一半按模式闸住（2026-10-08）──────────────
+    //
+    // `send_image` 是常驻内置工具，已经在 `builtin_specs()` 里了（工作模式
+    // 也要贴截图 / 图表）。这里单独注入 `send_meme` —— **只在能随便发图的
+    // 模式**下出现，这就是"工作时不发表情包"的**硬闸门**：不是提示词劝它
+    // 别发，而是工具表里根本没有这个东西，模型想调也调不到。
+    //
+    // 为什么模式判断放在函数内部、不改签名：与 `ptc::mode_active(data_dir)`
+    // 同一个手法 —— `data_dir` 已经在参数里了，为传一个 mode 把 6 个调用点
+    // 全改一遍不划算。
+    if memes_allowed(data_dir, session_id) {
+        specs.push(send_meme_spec());
+    }
+
     specs.push(fetch_url_spec());
     if web_search_ready {
         specs.push(web_search_spec());
     }
+
+    // ── L1：当前项目的脚本工具 ──────────────────────────────────────────
+    //
+    // 位置在 MCP 之前、内置之后：内置工具名是保留的（`is_builtin_tool_name`
+    // 在装配阶段就拒绝了撞名的项目工具），所以这里不会有名字冲突。
+    specs.extend(project_tool_specs(data_dir));
 
     let Some(reg) = mcp else { return specs };
 
@@ -579,6 +727,189 @@ pub fn tool_specs(mcp: Option<&crate::mcp::ToolRegistry>, web_search_ready: bool
     }
 
     specs
+}
+
+/// PTC 的 SDK 素材：(名字, 描述, 参数 schema)。
+///
+/// 直接复用 [`all_tool_specs`] —— 与 native 模式下的工具列表**逐项同源**，
+/// 这正是"公告面 = 可调用面"的实现方式。
+pub fn ptc_sdk_tools(
+    mcp: Option<&crate::mcp::ToolRegistry>,
+    web_search_ready: bool,
+    data_dir: &Path,
+    session_id: Option<&str>,
+) -> Vec<(String, String, Value)> {
+    all_tool_specs(mcp, web_search_ready, data_dir, session_id)
+        .into_iter()
+        .map(|s| (s.name, s.description, s.parameters))
+        .collect()
+}
+
+/// `run_code` 的工具规格（PTC 模式下模型唯一能直接调的工具）。
+fn run_code_spec() -> ToolSpec {
+    ToolSpec::new(
+        crate::ptc::RUN_CODE,
+        "执行一段 TypeScript 程序，在程序里调用工具。**这是本模式下唯一能直接调用的工具** —— \
+         其他工具（文件、命令、MCP 等）都以 SDK 声明的形式提供，在程序里用 \
+         `await tools.<名字>(args)` 调用。\n\n\
+         `code` 是一个 **async 函数的函数体**：可以直接 `await`、直接 `return`。\n\n\
+         为什么用它：批量任务（读几十个文件、多源汇总、逐条筛选）在程序里用 \
+         for / if / Promise.all / try-catch 组织，**中间结果不进入对话**，\
+         只有你 `return` 或 `console.log` 的内容会回到上下文。所以先在程序里\
+         筛选/汇总，只把结论交回来。\n\n\
+         互不依赖的**只读**调用可以 `await Promise.all([...])` 真正并发；\
+         有依赖的必须 `await` 串行。个别调用失败会 reject（`ToolCallError`，\
+         带 `toolName` / `message`），需要「个别失败不影响整体」就 `try/catch` 它。\n\n\
+         具体的工具声明见 system prompt 的「PTC 程序内可用的工具」段。",
+        json!({
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "TypeScript 程序的**函数体**（不是完整文件）。可以顶层 await / return。"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "一句话说明这个程序做什么（给用户看的进度标题）"
+                }
+            },
+            "required": ["code", "description"]
+        }),
+    )
+}
+
+/// 当前项目的 L1 脚本工具 → `ToolSpec` 列表。
+///
+/// 无项目 / 项目无 `tools` → 空表。
+///
+/// 描述里会**点明这是本机脚本**并附上脚本相对路径 —— 模型据此知道
+/// 它跑在用户机器上、且能看到参数模板，减少"瞎猜参数"的调用。
+fn project_tool_specs(data_dir: &Path) -> Vec<ToolSpec> {
+    let Some(a) = crate::project::active(data_dir) else {
+        return Vec::new();
+    };
+    a.bundle
+        .tools
+        .iter()
+        .map(|t| {
+            let mut desc = t.description.trim().to_string();
+            if !t.perm.trim().is_empty() {
+                desc.push_str(&format!("（权限声明：{}）", t.perm.trim()));
+            }
+            // 模板对模型是**有用信息**（知道参数怎么传），且不含密钥
+            desc.push_str(&format!(
+                " [项目脚本，argv 模板：{}]",
+                t.command_template.join(" ")
+            ));
+            ToolSpec {
+                name: t.name.clone(),
+                description: desc,
+                parameters: crate::project::tool_params(t),
+            }
+        })
+        .collect()
+}
+
+/// 执行一个**项目 L1 脚本工具**。
+///
+/// ## 安全路径（与 `run_command` **同一套闸门**，不另开通道）
+/// 1. `commandTemplate` 经 [`crate::project::expand_template`] 展开成 argv ——
+///    **逐参替换，绝不再拆分**（见该函数的契约）。
+/// 2. `cwd` 过**文件权限网关**（Gate 1，与 `run_command` 同）。
+/// 3. 命令文本过**命令策略**（Gate 2）—— 拼装项目的 `commandAllowExtra`
+///    只做白名单加法，硬阻断永不放宽。
+/// 4. 走 `shell::run_powershell_tick` 起进程。
+///
+/// ⚠️ 为什么把 argv 拼成一条命令串再过策略：`command_policy` 的判定对象是
+/// **命令行文本**（它做归一化、拆 `;|&&`、识别 `iex` 等）。argv 直接执行会
+/// **绕过这套静态分析**。所以这里把 argv 拼成字符串送进策略判定，
+/// 判定通过后再**用原始 argv 执行**（不经 shell 解析）——
+/// 判定看到的就是要跑的东西，执行时又不会引入 shell 语义。
+async fn run_project_tool(
+    t: &crate::project::ScriptTool,
+    args: &Value,
+    ctx: &ToolCtx<'_>,
+) -> Result<ToolOutput, String> {
+    let a = crate::project::active(ctx.data_dir)
+        .ok_or_else(|| "当前没有激活的项目".to_string())?;
+    let dir = a.dir(ctx.data_dir);
+
+    let argv = crate::project::expand_template(&t.command_template, &dir, args);
+    if argv.is_empty() {
+        return Err(format!("项目工具「{}」的 argv 模板展开为空", t.name));
+    }
+
+    // cwd = 项目目录（脚本的相对路径基准）
+    let cwd = dir.clone();
+
+    // ---- Gate 1：cwd 过文件权限网关 ----
+    authorize(ctx, &cwd, Access::Read)?;
+
+    // ---- Gate 2：拼成命令行文本送策略判定 ----
+    //
+    // ⚠️ 这一步是**为了过策略**，不是为了执行。执行走 argv（见下）。
+    //    拼串时对含空白/引号的参数加引号，让归一化后的文本能反映真实参数边界。
+    let cmd_text = argv
+        .iter()
+        .map(|a| {
+            if a.is_empty() || a.contains([' ', '\t', '"', '\'']) {
+                format!("\"{}\"", a.replace('"', "\\\""))
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // ---- Gate 2：命令策略（与 run_command **同一套判定**）----
+    //
+    // ⚠️ 这里传的是**拼出来的命令行文本**，不是 argv —— 因为
+    //    `command_policy` 的判定对象就是命令行文本（它要做归一化、拆 `;|&&`、
+    //    识别 `iex` / `$()` 等动态解析）。argv 直接执行会**绕过这套静态分析**。
+    //    判定通过后**执行仍走原始 argv**（见下），所以判定看到的东西
+    //    与实际跑的东西一致，而执行时又不引入任何 shell 语义。
+    match gate_command(&cmd_text, &cwd, ctx).await? {
+        CmdGate::Allowed { .. } => {}
+        CmdGate::Refused(out) => return Ok(out),
+    }
+
+    // ---- 执行：走 argv（不经 shell）----
+    //
+    // ⚠️ 这里**不**把 argv 拼成字符串交给 PowerShell —— 那会把上面精心
+    //    保持的"参数边界"重新交还给 shell 解析，等于前功尽弃。
+    //    而是让 shell.rs 直接以 argv 起进程。
+    let out = crate::shell::run_argv(
+        &argv,
+        &cwd,
+        600,
+        ctx.tick.clone(),
+        ctx.cancel.clone(),
+    )
+    .await?;
+
+    let mut text = String::new();
+    if !out.stdout.trim().is_empty() {
+        text.push_str(out.stdout.trim_end());
+    }
+    if !out.stderr.trim().is_empty() {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str("[stderr]\n");
+        text.push_str(out.stderr.trim_end());
+    }
+    if out.timed_out {
+        text.push_str("\n\n⏱ 执行超时（600s）已终止。");
+    }
+    if out.cancelled {
+        text.push_str("\n\n⏹ 被用户停止。");
+    }
+    if text.trim().is_empty() {
+        text = format!("（无输出，退出码 {:?}）", out.exit_code);
+    } else if out.exit_code != Some(0) {
+        text.push_str(&format!("\n\n退出码 {:?}", out.exit_code));
+    }
+    Ok(ToolOutput::text(text))
 }
 
 // ---------------------------------------------------------------------------
@@ -712,13 +1043,146 @@ fn deny_message(e: &DenyReason, need: Access) -> String {
     )
 }
 
+/// PTC 子调用的桥：把程序里的一次 `tools.x(args)` 接到**同一个** [`execute`]。
+///
+/// ## 为什么必须复用 `execute` 而不是另开一条快路
+///
+/// 这是整个 PTC 安全模型的关键：程序里的调用与模型直接发的调用**走同一条管线**，
+/// 于是文件权限网关、命令策略、权限卡、审计链、输出截断全部照旧生效。
+/// 若为了"快"另写一条只做分发的路径，就等于给模型开了一个绕过权限的后门 ——
+/// 而它看起来只是一个"性能优化"。
+///
+/// ## 递归
+///
+/// 程序里调用 `run_code` 本身是**允许**的（会被 [`execute`] 正常分派），
+/// 但那是嵌套的第二次 Node 进程 —— 代价高且几乎不是模型的本意。
+/// 这里显式拒绝，并给出清晰的理由，而不是让它悄悄起一堆 Node。
+struct ToolCtxSub<'a, 'b> {
+    ctx: &'a ToolCtx<'b>,
+}
+
+impl crate::ptc::SubCall for ToolCtxSub<'_, '_> {
+    async fn call(&self, name: &str, args: &Value) -> Result<Value, String> {
+        if name == crate::ptc::RUN_CODE {
+            return Err(
+                "程序里不能再调用 run_code（那是嵌套的第二层程序）。\
+                 请把逻辑写在同一段程序里。"
+                    .into(),
+            );
+        }
+        match execute_inner(name, args, self.ctx, true).await {
+            Ok(out) => {
+                // 子调用只把**文本**交给程序。图片（截图/view_image）不能进
+                // JSON 协议，也不该悄悄丢掉 —— 明确告诉程序"这里有张图"。
+                if out.image.is_some() {
+                    Ok(json!({
+                        "text": out.text,
+                        "image_path": out.image,
+                        "note": "该调用产生了一张图片，已单独附给你（不在程序里）。"
+                    }))
+                } else {
+                    Ok(json!({ "text": out.text }))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// `run_code` —— PTC 模式下模型唯一能直接调用的工具。
+///
+/// 流程见 `ptc.rs` 顶部文档。这里只负责：取参数 → 建工作目录 → 驱动 Node →
+/// 把结果转成 [`ToolOutput`]。
+async fn run_code(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
+    let code = get_str(args, "code")?;
+    let description = args
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if code.trim().is_empty() {
+        return Err("code 不能为空".into());
+    }
+
+    let Some(node) = crate::ptc::resolve_node() else {
+        return Err(
+            "找不到 Node（PTC 需要它来执行程序）。请安装 Node.js，\
+             或把 node.exe 的路径写进环境变量 ORBCAT_NODE 后重启。"
+                .into(),
+        );
+    };
+
+    if !description.is_empty() {
+        // 进度心跳复用 tick 通道：用户能在卡片上看到"在跑什么程序"
+        if let Some(t) = ctx.tick.as_ref() {
+            t(0, format!("run_code: {description}"));
+        }
+    }
+
+    let work = crate::ptc::WorkDir::create(ctx.data_dir, &code)?;
+    let sub = ToolCtxSub { ctx };
+
+    // 超时给得比 run_command 宽：一个程序可能要跑几十次工具调用。
+    // 真正的防死循环闸门是 MAX_SUB_CALLS，不是这个时间。
+    let outcome = crate::ptc::run_program(&node, &work, &sub, ctx.cancel.clone(), 600).await?;
+
+    eprintln!(
+        "[orbcat] run_code: {}（{} 次子调用，{}）",
+        description,
+        outcome.calls,
+        if outcome.ok { "成功" } else { "失败" }
+    );
+
+    Ok(ToolOutput::text(outcome.text))
+}
+
 /// 执行一个工具调用。
+///
+/// ## PTC 的「坍缩」在这里也要拦一道
+///
+/// PTC 下工具列表只剩 `run_code`（见 [`tool_specs`]），但模型**可能凭印象
+/// 直接发一个别的工具名**（它上一轮还在标准模式、或从 SDK 声明里抄了个名字）。
+/// 那时若放行，就出现"公告面与可调用面不一致"：公告说只有 run_code 能用，
+/// 实际却执行了别的工具。
+///
+/// DSH 的 `dsh-tools` 把这条写成 `UNKNOWN_TOOL` 并强调
+/// "通告面与可调用面保持一致" —— 同一个道理：**说了不让调，就真的不能调**，
+/// 否则模型学到的规律是"公告不可信"。
+///
+/// 子调用（程序内 `tools.x`）走的是同一个 `execute`，所以这里必须放行它们 ——
+/// 用 `in_ptc_sub` 标记区分"模型直接发的"与"程序里发的"。
 pub async fn execute(
     name: &str,
     args: &Value,
     ctx: &ToolCtx<'_>,
 ) -> Result<ToolOutput, String> {
+    execute_inner(name, args, ctx, false).await
+}
+
+/// 同 [`execute`]，但标记这次调用来自 PTC 程序内部（跳过坍缩检查）。
+async fn execute_inner(
+    name: &str,
+    args: &Value,
+    ctx: &ToolCtx<'_>,
+    in_ptc_sub: bool,
+) -> Result<ToolOutput, String> {
+    // PTC 坍缩：模型直接发的调用只允许 run_code
+    if !in_ptc_sub
+        && name != crate::ptc::RUN_CODE
+        && crate::ptc::mode_active(ctx.data_dir, Some(ctx.session_id))
+    {
+        return Err(format!(
+            "当前是 PTC 模式，只能直接调用 `{}`。\
+             工具 `{name}` 在 PTC 下不是直接调用的 —— \
+             请写一段 TypeScript，在程序里用 `await tools.{name}(...)` 调它。",
+            crate::ptc::RUN_CODE
+        ));
+    }
+
     match name {
+        crate::ptc::RUN_CODE => run_code(args, ctx).await,
         "read_file" => read_file(args, ctx),
         "list_dir" => list_dir(args, ctx),
         "glob_files" => glob_files(args, ctx),
@@ -738,6 +1202,8 @@ pub async fn execute(
         "request_access" => request_access(args, ctx).await,
         "capture_screen" => capture_screen(ctx.data_dir),
         "view_image" => view_image(args, ctx),
+        "send_image" => send_image(args, ctx),
+        "send_meme" => send_meme(args, ctx),
         "foreground_context" => {
             let out = match crate::context::cached().or_else(crate::context::current) {
                 Some(c) => c.summary(),
@@ -760,6 +1226,8 @@ pub async fn execute(
             )))
         }
         "remember" => remember(args, ctx.data_dir),
+        "distill_move" => distill_move(args, ctx.data_dir),
+        "life_items" => life_items(args, ctx).await,
         "ask_user" => ask_user(args, ctx).await,
         "recall_turns" => recall_turns(args, ctx),
         "load_skill" => {
@@ -812,6 +1280,17 @@ pub async fn execute(
             Ok(ToolOutput::text(reg.unload(&group)?))
         }
         other => {
+            // ── L1：当前项目的脚本工具 ──────────────────────────────────
+            //
+            // 放在 MCP 分支**之前**：项目工具名是普通标识符（`check_homework`），
+            // 与 `mcp__*` 命名不冲突；但先查项目能让"项目工具"这条路径
+            // 不受 MCP 未连接状态影响。
+            if let Some(a) = crate::project::active(ctx.data_dir) {
+                if let Some(t) = a.bundle.tools.iter().find(|t| t.name == other) {
+                    return run_project_tool(t, args, ctx).await;
+                }
+            }
+
             // MCP 工具：mcp__<server>__<tool>
             if let Some((_server, tool)) = crate::mcp::parse_mcp_tool_name(other) {
                 // 先查是否已加载 —— 未加载的组不该弹权限卡（用户批了也执行不了）
@@ -833,10 +1312,12 @@ pub async fn execute(
 
                 // Cline 式：默认问；「总是允许」写 mcp_grants.json 后免问。
                 // 执行权限档位 `full` 也免问（与命令侧同一开关，见 config::ExecTrust）。
+                //
+                // ⚠️ 档位取 `project::effective_exec_trust`：拼装项目可以**预选**
+                // 档位。这是"预选"而非"绕过"—— `full` 本来就能由用户自己在设置里
+                // 打开，项目只是替用户预先选了；硬阻断与防骚扰逻辑完全不受影响。
                 let allowed = crate::mcp::is_mcp_tool_allowed(ctx.data_dir, other)
-                    || crate::config::load_settings(ctx.data_dir)
-                        .exec_trust
-                        .auto_allows_mcp();
+                    || crate::project::effective_exec_trust(ctx.data_dir).auto_allows_mcp();
                 if !allowed {
                     let verdict = ctx
                         .perm
@@ -858,6 +1339,116 @@ pub async fn execute(
             Err(format!("未知工具：{other}"))
         }
     }
+}
+
+/// `life_items` —— 取某个数据源的**明细**。
+///
+/// ## 为什么需要它（摘要已经常驻了）
+///
+/// system prompt 里只常驻每个源**一行**（条数 + 新鲜度，见 `life.rs`）——
+/// 那是为了让模型"知道你的处境"，而不是把全文塞进每轮请求。
+/// 细节（作业标题、截止、备注）要模型主动来拿。
+///
+/// ## 为什么不把明细也常驻
+///
+/// 用户 2026-10 拍板「一行摘要常驻 + 详情按需」。全文常驻的代价是
+/// **每轮都在烧 token**，而且快照过期时模型会把旧数据当最新事实说 ——
+/// 那比"不知道"更糟。
+///
+/// ## 不带 `source` 参数 = 列出所有源
+///
+/// 与 `search_tools` 留空列出全部索引同一口径：模型可以先看一眼有哪些源。
+async fn life_items(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
+    let want = args
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let f = crate::life::load(ctx.data_dir);
+    if f.sources.is_empty() {
+        return Ok(ToolOutput::text(
+            "本机还没有配置任何数据源。\
+             在 设置 › 数据源 里加一个（读一个 JSON 快照，或跑一条命令）。",
+        ));
+    }
+
+    let enabled: Vec<crate::life::Source> =
+        f.sources.iter().filter(|s| s.enabled).cloned().collect();
+    if enabled.is_empty() {
+        return Ok(ToolOutput::text(
+            "配置里所有数据源都是关闭状态。要读取请在 设置 › 数据源 里打开。",
+        ));
+    }
+
+    // 不带 source → 列出有哪些源（不读数据，便宜）
+    if want.is_empty() {
+        let mut out = String::from("已启用的数据源：\n");
+        for s in &enabled {
+            out.push_str(&format!("- {}（id: `{}`）\n", s.name(), s.id));
+        }
+        out.push_str("\n要看某个源的明细，再调一次并传 `source`。");
+        return Ok(ToolOutput::text(out));
+    }
+
+    let Some(src) = enabled.iter().find(|s| s.id == want) else {
+        let ids: Vec<String> = enabled.iter().map(|s| s.id.clone()).collect();
+        return Err(format!(
+            "没有 id 为「{want}」的已启用数据源。可用的：{}",
+            ids.join(", ")
+        ));
+    };
+
+    // 用当前工作目录跑 command 类源（与设置页/摘要同一条路径）
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ctx.data_dir.to_path_buf());
+    let snap = crate::life::read_source(src, &cwd).await;
+
+    if !snap.ok {
+        return Ok(ToolOutput::text(format!(
+            "读取「{}」失败：{}\n\n\
+             （这是数据源侧的问题，不是工具坏了。可以告诉用户去 设置 › 数据源 看看，\
+             或检查产出快照的那个程序有没有在跑。）",
+            snap.label, snap.error
+        )));
+    }
+
+    if snap.items.is_empty() {
+        return Ok(ToolOutput::text(format!(
+            "{}：当前没有条目{}。",
+            snap.label,
+            if snap.updated_at.is_empty() {
+                String::new()
+            } else {
+                format!("（快照 {}）", snap.updated_at)
+            }
+        )));
+    }
+
+    let mut out = format!("{}：{} 条", snap.label, snap.items.len());
+    if !snap.updated_at.is_empty() {
+        out.push_str(&format!("（快照 {}）", snap.updated_at));
+    }
+    out.push('\n');
+    if snap.stale {
+        out.push_str(&format!(
+            "⚠️ 该快照已 {} 小时未更新，可能不是最新 —— 说明情况时要点出来。\n",
+            snap.age_hours.unwrap_or(0.0)
+        ));
+    }
+    for (i, it) in snap.items.iter().enumerate() {
+        out.push_str(&format!("\n{}. {}", i + 1, it.title));
+        if !it.group.is_empty() {
+            out.push_str(&format!("　[{}]", it.group));
+        }
+        if !it.due_raw.is_empty() {
+            out.push_str(&format!("\n   截止：{}", it.due_raw));
+        }
+        if !it.note.is_empty() && it.note != it.title {
+            out.push_str(&format!("\n   {}", it.note));
+        }
+    }
+    Ok(ToolOutput::text(out))
 }
 
 /// `mcp__ssh__run-command` → 原始 MCP 工具名 `ssh_1mcp_run-command`
@@ -1072,6 +1663,92 @@ fn remember(args: &Value, data_dir: &Path) -> Result<ToolOutput, String> {
     )))
 }
 
+/// `distill_move` 的 schema —— **只在蒸馏会话注入**（见 [`tool_specs_for_distill`]）。
+fn distill_move_spec() -> ToolSpec {
+    ToolSpec::new(
+        "distill_move",
+        "把长期记忆中转站（MEMORY.md）里的**一条**迁移到目标文件，并在成功后从中转站移除。\
+         仅在「记忆蒸馏」会话里可用。执行前会自动备份 MEMORY.md（按天）。\
+         `target`：user（用户画像）/ soul（人格语气）/ identity（称呼）/ duplicate（目标已有同文，只从中转站删）/ stay（保持不动）。\
+         `text` 必须与 MEMORY.md 里的条目正文一致（不含行首 \"- \"），否则报错。\
+         一次只迁一条；多条请多次调用（每条都会单独返回结果）。",
+        json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "条目正文（与 MEMORY.md 逐字一致，不含行首 \"- \"）" },
+                "target": { "type": "string", "enum": ["user", "soul", "identity", "duplicate", "stay"], "description": "迁往哪：user 用户画像 / soul 人格语气 / identity 称呼 / duplicate 已有同文只删中转 / stay 不动" },
+                "section": { "type": "string", "description": "目标文件里的小节标题（如 \"## 偏好\"）；留空则追加到文件末尾" },
+                "reason": { "type": "string", "description": "迁移理由（会在结果里回显，便于你向用户交代）" }
+            },
+            "required": ["text", "target"]
+        }),
+    )
+}
+
+/// `distill_move` —— 蒸馏会话专用：把中转站里的一条迁到目标文件并移除之。
+///
+/// 返回文本要**说清结果**（写进哪个文件/小节、是否跳过、中转站已移除、备份在哪），
+/// 因为模型会把它原样转述给用户 —— 含糊的返回会让用户不知道到底改没改。
+fn distill_move(args: &Value, data_dir: &Path) -> Result<ToolOutput, String> {
+    let p = crate::distill::DistillProposal {
+        text: get_str(args, "text")?,
+        target: get_str(args, "target")?,
+        section: args
+            .get("section")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        reason: args
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    };
+    let r = crate::distill::apply_entry(data_dir, &p)?;
+    let where_ = if p.section.trim().is_empty() {
+        format!("{}.md 末尾", p.target.to_uppercase())
+    } else {
+        format!("{}.md {}", p.target.to_uppercase(), p.section.trim())
+    };
+    let head = if !p.reason.trim().is_empty() {
+        format!("{}（理由：{}）", clip(&p.text, 60), p.reason.trim())
+    } else {
+        clip(&p.text, 60)
+    };
+    let mut msg = match p.target.as_str() {
+        "stay" => format!("「{head}」按你的判断留在中转站，未改动任何文件。"),
+        "duplicate" => format!(
+            "「{head}」目标文件已有同文，未重复写入；已从中转站移除。备份：memory/{}",
+            r.backup
+        ),
+        _ => {
+            if r.moved == 1 {
+                format!("「{head}」已写入 {where_}，并从中转站移除。备份：memory/{}", r.backup)
+            } else {
+                format!(
+                    "「{head}」**未写入**（{}），但已从中转站移除。备份：memory/{}",
+                    r.skipped.first().cloned().unwrap_or_else(|| "目标已有同文".into()),
+                    r.backup
+                )
+            }
+        }
+    };
+    if r.removed == 0 {
+        msg.push_str("（未从中转站移除）");
+    }
+    Ok(ToolOutput::text(msg))
+}
+
+/// 短文本裁剪（工具结果里回显用）
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max).collect();
+        format!("{t}…")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // capture_screen / view_image
 // ---------------------------------------------------------------------------
@@ -1098,6 +1775,142 @@ fn capture_screen(data_dir: &Path) -> Result<ToolOutput, String> {
 
 /// 查看一张图片文件。路径经权限网关后，把**文件路径**随 `ToolOutput.image` 带出，
 /// 由 agent loop 按模型能力转 base64 / 占位 —— 与 `capture_screen` 同一条递送链路。
+/// 当前模式允不允许发表情包。
+///
+/// `send_meme` 的**可见性**（`all_tool_specs` 里决定要不要给这个 schema）
+/// 与**可调用性**（`send_meme` 里的二次检查）共用这一处判断 —— 两条路径
+/// 分头判断的话，迟早出现"列表里没有但调了居然能过"这种裂缝。
+fn memes_allowed(data_dir: &Path, session_id: Option<&str>) -> bool {
+    crate::sessions::effective_mode(data_dir, session_id).freestyle_images()
+}
+
+/// `send_image` 的工具声明 —— **常驻**（所有模式都有）。
+fn send_image_spec() -> ToolSpec {
+    ToolSpec::new(
+        "send_image",
+        "把一张**图片**贴进你的回复，让用户直接看到（截图、图表、示意图、网图…）。\n\
+         \n\
+         调用后你会拿到一段 markdown。⚠️ **必须把它原样复制到你的回复正文里** —— \
+         工具返回值本身折叠在「过程」里，用户看不见；只有贴进正文才会显示成图。\n\
+         \n\
+         什么时候用：刚 `capture_screen` 截了屏、或你知道某个图片文件的路径，\
+         想让用户看到它。**纯文本能说清的就别发图**。\n\
+         \n\
+         跟 `view_image` 的分工：那个是**你看**（画面进下一轮，你来描述）；\
+         这个是**给用户看**（他亲眼看到原图）。",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "图片绝对路径（png/jpg/jpeg/webp/gif/bmp），或 http(s) 网址"
+                },
+                "caption": {
+                    "type": "string",
+                    "description": "图的说明（当 alt 用），可省"
+                }
+            },
+            "required": ["path"]
+        }),
+    )
+}
+
+/// `send_meme` 的工具声明 —— **只在能随便发图的模式里出现**。
+fn send_meme_spec() -> ToolSpec {
+    ToolSpec::new(
+        "send_meme",
+        "从你的**表情包库**里挑一张发出去（闲聊用）。\n\
+         \n\
+         库的位置和**可用标签**见系统提示的「表情包库」段。`query` 填一个标签\
+         （如「无语」「摸鱼」「大笑」）；不传就随机挑一张。\n\
+         一个标签下面通常有**好几张**，工具会随机挑其中一张 —— 你不会每次拿到同一张，\
+         所以**同一轮里没必要为了\"换一张\"再调一次**。\n\
+         \n\
+         调用后你会拿到一段 markdown。⚠️ **必须把它原样复制到你的回复正文里**，\
+         否则用户什么都看不到。\n\
+         \n\
+         找不到匹配的标签时工具会报错并列出可用的 —— 那时**换个标签重试，或者干脆不发**，\
+         绝对不要自己编一个路径（那只会渲染成「图（读不出来）」）。\n\
+         \n\
+         分寸：情绪到位才发，一条回复最多一张；用户明显在正经办事时不要发。",
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "标签词，如「无语」「摸鱼」。省略则全库随机"
+                }
+            },
+            "required": []
+        }),
+    )
+}
+
+/// `send_image` —— 把一张现成的图贴进回复。
+///
+/// 它**不**自己做渲染：只返回一段 markdown，由模型贴进正文，前端 `mdToHtml`
+/// 的图片分支负责显示（见 `markdown.ts` 的 `inline()`）。这样图出现在正文里，
+/// 而不是折叠的「过程」里 —— 后者用户根本看不到。
+fn send_image(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
+    let raw = get_str(args, "path")?;
+    let caption = args
+        .get("caption")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    // 外链直接放行（前端当 `<img src>` 加载，没读本地文件，不走权限网关）；
+    // 本地路径必须过网关 + 真存在 —— 同 `view_image` 的口径，不新开绕过面。
+    let is_url = raw.starts_with("http://") || raw.starts_with("https://");
+    let shown = if is_url {
+        raw.clone()
+    } else {
+        let safe = authorize(ctx, &raw, Access::Read)?;
+        if safe.is_dir() {
+            return Err(format!("{} 是目录，不是图片。", safe.display()));
+        }
+        if !crate::images::is_image_path(&safe) {
+            return Err(format!(
+                "{} 不是图片文件（支持 png/jpg/jpeg/webp/gif/bmp）。",
+                safe.display()
+            ));
+        }
+        safe.display().to_string()
+    };
+
+    let alt = if caption.is_empty() { "图" } else { caption.as_str() };
+    Ok(ToolOutput::text(format!(
+        "把下面这一行**原样复制**到你的回复里（不复制的话用户看不到图）：\n\n\
+         ![{}]({})",
+        alt, shown
+    )))
+}
+
+/// `send_meme` —— 从表情包库挑一张。
+fn send_meme(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
+    // 双保险：非 free 模式下这个工具本来就**不在工具表里**（见 `all_tool_specs`），
+    // 但模型可能凭上一轮的记忆硬调。那时给它一句能听懂的话，比含糊的
+    // "没有这个工具"有用 —— 后者会让它反复重试。
+    if !memes_allowed(ctx.data_dir, Some(ctx.session_id)) {
+        let mode = crate::sessions::effective_mode(ctx.data_dir, Some(ctx.session_id));
+        return Err(format!(
+            "当前是「{}」，这个模式不发表情包（要贴工作产物图请用 `send_image`）。\
+             想发表情包得让用户切到闲聊模式。",
+            mode.name
+        ));
+    }
+
+    let q = args.get("query").and_then(|v| v.as_str());
+    let picked = crate::memes::pick(ctx.data_dir, q)?;
+    Ok(ToolOutput::text(format!(
+        "把下面这一行**原样复制**到你的回复里（不复制的话用户看不到图）：\n\n\
+         ![{}]({})",
+        picked.label,
+        picked.path.display()
+    )))
+}
+
 fn view_image(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     let raw = get_str(args, "path")?;
     let safe = authorize(ctx, &raw, Access::Read)?;
@@ -1355,10 +2168,100 @@ fn glob_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
 // grep_files
 // ---------------------------------------------------------------------------
 
+/// 命中行在正文里最多显示多少字符（围绕**命中位置**取窗口，不是从行首截）。
+///
+/// ⚠️ 为什么必须围绕命中位置：压缩后的单行文件动辄几十万字符
+/// （实测 `trae_dump.cjs` 单行 116 万字符，词在第 50 万字符处）。
+/// 从行首 `take(200)` 会让模型看到一行**不含所搜词**的内容 ——
+/// 它据此判断"命中了但内容对不上"，然后放弃工具去写 Python 脚本。
+const GREP_LINE_CHARS: usize = 200;
+
+/// 文件大于这个体积就跳过（并在结果里**明确回报**跳过了几个）。
+const GREP_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// grep 的跳过统计 —— 每一条都要出现在返回文本里。
+///
+/// ## 为什么这是本工具最重要的设计（2026-10-01 定论）
+/// 旧版每一条跳过路径都是裸 `return`，返回的永远是 `(无匹配)`。
+/// 模型**无法区分**「真的没有」和「工具压根没读」—— 实测 543 次调用里
+/// 58% 报零命中，其中 145 次是 `path` 传了文件（`read_dir` 对文件必失败）、
+/// 还有大批撞在 2MB 上限与非 UTF-8 上。模型的反应是放弃工具改跑 PowerShell，
+/// 于是绕开权限网关、被 24KB 截断、甚至查错文件得出错误结论。
+///
+/// **跳过必须可见** —— 这是让模型能自我纠正的前提。
+#[derive(Default)]
+struct GrepSkips {
+    too_big: usize,
+    not_utf8: usize,
+    denied: usize,
+    ext_filtered: usize,
+    visited_limit: bool,
+}
+
+impl GrepSkips {
+    fn any(&self) -> bool {
+        self.too_big + self.not_utf8 + self.denied + self.ext_filtered > 0 || self.visited_limit
+    }
+
+    /// 拼成给模型看的说明。**没有跳过就返回空串**，避免噪声。
+    fn describe(&self) -> String {
+        if !self.any() {
+            return String::new();
+        }
+        let mut parts = Vec::new();
+        if self.too_big > 0 {
+            parts.push(format!(
+                "{} 个文件超过 {} MB 未读",
+                self.too_big,
+                GREP_MAX_FILE_BYTES / 1024 / 1024
+            ));
+        }
+        if self.not_utf8 > 0 {
+            parts.push(format!(
+                "{} 个文件不是 UTF-8 文本（GBK/二进制）未读",
+                self.not_utf8
+            ));
+        }
+        if self.denied > 0 {
+            parts.push(format!("{} 个文件因权限被过滤", self.denied));
+        }
+        if self.ext_filtered > 0 {
+            parts.push(format!("{} 个文件因 ext 过滤未读", self.ext_filtered));
+        }
+        if self.visited_limit {
+            parts.push("已达扫描文件数上限，后面的没扫".to_string());
+        }
+        format!("\n⚠️ 注意：{}\n", parts.join("；"))
+    }
+}
+
+/// 读文本文件：严格 UTF-8 优先，失败回落 GBK（中文 Windows 的 .md/.txt 常见）。
+///
+/// 旧版用 `std::fs::read_to_string` —— 它只认严格 UTF-8，GBK 文件直接失败，
+/// 然后被静默 `return` 掉。这台机器上 `D:\myword\文章\skills\nature-figure\SKILL.md`
+/// 就是 GBK，grep 永远搜不到它。
+fn read_text_lossy(path: &Path) -> Option<(String, bool)> {
+    let bytes = std::fs::read(path).ok()?;
+    match String::from_utf8(bytes) {
+        Ok(s) => Some((s, true)),
+        Err(e) => {
+            let bytes = e.into_bytes();
+            // 回落 CP_ACP（本机 = GBK）。GBK 解不出来就是二进制，跳过。
+            let s = crate::win32::decode_acp(&bytes);
+            if s.is_empty() {
+                None
+            } else {
+                Some((s, false))
+            }
+        }
+    }
+}
+
 fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     let needle = get_str(args, "pattern")?;
     let raw = get_str(args, "path")?;
     let roots = authorize(ctx, &raw, Access::Read)?;
+
     // 不支持正则（本项目不引 regex crate）。schema/描述只承诺子串匹配。
     let use_regex = args
         .get("regex")
@@ -1369,11 +2272,29 @@ fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
             "grep_files 只支持子串匹配（regex=true 未启用）。请用普通 pattern，或 run_command + rg".into(),
         );
     }
+    // 模型习惯性写正则（实测 32 次：`a|b`、`.*`、`\[x\]`）—— 子串匹配下必然 0 命中。
+    // 与其让它拿到"无匹配"去猜，不如直接点破。
+    if let Some(hint) = regex_looking_pattern(&needle) {
+        return Err(format!(
+            "grep_files 只做**字面量子串**匹配，不支持正则。你给的 pattern 含正则语法（{hint}），\
+             照这样搜一定 0 命中。\n\
+             → 请改成普通子串（例如搜 `foo` 而不是 `foo|bar`），\
+             多个词就**分开搜几次**；确实需要正则时用 run_command 跑 rg。"
+        ));
+    }
+
     let context = args
         .get("context")
         .and_then(Value::as_u64)
         .unwrap_or(0)
         .min(3) as usize;
+
+    // 大小写：默认不敏感（实测 319 次零命中里 206 次 pattern 纯小写，
+    // 而目标是 `Custom Endpoint` 这类首字母大写 —— 大小写敏感是纯坑）。
+    let case_sensitive = args
+        .get("caseSensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let exts: Vec<String> = args
         .get("ext")
@@ -1382,17 +2303,21 @@ fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
         .unwrap_or_default();
 
     let mut hits: Vec<String> = Vec::new();
+    let mut hit_count = 0usize;
     let mut visited = 0usize;
+    let mut skips = GrepSkips::default();
 
-    walk(&roots, &mut |p: &Path| {
-        if hits.len() >= MAX_GREP_HITS {
+    // 搜索单个文件的内容。抽成闭包是因为下面要处理两种入口：
+    // ① `path` 是目录 → walk 出每个文件；② `path` 是文件 → 直接搜它。
+    let needle_cmp = if case_sensitive {
+        needle.clone()
+    } else {
+        needle.to_lowercase()
+    };
+    let scan_file = |p: &Path, hits: &mut Vec<String>, hit_count: &mut usize, skips: &mut GrepSkips| {
+        if *hit_count >= MAX_GREP_HITS {
             return;
         }
-        visited += 1;
-        if visited > 20000 {
-            return;
-        }
-
         // 扩展名过滤
         if !exts.is_empty() {
             let ok = p
@@ -1400,61 +2325,168 @@ fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
                 .map(|e| exts.contains(&e.to_string_lossy().to_lowercase()))
                 .unwrap_or(false);
             if !ok {
+                skips.ext_filtered += 1;
                 return;
             }
         }
 
-        // 大文件跳过
+        // 大文件跳过（**计数**，不再静默）
         let Ok(md) = p.metadata() else { return };
-        if md.len() > 2 * 1024 * 1024 {
+        if md.len() > GREP_MAX_FILE_BYTES {
+            skips.too_big += 1;
             return;
         }
 
         // 权限：逐个文件再确认（防止 walk 过程中穿过 junction）。
         // ⚠️ 同 glob：用**不消费**的 check_passive，否则一次 grep 会把「一次」授权吃光。
         let Some(safe) = check_passive(ctx, p, Access::Read) else {
+            skips.denied += 1;
             return;
         };
-        let Ok(content) = std::fs::read_to_string(&safe) else {
+        // 非 UTF-8 回落 GBK；解不出来才算"不是文本"
+        let Some((content, _is_utf8)) = read_text_lossy(&safe) else {
+            skips.not_utf8 += 1;
             return;
         };
 
-        for (i, line) in content.lines().enumerate() {
-            if hits.len() >= MAX_GREP_HITS {
+        let all: Vec<&str> = content.lines().collect();
+        for (i, line) in all.iter().enumerate() {
+            if *hit_count >= MAX_GREP_HITS {
                 return;
             }
-            if line.contains(&needle) {
-                let trimmed: String = line.trim().chars().take(200).collect();
-                if context > 0 {
-                    let all: Vec<&str> = content.lines().collect();
-                    let idx = i;
-                    let start = idx.saturating_sub(context);
-                    let end = (idx + context + 1).min(all.len());
-                    for j in start..end {
-                        let mark = if j == idx { ">" } else { " " };
-                        let ctx_line: String = all[j].trim().chars().take(120).collect();
-                        hits.push(format!("{}:{}: {mark} {}", safe.display(), j + 1, ctx_line));
-                    }
-                } else {
-                    hits.push(format!("{}:{}: {}", safe.display(), i + 1, trimmed));
+            let matched = if case_sensitive {
+                line.contains(&needle_cmp)
+            } else {
+                line.to_lowercase().contains(&needle_cmp)
+            };
+            if !matched {
+                continue;
+            }
+            *hit_count += 1;
+            if context > 0 {
+                let start = i.saturating_sub(context);
+                let end = (i + context + 1).min(all.len());
+                for j in start..end {
+                    let mark = if j == i { ">" } else { " " };
+                    // 上下文行也要围绕命中位置取窗口
+                    let shown = window_around(all[j], &needle_cmp, case_sensitive, 120);
+                    hits.push(format!("{}:{}: {mark} {}", safe.display(), j + 1, shown));
                 }
+            } else {
+                let shown = window_around(line, &needle_cmp, case_sensitive, GREP_LINE_CHARS);
+                hits.push(format!("{}:{}: {}", safe.display(), i + 1, shown));
             }
         }
-    });
+    };
 
-    let mut out = format!("在 {} 中搜索「{}」，命中 {} 行\n", roots.display(), needle, hits.len());
+    if roots.is_file() {
+        // ★ 2026-10-01 修：`path` 传文件时**直接搜这个文件**。
+        //
+        // 旧版把 roots 丢给 `walk()`，而 walk 第一件事是 `read_dir` ——
+        // 对文件必然失败，然后裸 `return`，于是返回「命中 0 行」。
+        // 实测这一条坑掉了 26% 的调用（145/543），模型完全无从察觉。
+        scan_file(&roots, &mut hits, &mut hit_count, &mut skips);
+    } else {
+        walk(&roots, &mut |p: &Path| {
+            if hit_count >= MAX_GREP_HITS {
+                return;
+            }
+            visited += 1;
+            if visited > 20000 {
+                skips.visited_limit = true;
+                return;
+            }
+            scan_file(p, &mut hits, &mut hit_count, &mut skips);
+        });
+    }
+
+    // ⚠️ 标题里的"命中 N 行"必须是**真正的命中行数**（hit_count），
+    //    不能是 `hits.len()` —— 带 context 时后者是"命中行 + 上下文行"，
+    //    实测 context=2 报「命中 200 行」其实只有 40 处命中（虚高 160）。
+    let scope = if roots.is_file() {
+        format!("文件 {}", roots.display())
+    } else {
+        format!("{} 中", roots.display())
+    };
+    let mut out = format!("在 {}搜索「{}」，命中 {} 行\n", scope, needle, hit_count);
     for h in &hits {
         out.push_str(h);
         out.push('\n');
     }
-    if hits.len() >= MAX_GREP_HITS {
-        out.push_str(&format!("\n… [已截断，最多 {MAX_GREP_HITS} 行]\n"));
+    if hit_count >= MAX_GREP_HITS {
+        out.push_str(&format!("\n… [已截断，最多 {MAX_GREP_HITS} 行命中]\n"));
     }
-    if hits.is_empty() {
-        out.push_str("(无匹配)\n");
+    out.push_str(&skips.describe());
+    if hit_count == 0 {
+        if skips.any() {
+            out.push_str("(在这些被读取的文件里无匹配 —— 注意上面列出的跳过项，答案可能就在里面)\n");
+        } else {
+            out.push_str("(无匹配)\n");
+        }
     }
 
     Ok(ToolOutput::text(out))
+}
+
+/// 在长行里**围绕命中位置**取一段窗口，而不是从行首截。
+///
+/// 压缩/单行文件里命中位置可能在几十万字符处，从行首截等于返回一段
+/// 与所搜词无关的内容 —— 模型会认为"命中了但内容不对"，进而放弃工具。
+fn window_around(line: &str, needle_lower: &str, case_sensitive: bool, max_chars: usize) -> String {
+    let trimmed = line.trim();
+    // 找到命中位置（字符下标，避免多字节切坏）
+    let hay = if case_sensitive {
+        trimmed.to_string()
+    } else {
+        trimmed.to_lowercase()
+    };
+    let byte_pos = hay.find(needle_lower).unwrap_or(0);
+    // 字节位置 → 字符位置
+    let char_pos = hay[..byte_pos].chars().count();
+
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= max_chars {
+        return trimmed.to_string();
+    }
+    // 命中处前面留 1/4 窗口，保证词可见且有上下文
+    let lead = max_chars / 4;
+    let start = char_pos.saturating_sub(lead);
+    let end = (start + max_chars).min(chars.len());
+    let start = end.saturating_sub(max_chars);
+    let mut s: String = chars[start..end].iter().collect();
+    if start > 0 {
+        s.insert_str(0, "…");
+    }
+    if end < chars.len() {
+        s.push('…');
+    }
+    s
+}
+
+/// pattern 看着像正则就返回命中的语法提示（用于给出**可操作**的报错）。
+///
+/// 只认明确的信号，避免把普通文本误判：`|` 交替、`.*`/`.+`、`\d`/`\w`/`\s`、
+/// 字符类 `[...]`、锚点 `^`/`$`、转义括号 `\(`/`\[`。
+fn regex_looking_pattern(pat: &str) -> Option<&'static str> {
+    if pat.contains("|") {
+        return Some("`|` 交替");
+    }
+    if pat.contains(".*") || pat.contains(".+") {
+        return Some("`.*` / `.+` 通配");
+    }
+    if pat.contains("\\d") || pat.contains("\\w") || pat.contains("\\s") || pat.contains("\\b") {
+        return Some("`\\d`/`\\w`/`\\s` 转义类");
+    }
+    if pat.contains("\\[") || pat.contains("\\(") || pat.contains("\\]") || pat.contains("\\)") {
+        return Some("转义括号");
+    }
+    if pat.starts_with('^') || pat.ends_with('$') {
+        return Some("`^`/`$` 锚点");
+    }
+    if pat.contains('[') && pat.contains(']') {
+        return Some("`[...]` 字符类");
+    }
+    None
 }
 
 /// 递归遍历（不跟随目录符号链接，避免出界）
@@ -2240,6 +3272,157 @@ async fn ask_user(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String>
     Ok(ToolOutput::text(msg))
 }
 
+/// 命令闸门的判定结果。
+///
+/// 抽出来是为了让 **`run_command` 与项目 L1 脚本工具走完全相同的一套判定** ——
+/// 各写一份的结果是"两个入口的权限语义慢慢分叉"，而分叉的那一侧
+/// 就是安全漏洞（通常是后来加的那个忘了补某个检查）。
+enum CmdGate {
+    /// 放行。`source` 用于审计（白名单 / 免问 / 已授权 / 用户批准）
+    Allowed {
+        source: String,
+        risk: command_policy::Risk,
+        norm: command_policy::Normalized,
+    },
+    /// 不执行 —— 这段文本直接回给模型（硬阻断 / 用户拒绝 / 防骚扰）
+    Refused(ToolOutput),
+}
+
+/// **命令执行的唯一闸门**（Gate 2 全流程）。
+///
+/// 覆盖：硬阻断 → 白名单 → 临时授权 → 防骚扰 → 执行档位 → 弹卡。
+/// 顺序是**有意的**，不要调整：
+/// - 硬阻断最前：任何档位、任何项目预设都拦
+/// - 防骚扰在档位之前：用户刚拒过的命令，切档位也不该偷偷放行
+///
+/// 调用方负责 Gate 1（`cwd` 过文件权限网关）与真正的进程启动。
+async fn gate_command(
+    cmd: &str,
+    cwd: &Path,
+    ctx: &ToolCtx<'_>,
+) -> Result<CmdGate, String> {
+    // ⚠️ 用 `project::effective_policy` 而**不是** `load_policy`：
+    // 拼装项目可以在白名单上做**加法**（`permPreset.commandAllowExtra`）。
+    // `hard_block` 由该函数原样保留，且 `PermPreset::validated` 在装配阶段
+    // 已经拒绝过试图命中硬阻断的白名单条目 —— 两层保证，改任何一层都破不了防。
+    let policy = crate::project::effective_policy(ctx.data_dir);
+    let norm = command_policy::normalize(cmd);
+
+    match command_policy::evaluate(&policy, cmd) {
+        CmdVerdict::HardBlock { reason } => {
+            audit_cmd(
+                ctx, cmd, &norm, cwd, "blocked", "hard-block", command_policy::Risk::High, None,
+            );
+            Err(format!(
+                "命令被**硬性阻断**（不可申请）：{reason}\n\
+                 这条命令命中危险模式，永远不会执行 —— 不要重试，也不要换个写法绕过。\n\
+                 如确有正当需要，请让用户**手工**执行。"
+            ))
+        }
+        CmdVerdict::Allow { reason } => {
+            let risk = command_policy::Risk::Low;
+            audit_cmd(ctx, cmd, &norm, cwd, "allowed", "whitelist", risk, None);
+            Ok(CmdGate::Allowed {
+                source: format!("白名单（{reason}）"),
+                risk,
+                norm,
+            })
+        }
+        CmdVerdict::Ask { reason, risk } => {
+            // ① 已有临时授权（Once/Turn/Task 三档）→ 消费一次直接放行
+            let hit = {
+                let mut store = ctx
+                    .perm
+                    .cmd_grants()
+                    .lock()
+                    .map_err(|e| format!("命令授权表锁失败: {e}"))?;
+                match store.find(cmd) {
+                    Some(i) => {
+                        store.consume(i);
+                        true
+                    }
+                    None => false,
+                }
+            };
+
+            if hit {
+                audit_cmd(ctx, cmd, &norm, cwd, "allowed", "grant", risk, None);
+                return Ok(CmdGate::Allowed {
+                    source: "已授权（临时授权生效）".into(),
+                    risk,
+                    norm,
+                });
+            }
+
+            // ② 防骚扰：这条命令刚被拒过 → 不再弹卡，直接把理由回给模型
+            let full_fp = norm.full();
+            if let Some(m) = ctx.perm.find_denied_cmd(ctx.session_id, &full_fp) {
+                let why = if m.reason.is_empty() {
+                    "（用户上次没有说明理由）".to_string()
+                } else {
+                    format!("用户上次给的理由：{}", m.reason)
+                };
+                return Ok(CmdGate::Refused(ToolOutput::text(format!(
+                    "这条命令刚刚已经被拒绝过了，**不会重复弹卡**。\n{why}\n\n\
+                     请按这个理由调整：换一种做法，或如实告诉用户你做不了。"
+                ))));
+            }
+
+            // ③ 执行权限档位（smart/full 档免问直接跑）。
+            //    ⚠️ 放在防骚扰**之后** —— 用户刚拒过的命令，切档位也不该偷偷放行。
+            //    取 `project::effective_exec_trust`：拼装项目可**预选**档位
+            //    （不是绕过 —— 用户自己本来就能开 full）。
+            let trust = crate::project::effective_exec_trust(ctx.data_dir);
+            if trust.auto_allows_command(risk == command_policy::Risk::High) {
+                let source = format!(
+                    "免问放行（{}档）",
+                    match trust {
+                        crate::config::ExecTrust::Smart => "智能",
+                        _ => "完全访问",
+                    }
+                );
+                audit_cmd(ctx, cmd, &norm, cwd, "allowed", "trust-auto", risk, None);
+                return Ok(CmdGate::Allowed { source, risk, norm });
+            }
+
+            // ④ 弹卡等用户当场拍板
+            let passed_head = norm.head();
+            let passed_full = norm.full();
+            let verdict = ctx
+                .perm
+                .ask_command(
+                    cmd.to_string(),
+                    passed_full.clone(),
+                    passed_head,
+                    passed_full,
+                    risk,
+                    reason.clone(),
+                    ctx.session_id,
+                )
+                .await?;
+
+            if !verdict.is_approved() {
+                audit_cmd(ctx, cmd, &norm, cwd, "rejected", "user-denied", risk, None);
+                return Ok(CmdGate::Refused(ToolOutput::text(verdict.to_model_message())));
+            }
+
+            let applied = ctx.perm.apply_cmd_decision(verdict.decision, cmd, &reason);
+            let Some(g) = applied else {
+                return Ok(CmdGate::Refused(ToolOutput::text(
+                    "用户已批准，但命令授权写入失败，请重试一次。",
+                )));
+            };
+            let scope_label = match g.scope {
+                CmdScope::Prefix => "记住这类命令",
+                CmdScope::Full => "记住完整命令",
+            };
+            let source = format!("用户已批准（{scope_label}）");
+            audit_cmd(ctx, cmd, &norm, cwd, "approved", "user-approved", risk, None);
+            Ok(CmdGate::Allowed { source, risk, norm })
+        }
+    }
+}
+
 async fn run_command(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     let cmd = get_str(args, "command")?;
     if cmd.trim().is_empty() {
@@ -2266,117 +3449,13 @@ async fn run_command(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Stri
         .unwrap_or(600)
         .clamp(1, 3600);
 
-    // ---- Gate 2：命令策略 ----
-    let policy = command_policy::load_policy(ctx.data_dir);
-    let norm = command_policy::normalize(&cmd);
-
-    let source: String;
-    let risk: command_policy::Risk;
-
-    match command_policy::evaluate(&policy, &cmd) {
-        CmdVerdict::HardBlock { reason } => {
-            audit_cmd(
-                ctx, &cmd, &norm, &cwd, "blocked", "hard-block", command_policy::Risk::High, None,
-            );
-            return Err(format!(
-                "命令被**硬性阻断**（不可申请）：{reason}\n\
-                 这条命令命中危险模式，永远不会执行 —— 不要重试，也不要换个写法绕过。\n\
-                 如确有正当需要，请让用户**手工**执行。"
-            ));
-        }
-        CmdVerdict::Allow { reason } => {
-            risk = command_policy::Risk::Low;
-            source = format!("白名单（{reason}）");
-            audit_cmd(ctx, &cmd, &norm, &cwd, "allowed", "whitelist", risk, None);
-        }
-        CmdVerdict::Ask { reason, risk: r } => {
-            risk = r;
-
-            // ① 已有临时授权（Once/Turn/Task 三档）→ 消费一次直接放行
-            let hit = {
-                let mut store = ctx
-                    .perm
-                    .cmd_grants()
-                    .lock()
-                    .map_err(|e| format!("命令授权表锁失败: {e}"))?;
-                match store.find(&cmd) {
-                    Some(i) => {
-                        store.consume(i);
-                        true
-                    }
-                    None => false,
-                }
-            };
-
-            if hit {
-                source = "已授权（临时授权生效）".into();
-                audit_cmd(ctx, &cmd, &norm, &cwd, "allowed", "grant", risk, None);
-            } else {
-                // ② 防骚扰：这条命令刚被拒过 → 不再弹卡，直接把理由回给模型
-                let full_fp = norm.full();
-                if let Some(m) = ctx.perm.find_denied_cmd(ctx.session_id, &full_fp) {
-                    let why = if m.reason.is_empty() {
-                        "（用户上次没有说明理由）".to_string()
-                    } else {
-                        format!("用户上次给的理由：{}", m.reason)
-                    };
-                    return Ok(ToolOutput::text(format!(
-                        "这条命令刚刚已经被拒绝过了，**不会重复弹卡**。\n{why}\n\n\
-                         请按这个理由调整：换一种做法，或如实告诉用户你做不了。"
-                    )));
-                }
-
-                // ③ 执行权限档位（settings.exec_trust）：smart/full 档免问直接跑。
-                //    ⚠️ 放在防骚扰**之后** —— 用户刚拒过的命令，切档位也不该偷偷放行。
-                let trust = crate::config::load_settings(ctx.data_dir).exec_trust;
-                if trust.auto_allows_command(risk == command_policy::Risk::High) {
-                    source = format!(
-                        "免问放行（{}档）",
-                        match trust {
-                            crate::config::ExecTrust::Smart => "智能",
-                            _ => "完全访问",
-                        }
-                    );
-                    audit_cmd(ctx, &cmd, &norm, &cwd, "allowed", "trust-auto", risk, None);
-                } else {
-                    // ④ 弹卡等用户当场拍板
-                    let passed_head = norm.head();
-                    let passed_full = norm.full();
-                    let verdict = ctx
-                        .perm
-                        .ask_command(
-                            cmd.clone(),
-                            passed_full.clone(),
-                            passed_head,
-                            passed_full,
-                            risk,
-                            reason.clone(),
-                            ctx.session_id,
-                        )
-                        .await?;
-
-                    if !verdict.is_approved() {
-                        audit_cmd(ctx, &cmd, &norm, &cwd, "rejected", "user-denied", risk, None);
-                        return Ok(ToolOutput::text(verdict.to_model_message()));
-                    }
-
-                    let applied = ctx.perm.apply_cmd_decision(verdict.decision, &cmd, &reason);
-                    let Some(g) = applied else {
-                        return Ok(ToolOutput::text(
-                            "用户已批准，但命令授权写入失败，请重试一次。",
-                        ));
-                    };
-                    let scope_label = match g.scope {
-                        CmdScope::Prefix => "记住这类命令",
-                        CmdScope::Full => "记住完整命令",
-                    };
-                    source = format!("用户已批准（{scope_label}）");
-                    audit_cmd(ctx, &cmd, &norm, &cwd, "approved", "user-approved", risk, None);
-                }
-            }
-        }
-    }
-
+    // ---- Gate 2：命令策略（唯一闸门，见 `gate_command`）----
+    //
+    // 与项目 L1 脚本工具**共用同一套判定** —— 不各写一份。
+    let (source, risk, norm) = match gate_command(&cmd, &cwd, ctx).await? {
+        CmdGate::Allowed { source, risk, norm } => (source, risk, norm),
+        CmdGate::Refused(out) => return Ok(out),
+    };
     // ---- 执行 ----
     //
     // 两条路，取决于「后台桌面」开关（`win32desk::is_enabled`）：
@@ -2619,15 +3698,430 @@ mod tests {
 
     #[test]
     fn specs_include_loaded_mcp_tools_only() {
+        let tmp = std::env::temp_dir().join(format!("orbcat_specs_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
         let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
-        let before = tool_specs(Some(&mcp.try_lock().unwrap()), false).len();
-        // 初始：内置 + fetch_url（无 MCP）
+        let before = tool_specs(Some(&mcp.try_lock().unwrap()), false, &tmp, None).len();
+        // 初始：内置 + fetch_url（无 MCP、无项目）
         assert_eq!(before, builtin_specs().len() + 1, "初始 = 内置 + fetch_url");
-        assert!(tool_specs(None, false).iter().any(|s| s.name == "fetch_url"));
-        let with = tool_specs(Some(&mcp.try_lock().unwrap()), true).len();
+        assert!(tool_specs(None, false, &tmp, None).iter().any(|s| s.name == "fetch_url"));
+        let with = tool_specs(Some(&mcp.try_lock().unwrap()), true, &tmp, None).len();
         assert_eq!(with, builtin_specs().len() + 2, "应有 fetch_url + web_search");
-        assert!(tool_specs(None, false).iter().all(|s| s.name != "web_search"));
-        assert!(tool_specs(None, true).iter().any(|s| s.name == "web_search"));
+        assert!(tool_specs(None, false, &tmp, None).iter().all(|s| s.name != "web_search"));
+        assert!(tool_specs(None, true, &tmp, None).iter().any(|s| s.name == "web_search"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 内置工具名清单必须与**实际可调用的内置工具**完全一致。
+    ///
+    /// `BUILTIN_TOOL_NAMES` 是 `project.rs` 用来拒绝"项目脚本工具撞名"的依据。
+    /// 漏一个的后果很具体：项目可以定义一个与内置同名的工具，
+    /// 而 `execute` 的 `match` 会先命中内置分支 —— 用户的脚本**永远不执行**，
+    /// 模型只看到"我调了但没反应"。
+    ///
+    /// ⚠️ 注意 `fetch_url` 与 `web_search` **不在** `builtin_specs()` 里：
+    /// 前者由 `tool_specs` 无条件追加，后者按配置追加。但它们都是
+    /// `execute` 里真实存在的分支，所以必须在这份清单里。
+    #[test]
+    fn builtin_name_list_covers_every_spec() {
+        let from_specs: std::collections::HashSet<String> = builtin_specs()
+            .into_iter()
+            .map(|s| s.name)
+            // ⚠️ 这三个不在 `builtin_specs()` 里，但**仍是保留的内置工具名**：
+            //   web_search / fetch_url 按配置条件注入；distill_move 只在
+            //   「记忆蒸馏」会话注入（见 tool_specs_for_distill）。它们照样要进
+            //   保留清单，否则项目脚本工具能起同名工具把它顶掉。
+            .chain([
+                "web_search".to_string(),
+                "fetch_url".to_string(),
+                "distill_move".to_string(),
+                // 2026-10-08：只在 `imageReplies = "free"` 的模式里注入
+                // （见 `all_tool_specs`），但**名字必须保留** —— 否则项目
+                // 脚本工具能起个同名的，把这道闸门顶掉。
+                "send_meme".to_string(),
+            ])
+            .collect();
+        let listed: std::collections::HashSet<String> =
+            BUILTIN_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+
+        let missing: Vec<_> = from_specs.difference(&listed).collect();
+        assert!(
+            missing.is_empty(),
+            "BUILTIN_TOOL_NAMES 漏了这些内置工具（会导致项目脚本可与之撞名）：{missing:?}"
+        );
+        let extra: Vec<_> = listed.difference(&from_specs).collect();
+        assert!(
+            extra.is_empty(),
+            "BUILTIN_TOOL_NAMES 里有已不存在的工具（清单过期）：{extra:?}"
+        );
+    }
+
+    /// `send_meme` 必须被模式**硬**闸住（用户 2026-10-08 要求）。
+    ///
+    /// 这条别退化成提示词：闸门的意义就是"模型想调也调不到"。
+    /// 同时钉住另一半 —— `send_image` 常驻（工作模式也要贴截图 / 图表）。
+    #[test]
+    fn send_meme_spec_is_gated_by_mode() {
+        let d = std::env::temp_dir().join(format!(
+            "orbcat_memegate_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|x| x.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+
+        std::fs::write(
+            d.join("modes.json"),
+            r#"{"modes":[
+                 {"id":"standard","name":"标准","description":"x","mcpGroupsPreload":"all"},
+                 {"id":"chat","name":"闲聊","description":"x","mcpGroupsPreload":[],
+                  "imageReplies":"free"}
+               ]}"#,
+        )
+        .unwrap();
+
+        let names = |dir: &Path, mode: &str| -> Vec<String> {
+            // 模式跟会话走（2026-10-08）：给这个模式**建一条会话**，按它的 id 取工具表。
+            // ⚠️ 不能再写 `settings.json` 的 `activeMode` —— 那个字段已删，
+            //    而且就算留着也不影响任何一条会话的模式（曾经靠它切模式的写法已全废）。
+            let sid = crate::sessions::new_session(dir, mode).id;
+            tool_specs(None, false, dir, Some(&sid))
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        };
+
+        // work（standard）：有 send_image，**没有** send_meme
+        let work = names(&d, "standard");
+        assert!(
+            work.contains(&"send_image".to_string()),
+            "send_image 必须常驻: {work:?}"
+        );
+        assert!(
+            !work.contains(&"send_meme".to_string()),
+            "work 模式不该出现 send_meme（这是硬闸门，不是提示词）: {work:?}"
+        );
+
+        // free（chat）：两个都在
+        let chat = names(&d, "chat");
+        assert!(chat.contains(&"send_image".to_string()));
+        assert!(
+            chat.contains(&"send_meme".to_string()),
+            "free 模式必须有 send_meme: {chat:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 清单里的**每一个**名字都必须在 `execute` 里真的有分支。
+    ///
+    /// 反向检查：防止清单里混进一个"已经删掉的内置工具名"，
+    /// 那会让项目工具被无理由地拒绝（用户看到"名字不合法"却不知道为什么）。
+    #[test]
+    fn builtin_names_are_all_real_dispatch_targets() {
+        for name in BUILTIN_TOOL_NAMES {
+            // MCP 元工具与项目工具走 `other` 分支，所以这里只断言
+            // "内置清单里的名字都被 is_builtin_tool_name 认可"这个自洽性，
+            // 真正的分派覆盖由 `builtin_name_list_covers_every_spec` 保证。
+            assert!(
+                is_builtin_tool_name(name),
+                "清单自洽性坏了：{name}"
+            );
+        }
+        // 反向：普通名字不该被当成内置
+        assert!(!is_builtin_tool_name("my_project_tool"));
+        assert!(!is_builtin_tool_name("mcp__github__create_issue"));
+        assert!(!is_builtin_tool_name(""));
+    }
+
+    // ---------------- 项目 L1 脚本工具（端到端 + 注入穿透）----------------
+
+    /// 造一个带 L1 脚本工具的项目，返回 `(data_dir, 项目目录)`。
+    fn setup_project_tool(
+        tag: &str,
+        tool_name: &str,
+        template: &[&str],
+        script: Option<(&str, &str)>, // (相对路径, 内容)
+    ) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "orbcat_ptool_{tag}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|x| x.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+
+        let bundle = crate::project::bundle_dir(&d, "p");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let json = json!({
+            "schemaVersion": 1,
+            "name": "测试项目",
+            "tools": [{
+                "name": tool_name,
+                "description": "测试脚本工具",
+                "params": {"type":"object","properties":{"msg":{"type":"string"}}},
+                "commandTemplate": template,
+            }]
+        });
+        std::fs::write(
+            bundle.join(crate::project::BUNDLE_FILE),
+            serde_json::to_string_pretty(&json).unwrap(),
+        )
+        .unwrap();
+
+        if let Some((rel, content)) = script {
+            let p = bundle.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(p, content).unwrap();
+        }
+
+        // 激活
+        let mut s = crate::config::load_settings(&d);
+        s.active_bundle = Some("p".into());
+        // 测试要免问：否则会弹卡等到超时。这里验证的是**注入面**，
+        // 不是权限卡（权限卡有它自己的测试）。
+        s.exec_trust = crate::config::ExecTrust::Full;
+        crate::config::save_settings(&d, &s).unwrap();
+
+        d
+    }
+
+    /// **注入穿透测试：用户输入里的 shell 元字符必须原样留在同一个参数里。**
+    ///
+    /// 这是 L1 安全性的核心断言，而且是**真起子进程**的端到端验证 ——
+    /// 光测 `expand_template` 只证明"字符串没被拆"，证明不了
+    /// "从工具调用到子进程这一整条路都没有把参数交给 shell"。
+    ///
+    /// 做法：脚本把收到的每个参数**逐行原样打印**，然后断言：
+    ///   ① 危险字符出现在输出里（说明脚本真的收到了它）
+    ///   ② 脚本**没有被注入执行**（副作用标记文件不存在）
+    #[tokio::test]
+    async fn project_tool_does_not_interpret_shell_metacharacters() {
+        let marker = std::env::temp_dir().join(format!(
+            "orbcat_pwned_{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|x| x.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        // 假脚本：把 argv 逐行打印。若参数被 shell 解析，`;` 之后的
+        // 命令就会真的执行（下面那个 `New-Item` 会创建 marker）。
+        let script_body = r#"
+param([string]$msg)
+[Console]::OutputEncoding=[System.Text.Encoding]::UTF8
+Write-Output "ARG=$msg"
+"#;
+        let payload = format!(
+            "safe; New-Item -Path '{}' -ItemType File -Force; echo",
+            marker.to_string_lossy()
+        );
+
+        let d = setup_project_tool(
+            "inject",
+            "echo_tool",
+            &["{exe}", "-NoProfile", "-NonInteractive", "-File", "{project}/tools/echo.ps1", "-msg", "{param.msg}"],
+            Some(("tools/echo.ps1", script_body)),
+        );
+        // 模板里第 0 项用真实解释器路径
+        let (exe, _) = crate::shell::resolve_interpreter();
+        let bundle = crate::project::bundle_dir(&d, "p");
+        let json = json!({
+            "schemaVersion": 1,
+            "name": "测试项目",
+            "tools": [{
+                "name": "echo_tool",
+                "description": "回显参数",
+                "params": {"type":"object","properties":{"msg":{"type":"string"}}},
+                "commandTemplate": [exe, "-NoProfile", "-NonInteractive", "-File",
+                                    "{project}/tools/echo.ps1", "-msg", "{param.msg}"],
+            }]
+        });
+        std::fs::write(
+            bundle.join(crate::project::BUNDLE_FILE),
+            serde_json::to_string_pretty(&json).unwrap(),
+        )
+        .unwrap();
+
+        let gate = gate_for(&d);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let out = match execute(
+            "echo_tool",
+            &json!({ "msg": payload }),
+            &ctx_for!(gate, &d, mcp),
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                // 起不了进程（受限环境）→ 跳过，别误红
+                eprintln!("跳过：{e}");
+                let _ = std::fs::remove_dir_all(&d);
+                return;
+            }
+        };
+
+        // ① 危险字符**确实**到达了脚本（说明没有被静默丢弃/转义掉语义）
+        assert!(
+            out.text.contains("ARG="),
+            "脚本应打印参数，实际输出: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("safe;"),
+            "参数里的 `;` 应原样传给脚本（作为普通字符）: {}",
+            out.text
+        );
+
+        // ② **关键**：注入没有生效 —— marker 文件不该被创建
+        assert!(
+            !marker.exists(),
+            "注入生效了！`;` 之后的命令被执行，marker={} 被创建。\
+             这说明参数在某处被交给了 shell 解析。",
+            marker.display()
+        );
+
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// **`{param.*}` 不会被再拆分** —— 含空格的单个参数仍是一个参数。
+    ///
+    /// 若被拆分，`--msg "a b"` 会变成两个参数，
+    /// 用户就能用一个值伪造出额外开关（如 `x --dangerous-flag`）。
+    #[tokio::test]
+    async fn project_tool_keeps_spaced_param_as_one_argument() {
+        let script_body = r#"
+param([string]$msg)
+[Console]::OutputEncoding=[System.Text.Encoding]::UTF8
+Write-Output "COUNT_MARK"
+Write-Output "ARG=[$msg]"
+"#;
+        let d = setup_project_tool(
+            "spaces",
+            "echo_tool",
+            &["{exe}", "-NoProfile", "-File", "{project}/tools/echo.ps1", "-msg", "{param.msg}"],
+            Some(("tools/echo.ps1", script_body)),
+        );
+        let (exe, _) = crate::shell::resolve_interpreter();
+        let bundle = crate::project::bundle_dir(&d, "p");
+        let json = json!({
+            "schemaVersion": 1,
+            "name": "测试项目",
+            "tools": [{
+                "name": "echo_tool",
+                "description": "回显",
+                "params": {"type":"object","properties":{"msg":{"type":"string"}}},
+                "commandTemplate": [exe, "-NoProfile", "-File",
+                                    "{project}/tools/echo.ps1", "-msg", "{param.msg}"],
+            }]
+        });
+        std::fs::write(
+            bundle.join(crate::project::BUNDLE_FILE),
+            serde_json::to_string_pretty(&json).unwrap(),
+        )
+        .unwrap();
+
+        let gate = gate_for(&d);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let out = match execute(
+            "echo_tool",
+            &json!({ "msg": "带 空格 的 值" }),
+            &ctx_for!(gate, &d, mcp),
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("跳过：{e}");
+                let _ = std::fs::remove_dir_all(&d);
+                return;
+            }
+        };
+
+        // 参数应被**完整**收到（带空格也只有一个值）
+        assert!(
+            out.text.contains("带 空格 的 值"),
+            "含空格的参数应完整传给脚本（说明没被拆成多个）: {}",
+            out.text
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// **硬阻断在项目工具上照样拦**（即使项目把 exec_trust 设成 full）。
+    ///
+    /// 这条是"拼装层在闸门之下"的端到端证明：
+    /// 一个项目可以把档位预选成 full（免问），但硬阻断的命令仍然**不执行**。
+    #[tokio::test]
+    async fn project_tool_hard_block_still_applies_under_full_trust() {
+        // 模板直接调用一个会被硬阻断的命令（shutdown 在硬阻断清单里）
+        let d = setup_project_tool(
+            "hardblock",
+            "danger_tool",
+            &["shutdown", "/s"],
+            None,
+        );
+
+        let gate = gate_for(&d);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let r = execute(
+            "danger_tool",
+            &json!({}),
+            &ctx_for!(gate, &d, mcp),
+        )
+        .await;
+
+        // 必须是**错误**（硬阻断）—— 不能返回成功
+        match r {
+            Err(e) => {
+                assert!(
+                    e.contains("硬性阻断") || e.contains("硬阻断"),
+                    "应是硬阻断错误，实际: {e}"
+                );
+            }
+            Ok(o) => panic!(
+                "硬阻断被绕过了！full 档 + 项目工具不该放行 shutdown。输出: {}",
+                o.text
+            ),
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 项目工具**未激活时不可调用**（调用会走到 MCP 分支然后报未知工具）。
+    #[tokio::test]
+    async fn project_tool_not_callable_when_project_inactive() {
+        let d = std::env::temp_dir().join(format!(
+            "orbcat_ptool_inactive_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|x| x.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // 写包但**不激活**
+        let bundle = crate::project::bundle_dir(&d, "p");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(
+            bundle.join(crate::project::BUNDLE_FILE),
+            r#"{"schemaVersion":1,"name":"p","tools":[{"name":"ghost_tool","description":"x","commandTemplate":["echo","hi"]}]}"#,
+        )
+        .unwrap();
+
+        let gate = gate_for(&d);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let r = execute("ghost_tool", &json!({}), &ctx_for!(gate, &d, mcp)).await;
+        assert!(r.is_err(), "未激活的项目工具不该能调用");
+        let e = r.unwrap_err();
+        assert!(e.contains("未知工具"), "应报未知工具，实际: {e}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[tokio::test]
@@ -2747,7 +4241,7 @@ mod tests {
         let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
 
         // 造一个有历史的会话
-        let s = crate::sessions::new_session(&tmp);
+        let s = crate::sessions::new_session(&tmp, "standard");
         crate::sessions::append_turn(&tmp, "先把 venera 的跳页 bug 修了", &[], "好的", &[]).unwrap();
         crate::sessions::append_turn(&tmp, "再顺手看看 apidash", &[], "行", &[]).unwrap();
         let sid = s.id.as_str();
@@ -2848,6 +4342,7 @@ mod tests {
             summary_upto: None,
             last_prompt_tokens: None,
             token_scale: None,
+            mode: Some("standard".to_string()),
         };
         crate::sessions::save(dir, &s).unwrap();
     }
@@ -3150,6 +4645,283 @@ mod tests {
         assert!(names.contains(&"search_tools".to_string()), "缺 search_tools");
     }
 
+    // -----------------------------------------------------------------------
+    // grep_files 的「静默失败」回归（2026-10-01）
+    //
+    // 背景：543 次真实调用里 58% 报零命中，其中 145 次是 `path` 传了文件 ——
+    // walk() 对文件 read_dir 必失败后裸 return，工具报「命中 0 行」，
+    // 模型无从区分「真的没有」和「压根没读」，于是放弃工具改跑 PowerShell。
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn regex_looking_pattern_flags_real_regex_syntax() {
+        // 实测模型真写过的那些（32 次零命中的形态）
+        assert!(regex_looking_pattern("mimo-server-cn|/api/route/chat").is_some());
+        assert!(regex_looking_pattern("current.*source").is_some());
+        assert!(regex_looking_pattern("8883|10558|llm-server").is_some());
+        assert!(regex_looking_pattern("\\[mimo\\]\\[api\\]").is_some());
+        assert!(regex_looking_pattern("^=====").is_some());
+        assert!(regex_looking_pattern("fn \\w+").is_some());
+        // 普通子串不能误判 —— 这些必须放行
+        assert!(regex_looking_pattern("fn find_model").is_none());
+        assert!(regex_looking_pattern("Custom Endpoint").is_none());
+        assert!(regex_looking_pattern("已配置").is_none());
+        assert!(regex_looking_pattern("deepseek").is_none());
+        assert!(regex_looking_pattern("api/ide/v1/chat").is_none());
+    }
+
+    #[test]
+    fn window_around_keeps_needle_visible_in_giant_line() {
+        // 复刻 trae_dump.cjs：单行 116 万字符，词在第 50 万字符处。
+        // 旧版 `trim().chars().take(200)` 会返回一段**不含该词**的内容。
+        let mut line = "x".repeat(500_000);
+        line.push_str("NEEDLE_HERE");
+        line.push_str(&"y".repeat(500_000));
+        let shown = window_around(&line, "needle_here", false, 200);
+        assert!(
+            shown.to_lowercase().contains("needle_here"),
+            "围绕命中位置取窗口后必须仍能看到所搜词，实际: {}",
+            &shown[..shown.len().min(80)]
+        );
+        assert!(shown.chars().count() <= 202, "窗口不能超长（含省略号）");
+        // 短行原样返回
+        assert_eq!(window_around("hello world", "world", false, 200), "hello world");
+    }
+
+    #[test]
+    fn window_around_is_multibyte_safe() {
+        // 中文命中位置不能把字符切坏
+        let line = format!("{}目标词{}", "汉".repeat(500), "字".repeat(500));
+        let shown = window_around(&line, "目标词", false, 120);
+        assert!(shown.contains("目标词"), "中文窗口必须保留命中词");
+    }
+
+    #[test]
+    fn grep_skips_describe_reports_every_category() {
+        // 「跳过必须可见」—— 这是本工具最重要的设计约束
+        let mut s = GrepSkips::default();
+        assert!(!s.any(), "没有跳过时 any() 必须为 false");
+        assert!(s.describe().is_empty(), "没有跳过时不能产生噪声");
+
+        s.too_big = 2;
+        s.not_utf8 = 1;
+        s.denied = 3;
+        assert!(s.any());
+        let d = s.describe();
+        assert!(d.contains("2 个文件超过 2 MB"), "必须说明大文件跳过: {d}");
+        assert!(d.contains("1 个文件不是 UTF-8"), "必须说明非文本跳过: {d}");
+        assert!(d.contains("3 个文件因权限"), "必须说明权限跳过: {d}");
+
+        let mut s2 = GrepSkips::default();
+        s2.visited_limit = true;
+        assert!(s2.describe().contains("扫描文件数上限"));
+    }
+
+    #[test]
+    fn read_text_lossy_falls_back_to_gbk() {
+        let dir = fresh_tmp("grep_gbk");
+        // 中文机器上的 GBK 文本（严格 UTF-8 解不开）——旧版直接静默跳过
+        let p = dir.join("gbk.md");
+        let gbk: &[u8] = &[0xCA, 0xFD, 0xBE, 0xDD, 0x2E, 0x6D, 0x64]; // "数据.md" 的 GBK 字节
+        std::fs::write(&p, gbk).unwrap();
+        let got = read_text_lossy(&p);
+        assert!(got.is_some(), "GBK 文件必须能读出来（回落 CP_ACP），不能静默跳过");
+        let (text, is_utf8) = got.unwrap();
+        assert!(!is_utf8, "应标记为非 UTF-8");
+        assert!(!text.is_empty(), "解码结果不能为空");
+
+        // 纯 UTF-8 文件走原路径
+        let p2 = dir.join("utf8.md");
+        std::fs::write(&p2, "正常 UTF-8 内容").unwrap();
+        let (t2, u2) = read_text_lossy(&p2).unwrap();
+        assert!(u2 && t2.contains("正常"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // grep_files 端到端：重放真实失败现场（2026-10-01）
+    // -----------------------------------------------------------------------
+
+    /// 复刻 `s1790833919027-2` 那次事故：模型对**单个文件**调 grep_files，
+    /// 文件里明明有这个词，工具却报「命中 0 行」→ 模型放弃工具改跑 PowerShell。
+    #[test]
+    fn grep_files_accepts_a_file_as_path() {
+        let dir = fresh_tmp("grep_filepath");
+        let f = dir.join("wb_sysprompt_extract.txt");
+        // 真实内容形态：system prompt 全文，第 78 行那句收尾模板
+        let body = format!(
+            "line1\n{}\n- End-of-turn summary: What changed and what's next. Nothing else.\n{}",
+            "填充\n".repeat(70),
+            "尾巴\n".repeat(30)
+        );
+        std::fs::write(&f, &body).unwrap();
+
+        let gate = gate_for(&dir);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &dir, mcp);
+
+        // ★ 旧版在这里返回「命中 0 行」——walk() 对文件 read_dir 必失败
+        let out = grep_files(
+            &json!({ "pattern": "End-of-turn summary", "path": f.to_string_lossy() }),
+            &ctx,
+        )
+        .expect("grep 不应报错");
+        assert!(
+            out.text.contains("命中 1 行"),
+            "path 传文件必须能搜到内容，实际返回:\n{}",
+            out.text
+        );
+        assert!(out.text.contains("End-of-turn summary"), "应回显命中行");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 大小写不敏感：实测 319 次零命中里 206 次 pattern 纯小写，
+    /// 而目标是 `Custom Endpoint` 这类首字母大写。
+    #[test]
+    fn grep_files_is_case_insensitive_by_default() {
+        let dir = fresh_tmp("grep_case");
+        std::fs::write(dir.join("a.md"), "配置里叫 Custom Endpoint，只支持 openai 兼容。").unwrap();
+
+        let gate = gate_for(&dir);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &dir, mcp);
+
+        let out = grep_files(
+            &json!({ "pattern": "custom endpoint", "path": dir.to_string_lossy() }),
+            &ctx,
+        )
+        .unwrap();
+        assert!(out.text.contains("命中 1 行"), "小写 pattern 应能命中大写文本:\n{}", out.text);
+
+        // 显式要求区分大小写时，就不该命中
+        let out2 = grep_files(
+            &json!({
+                "pattern": "custom endpoint",
+                "path": dir.to_string_lossy(),
+                "caseSensitive": true
+            }),
+            &ctx,
+        )
+        .unwrap();
+        assert!(out2.text.contains("命中 0 行"), "caseSensitive=true 时不应命中");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「命中 N 行」必须只数真正的命中行 —— 带 context 时不能把上下文行算进去。
+    /// （实测 context=2 报「命中 200 行」其实只有 40 处命中，虚高 160。）
+    #[test]
+    fn grep_files_hit_count_excludes_context_lines() {
+        let dir = fresh_tmp("grep_ctxcount");
+        // 3 处命中，每处前后各 2 行 → 旧版会报 3×5 = 15 行
+        let mut s = String::new();
+        for i in 0..3 {
+            s.push_str("ctx-a\nctx-b\n");
+            s.push_str(&format!("NEEDLE at {i}\n"));
+            s.push_str("ctx-c\nctx-d\n");
+        }
+        std::fs::write(dir.join("a.txt"), &s).unwrap();
+
+        let gate = gate_for(&dir);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &dir, mcp);
+
+        let out = grep_files(
+            &json!({ "pattern": "NEEDLE", "path": dir.to_string_lossy(), "context": 2 }),
+            &ctx,
+        )
+        .unwrap();
+        assert!(
+            out.text.contains("命中 3 行"),
+            "命中数必须是 3（真正的命中行），不能把上下文行算进去:\n{}",
+            out.text
+        );
+        // 上下文行仍要展示出来
+        assert!(out.text.contains("ctx-a"), "上下文行仍应显示");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 跳过的文件必须**明确回报** —— 这是让模型能自我纠正的前提。
+    #[test]
+    fn grep_files_reports_skipped_oversized_file() {
+        let dir = fresh_tmp("grep_skipbig");
+        // > 2MB 的文件，里面有目标词 —— 旧版静默跳过并报「无匹配」
+        let big = dir.join("big.log");
+        let mut s = String::from("PADDING\n");
+        s.push_str(&"x".repeat(3 * 1024 * 1024));
+        s.push_str("\nTARGET_TOKEN\n");
+        std::fs::write(&big, &s).unwrap();
+
+        let gate = gate_for(&dir);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &dir, mcp);
+
+        let out = grep_files(
+            &json!({ "pattern": "TARGET_TOKEN", "path": dir.to_string_lossy() }),
+            &ctx,
+        )
+        .unwrap();
+        assert!(out.text.contains("命中 0 行"), "大文件确实读不了");
+        assert!(
+            out.text.contains("超过 2 MB"),
+            "必须明确告诉模型有文件因体积被跳过（否则它无法区分'没有'和'没读'）:\n{}",
+            out.text
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 正则语法要**当场点破**，而不是返回一个误导性的「无匹配」。
+    #[test]
+    fn grep_files_rejects_regex_syntax_with_actionable_error() {
+        let dir = fresh_tmp("grep_regex");
+        std::fs::write(dir.join("a.md"), "mimo-server-cn").unwrap();
+
+        let gate = gate_for(&dir);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &dir, mcp);
+
+        // 模型真实写过的形态：多词用 | 串联
+        let err = grep_files(
+            &json!({ "pattern": "mimo-server-cn|/api/route/chat", "path": dir.to_string_lossy() }),
+            &ctx,
+        )
+        .expect_err("含正则语法必须报错，不能返回误导性的 0 命中");
+        assert!(err.contains("子串"), "错误信息要说清是子串匹配: {err}");
+        assert!(err.contains("|"), "应点出具体是哪个语法: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GBK 文件不再被静默跳过（中文 Windows 的 .md/.txt 常见）。
+    #[test]
+    fn grep_files_reads_gbk_files() {
+        let dir = fresh_tmp("grep_gbk_e2e");
+        // "数据.md" 的 GBK 字节（数=CAFD 据=BEDD）—— 严格 UTF-8 解不开
+        let gbk: &[u8] = &[0xCA, 0xFD, 0xBE, 0xDD, 0x2E, 0x6D, 0x64];
+        std::fs::write(dir.join("gbk.md"), gbk).unwrap();
+
+        let gate = gate_for(&dir);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &dir, mcp);
+
+        let out = grep_files(
+            &json!({ "pattern": "数据", "path": dir.to_string_lossy() }),
+            &ctx,
+        )
+        .unwrap();
+        assert!(
+            out.text.contains("命中 1 行"),
+            "GBK 文件里的中文必须能搜到:\n{}",
+            out.text
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn fresh_tmp(tag: &str) -> PathBuf {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3158,6 +4930,246 @@ mod tests {
         let d = std::env::temp_dir().join(format!("orbcat_{tag}_{stamp}"));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    // -----------------------------------------------------------------------
+    // run_code（PTC）端到端
+    // -----------------------------------------------------------------------
+    //
+    // ⚠️ 这些测试**真的会起 Node**，且走的是**真实的 `execute`**（含权限网关）。
+    // 为什么值得：PTC 的全部价值在于"程序里的调用与模型直接发的调用走同一条
+    // 管线"—— 若为子调用另开一条绕过权限的快路，那就是个后门。
+    // 假 Node 或假 execute 都证明不了这件事。
+
+    /// PTC 下 `run_code` 能真的读文件，且**权限网关照常生效**。
+    ///
+    /// 这条同时钉住两件事：
+    ///   1. 子调用复用了 `execute`（所以文件真被读到）
+    ///   2. 越权路径仍被拒（所以不是绕过网关的旁路）
+    #[tokio::test]
+    async fn run_code_reads_file_through_the_real_permission_gate() {
+        let tmp = fresh_tmp("ptc_read");
+        if crate::ptc::resolve_node().is_none() {
+            eprintln!("跳过：本机没有 node");
+            return;
+        }
+        // 建一个数据目录 + 一个目标文件（都在网关允许的范围内）
+        let data = tmp.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let target = tmp.join("hello.txt");
+        std::fs::write(&target, "PTC_MARKER_12345").unwrap();
+
+        let gate = gate_for(&tmp);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &data, mcp);
+
+        let code = format!(
+            "const r = await tools.read_file({{ path: {} }});\nreturn r;",
+            serde_json::to_string(&target.to_string_lossy()).unwrap()
+        );
+        let out = execute(
+            crate::ptc::RUN_CODE,
+            &json!({ "code": code, "description": "读一个文件" }),
+            &ctx,
+        )
+        .await
+        .expect("run_code 本身不该 Err");
+
+        assert!(
+            out.text.contains("PTC_MARKER_12345"),
+            "程序里读到的文件内容要回到模型: {}",
+            out.text
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 程序里调用**不存在**的工具 → 程序收到 reject，`try/catch` 能接住。
+    /// 证明子调用真的走的是工具管线（而不是"什么都成功"的假桥）。
+    #[tokio::test]
+    async fn run_code_sub_call_failure_is_catchable_in_program() {
+        let tmp = fresh_tmp("ptc_fail");
+        if crate::ptc::resolve_node().is_none() {
+            return;
+        }
+        let gate = gate_for(&tmp);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &tmp, mcp);
+
+        let code = "let got = null;\n\
+                    try { await tools.no_such_tool({}); } catch (e) { got = e.toolName; }\n\
+                    return { got };";
+        let out = execute(
+            crate::ptc::RUN_CODE,
+            &json!({ "code": code, "description": "试探不存在的工具" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            out.text.contains("no_such_tool"),
+            "失败要能被程序捕获且带上工具名: {}",
+            out.text
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 程序里**不能**再调 `run_code`（嵌套第二层 Node 进程）。
+    /// 必须给出清晰理由，而不是悄悄起一堆 Node。
+    #[tokio::test]
+    async fn run_code_refuses_nested_run_code() {
+        let tmp = fresh_tmp("ptc_nested");
+        if crate::ptc::resolve_node().is_none() {
+            return;
+        }
+        let gate = gate_for(&tmp);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &tmp, mcp);
+
+        let code = "let msg = null;\n\
+                    try { await tools.run_code({ code: 'return 1', description: 'x' }); } \
+                    catch (e) { msg = e.message; }\n\
+                    return { msg };";
+        let out = execute(
+            crate::ptc::RUN_CODE,
+            &json!({ "code": code, "description": "试着嵌套" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            out.text.contains("嵌套"),
+            "嵌套 run_code 要被拒并说明原因: {}",
+            out.text
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `code` 为空要当场报错（别白起一个 Node 进程）。
+    #[tokio::test]
+    async fn run_code_rejects_empty_code() {
+        let tmp = fresh_tmp("ptc_empty");
+        let gate = gate_for(&tmp);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &tmp, mcp);
+
+        let err = execute(
+            crate::ptc::RUN_CODE,
+            &json!({ "code": "   ", "description": "x" }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("不能为空"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// PTC 的 `run_code` 规格必须在**坍缩后**的工具列表里（且是唯一一个）。
+    #[test]
+    fn run_code_spec_is_present_and_well_formed() {
+        let spec = run_code_spec();
+        assert_eq!(spec.name, crate::ptc::RUN_CODE);
+        let req = spec
+            .parameters
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("run_code 要有 required");
+        let names: Vec<&str> = req.iter().filter_map(Value::as_str).collect();
+        assert!(names.contains(&"code"), "code 必填");
+        assert!(names.contains(&"description"), "description 必填");
+        // 描述里必须点明"唯一能直接调用的工具"，否则模型会去猜别的工具名
+        assert!(
+            spec.description.contains("唯一能直接调用"),
+            "run_code 描述要说明它是唯一入口"
+        );
+    }
+
+    /// 🔴 **坍缩必须同时作用在"可调用面"上**，不只是工具列表。
+    ///
+    /// 只藏工具列表、却仍执行模型直接发的别的工具名，就是"公告面与可调用面
+    /// 不一致"：模型会学到"公告不可信"，然后开始乱试工具名。
+    /// DSH 的 `dsh-tools` 把这条做成 `UNKNOWN_TOOL`，同一个道理。
+    #[tokio::test]
+    async fn ptc_collapse_blocks_direct_calls_to_other_tools() {
+        let tmp = fresh_tmp("ptc_collapse_block");
+        let gate = gate_for(&tmp);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+
+        // 先确认**非 PTC** 下 read_file 是能调的（否则下面证明不了什么）
+        // 注：`ctx_for!` 的 `session_id` 是空串 → `effective_mode` 兜到内置默认
+        // （standard），正是"非 PTC"那一侧。
+        let target = tmp.join("x.txt");
+        std::fs::write(&target, "OK_CONTENT").unwrap();
+        {
+            let ctx = ctx_for!(gate, &tmp, mcp);
+            let ok = execute(
+                "read_file",
+                &json!({ "path": target.to_string_lossy() }),
+                &ctx,
+            )
+            .await
+            .expect("标准模式下 read_file 该能调");
+            assert!(ok.text.contains("OK_CONTENT"));
+        }
+
+        // 换成一条 **PTC 会话**（模式跟会话走，2026-10-08）。
+        // ⚠️ 不能再写 `settings.json` 的 `activeMode` —— 那字段已删。
+        let sid = crate::sessions::new_session(&tmp, "ptc").id;
+
+        let ctx = ctx_with_session!(gate, &tmp, mcp, &sid);
+        let err = execute(
+            "read_file",
+            &json!({ "path": target.to_string_lossy() }),
+            &ctx,
+        )
+        .await
+        .expect_err("PTC 下模型不该能直接调 read_file");
+
+        // 报错要**教它怎么写**，而不是只说"不行"
+        assert!(err.contains(crate::ptc::RUN_CODE), "要指出唯一入口: {err}");
+        assert!(err.contains("tools.read_file"), "要给出程序内的写法: {err}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 但**程序内部**的调用不能被上面那道闸拦住（否则 PTC 直接不可用）。
+    /// 这条与上一条是一对：一个证明拦得住，一个证明没拦错。
+    #[tokio::test]
+    async fn ptc_sub_calls_are_not_blocked_by_the_collapse() {
+        let tmp = fresh_tmp("ptc_sub_ok");
+        if crate::ptc::resolve_node().is_none() {
+            eprintln!("跳过：本机没有 node");
+            return;
+        }
+        let target = tmp.join("y.txt");
+        std::fs::write(&target, "SUB_CALL_OK").unwrap();
+
+        // 整场都在 PTC 会话里跑（模式跟会话走，2026-10-08）
+        let sid = crate::sessions::new_session(&tmp, "ptc").id;
+
+        let gate = gate_for(&tmp);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_with_session!(gate, &tmp, mcp, &sid);
+
+        let code = format!(
+            "return await tools.read_file({{ path: {} }});",
+            serde_json::to_string(&target.to_string_lossy()).unwrap()
+        );
+        let out = execute(
+            crate::ptc::RUN_CODE,
+            &json!({ "code": code, "description": "程序内读文件" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            out.text.contains("SUB_CALL_OK"),
+            "程序内的 read_file 必须能正常执行: {}",
+            out.text
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// `search_tools` 是**能力发现**入口，必须端到端可用：

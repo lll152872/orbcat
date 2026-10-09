@@ -16,6 +16,20 @@ import {
 } from "./helpers";
 
 describe("发送边界", () => {
+  it("按下发送 = **立刻**调 chat（回归：不许再有等待窗口把消息吞掉）", async () => {
+    // 2026-10-09 用户报的 bug：消息进了"待发批次"、还没真发出去时把面板收起
+    // （切悬浮球态、不退出）→ 批次被当成"没地方去"直接丢掉，消息凭空消失。
+    // 修法是**删掉合并窗口**，回到"按下即发出"。这条锁住它别再回来。
+    await bootApp();
+    await openPanel();
+    typeInput("立刻发");
+    await clickSend();
+    // 只给一个宏任务（send() 内部那个 `await mem_pending` 的微任务要落地）
+    await sleep(0);
+    expect(callsOf("chat").length, "发送必须立刻落到 chat，不许攒着等窗口").toBe(1);
+    expect(String(callsOf("chat")[0]?.args?.input)).toBe("立刻发");
+  });
+
   it("只有空白字符时不会 invoke chat", async () => {
     await bootApp();
     await openPanel();
@@ -59,7 +73,7 @@ describe("发送边界", () => {
     );
   });
 
-  it("跑完后过程包进默认折叠的 run-process，展开状态可保持", async () => {
+  it("跑完整轮收进默认折叠的「过程」，里面工具条目也各自折叠且展开可保持", async () => {
     await bootApp();
     await openPanel();
     await sendText("做点事");
@@ -69,13 +83,24 @@ describe("发送边界", () => {
       4000,
       "finished",
     );
+
+    // 2026-10-02（用户："这个应该全部压缩掉啊"）：整轮收成一行「过程 · N 步」，
+    // **默认闭合** —— 回看时不该占十几行。
     const proc = document.querySelector<HTMLDetailsElement>("details.run-process");
-    expect(proc, "mock steps 非空应出现 run-process").toBeTruthy();
-    expect(proc!.open).toBe(false);
+    expect(proc, "跑完应出现「过程」外壳").toBeTruthy();
+    expect(proc!.open, "「过程」必须默认闭合").toBe(false);
+    expect(proc!.querySelector("summary")?.textContent).toContain("步");
+
+    // 外壳里面：工具调用/返回各折成一行，同样默认闭合
+    const tools = Array.from(proc!.querySelectorAll<HTMLDetailsElement>("details.tl-tool"));
+    expect(tools.length, "mock 有 tool_call/tool_result，应渲染成折叠行").toBeGreaterThan(0);
+    tools.forEach((d) => expect(d.open, `${d.className} 应默认折叠`).toBe(false));
 
     // 用户展开后重绘应保持 open（E3/E5）
     proc!.open = true;
     proc!.dataset.userOpen = "1";
+    tools[0]!.open = true;
+    tools[0]!.dataset.userOpen = "1";
     // 触发一次 paintMessages 路径：再发一条并完成
     await sendText("再来一条");
     await waitFor(
@@ -83,8 +108,9 @@ describe("发送边界", () => {
       4000,
       "second finished",
     );
-    const procs = document.querySelectorAll<HTMLDetailsElement>("details.run-process");
-    // 至少有一条过程；用户展开过的 key 仍应 open
+    const procs = Array.from(document.querySelectorAll<HTMLDetailsElement>("details.run-process"));
     expect(procs.length).toBeGreaterThan(0);
+    // 展开过的那条（按 data-open-key 复原）在重绘后仍是 open
+    expect(procs.some((d) => d.open)).toBe(true);
   });
 });

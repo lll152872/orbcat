@@ -390,6 +390,195 @@ impl MemoryStore {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
+
+    /// 改/清项目的 `source.ref`（面板「改路径」用）。
+    ///
+    /// `path` 为空 = **解绑**：删掉 source.ref（该项目从此显示「未绑定路径」，
+    /// 不再参与前台路径注入 —— 与"路径死了不注入"同一懒检测语义）。
+    pub fn set_project_source(&self, name: &str, path: &str) -> Result<(), String> {
+        let name = name.trim();
+        // 名字要能安全拼进路径：拒绝空、隐藏目录、路径分隔与穿越
+        if name.is_empty()
+            || name.starts_with('.')
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+        {
+            return Err("非法项目名".into());
+        }
+        let dir = self.projects_dir().join(name);
+        if !dir.is_dir() {
+            return Err(format!("项目「{name}」不存在"));
+        }
+        let ref_path = dir.join("source.ref");
+        let path = path.trim();
+        if path.is_empty() {
+            let _ = std::fs::remove_file(&ref_path);
+        } else {
+            std::fs::write(&ref_path, path).map_err(|e| format!("写 source.ref 失败: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// 读全局长期记忆 MEMORY.md 全文（自动蒸馏查重用；读不到 = 空串）。
+    pub fn long_term_md(&self) -> Result<String, String> {
+        let p = self.long_term_path();
+        if !p.exists() {
+            return Ok(String::new());
+        }
+        std::fs::read_to_string(&p).map_err(|e| format!("读 MEMORY.md 失败: {e}"))
+    }
+
+    /// 归档一个项目记忆目录（面板「归档」用）。
+    ///
+    /// ⚠️ **绝不硬删**（RULES.md 第二节绝对红线）：整个目录改名挪进
+    /// `agent-data/.trash/projects-<名>-<ts>/`，来路可查、手工可还原。
+    /// 返回归档后的路径。
+    pub fn archive_project(&self, name: &str) -> Result<String, String> {
+        let name = name.trim();
+        if name.is_empty()
+            || name.starts_with('.')
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+        {
+            return Err("非法项目名".into());
+        }
+        let dir = self.projects_dir().join(name);
+        if !dir.is_dir() {
+            return Err(format!("项目「{name}」不存在"));
+        }
+        let trash = self.root.join(".trash");
+        std::fs::create_dir_all(&trash).map_err(|e| format!("建 .trash 失败: {e}"))?;
+        let dest = trash.join(format!("projects-{}-{}", name, now_string()));
+        std::fs::rename(&dir, &dest).map_err(|e| format!("归档失败: {e}"))?;
+        Ok(dest.display().to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 轮末自动蒸馏（2026-10-07 用户定案：不靠模型自觉调 remember）
+// ---------------------------------------------------------------------------
+
+/// 自动蒸馏单次写入的条数上限
+const AUTO_DISTILL_MAX: usize = 3;
+/// 送进提取请求的正文截断（按字符）
+const AUTO_DISTILL_INPUT_CHARS: usize = 1500;
+const AUTO_DISTILL_ANSWER_CHARS: usize = 2500;
+/// 本轮「提问 + 回答」合计低于这个字数就不值得发提取请求（寒暄省一次调用）
+pub const AUTO_DISTILL_MIN_CHARS: usize = 60;
+
+/// 从一轮问答里自动提取记忆条目并落库，返回写入条数。
+///
+/// ## 路由（与 `remember` 工具同一条规则）
+/// - 激活项目 → **直写** `projects/<名>/MEMORY.md`（source=auto）——
+///   项目内 remember 本来就是直写，不新增审批面；
+/// - 主对话 → 进**全局待审批候选**（source=auto）—— 全局记忆保留审批关。
+///
+/// ## 契约
+/// - 调用方（lib.rs::chat 收尾）负责把它丢进后台任务：不阻塞本轮返回、
+///   失败只打日志 —— 蒸馏挂了不能影响对话本身。
+/// - 查重见 [`store_auto_entries`]：反复聊同一句约定不该每次都进一遍。
+pub async fn auto_distill(
+    cfg: &crate::config::ModelConfig,
+    data_dir: &Path,
+    user_text: &str,
+    answer: &str,
+) -> Result<usize, String> {
+    let q: String = user_text.trim().chars().take(AUTO_DISTILL_INPUT_CHARS).collect();
+    let a: String = answer.trim().chars().take(AUTO_DISTILL_ANSWER_CHARS).collect();
+    if q.chars().count() + a.chars().count() < AUTO_DISTILL_MIN_CHARS {
+        return Ok(0);
+    }
+
+    let prompt = format!(
+        "从下面这轮「用户与 AI 助手」的对话中，提取值得跨会话长期记住的事实。\n\n\
+         只提取这几类：用户明确说过的偏好/称呼/工作习惯；项目路径与结构等稳定事实；\
+         用户确认过的决策与约定；踩过的坑与验证过的结论（要能复用）。\n\
+         不要提取：寒暄闲聊、临时状态、一次性的具体操作、未经用户确认的推断。\n\
+         每条不超过 120 字，写成独立成立的事实句（不要\"用户说\"这类话术）。\n\
+         没有值得记的就输出空数组。\n\n\
+         只输出一个 JSON 字符串数组，例如 [\"条目一\",\"条目二\"]，不要任何解释。\n\n\
+         --- 对话开始 ---\n【用户】{q}\n\n【助手】{a}\n--- 对话结束 ---"
+    );
+
+    let messages = vec![crate::llm::ChatMessage::user(prompt)];
+    let out = crate::llm::chat(cfg, messages, None).await?;
+    let items = parse_json_array(&out.text())?;
+    store_auto_entries(data_dir, &items)
+}
+
+/// 把提取出的条目按当前项目状态落库（查重后写入），返回写入条数。
+///
+/// 同文判定 = trim 后逐字相等 / 目标文件已包含 —— 够用且零依赖；
+/// 误杀率可忽略（记忆条目本来就短且具体）。
+fn store_auto_entries(data_dir: &Path, items: &[String]) -> Result<usize, String> {
+    let items: Vec<&str> = items
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .take(AUTO_DISTILL_MAX)
+        .collect();
+    if items.is_empty() {
+        return Ok(0);
+    }
+
+    // 路由：激活项目 → 直写项目 MEMORY.md
+    let settings = crate::config::load_settings(data_dir);
+    if let Some(pid) = settings.active_project_id {
+        if let Ok(all) = crate::pmem::list_projects(data_dir) {
+            if let Some(p) = all.iter().find(|x| x.id == pid) {
+                let mut existing =
+                    crate::pmem::project_memory_md(data_dir, &p.name).unwrap_or_default();
+                let mut written = 0usize;
+                for it in &items {
+                    if existing.contains(it) {
+                        continue;
+                    }
+                    crate::pmem::append_project_memory(data_dir, &p.name, it, "auto")?;
+                    // ⚠️ 同轮内的第二条同文也要拦住：existing 是查重基准，
+                    // 写入后必须同步追加，否则上面的 contains 永远查不到刚写的。
+                    existing.push('\n');
+                    existing.push_str(it);
+                    written += 1;
+                }
+                return Ok(written);
+            }
+        }
+    }
+
+    // 主对话 → 全局待审批候选（保留审批关）
+    let store = MemoryStore::new(data_dir);
+    let pending = store.list_pending().unwrap_or_default();
+    let lt = store.long_term_md().unwrap_or_default();
+    let mut written = 0usize;
+    for it in &items {
+        if pending.iter().any(|c| c.content.trim() == *it) {
+            continue;
+        }
+        if lt.contains(it) {
+            continue;
+        }
+        store.propose(it, "auto")?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// 从模型输出里抠 JSON 字符串数组（容忍 ```json 包裹 / 前后废话）。
+fn parse_json_array(text: &str) -> Result<Vec<String>, String> {
+    let s = text.trim();
+    let start = s
+        .find('[')
+        .ok_or_else(|| "输出里没有 JSON 数组".to_string())?;
+    let end = s
+        .rfind(']')
+        .ok_or_else(|| "输出里没有数组结束符".to_string())?;
+    if end < start {
+        return Err("JSON 数组区间不合法".into());
+    }
+    serde_json::from_str::<Vec<String>>(&s[start..=end])
+        .map_err(|e| format!("解析 JSON 数组失败: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -511,6 +700,87 @@ mod tests {
         std::fs::write(p.join("source.ref"), r"D:\definitely-not-here-xyz").unwrap();
         std::fs::write(p.join("MEMORY.md"), "不该出现").unwrap();
         assert!(s.match_project_memory(&[Path::new(r"D:\definitely-not-here-xyz\a")]).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- 轮末自动蒸馏 ----
+
+    #[test]
+    fn parse_json_array_tolerates_wrapping_and_noise() {
+        assert_eq!(parse_json_array(r#"["a","b"]"#).unwrap(), vec!["a", "b"]);
+        // ```json 包裹
+        assert_eq!(
+            parse_json_array("```json\n[\"条目\"]\n```").unwrap(),
+            vec!["条目"]
+        );
+        // 前后有废话
+        assert_eq!(
+            parse_json_array("提取结果如下：\n[\"x\"]\n以上。").unwrap(),
+            vec!["x"]
+        );
+        // 空数组
+        assert_eq!(parse_json_array("[]").unwrap(), Vec::<String>::new());
+        // 没有数组 → 报错（不 panic）
+        assert!(parse_json_array("我觉得没什么好记的").is_err());
+    }
+
+    /// 激活项目 → 直写项目 MEMORY.md；已有同文跳过
+    #[test]
+    fn store_auto_entries_routes_to_active_project_with_dedup() {
+        let (s, dir) = fresh_store("auto_proj");
+        let p = crate::pmem::create_project(&dir, "项目甲", "").unwrap();
+        let mut st = crate::config::load_settings(&dir);
+        st.active_project_id = Some(p.id);
+        crate::config::save_settings(&dir, &st).unwrap();
+
+        let n = store_auto_entries(
+            &dir,
+            &["构建用 cargo build（dev）".to_string(), "构建用 cargo build（dev）".to_string()],
+        )
+        .unwrap();
+        assert_eq!(n, 1, "同文两条只写一条: {n}");
+        let mem = crate::pmem::project_memory_md(&dir, "项目甲").unwrap();
+        assert!(mem.contains("cargo build"), "应直写项目记忆: {mem}");
+        assert!(mem.contains("auto"), "来源应标 auto: {mem}");
+        assert!(
+            s.list_pending().unwrap().is_empty(),
+            "有项目时不进全局候选"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 主对话 → 进全局待审批候选；与已有候选/长期记忆同文跳过
+    #[test]
+    fn store_auto_entries_routes_to_pending_in_main_chat() {
+        let (s, dir) = fresh_store("auto_main");
+
+        // 先塞一条候选 + 一条已在长期记忆
+        s.propose("已有候选甲", "model").unwrap();
+        s.approve(&s.list_pending().unwrap()[0].id).unwrap();
+        // （approve 后 MEMORY.md 里已有「已有候选甲」）
+
+        let n = store_auto_entries(
+            &dir,
+            &[
+                "已有候选甲".to_string(),   // 与长期记忆同文 → 跳过
+                "新事实乙".to_string(),     // 新 → 写入
+            ],
+        )
+        .unwrap();
+        assert_eq!(n, 1, "只应写入新的一条: {n}");
+        let pending = s.list_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].content, "新事实乙");
+        assert_eq!(pending[0].source, "auto", "来源应标 auto");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空条目 / 纯空白全部过滤
+    #[test]
+    fn store_auto_entries_ignores_blanks() {
+        let (_s, dir) = fresh_store("auto_blank");
+        let n = store_auto_entries(&dir, &["  ".to_string(), String::new()]).unwrap();
+        assert_eq!(n, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

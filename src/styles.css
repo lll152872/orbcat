@@ -349,7 +349,8 @@ body {
    工具栏**只有一行**（2026-09-29 二次压缩，用户截图圈出右侧空位：
    "压缩到画圈的部分"）。模型 chip 从"独占一整行"改为挂在项目行**最右侧**，
    只留 🐱 + 显示名 + ▾ —— 上下文 / host / 功能标签全部挪进 title tooltip。
-   点卡片本体弹「模型管理」独立窗口，点 ▾ 出纯名称下拉。 */
+   点卡片出「模型列表」（组别+模型名 + 底部添加自定义模型）；
+   管理窗口改由 设置 › 🧩 模型 进入（2026-10-02 用户改定）。 */
 
 .model-chip {
   /* 2026-10 用户："那块空出来的正好是红色区域，这个是让你放模型的部分啊，组别+模型名"
@@ -487,6 +488,39 @@ body {
 
 .fg-ctx.fg-expanded {
   max-height: 160px;
+}
+
+/* ---------------- 非对话视图的固定标题条（2026-10-08） ----------------
+
+   与 #fg-ctx 同位置、互斥显示：对话看前台应用，其余视图看当前页标题 + 返回。
+
+   关键点是**它不在 #panel-body 里** —— 返回按钮因此不随内容滚动，
+   滚到页面底部也点得到。（原来返回按钮写在内容流里，滚下去就够不着，
+   用户截图报过这个 bug："退出一定要在最上面才能退出"。） */
+.sub-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 10px;
+  background: rgba(120, 160, 255, 0.06);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.sub-bar-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: #cdd6f4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 返回按钮复用 .mem-back 的观感，只是这里贴右对齐 */
+.sub-bar-back {
+  flex-shrink: 0;
 }
 
 /* ---------------- 「另一个会话在后台跑」提示条 ---------------- */
@@ -914,89 +948,187 @@ body {
 
 /* ---------------- 渲染后的 Markdown ---------------- */
 
-/* 纯文本气泡用 pre-wrap 保留换行；渲染成 HTML 的必须用 normal，
-   否则源码里的缩进和换行会被当成可见空白，出现大片空行 */
-.msg-body.md {
+/* 容器自身（字号/内边距/圆角）：**只对消息气泡生效**。
+   排版规则（h1/p/table/code…）用通用 `.md`，好让运行中的中途正文
+   （`.run-stream`）与时间线里的中途正文（`.tl-text`）复用同一套。
+   但那些容器自带 padding / 字号（见下面各自定义），不能被这里覆盖 ——
+   所以把气泡专属的盒子样式收回 `.msg-body.md`。 */
+.md {
   white-space: normal;
-  font-size: 13px;
   line-height: 1.68;
-  padding: 9px 12px;
-  border-radius: 10px;
   user-select: text;
   cursor: text;
 }
 
-.msg.assistant .msg-body.md {
+.msg-body.md {
+  font-size: 13px;
+  padding: 9px 12px;
+  border-radius: 10px;
+}
+
+.msg.assistant .md {
   background: rgba(255, 255, 255, 0.07);
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+/* ---------------- 闲聊模式：一条回复拆成多个气泡（2026-10-08） ----------------
+
+   背景见 `src/bubble.ts` —— 模型照常输出一条正文，前端按规则切成气泡逐条显示，
+   模拟 QQ 里"连着发几条短消息"的观感。
+
+   气泡外观**复用** `.msg-body.md`（同一套排版），这里只额外管两件事：
+   ① 气泡之间的间距（比"两条独立消息"紧、比同一段的两行松）
+   ② 「逐条出现」的入场动画（延迟由 `paintMessages` 逐泡写进 inline style） */
+.msg.chatty {
+  gap: 5px;
+}
+
+/* ⚠️ 只有**首播**的气泡才加 `.play` —— 否则每次重绘（发消息、切视图）整屏历史
+   气泡都会重新蹦一遍，那比不动画还难受。打标记的逻辑在 `paintMessages` 里。 */
+.msg.chatty .bubble.play {
+  opacity: 0;
+  animation: bubble-in 0.22s ease-out forwards;
+}
+
+@keyframes bubble-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* 正在生成的那一条：末尾光标，表示"还在打字" */
+.msg.chatty .bubble.typing::after {
+  content: "▌";
+  margin-left: 1px;
+  opacity: 0.45;
+  animation: bubble-caret 1s step-end infinite;
+}
+
+@keyframes bubble-caret {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* ---------------- 正文里的图片（模型发的图，2026-10-08） ----------------
+
+   来源：模型在正文写 `![说明](路径 或 URL)` —— 解析见 markdown.ts 的 inline()。
+
+   两种形态：
+   - 外链（http/https）→ 直接有 src，浏览器自己加载；
+   - 本地路径 → 先是 `<img class="md-img md-img-local" data-img="…">` 占位，
+     由 main.ts 的 hydrateBodyImages() 走 `image_thumb` 换成 data URL。
+
+   ⚠️ 这里**不要给固定 width/height**：换图前后尺寸一变就会顶动整个消息列表
+     的滚动位置（用户正看着的内容会跳）。用 max-* 让浏览器按原图比例撑。 */
+.md-img {
+  display: block;
+  max-width: 100%;
+  max-height: 320px;
+  width: auto;
+  height: auto;
+  margin: 6px 0;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.2);
+  object-fit: contain;
+}
+
+/* **表情包 = 贴纸尺寸**（2026-10-08 用户："图太大了"）。
+   QQ 里发表情就是小小的.inline 一张，撑满面板既吵又把消息顶出屏幕。
+   判据见 main.ts 的 isMemePath()（路径里有 memes 这级目录）；
+   工作产物图（截图/图表）**不**走这条，仍然全宽可读。 */
+.md-img-meme {
+  max-width: 160px;
+  max-height: 160px;
+  display: inline-block;
+  margin: 4px 0;
+}
+
+/* 读不出来（文件被删 / 格式不支持 / 路径写错）→ 换成一个小标记。
+   撑成 320px 的空洞比直接说"读不出来"更让人困惑。 */
+.md-img-bad {
+  display: inline-block;
+  max-width: 100%;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: #8b6b6b;
+  border: 1px solid rgba(255, 120, 120, 0.25);
+  border-radius: 8px;
+  background: rgba(255, 120, 120, 0.08);
+}
+
 /* 首个/末个子元素不要多余外边距 */
-.msg-body.md > *:first-child {
+.md > *:first-child {
   margin-top: 0;
 }
-.msg-body.md > *:last-child {
+.md > *:last-child {
   margin-bottom: 0;
 }
 
-.msg-body.md h1,
-.msg-body.md h2,
-.msg-body.md h3,
-.msg-body.md h4,
-.msg-body.md h5,
-.msg-body.md h6 {
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
   margin: 12px 0 6px;
   color: #f0f2fa;
   line-height: 1.35;
   font-weight: 600;
 }
 
-.msg-body.md h1 {
+.md h1 {
   font-size: 16px;
   padding-bottom: 4px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.12);
 }
-.msg-body.md h2 {
+.md h2 {
   font-size: 14.5px;
 }
-.msg-body.md h3 {
+.md h3 {
   font-size: 13.5px;
 }
-.msg-body.md h4,
-.msg-body.md h5,
-.msg-body.md h6 {
+.md h4,
+.md h5,
+.md h6 {
   font-size: 13px;
 }
 
-.msg-body.md p {
+.md p {
   margin: 6px 0;
 }
 
-.msg-body.md strong {
+.md strong {
   color: #fff;
   font-weight: 600;
 }
 
-.msg-body.md em {
+.md em {
   color: #c9cfec;
 }
 
-.msg-body.md del {
+.md del {
   opacity: 0.55;
 }
 
-.msg-body.md a {
+.md a {
   color: #8fa4ff;
   text-decoration: none;
   border-bottom: 1px solid rgba(143, 164, 255, 0.4);
 }
 
-.msg-body.md a:hover {
+.md a:hover {
   color: #a8b8ff;
 }
 
 /* 行内代码 */
-.msg-body.md code {
+.md code {
   font-family: "Cascadia Mono", "Consolas", "JetBrains Mono", monospace;
   font-size: 11.5px;
   color: #9fb0ff;
@@ -1006,7 +1138,7 @@ body {
 }
 
 /* 代码块 */
-.msg-body.md pre.md-code {
+.md pre.md-code {
   margin: 8px 0;
   padding: 9px 11px;
   border-radius: 8px;
@@ -1015,7 +1147,7 @@ body {
   overflow-x: auto;
 }
 
-.msg-body.md pre.md-code code {
+.md pre.md-code code {
   background: none;
   padding: 0;
   color: #cfd6f5;
@@ -1025,7 +1157,7 @@ body {
 }
 
 /* ---- 代码块外壳：语言标签 + 复制按钮 ---- */
-.msg-body.md .md-code-wrap {
+.md .md-code-wrap {
   margin: 8px 0;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 8px;
@@ -1033,7 +1165,7 @@ body {
   background: rgba(0, 0, 0, 0.35);
 }
 
-.msg-body.md .md-code-bar {
+.md .md-code-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1043,7 +1175,7 @@ body {
   border-bottom: 1px solid rgba(255, 255, 255, 0.07);
 }
 
-.msg-body.md .md-code-lang {
+.md .md-code-lang {
   font-size: 10.5px;
   color: #7f88a8;
   letter-spacing: 0.03em;
@@ -1051,7 +1183,7 @@ body {
   user-select: none;
 }
 
-.msg-body.md .md-code-wrap pre.md-code {
+.md .md-code-wrap pre.md-code {
   margin: 0;
   border: none;
   border-radius: 0;
@@ -1343,17 +1475,17 @@ body {
   cursor: default;
 }
 
-.msg-body.md ul,
-.msg-body.md ol {
+.md ul,
+.md ol {
   margin: 6px 0;
   padding-left: 20px;
 }
 
-.msg-body.md li {
+.md li {
   margin: 3px 0;
 }
 
-.msg-body.md blockquote {
+.md blockquote {
   margin: 8px 0;
   padding: 6px 11px;
   border-left: 2px solid rgba(120, 137, 255, 0.5);
@@ -1362,42 +1494,42 @@ body {
   color: #b9c1de;
 }
 
-.msg-body.md blockquote > *:first-child {
+.md blockquote > *:first-child {
   margin-top: 0;
 }
-.msg-body.md blockquote > *:last-child {
+.md blockquote > *:last-child {
   margin-bottom: 0;
 }
 
-.msg-body.md hr {
+.md hr {
   border: none;
   border-top: 1px solid rgba(255, 255, 255, 0.12);
   margin: 11px 0;
 }
 
 /* 表格 */
-.msg-body.md table.md-table {
+.md table.md-table {
   width: 100%;
   border-collapse: collapse;
   margin: 8px 0;
   font-size: 11.5px;
 }
 
-.msg-body.md table.md-table th,
-.msg-body.md table.md-table td {
+.md table.md-table th,
+.md table.md-table td {
   border: 1px solid rgba(255, 255, 255, 0.12);
   padding: 5px 8px;
   text-align: left;
   vertical-align: top;
 }
 
-.msg-body.md table.md-table th {
+.md table.md-table th {
   background: rgba(120, 137, 255, 0.15);
   color: #e8eaf2;
   font-weight: 600;
 }
 
-.msg-body.md table.md-table tr:nth-child(even) td {
+.md table.md-table tr:nth-child(even) td {
   background: rgba(255, 255, 255, 0.03);
 }
 
@@ -2424,6 +2556,55 @@ body {
   background: rgba(120, 137, 255, 0.22);
 }
 
+/* 「＋」新建会话菜单：模式项 = 图标 + 名字（有「默认」标时右对齐）
+   ⚠️ 用一层 `.ctx-row` 包住，而不是把 `.ctx-item` 本身改成 flex ——
+   `.ctx-item` 还被会话右键菜单用着，改它的 display 会连带影响那边。
+   包一层也能让「写错的组名」那行 `ctx-sub` 正常落到第二行。 */
+.ctx-row {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.ctx-item-ico {
+  flex: 0 0 auto;
+  width: 16px;
+  text-align: center;
+}
+
+.ctx-item-name {
+  flex: 1 1 auto;
+  white-space: nowrap;
+}
+
+.ctx-item-note {
+  flex: 0 0 auto;
+  margin-left: 10px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 9.5px;
+  line-height: 15px;
+  color: #aab4d8;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* 新建会话菜单比会话右键菜单宽：模式名 + 「默认」标 + 可能的组名警告一行放不下 */
+#new-ctx {
+  min-width: 208px;
+}
+
+/* 菜单里那行「⚠️ 模式里写了不存在的组」要对齐到**模式名**下面，
+   而不是贴着图标左边缘 —— 19px = 图标 16 + 间距 3（见 `.ctx-row` 的 gap）。
+   只在 `#new-ctx` 里加：`.ctx-sub` 还被权限档位菜单用着，那边不需要缩进。 */
+#new-ctx .ctx-sub {
+  margin-left: 19px;
+}
+
+/* 会话列表里那条 sess-meta 尾部的模式标记（默认模式不显示） */
+.sess-mode {
+  color: #9aa3c8;
+}
+
 .ctx-item.danger {
   color: #ff8e8e;
 }
@@ -2476,6 +2657,43 @@ body {
 .mg-unknown {
   color: #6b7290;
   text-decoration: line-through dotted rgba(255, 255, 255, 0.25);
+}
+
+/* 呈现方式那一行：native 是常态（弱化），ptc 是**行为差异**（强调）——
+   用户切到 PTC 后能直接调的工具会整个变掉，界面必须说明白，
+   否则看起来像"工具全没了"。 */
+.mg-label2 {
+  color: #8a93b8;
+}
+
+.mg-ptc {
+  color: #c9a7ff;
+  font-weight: 600;
+}
+
+/* ── 数据源页（设置 › 数据源）─────────────────────────────────────── */
+.life-row {
+  align-items: flex-start;
+}
+
+.life-kind {
+  color: #8a93b8;
+  font-size: 10px;
+  margin-left: 6px;
+}
+
+/* 读取失败 / 快照过期：用暖色，与 .mg-off（中性灰）区分 ——
+   「关闭」是用户的选择，「失败」是要处理的问题。 */
+.life-bad {
+  color: #ff9d8e;
+}
+
+.life-preview {
+  margin-top: 4px;
+  color: #9aa3c4;
+  font-size: 10px;
+  line-height: 1.6;
+  word-break: break-all;
 }
 
 /* ── 输入行的「行为」logo（2026-10）────────────────────────────────────
@@ -2894,6 +3112,85 @@ button.fetch-id {
 .mcp-srv-row .mcp-srv-id {
   margin-right: 6px;
 }
+
+/* 传输形态标签（http / stdio）—— 一眼看出这条是怎么连的 */
+.mcp-kind {
+  font-size: 10px;
+  border-radius: 5px;
+  padding: 1px 5px;
+  margin-right: 6px;
+  border: 1px solid transparent;
+}
+.mcp-kind.http {
+  color: #8fb8f0;
+  background: rgba(90, 140, 220, 0.15);
+  border-color: rgba(90, 140, 220, 0.35);
+}
+.mcp-kind.stdio {
+  color: #a6d9a0;
+  background: rgba(90, 190, 110, 0.15);
+  border-color: rgba(90, 190, 110, 0.35);
+}
+/* stdio 的参数与 env 计数：次要信息，压低对比度 */
+.mcp-args,
+.mcp-env-n {
+  font-size: 11px;
+  opacity: 0.7;
+  margin-left: 4px;
+}
+
+/* ---- 项目（拼装包）页 ---- */
+
+/* 标签：含权限预设 / 脚本权限声明 —— 提醒用户"这个包会动权限" */
+.proj-tag {
+  font-size: 10px;
+  border-radius: 5px;
+  padding: 1px 5px;
+  margin-left: 6px;
+  border: 1px solid transparent;
+}
+.proj-tag.perm {
+  color: #f0c98a;
+  background: rgba(230, 170, 70, 0.15);
+  border-color: rgba(230, 170, 70, 0.35);
+}
+
+/* 警告块：权限预设被丢弃 / 引用失效 —— 必须显眼，不能只是灰字 */
+.proj-warn {
+  margin: 6px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #f0c98a;
+  background: rgba(230, 170, 70, 0.12);
+  border: 1px solid rgba(230, 170, 70, 0.3);
+}
+.proj-warn ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+/* project.json 编辑器 —— 等宽、可纵向拉伸、够高看全一个包 */
+.proj-editor {
+  width: 100%;
+  min-height: 200px;
+  box-sizing: border-box;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px;
+  border-radius: 6px;
+  resize: vertical;
+  color: inherit;
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+}
+.proj-editor:focus {
+  outline: none;
+  border-color: rgba(120, 170, 240, 0.5);
+}
+
 .mcp-add-form {
   display: flex;
   flex-wrap: wrap;
@@ -3155,9 +3452,11 @@ button.fetch-id {
   }
 }
 
-/* 时间线：一轮里「想了什么 / 做了什么」按发生顺序排列。
-   思考是可折叠块（.run-reason），工具/状态各占一行（.tl-line）——
-   两者**同处一个容器**，所以能形成「思考 → 调工具 → 思考 → 调工具」的节奏。
+/* 时间线：一轮里「想了什么 / 做了什么」按发生顺序排列，**摊平**展示。
+   两级：跑完整轮进 `details.run-process`（一行）；里面一律折叠 ——
+   思考 `.run-reason`、工具调用/返回 `details.tl-tool`（各折一行）。
+   常显：中途正文 `.tl-text`（只在展开外壳后可见）、状态/错误 `.tl-line`。
+   两者**同处一个容器**，所以能形成「思考 → 调工具 → 正文 → 调工具」的节奏。
    以前是「一个思考块 + 一个工具列表」分开放，思考必然堆成一坨。 */
 .run-timeline {
   margin-top: 6px;
@@ -3219,6 +3518,10 @@ button.fetch-id {
   font-size: 13px;
   line-height: 1.65;
   overflow-wrap: anywhere;
+  /* 正文已按 markdown 渲染成 HTML，不能 pre-wrap（会多出空行） */
+  white-space: normal;
+  /* 表格/代码块可能比面板宽，横向可滚，别撑破布局 */
+  overflow-x: auto;
 }
 
 /* 模型中途改调工具：弱化标记，但**不要删除线处死**——中间正文仍可看 */
@@ -3232,7 +3535,9 @@ button.fetch-id {
   margin-top: 5px;
 }
 
-/* 跑完折叠的「过程」 */
+/* 跑完之后：整轮收成一行「过程 · N 步」（2026-10-02 用户："这个应该全部压缩掉啊"）。
+   **默认闭合**是重点 —— 回看一条消息时它必须只占一行，最终答案不能被顶到屏幕外。
+   点开之后里面每条仍各自折叠（思考 / 工具行），不会一次哗啦出一屏原文。 */
 details.run-process {
   margin-top: 8px;
   border: 1px solid rgba(140, 150, 180, 0.22);
@@ -3245,13 +3550,26 @@ details.run-process > summary {
   font-size: 11.5px;
   color: #9aa3c0;
 }
-details.tl-tool-res {
-  margin-top: 4px;
+
+/* 工具调用 / 工具返回：**默认折叠成一行**（2026-10-02 用户拍板）。
+   以前把参数 JSON 与返回预览直接铺在时间线上 —— 那是给机器看的，不是给用户看的。
+   现在只留「🔧 运行命令」/「✅ 运行命令」，点开才看原文。 */
+details.tl-tool {
+  margin: 2px 0;
   font-size: 11.5px;
 }
-details.tl-tool-res > summary {
+details.tl-tool > summary {
   cursor: pointer;
   user-select: none;
+  color: #8b93b0;
+  overflow-wrap: anywhere;
+}
+details.tl-tool > summary:hover {
+  color: #b9c0d8;
+}
+/* 返回行比调用行更淡一点：一调一返回是同一件事 */
+details.tl-tool.tl-res > summary {
+  color: #7c85a3;
 }
 .tl-tool-pre {
   margin: 4px 0 0;
@@ -3294,7 +3612,10 @@ details.tl-tool-res > summary {
   font-size: 12px;
   line-height: 1.6;
   color: #e8eaf2;
-  white-space: pre-wrap;
+  /* ⚠️ **不要** pre-wrap（2026-10-03）：正文已按 markdown 渲染成 HTML，
+     pre-wrap 会把标签之间的换行/缩进当可见空白，表格和列表之间凭空多出空行。
+     换行由 `mdToHtml` 产出的 `<br>` / 块级元素负责。 */
+  white-space: normal;
   word-break: break-word;
 }
 .tl-text-tag {
@@ -3308,6 +3629,27 @@ details.tl-tool-res > summary {
 .run-reason {
   margin-top: 6px;
   font-size: 11.5px;
+}
+
+/* 思考块里渲染出来的 markdown：整体比正文小一号、弱一档。
+   它是"想看才点开"的辅助内容，不该跟最终答复抢视觉重量。 */
+.run-reason .md {
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.run-reason .md h1,
+.run-reason .md h2,
+.run-reason .md h3,
+.run-reason .md h4,
+.run-reason .md h5,
+.run-reason .md h6 {
+  font-size: 11.5px;
+  margin: 9px 0 4px;
+}
+
+.run-reason .md table.md-table {
+  font-size: 10.5px;
 }
 
 /* 历史消息里的思考过程：默认收起（回看时才展开，别让思维链淹没正文） */
@@ -3344,6 +3686,12 @@ details.tl-tool-res > summary {
   color: #6f778f;
 }
 
+/* 思考块正文容器。
+   两种形态共用一个 <pre>：
+   - 未转换（默认，折叠中 / 用户没点开）→ pre-wrap 原样显示
+   - 已转换（`data-md="1"`，markdown 懒渲染后）→ 必须 white-space: normal，
+     否则标签之间的换行会被当可见空白，表格前后凭空多出空行。
+   保持 <pre> 标签本身：patchTimeline 的滚动跟随按 pre 元素算 scrollHeight。 */
 .run-reason pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -3361,6 +3709,12 @@ details.tl-tool-res > summary {
      思考过程按用户要求完全展示，由内层滚动改成随内容自然展开。 */
   max-height: none;
   overflow-y: visible;
+}
+
+.run-reason pre[data-md="1"] {
+  white-space: normal;
+  /* 渲染后思维链里的表格/代码块可能比容器宽，允许横向滚，别把面板撑破 */
+  overflow-x: auto;
 }
 
 /* ---------------- 轻提示（toast） ----------------
@@ -3890,8 +4244,10 @@ body.models-page {
   }
 }
 
-/* ---------------- 面板 ▾ 纯名称下拉（只选不管） ----------------
-   挂在 .model-chip 内部，绝对定位到卡片下方。 */
+/* ---------------- 模型列表（点 chip 出，只选不管 + 底部添加） ----------------
+   挂在 .model-chip 内部，绝对定位到卡片下方。
+   2026-10-02：条目改成「组别 + 模型名」两行，与 chip 同构（用户要"chip 的罗列"）；
+   底部多一颗「＋ 添加自定义模型」，用分隔线与可选条目分开。 */
 
 .model-chip {
   position: relative; /* .mc-menu 的定位锚点 */
@@ -3900,12 +4256,12 @@ body.models-page {
 .mc-menu {
   position: absolute;
   top: calc(100% + 6px);
-  right: 0; /* chip 挂在工具栏最右，下拉向左展开 */
+  right: 0; /* chip 挂在工具栏最右，菜单向左展开 */
   left: auto;
-  min-width: 200px;
-  max-width: 280px;
+  min-width: 214px;
+  max-width: 300px;
   z-index: 4000; /* 与既有 overlay 惯例对齐 */
-  max-height: 240px;
+  max-height: 300px;
   overflow-y: auto;
   background: #1e2233;
   border: 1px solid rgba(120, 137, 255, 0.4);
@@ -3923,7 +4279,7 @@ body.models-page {
   background: transparent;
   color: #dfe3f0;
   font-size: 12.5px;
-  padding: 7px 9px;
+  padding: 6px 9px;
   border-radius: 6px;
   cursor: pointer;
   text-align: left;
@@ -3937,9 +4293,29 @@ body.models-page {
   background: rgba(120, 137, 255, 0.26);
 }
 
-.mc-mi-name {
+/* 两行文本列：组别在上（小、淡），模型名在下（亮） */
+.mc-mi-text {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  line-height: 1.25;
+}
+
+.mc-mi-group {
+  font-size: 9.5px;
+  color: #8f98ba;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mc-mi-name {
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #eef1fa;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3956,6 +4332,18 @@ body.models-page {
   font-size: 12px;
   color: #8b93b0;
   text-align: center;
+}
+
+/* 分隔线以下那颗「＋ 添加自定义模型」：是动作不是选项，用强调色区分 */
+.mc-menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: rgba(140, 150, 180, 0.28);
+}
+
+.mc-mi-add .mc-mi-name {
+  font-weight: 500;
+  color: #9fb0ff;
 }
 
 /* ---------------- 备份与回收站（2026-09-30） ----------------
@@ -4057,4 +4445,33 @@ body.models-page {
 
 .rec-err {
   color: #ff8a8a;
+}
+
+/* ---------------- 消息「编辑」按钮（2026-10-03） ----------------
+   与 .msg-del 同款骨架，hover 用绿色（"编辑并重发"是带恢复余地的动作，
+   不是纯破坏）。只出现在最后一条已落盘的用户消息上。 */
+
+.msg-edit {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #aab4dd;
+  font-size: 10.5px;
+  line-height: 1;
+  padding: 3px 7px;
+  margin-right: 6px;
+  cursor: pointer;
+  user-select: none;
+  opacity: 0.45;
+  transition: background 0.12s, color 0.12s;
+}
+
+.msg-edit:hover {
+  background: rgba(80, 180, 120, 0.3);
+  border-color: rgba(80, 180, 120, 0.5);
+  color: #d6ffe6;
+}
+
+.msg:hover .msg-edit {
+  opacity: 1;
 }

@@ -115,8 +115,14 @@ pub fn parse_frontmatter(txt: &str) -> (Option<String>, Option<String>) {
 
 /// 给 system prompt 用的技能清单。
 /// 只有一行/技能 —— 正文靠 load_skill。
+///
+/// ⚠️ 过项目过滤：项目 `skills` 清单非空时只列其中启用的（见 `project.rs`）。
+/// 被排除的技能**不出现在 prompt 里**，模型就不会去调它。
 pub fn catalog(data_dir: &Path) -> String {
-    let list = discover(data_dir);
+    let list: Vec<Skill> = discover(data_dir)
+        .into_iter()
+        .filter(|s| crate::project::allows_skill(data_dir, &s.name))
+        .collect();
     if list.is_empty() {
         return "（当前没有技能。当用户教会你一套今后会反复用到的操作流程时，\
                 用 save_skill 保存下来。）"
@@ -155,6 +161,11 @@ pub fn autoload(data_dir: &Path, message: &str) -> String {
 
     let mut hits: Vec<(usize, Skill, String)> = Vec::new();
     for sk in discover(data_dir) {
+        // 项目未启用的技能不该被自动注入 —— 那比"出现在清单里"更糟：
+        // 正文会直接进 prompt，用户根本不知道它被加载了。
+        if !crate::project::allows_skill(data_dir, &sk.name) {
+            continue;
+        }
         let score = autoload_score(&sk, &msg_norm, &msg_stripped);
         if score == 0 {
             continue;
@@ -333,6 +344,10 @@ fn is_noise(p: &str) -> bool {
 }
 
 /// load_skill：返回 SKILL.md 全文 + 附属文件清单。
+///
+/// ⚠️ **必须过项目过滤**（`project::allows_skill`）：`catalog` 里被排除的技能，
+/// 模型仍可能凭记忆直接调 `load_skill` 点名要 —— 只过滤清单不过滤这里，
+/// 等于过滤形同虚设。三处（catalog / autoload / load）口径必须一致。
 pub fn load(data_dir: &Path, name: &str) -> Result<String, String> {
     let sk = discover(data_dir)
         .into_iter()
@@ -342,6 +357,13 @@ pub fn load(data_dir: &Path, name: &str) -> Result<String, String> {
                 discover(data_dir).into_iter().map(|s| s.name).collect();
             format!("没有名为「{name}」的技能。现有技能：{have:?}")
         })?;
+    if !crate::project::allows_skill(data_dir, &sk.name) {
+        return Err(format!(
+            "当前项目未启用技能「{}」。需要它请在项目设置里加入 skills 清单，\
+             或切换/退出项目。",
+            sk.name
+        ));
+    }
     let txt = std::fs::read_to_string(&sk.path).map_err(|e| format!("读取失败: {e}"))?;
 
     let mut out = txt.trim_end().to_string();

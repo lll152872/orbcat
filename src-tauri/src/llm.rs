@@ -16,16 +16,9 @@ use serde_json::{json, Value};
 
 use crate::config::ModelConfig;
 
-/// 状态文案用的模型标签：显示名 ≠ 接口 model id 时两个都标出来。
-///
-/// 为什么不能只显示 name：用户可能只改了显示名，请求里 `model` 仍是旧 id；
-/// 界面若写「glm」实际打的是 dpsk，会掩盖配置错误。
+/// 状态文案用的模型标签：就是接口 model id（显示名已废弃，请求发的就是这个 id）。
 pub fn model_status_label(cfg: &ModelConfig) -> String {
-    let name = cfg.name.trim();
-    if name.is_empty() || name == cfg.id {
-        return cfg.id.clone();
-    }
-    format!("{name}（接口 model={}）", cfg.id)
+    cfg.id.clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +507,7 @@ struct DeltaToolCall {
 
 #[derive(Debug, Deserialize)]
 struct DeltaFunction {
+    /// 工具名（流式分片里逐段给全名；归并逻辑以 index 分组、首片取名）
     #[serde(default)]
     name: Option<String>,
     /// 工具参数分片。**形态不统一**（2026-09-25）：
@@ -1583,25 +1577,15 @@ mod tests {
         );
     }
 
-    /// 显示名改了但接口 model id 没改时，状态文案必须把真实 id 标出来
+    /// 状态文案 = 接口 model id（显示名已废弃，请求发的就是这个 id）
     #[test]
-    fn status_label_shows_api_model_id_when_name_differs() {
+    fn status_label_returns_api_model_id() {
         let cfg = ModelConfig {
             id: "deepseek-v4.1-flash".into(),
-            name: "glm5.3-flash".into(),
             url: "https://ark.example.com/v3".into(),
             api_key: "k".into(),
             ..Default::default()
         };
-        let s = model_status_label(&cfg);
-        assert!(s.contains("glm5.3-flash"), "{s}");
-        assert!(s.contains("deepseek-v4.1-flash"), "{s}");
-
-        let same = ModelConfig {
-            id: "m1".into(),
-            name: "m1".into(),
-            ..Default::default()
-        };
-        assert_eq!(model_status_label(&same), "m1");
+        assert_eq!(model_status_label(&cfg), "deepseek-v4.1-flash");
     }
 }

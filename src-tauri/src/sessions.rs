@@ -198,6 +198,20 @@ pub struct Session {
     /// 只在两端都拿到时写入，缺失即 None（表示"未校准"，按 1.0 处理）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_scale: Option<f64>,
+    /// 这个会话绑定的 agent 模式 id（2026-10-08，用户定案）。
+    ///
+    /// ## 为什么模式要跟着会话走
+    ///
+    /// 以前它在 `settings.json` 里是**全局**的 —— 切一下全场生效，后果是
+    /// **回看历史消息时渲染方式会跟着变**（闲聊的一串气泡变回一大段）。
+    /// 绑到会话上之后，"当前模式"与"生成这条消息时的模式"永远是同一个，
+    /// 前端不必再往每条消息上挂标记。
+    ///
+    /// ⚠️ 老会话没这个字段 → `None`，由 [`effective_mode`] 兜到内置默认
+    ///    （`modes::DEFAULT_MODE_ID`），**不做迁移脚本**：升级用户的会话文件
+    ///    一个字节都不动，只在读取时给个确定的值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -229,6 +243,9 @@ pub struct SessionMeta {
     pub count: usize,
     pub current: bool,
     pub kind: String,
+    /// 这个会话绑的模式 id —— 会话列表里要显示"这条是闲聊还是工作"。
+    /// 老会话没有 → 补内置默认（在 [`list`] 里补）。
+    pub mode: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +377,7 @@ fn set_current(data_dir: &Path, id: &str) {
 /// 建一个**任务会话**并设为当前。
 ///
 /// 主会话不由这里创建 —— 它由 [`unique_main`] 保证存在，全库唯一。
-pub fn new_session(data_dir: &Path) -> Session {
+pub fn new_session(data_dir: &Path, mode: &str) -> Session {
     let now = now_ms();
     let s = Session {
         id: new_id(),
@@ -375,6 +392,10 @@ pub fn new_session(data_dir: &Path) -> Session {
         summary_upto: None,
         last_prompt_tokens: None,
         token_scale: None,
+        // 会话**建的时候**就把模式钉死，之后不再改（用户 2026-10-08：
+        // "一个会话模式不能变"）。空串 / 无效 id 会在 `effective_mode`
+        // 的 `resolve` 里兜到标准模式。
+        mode: Some(mode.to_string()),
     };
     let _ = write_session(data_dir, &s);
     set_current(data_dir, &s.id);
@@ -460,6 +481,11 @@ fn create_main(data_dir: &Path) -> Session {
         summary_upto: None,
         last_prompt_tokens: None,
         token_scale: None,
+        // 主会话是最早那条，建的时候就落**内置默认模式**（用户 2026-10-08：默认 standard）。
+        //
+        // ⚠️ 显式落盘而不是留 `None`：留 None 会走 `effective_mode` 的兜底 —— 结果一样，
+        //    但文件里看不到这个会话是什么模式，排查时要靠推理。
+        mode: Some(crate::modes::DEFAULT_MODE_ID.to_string()),
     };
     let _ = write_session(data_dir, &s);
     s
@@ -487,6 +513,29 @@ pub fn ensure_current(data_dir: &Path) -> Session {
 
 pub fn load(data_dir: &Path, id: &str) -> Option<Session> {
     read_session(&session_file(data_dir, id))
+}
+
+/// **只读**地回答"现在应该是哪条会话" —— 与 [`ensure_current`] 同一套判断，
+/// 但**不写盘**（不自愈、不落指针）。
+///
+/// 为什么必须有它：`allowed_for_dir`（算 MCP 活跃组）跑在后台线程里，
+/// 不该有写盘副作用；但如果只看 [`current_id`]，在**指针缺失**时（真实发生过：
+/// `sessions/current` 根本不存在）它会返回 `None` → 兜到内置默认模式，
+/// 而界面 / agent 走 [`ensure_current`] 落到的是**另一条会话** ——
+/// 于是出现"界面在闲聊会话里、MCP 工具组却按标准模式算"的劈叉，
+/// 而且两边各自都说得通，极难排查。所以这里把判断规则抄成一份只读版。
+pub fn current_or_main(data_dir: &Path) -> Session {
+    if let Some(id) = current_id(data_dir) {
+        if let Some(s) = read_session(&session_file(data_dir, &id)) {
+            return s;
+        }
+    }
+    if let Some(latest) = list(data_dir).into_iter().next() {
+        if let Some(s) = read_session(&session_file(data_dir, &latest.id)) {
+            return s;
+        }
+    }
+    unique_main(data_dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -564,6 +613,12 @@ pub fn list(data_dir: &Path) -> Vec<SessionMeta> {
             continue;
         }
         let Some(s) = read_session(&p) else { continue };
+        // 老会话没有 `mode` → 用**内置默认模式**兜（列表里总得显示一个）。先算再 move 字段。
+        // ⚠️ 别再改回"读 settings" —— `settings.activeMode` 已删（见 `effective_mode` 的说明）。
+        let mode = s
+            .mode
+            .clone()
+            .unwrap_or_else(|| crate::modes::DEFAULT_MODE_ID.to_string());
         out.push(SessionMeta {
             current: s.id == cur,
             id: s.id,
@@ -572,6 +627,7 @@ pub fn list(data_dir: &Path) -> Vec<SessionMeta> {
             updated_at: s.updated_at,
             count: s.messages.len(),
             kind: s.kind,
+            mode,
         });
     }
     // 主会话置顶；同一层内按 updated_at 倒序。
@@ -593,6 +649,51 @@ pub fn switch(data_dir: &Path, id: &str) -> Result<Session, String> {
     Ok(s)
 }
 
+/// 一个会话**实际生效**的模式 —— 全项目读"当前是什么模式"的**唯一入口**（2026-10-08）。
+///
+/// 规则（按优先级）：
+/// 1. 会话自带 `mode` → 用它（**绝大多数情况**）
+/// 2. 老会话没这个字段（升级前建的）→ 内置默认 `modes::DEFAULT_MODE_ID`（= `standard`）
+/// 3. `session_id` 为空 / 会话不存在 → 同样给内置默认
+///
+/// ## `settings.activeMode` 呢？
+///
+/// **2026-10-08 已删**。它经历了三级演变，值得记一笔免得有人又想加回来：
+/// 全局"当前模式" → "新建会话的默认模式" → 彻底删掉。
+/// 删它的触发点很具体：用户看到新建菜单里**「闲聊」被标成「默认」**，
+/// 而他要的是「标准是默认」。当时那个标读的正是 `settings.activeMode`
+/// —— 用户早先在设置页切过闲聊，这个值就留在文件里成了"默认"。
+/// 教训：**一旦界面上没有改它的入口，任何"用户可配的默认值"都会变成
+/// 一个会撒谎的死字段**（手编也不生效）。所以默认值只能是编译期常量。
+///
+/// 老 `settings.json` 里残留的 `"activeMode"` 由 serde 忽略（见
+/// `config::tests::legacy_settings_active_mode_is_ignored`）。
+///
+/// ## 由此消掉的一个旧副作用
+///
+/// `Session.mode` 是 `Option` 且 `skip_serializing_if = "Option::is_none"`，
+/// 读写原样往返 → 升级前建的会话 `mode` 字段**永远写不出来**。
+/// 以前它的兜底是 `settings.activeMode`，于是那些会话会"跟着默认值变"
+/// （现场效果 = 主聊天跟着走、新会话被钉死，两条路并存）。
+/// 现在兜底是常量，**所有老会话一律 `standard`** —— 一个可预测、可解释的行为。
+/// 想要闲聊/工作目录会话，用工具栏「＋」新建。
+///
+/// ## 为什么必须收成一个函数
+///
+/// 以前 `ptc.rs` / `tools.rs` / `agent.rs` 各自"读 settings + resolve modes"，
+/// 这次全改成"按会话读"。各写一遍迟早写岔，而写岔的后果是
+/// **模式只在部分地方生效**（工具坍缩了但提示词没换、或反过来）——
+/// 那种半坏状态最难查。所以留这一个入口，谁问模式都走它。
+/// （2026-10-08 实测抓到过一处漏改：`agent.rs` 的"当前模式：按需 / PTC"
+///  动态段还在读全局 `activeMode`，闲聊会话会拿到 PTC 的行为段。）
+pub fn effective_mode(data_dir: &Path, session_id: Option<&str>) -> crate::modes::Mode {
+    let id = session_id
+        .and_then(|sid| load(data_dir, sid))
+        .and_then(|s| s.mode)
+        .unwrap_or_else(|| crate::modes::DEFAULT_MODE_ID.to_string());
+    crate::modes::resolve(data_dir, Some(&id))
+}
+
 /// 改会话标题（主聊天标题固定，不可改）
 pub fn set_title(data_dir: &Path, id: &str, title: &str) -> Result<(), String> {
     let mut s = load(data_dir, id).ok_or_else(|| format!("会话 {id} 不存在"))?;
@@ -605,6 +706,33 @@ pub fn set_title(data_dir: &Path, id: &str, title: &str) -> Result<(), String> {
     }
     s.title = t.to_string();
     write_session(data_dir, &s)
+}
+
+// ---------------------------------------------------------------------------
+// 蒸馏会话标记（2026-10-03）
+// ---------------------------------------------------------------------------
+//
+// 为什么用「同目录一个空标记文件」而不是往会话 JSON 里加字段：
+// 会话文件是热路径（每轮追加写），多一个字段就得考虑老数据兼容与迁移；
+// 而蒸馏只是**该会话的一种角色**，用 `sessions/<id>.distill` 这种零内容标记
+// 表达最省事 —— 判真就是「文件在不在」，删掉标记即退回普通会话。
+
+fn distill_marker(data_dir: &Path, id: &str) -> PathBuf {
+    data_dir.join("sessions").join(format!("{id}.distill"))
+}
+
+/// 把会话标为「记忆蒸馏会话」
+pub fn set_distill(data_dir: &Path, id: &str) -> Result<(), String> {
+    std::fs::create_dir_all(data_dir.join("sessions")).map_err(|e| e.to_string())?;
+    std::fs::write(distill_marker(data_dir, id), b"").map_err(|e| format!("写蒸馏标记失败: {e}"))
+}
+
+/// 该会话是否是「记忆蒸馏会话」
+pub fn is_distill(data_dir: &Path, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    distill_marker(data_dir, id).exists()
 }
 
 /// 删除一个会话。
@@ -673,17 +801,16 @@ pub fn truncate(data_dir: &Path, id: &str, upto: usize) -> Result<Session, Strin
 
 /// 从**主聊天**的某条消息处分叉出一条新会话。
 ///
-/// ## 语义（用户 2026-09-20 修正）
-/// **分叉的上下文 = 下一轮实际会喂给模型的那段窗口**，不是"到那条为止的全部历史"。
-/// 也就是说：把主聊天切成 `messages[..=upto]` 这个前缀，再套用 [`crate::history::pick_window`]
-/// 的同一套规则（最近 [`crate::history::WINDOW_HOURS`] 小时 ∪ 最近
-/// [`crate::history::FALLBACK_TURNS`] 条），**只把选出来的那几条复制进新会话**。
+/// ## 语义（用户 2026-09-20 修正；选取口径 2026-10-07 改全量）
+/// **分叉的上下文 = 下一轮实际会喂给模型的那段历史**，不是别的加工版。
+/// 也就是说：把主聊天切成 `messages[..=upto]` 这个前缀，套用
+/// [`crate::history::pick_window`] 的同一套规则（全量注入 —— 原先是
+/// 「时间窗 ∪ 轮数兜底」筛选，已废弃），**把选出来的消息复制进新会话**。
 ///
 /// 为什么必须和回灌共用规则：分叉的意义是"从这里接着聊"，而接着聊时模型真正
-/// 看到的就只有那个窗口。若把 400 条历史原样搬过去，新会话一开场的上下文预算
-/// 就白占一大截，而且和"从这条消息继续"的真实视图对不上。
+/// 看到的就只有那个前缀。两边各写一套规则迟早对不上。
 ///
-/// 因为最后一条必然落在最近 `FALLBACK_TURNS` 条内，**分叉点自己一定在窗口里**。
+/// **分叉点自己一定在前缀里**（`[..=idx]` 闭区间）。
 ///
 /// ## 三条硬约束
 /// - **只有主聊天能分叉**（`can_fork`）。任务会话分叉只会产出没人认领的碎片。
@@ -709,11 +836,11 @@ pub fn fork(data_dir: &Path, src: &Session, upto: usize) -> Result<Session, Stri
         return Err("分叉点必须选在一条 AI 回复上".into());
     }
 
+    // 前缀 → 套用回灌同一套选取规则（"下一轮塞什么，分叉的上下文就是什么"）
+    let window = crate::history::pick_window(&src.messages[..=idx]);
     let now = now_ms();
-    // 前缀 → 套用回灌同一套窗口规则（"下一轮塞什么，分叉的上下文就是什么"）
-    let window = crate::history::pick_window(&src.messages[..=idx], now);
     if window.is_empty() {
-        return Err("分叉点之前没有落在上下文窗口里的消息".into());
+        return Err("分叉点之前没有消息".into());
     }
 
     // 标题优先取分叉点前最近一条用户提问 —— 会话列表里比 assistant 正文好认
@@ -745,6 +872,9 @@ pub fn fork(data_dir: &Path, src: &Session, upto: usize) -> Result<Session, Stri
         // 新窗口的构成不同，带过来会把预算算错。让新会话自己重新校准。
         last_prompt_tokens: None,
         token_scale: None,
+        // **继承源会话的模式**：分叉是"从这里接着聊"，换个模式等于换了个说话方式，
+        // 那就不叫接着聊了（2026-10-08）。
+        mode: src.mode.clone(),
     };
     write_session(data_dir, &s)?;
     set_current(data_dir, &s.id);
@@ -1565,7 +1695,7 @@ mod tests {
     fn pinned_session_writes_survive_switch_away() {
         let d = tmp("pinned_switch");
         let a = ensure_current(&d); // A：开跑的那个会话
-        let b = new_session(&d); // B：用户中途切过去的会话（new_session 会 set_current）
+        let b = new_session(&d, "standard"); // B：用户中途切过去的会话（new_session 会 set_current）
 
         // 开跑：显式钉在 A —— 此刻 current 其实已经是 B
         begin_turn_in(&d, Some(&a.id), "在 A 里问", &[]).unwrap();
@@ -1696,7 +1826,7 @@ mod tests {
         assert_eq!(again.messages[1].text, "好的");
 
         // 普通任务会话才用首条消息做标题
-        let t = new_session(&d);
+        let t = new_session(&d, "standard");
         append_turn(&d, "任务会话的首条", &[], "ok", &[]).unwrap();
         let t2 = load(&d, &t.id).unwrap();
         assert_eq!(t2.title, "任务会话的首条");
@@ -1719,7 +1849,7 @@ mod tests {
     #[test]
     fn legacy_inline_base64_images_are_dropped() {
         let d = tmp("legacy");
-        let s = new_session(&d);
+        let s = new_session(&d, "standard");
         // 手写一个带旧格式内联图的会话文件
         let legacy = serde_json::json!({
             "id": s.id,
@@ -1755,7 +1885,7 @@ mod tests {
         assert!(a.is_main());
         append_turn(&d, "会话A", &[], "ok", &[]).unwrap();
 
-        let b = new_session(&d);
+        let b = new_session(&d, "standard");
         append_turn(&d, "会话B", &[], "ok", &[]).unwrap();
         assert_eq!(current_id(&d).unwrap(), b.id);
 
@@ -1866,18 +1996,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// **分叉带的是"下一轮会喂给模型的窗口"，不是全部历史**（用户 2026-09-20 修正）。
+    /// **分叉带的是"下一轮会喂给模型的那段历史"**（2026-10-07 起为全量前缀）。
     ///
-    /// 造 30 条：前 20 条是"很久以前"（时间窗外），后 10 条是刚聊的。
-    /// 分叉点取第 29 条（assistant 回复）→ 只应带最近 10 条，老消息一条都不进。
+    /// 造 30 条（新旧时间戳混排），分叉点取第 29 条（assistant 回复）→
+    /// 分叉会话应带上 `[0..=29]` **全部 30 条**：窗口筛选已废弃，
+    /// 分叉上下文与回灌共用同一口径（全量）。
     #[test]
-    fn fork_takes_only_the_injected_window() {
+    fn fork_takes_the_full_prefix() {
         let d = tmp("fork_window");
         let main = ensure_current(&d);
         let mut s = load(&d, &main.id).unwrap();
         let now = now_ms();
         for i in 0..30u64 {
-            // 前 20 条 100 小时前（时间窗外、且超出最近 10 条）
+            // 前 20 条 100 小时前（旧「时间窗」语义下会被挡掉的时间戳）
             let at = if i < 20 { now - 100 * 3600 * 1000 } else { now - 60_000 };
             s.messages.push(StoredMessage {
                 role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
@@ -1901,15 +2032,11 @@ mod tests {
         let f = fork(&d, &src, 29).unwrap();
         assert_eq!(
             f.messages.len(),
-            10,
-            "只带最近 10 条（时间窗外的老消息不进分叉）"
+            30,
+            "全量口径：分叉点之前一条不丢（老时间戳也不例外）"
         );
-        assert_eq!(f.messages.first().unwrap().text, "m20", "窗口起点");
+        assert_eq!(f.messages.first().unwrap().text, "m0", "最老的也在");
         assert_eq!(f.messages.last().unwrap().text, "m29", "分叉点收尾");
-        assert!(
-            f.messages.iter().all(|m| m.text != "m0" && m.text != "m10"),
-            "窗外老消息一条都不该被复制"
-        );
 
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1958,7 +2085,7 @@ mod tests {
         append_turn(&d, "问", &[], "答", &[]).unwrap();
 
         // ① 任务会话不能分叉
-        let t = new_session(&d);
+        let t = new_session(&d, "standard");
         assert!(fork(&d, &t, 0).is_err(), "任务会话不该能被分叉");
 
         // ② 分叉出来的会话也不能再分叉（"其他的不行"）
@@ -2037,7 +2164,7 @@ mod tests {
 
         // 再建两条任务会话，并让它们比主会话更新
         for i in 0..2 {
-            let t = new_session(&d);
+            let t = new_session(&d, "standard");
             append_turn(&d, &format!("任务{i}"), &[], "ok", &[]).unwrap();
             assert!(!t.is_main(), "new_session 建出的必须是任务会话");
         }
@@ -2310,7 +2437,7 @@ mod tests {
     #[test]
     fn grants_roundtrip_and_delete_cleans_up() {
         let d = tmp("grants_roundtrip");
-        let s = new_session(&d);
+        let s = new_session(&d, "standard");
         assert!(load_grants(&d, &s.id).is_empty(), "没写过就该是空表，不是错误");
 
         let gs = vec![permission::Grant::lasting(
@@ -2344,7 +2471,7 @@ mod tests {
     #[test]
     fn save_empty_grants_removes_file() {
         let d = tmp("grants_empty");
-        let s = new_session(&d);
+        let s = new_session(&d, "standard");
 
         save_grants(
             &d,
@@ -2373,11 +2500,233 @@ mod tests {
         // 坏文件按空表处理 —— 方向必须**保守**：无授权 = 回到纯规则判定 = 更严，
         // 绝不能因为文件损坏而多放行什么。
         let d = tmp("grants_corrupt");
-        let s = new_session(&d);
+        let s = new_session(&d, "standard");
         std::fs::create_dir_all(sessions_dir(&d)).unwrap();
         std::fs::write(grants_file(&d, &s.id), "{ 这不是 JSON").unwrap();
 
         assert!(load_grants(&d, &s.id).is_empty(), "坏文件应退化为空表");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ------------------------------------------------------------------
+    // 模式跟会话走（2026-10-08）
+    //
+    // 用户定案："我判断为模式跟会话走，一个会话模式不能变"。
+    // 下面这一组锁的就是这条不变量 —— 它的反面（模式是全局设置）曾经是事实，
+    // 所以每条断言都在防"某个调用点又回去读全局模式"。
+    //
+    // ⚠️ 这一组**不能**再出现 `set_default_mode` 这类辅助函数：
+    //    `settings.activeMode` 已删（见 `effective_mode` 的说明）。想表达
+    //    "另一条会话是别的模式"就老老实实 `new_session(&d, "chat")`。
+    // ------------------------------------------------------------------
+
+    /// 新建会话时把模式**钉死**在会话上，且**落盘**。
+    ///
+    /// 只活在返回值里的话，重启就退回默认了 —— 那种"重启后模式变了"
+    /// 最难查（用户会以为是自己点错了）。
+    #[test]
+    fn new_session_pins_the_mode_it_was_created_with() {
+        let d = tmp("mode_pin");
+        let s = new_session(&d, "chat");
+        assert_eq!(s.mode.as_deref(), Some("chat"));
+
+        let back = load(&d, &s.id).unwrap();
+        assert_eq!(back.mode.as_deref(), Some("chat"), "模式必须落盘");
+        assert_eq!(effective_mode(&d, Some(&s.id)).id, "chat");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// **两条会话的模式互不干扰** —— 模式跟会话走的核心不变量。
+    ///
+    /// 以前全局模式下这是做不到的：换一下全场生效，回看历史消息的
+    /// 渲染方式都会跟着变。这条断言一边一条会话，来回问，谁都不许串味。
+    #[test]
+    fn two_sessions_keep_their_own_modes() {
+        let d = tmp("mode_two");
+        let a = new_session(&d, "chat");
+        let b = new_session(&d, "ptc");
+
+        assert_eq!(effective_mode(&d, Some(&a.id)).id, "chat");
+        assert_eq!(effective_mode(&d, Some(&b.id)).id, "ptc");
+        // 再来回问一遍：后建的那条不许把先建的那条"带走"
+        assert_eq!(effective_mode(&d, Some(&a.id)).id, "chat");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// **主会话只能是它建时的模式**（内置默认 standard），
+    /// 而且没有任何"全局开关"能把它改掉。
+    ///
+    /// 回归背景（2026-10-08）：`create_main` 原来读 `settings.activeMode`。
+    /// 用户 `settings.json` 里留着早先在设置页切过的 `"chat"`，
+    /// 于是主聊天莫名其妙跟着那个值跑。现在它是常量。
+    #[test]
+    fn main_session_mode_is_the_builtin_default() {
+        let d = tmp("mode_main");
+        let main = unique_main(&d);
+        assert_eq!(
+            main.mode.as_deref(),
+            Some(crate::modes::DEFAULT_MODE_ID),
+            "主会话必须落内置默认模式，不能受任何全局设置影响"
+        );
+        assert_eq!(
+            effective_mode(&d, Some(&main.id)).id,
+            crate::modes::DEFAULT_MODE_ID
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// **残留的 `settings.activeMode` 不许再有任何影响**。
+    ///
+    /// 这是删那个字段的直接理由锁：用户升级后 `settings.json` 里还写着
+    /// `"activeMode":"chat"`（老版本写的），如果它还影响什么，用户就会看到
+    /// "我明明把对话改成了标准，怎么还是闲聊" —— 那种静默失效最难查。
+    /// 现在它只是个被 serde 忽略的陌生键（`config` 侧另有一条测它不报错）。
+    #[test]
+    fn stale_settings_active_mode_has_no_effect() {
+        let d = tmp("mode_stale");
+        let main = unique_main(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("settings.json"),
+            r#"{"activeMode":"chat","selectedModel":"x"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            effective_mode(&d, Some(&main.id)).id,
+            crate::modes::DEFAULT_MODE_ID,
+            "settings.json 里残留的 activeMode 不许影响任何会话"
+        );
+        assert_eq!(
+            effective_mode(&d, None).id,
+            crate::modes::DEFAULT_MODE_ID,
+            "不带会话 id 时给的也必须是内置默认，不是 settings 里那个值"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 老会话磁盘上没有 `mode` 字段（升级前建的）→ 内置默认（standard）。
+    ///
+    /// 为什么不迁移/不补写：升级用户的会话文件一个字节都不动，
+    /// 只在**读取**时给个确定的值。写盘也不该顺手补 —— 那会让"老会话"
+    /// 这个状态在两次写盘之间神秘消失，排查时看不出自己看的是哪一份。
+    #[test]
+    fn legacy_session_without_mode_gets_builtin_default_and_stays_untouched() {
+        let d = tmp("mode_legacy");
+        let s = new_session(&d, "chat");
+        // 抹掉 mode，模拟老文件（`Session.mode` 是 Option + serde default）
+        let mut f = load(&d, &s.id).unwrap();
+        f.mode = None;
+        write_session(&d, &f).unwrap();
+
+        assert_eq!(
+            effective_mode(&d, Some(&s.id)).id,
+            crate::modes::DEFAULT_MODE_ID,
+            "老会话兜到内置默认"
+        );
+
+        // ⚠️ 再写一次盘，`mode` 字段**不会**被补上（`skip_serializing_if`）——
+        //    这是刻意的：没有迁移脚本，读到的值和盘上的内容一一对应。
+        save(&d, &f).unwrap();
+        let raw = std::fs::read_to_string(session_file(&d, &s.id)).unwrap();
+        assert!(!raw.contains("\"mode\""), "老会话不该被补上 mode 字段");
+        assert_eq!(
+            effective_mode(&d, Some(&s.id)).id,
+            crate::modes::DEFAULT_MODE_ID
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 会话 id 不存在 / 为空 / 传 None → 内置默认，不 panic。
+    #[test]
+    fn effective_mode_falls_back_for_unknown_or_missing_session() {
+        let d = tmp("mode_unknown");
+        let want = crate::modes::DEFAULT_MODE_ID;
+
+        assert_eq!(effective_mode(&d, None).id, want);
+        assert_eq!(effective_mode(&d, Some("")).id, want);
+        assert_eq!(effective_mode(&d, Some("没有这条会话")).id, want);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 会话上写了一个**不存在的**模式 id（用户把 modes.json 里那条删了）→
+    /// 退回标准模式，而不是"什么都不给"（后者会让 MCP 工具一个都用不了）。
+    #[test]
+    fn session_mode_with_unknown_id_falls_back_to_standard() {
+        let d = tmp("mode_bogus");
+        let s = new_session(&d, "这个模式删掉了");
+        assert_eq!(
+            effective_mode(&d, Some(&s.id)).id,
+            crate::modes::DEFAULT_MODE_ID
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 分叉**继承源会话的模式**。
+    ///
+    /// 为什么不是"落默认模式"：分叉带走的上下文是源会话的直接延续，
+    /// 换个模式会当场换一整套工具面 —— 与"这一整段上下文是同一个任务"矛盾。
+    #[test]
+    fn fork_inherits_source_mode() {
+        let d = tmp("mode_fork");
+        let main = unique_main(&d);
+        let _ = switch(&d, &main.id);
+        append_turn(&d, "问", &[], "答", &[]).unwrap();
+
+        // 直接落盘改模式，等价于"建的时候选了闲聊"
+        let mut m = load(&d, &main.id).unwrap();
+        m.mode = Some("chat".into());
+        write_session(&d, &m).unwrap();
+
+        let src = load(&d, &main.id).unwrap();
+        let f = fork(&d, &src, 1).unwrap();
+        assert_eq!(f.mode.as_deref(), Some("chat"), "分叉要继承源会话的模式");
+        assert_eq!(effective_mode(&d, Some(&f.id)).id, "chat");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `list()` 每行都要带模式（前端会话列表按行显示标记，`currentModeId()` 也读它）。
+    ///
+    /// 老会话那半条是**兜底**契约：留空的话前端拿不到值，
+    /// 只好按默认走 —— 于是闲聊会话的回复会画成一整块而不是泡泡。
+    #[test]
+    fn list_reports_mode_for_each_session() {
+        let d = tmp("mode_list");
+
+        // ⚠️ 顺序要紧：`unique_main` 在"一条 main 都没有"时会把 **created_at 最小**
+        //    的那条提拔成主会话（见它上面的注释）。所以必须先让它把主会话建出来，
+        //    再 `new_session` —— 否则新建的 task 会被提拔成 main，
+        //    紧接着下面那句"把主会话的 mode 抹掉"就抹到了 task 头上。
+        let main = unique_main(&d);
+        let chat = new_session(&d, "chat");
+        let mut m = load(&d, &main.id).unwrap();
+        m.mode = None;
+        write_session(&d, &m).unwrap();
+
+        let metas = list(&d);
+        let mode_of = |id: &str| {
+            metas
+                .iter()
+                .find(|x| x.id == id)
+                .unwrap_or_else(|| panic!("列表里缺会话 {id}"))
+                .mode
+                .clone()
+        };
+        assert_eq!(mode_of(&chat.id), "chat");
+        assert_eq!(
+            mode_of(&main.id),
+            crate::modes::DEFAULT_MODE_ID,
+            "老会话在列表里要兜到内置默认，不能是空串"
+        );
 
         let _ = std::fs::remove_dir_all(&d);
     }

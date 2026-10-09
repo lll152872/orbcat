@@ -12,7 +12,14 @@
  *   链接也强制白名单协议（http/https/mailto），挡掉 `javascript:`。
  *
  * 支持：标题 / 粗体 / 斜体 / 行内代码 / 代码块 / 有序无序列表 /
- *       引用 / 表格 / 分隔线 / 链接
+ *       引用 / 表格 / 分隔线 / 链接 / **图片**
+ *
+ * ## 图片（2026-10-08 加）
+ *
+ * 模型在正文里写 `![说明](来源)` 就能把图显示在回复里。来源两种：
+ * `http(s)` 外链、本地绝对路径。**本地路径产的是占位 `<img data-img>`**，
+ * 真正的 data URL 由 `main.ts` 走 `image_thumb` 异步换上去 ——
+ * 本模块是纯同步函数，碰不了 IPC。
  */
 
 function esc(s: string): string {
@@ -32,6 +39,34 @@ function safeUrl(raw: string): string | null {
   return null;
 }
 
+/**
+ * 判定 markdown 图片的**来源**是否可渲染（2026-10-08 加）。
+ *
+ * 只放行两类：
+ *   - `http(s)://` 外链 —— webview 直接加载（本项目 `tauri.conf.json` 的
+ *     `csp` 为 `null`，没有外链拦截）
+ *   - **本地绝对路径** —— 走 `image_thumb` 命令转 data URL。webview 读不了
+ *     `file://`，这正是本地图必须先产占位 img、再由 `main.ts` 异步换 `src`
+ *     的原因（见 `inline()` 里的图片分支）。
+ *
+ * **刻意挡掉 `data:`**：它是任意 base64 的载体，混进 `src` 等于开了一个
+ * 绕过"先 escape 再套标签"这条结构防线的口子。`javascript:` 在 `img src`
+ * 里本来就不会执行，但一并挡掉，免得日后有代码把这里的结果挪去 `href`。
+ *
+ * 判定失败返回 `null` → 调用方**原样保留文本**。宁可让用户看到一串路径，
+ * 也不要图凭空消失（那会让人以为是渲染 bug）。
+ */
+function imgSrc(raw: string): { kind: "url" | "path"; value: string } | null {
+  const u = raw.trim();
+  if (!u) return null;
+  if (/^https?:\/\//i.test(u)) return { kind: "url", value: u };
+  // Windows 盘符绝对路径（C:\pics\a.png 或 C:/pics/a.png）
+  if (/^[a-zA-Z]:[\\/]/.test(u)) return { kind: "path", value: u };
+  // POSIX 绝对路径 —— 排除协议相对的 `//host/…`（那个在本地文件语境下无意义）
+  if (u.startsWith("/") && !u.startsWith("//")) return { kind: "path", value: u };
+  return null;
+}
+
 /** 行内语法：代码 → 链接 → 粗体 → 斜体 → 删除线 */
 function inline(src: string): string {
   let s = esc(src);
@@ -42,6 +77,36 @@ function inline(src: string): string {
     codes.push(code);
     return `\u0000CODE${codes.length - 1}\u0000`;
   });
+
+  // 图片 ![说明](来源) —— **必须排在链接之前**（2026-10-08 加）。
+  // 否则 `[说明](来源)` 会被下面的链接规则先吃掉，留下一个孤零零的 `!`，
+  // 渲染出来就是「!<a href=…>说明</a>`」这种残废输出（加图之前就是这个表现）。
+  //
+  // 来源写法支持两种：`(路径)` 与 `(<路径>)`。后者专治**带空格的路径**
+  // ——Windows 下 `C:\My Pics\a.png` 用裸括号会被 `[^)\s]+` 在空格处截断，
+  // 所以系统提示里教模型：路径有空格就用尖括号裹起来。
+  //
+  // ⚠️ 正则里写的是 `&lt;` / `&gt;` 而**不是** `<` / `>`：`inline()` 开头先跑了
+  //    `esc()`，此刻原文里的尖括号早已变成实体。**这里极容易改错** ——
+  //    想把正则改回字面尖括号等于同时打开注入面（esc 在前的顺序是安全前提，
+  //    不能为了让正则好写而调序）。
+  s = s.replace(
+    /!\[([^\]\n]*)\]\((?:&lt;([^\n]*?)&gt;|([^)\s]+))\)/g,
+    (m, alt: string, angled: string | undefined, plain: string | undefined) => {
+      const hit = imgSrc((angled ?? plain ?? "").replace(/&amp;/g, "&"));
+      if (!hit) return m; // 不支持的来源 → 原样保留文本（用户能看到路径）
+      if (hit.kind === "url") {
+        // 外链：直接给 src，webview 自己加载
+        return `<img class="md-img" src="${esc(hit.value)}" alt="${alt}" loading="lazy">`;
+      }
+      // 本地路径：**不写 src**，只把路径挂到 data-img，
+      // 由 main.ts 的 hydrateBodyImages() 走 image_thumb 异步换成 data URL。
+      // 写 src="C:\…" 在 webview 里必定加载失败，只会留一个破图标。
+      return `<img class="md-img md-img-local" data-img="${esc(hit.value)}" alt="${alt}" title="${esc(
+        hit.value,
+      )}">`;
+    },
+  );
 
   // 链接 [文本](url)
   s = s.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, txt: string, url: string) => {
@@ -61,7 +126,53 @@ function inline(src: string): string {
   return s;
 }
 
-/** 判断一行是不是表格分隔行（|---|---|） */
+/**
+ * 把流式文本切成「已稳定」与「还在吐」两段。
+ *
+ * 为什么需要（2026-10-03）：`mdToHtml` 判表格靠"当前行有 `|` 且下一行是 `|---|`"，
+ * 而流式是逐 chunk 到的。同一个表格在到达分隔行之前会被当成普通段落，
+ * 补上分隔行的瞬间整块突变成 `<table>` —— 列宽一变，用户正看着的位置就跳。
+ * 逐 chunk 全量重渲的话，一段输出里这种突变能有几十次，看着像闪烁。
+ *
+ * 这里的规则：**只有确定吐完的块才交给 mdToHtml，尾巴保持纯文本**。
+ * 判定"吐完"用空行 —— markdown 里空行是块边界，模型写完一段几乎总会空行。
+ * 于是每个块只会**在它自己收尾的那一瞬间**从纯文本变 markdown（1 次），
+ * 而不是每个 chunk 都抖。
+ *
+ * 未闭合的 ``` 代码块要额外回退：代码块内部常有空行，只按空行切会把
+ * 半个代码块当"已稳定"，`mdToHtml` 会把剩下的全吞进代码块里。
+ *
+ * @returns `stable` 可安全渲染；`tail` 必须原样 escape + `<br>`
+ */
+export function splitStable(src: string): { stable: string; tail: string } {
+  if (!src) return { stable: "", tail: "" };
+
+  // ① 最后一个空行（允许行尾只有空白字符）之后的部分 = 活动尾巴
+  let cut = -1;
+  const blank = /\n[ \t]*\n/g;
+  let m: RegExpExecArray | null;
+  while ((m = blank.exec(src)) !== null) {
+    cut = m.index + m[0].length;
+  }
+  let stable = cut >= 0 ? src.slice(0, cut) : "";
+  let tail = cut >= 0 ? src.slice(cut) : src;
+
+  // ② 未闭合的 ``` 围栏 → 整段退回围栏之前（`mdToHtml` 的围栏循环会吞到末尾）
+  const fences = (stable.match(/^\s*```/gm) ?? []).length;
+  if (fences % 2 === 1) {
+    const lastFence = stable.lastIndexOf("```");
+    // 往前找围栏所在行之前的最后一个空行；找不到就整段当尾巴（宁可不渲染）
+    const before = stable.slice(0, lastFence);
+    const blankBefore = [...before.matchAll(/\n[ \t]*\n/g)].pop();
+    stable = blankBefore ? before.slice(0, blankBefore.index! + blankBefore[0].length) : "";
+    tail = src.slice(stable.length);
+  }
+
+  return { stable, tail };
+}
+
+/**
+ * 判断一行是不是表格分隔行（|---|---|） */
 function isTableSep(line: string): boolean {
   return /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(line) && line.includes("-");
 }

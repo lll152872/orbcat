@@ -192,3 +192,15 @@ export function isTypingInInput(): boolean {
   const a = document.activeElement;
   return a instanceof HTMLTextAreaElement || a instanceof HTMLInputElement;
 }
+
+/**
+ * 「这次打开模型窗口是为了**添加**」的一次性意图位（面板 → 模型管理窗口）。
+ *
+ * 为什么走 `localStorage`：面板与模型窗口是**两个 webview**，面板手上没有
+ * "给对方发事件"的命令（后端只有 `models_window_open` / `models_window_close`），
+ * 但两者同源（`tauri://localhost`）—— `localStorage` 是共享的，当一次性信使正合适。
+ * 写入方 `main.ts`（openModelsAdd），消费方 `models.ts`（boot + window focus 各读一次，
+ * 读完立刻删）。**键名必须两边一致**，所以常量放这儿当唯一出处。
+ */
+export const MODELS_INTENT_KEY = "orbcat.models.intent";
+

@@ -72,6 +72,22 @@ pub struct Rule {
     pub label: String,
 }
 
+/// 动态规则的 label 前缀：**激活项目绑定目录**的授权（pmem 项目的 root_path）。
+///
+/// 这类规则**只活内存**，有三个硬约束：
+///   1. 不落盘 —— [`save_gate`] 会把它们滤掉（否则切走项目后文件里还留着授权）；
+///   2. 不进设置页列表 —— lib.rs 的 `perm_rules` 返回前滤掉（删不掉的规则
+///      摆在列表里只会让人困惑，项目面板里看绑定路径更直观）；
+///   3. 由 `refresh_project_dir_rules`（lib.rs）在启动 / 切项目 / 改路径时重建。
+///
+/// 没绑路径的项目 = 没有这条规则 = 没有额外授权（fail-closed）。
+pub const PROJECT_DIR_LABEL_PREFIX: &str = "项目目录「";
+
+/// 一条规则是否是**动态**的（见 [`PROJECT_DIR_LABEL_PREFIX`]）。
+pub fn is_dynamic_label(label: &str) -> bool {
+    label.starts_with(PROJECT_DIR_LABEL_PREFIX)
+}
+
 /// 拒绝原因
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenyReason {
@@ -167,6 +183,16 @@ impl PermissionGate {
     pub fn remove_rules_by_label(&mut self, label: &str) -> usize {
         let before = self.rules.len();
         self.rules.retain(|r| r.label != label);
+        before - self.rules.len()
+    }
+
+    /// 按谓词批量删除规则，返回删除条数。
+    ///
+    /// 给动态规则重建用：旧的项目目录规则可能来自**多个**项目（先切 A 再切 B），
+    /// 按 label 全等删不完，必须按前缀摘。
+    pub fn retain_rules(&mut self, keep: impl Fn(&Rule) -> bool) -> usize {
+        let before = self.rules.len();
+        self.rules.retain(keep);
         before - self.rules.len()
     }
 
@@ -456,7 +482,14 @@ pub fn load_gate(agent_data_dir: impl AsRef<Path>, app_dir: impl AsRef<Path>) ->
 pub fn save_gate(data_dir: &Path, gate: &PermissionGate) -> Result<PathBuf, String> {
     let path = rules_path(data_dir);
     let file = RulesFile {
-        rules: gate.export_rules(),
+        // ⚠️ 动态规则（激活项目目录授权）不落盘：它跟着「当前激活项目」走，
+        // 落了盘就变成永久授权 —— 切走项目也收不回来。重启后由
+        // `refresh_project_dir_rules` 按当时的激活项目重建。
+        rules: gate
+            .export_rules()
+            .into_iter()
+            .filter(|r| !is_dynamic_label(&r.label))
+            .collect(),
     };
     let txt = serde_json::to_string_pretty(&file).map_err(|e| format!("序列化失败: {e}"))?;
     std::fs::write(&path, txt).map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;

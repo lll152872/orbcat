@@ -2,29 +2,31 @@
 //!
 //! ## 为什么单独一份
 //! `sessions.rs` 只管**怎么存**（JSON 落盘、消息上限、工具结果折叠），
-//! 这里只管 **发什么给模型**（时间窗、轮数兜底）。两者正交：
-//! 存的是预算内的原文，发的是预算内的子集。
+//! 这里只管 **发什么给模型**（选取 + 文本化）。两者正交：
+//! 存的是落盘原文，发的是其中的消息序列。
 //!
 //! ⚠️ **这里不做任何"读取时加工"**。工具结果折叠已在落盘时完成
 //! （`sessions::append_turn`）—— 因为 prompt cache 按 token 前缀逐字节比对，
 //! 每轮读出来的历史必须字节稳定。唯一的例外是存量老数据（折叠上线前
 //! 落盘的原文 steps），见 [`to_chat_message`] 里的兜底。
 //!
-//! ## 选取规则（用户 2026-09-19 定案）
-//! ```text
-//!   带入 = (最近 WINDOW_HOURS 小时内的消息) ∪ (最近 FALLBACK_TURNS 轮)
-//! ```
-//! - **时间窗**给大方向：长时间没聊，之前的话题自然淡出
-//! - **轮数兜底**防断片：隔夜回来（时间窗外）至少还知道刚在说什么
+//! ## 选取规则（**用户 2026-10-07 定案：全量注入**）
 //!
-//! 用并集而不是二选一，是因为单靠时间窗会出现「昨天 22:00 聊到 23:50，
-//! 今天 15:00 回来一个字的上下文都不带」——那正是用户要避免的。
+//! 早先是「6 小时时间窗 ∪ 最近 10 条」的窗口筛选，**已废弃**：磁盘上
+//! （未压缩区间）有什么就回灌什么，顺序与落盘一致 —— 该怎么注入怎么注入。
 //!
-//! ## 更早的内容
-//! 被窗口挡掉的部分**不是丢弃**，而是留给模型自己用 [`crate::tools`] 的
-//! `recall_turns` 工具去查（原文永久留在 `sessions/<id>.json`）。
-//! 但模型得先知道"有东西可查"，所以 system prompt 尾部会追加一句告知
-//! （见 `agent::build_system_prompt` 的调用方）。
+//! 为什么敢全量 —— 预算有两道独立防线兜底：
+//! 1. 自动 compact（0.6 水位，持久化摘要）：`summary_upto` 之前的消息
+//!    不再逐条回灌，由摘要顶上（[`SUMMARY_HEADER`]）；
+//! 2. agent loop 内的 75% 硬裁剪（compact 失败时的最后一道闸）。
+//!
+//! 顺带的收益：时间窗滚动会让回灌前缀逐轮漂移，prompt cache 大面积失配；
+//! 全量注入的历史集合是**单调增长**的，前缀天然稳定。
+//!
+//! ## 模型查更早内容
+//! 被 compact 摘要覆盖的部分原文仍永久留在 `sessions/<id>.json`，
+//! 模型可用 [`crate::tools`] 的 `recall_turns` 工具查。system prompt 尾部
+//! 有对应告知（见 `agent::build_system_prompt`）。
 
 use crate::config::ModelConfig;
 use crate::llm::ChatMessage;
@@ -40,24 +42,9 @@ Use this to get up to speed, and continue helping the user as the AI agent.\n\
 Some contents may be omitted.\n\
 （以下是本会话较早内容的压缩摘要，供你恢复上下文；不是用户刚刚说的话。）";
 
-/// 时间窗：带多少小时内的对话
-pub const WINDOW_HOURS: u64 = 6;
-
-/// 轮数兜底：至少带最近这么多条消息（**消息条数**，不是对话轮次）
-///
-/// 用户口径是"前 10 条"，按消息条数算 —— 一问一答算 2 条。
-pub const FALLBACK_TURNS: usize = 10;
-
-/// 一条历史消息 + 它是否属于"当前活跃窗口"
-struct Picked {
-    msg: StoredMessage,
-    /// 由轮数兜底（而非时间窗）选中的老消息。
-    ///
-    /// 保留这个标记是为了让它可被观测/调试：折叠本身已在落盘时完成，
-    /// 不再区分力度（见 `sessions::append_turn` 的说明）。
-    #[allow(dead_code)]
-    fallback: bool,
-}
+/// 时间窗 / 轮数兜底已废弃（用户 2026-10-07 定案：全量注入）。
+/// 常量一并删除 —— 重新引入任何筛选前，先想清楚它对 prompt cache
+/// 前缀稳定性的破坏（见模块头注释）。
 
 /// 组装要回灌的历史消息（不含 system、不含当前这轮的输入）。
 ///
@@ -66,17 +53,17 @@ struct Picked {
 ///
 /// **compact 摘要**：若会话带 `summary` / `summary_upto`，则
 /// `messages[0..summary_upto]` 不再逐条回灌，改为在最前面插一条
-/// 摘要消息（[`SUMMARY_HEADER`] + 摘要正文）。摘要之后的区间照常按
-/// 时间窗 ∪ 轮数兜底选取。
-pub fn build_history(data_dir: &std::path::Path, session_id: &str, now_ms: u64) -> Vec<ChatMessage> {
+/// 摘要消息（[`SUMMARY_HEADER`] + 摘要正文）。摘要之后的区间**全量**回灌
+/// （用户 2026-10-07 定案，见模块头注释）。
+pub fn build_history(data_dir: &std::path::Path, session_id: &str) -> Vec<ChatMessage> {
     let Some(s) = sessions::load(data_dir, session_id) else {
         return Vec::new();
     };
 
-    // 被摘要覆盖的消息（messages[0..upto]）不再逐条回灌：
-    // 直接对**未摘要区间**套用时间窗 ∪ 轮数兜底，规则与原来一致。
+    // 被摘要覆盖的消息（messages[0..upto]）不再逐条回灌，
+    // 摘要之后的区间全量带上（顺序 = 落盘顺序）。
     let upto = s.summary_upto.unwrap_or(0).min(s.messages.len());
-    let picked = pick(&s.messages[upto..], now_ms);
+    let picked = pick(&s.messages[upto..]);
 
     let mut out: Vec<ChatMessage> = Vec::new();
     // 摘要放在最前（它在语义上"概括了更早的内容"，顺序上必须在所有存活消息之前）
@@ -85,68 +72,42 @@ pub fn build_history(data_dir: &std::path::Path, session_id: &str, now_ms: u64) 
             out.push(ChatMessage::system(format!("{SUMMARY_HEADER}\n\n{sum}")));
         }
     }
-    out.extend(picked.into_iter().filter_map(|p| {
+    out.extend(picked.into_iter().filter_map(|m| {
         // ⚠️ 空的助手消息不回灌（2026-09-26）。来源：「退出不丢轮」机制在开跑时
         // 落下的 `partial` 占位 —— 进程若在产出任何内容前被关掉，磁盘上就留着
         // 一条 `text=""`、`steps=[]` 的助手消息。把它喂给模型，部分厂商 API 会
         // 直接因"空 content"报 400。有 steps 的占位照常回灌（那是真实轨迹）。
-        let empty_assistant =
-            p.msg.role == "assistant" && p.msg.text.trim().is_empty() && p.msg.steps.is_empty();
+        let empty_assistant = m.role == "assistant" && m.text.trim().is_empty() && m.steps.is_empty();
         if empty_assistant {
             return None;
         }
-        Some(to_chat_message(p))
+        Some(to_chat_message(m))
     }));
     out
 }
 
-/// 挑出要回灌的消息（时间窗 ∪ 轮数兜底）
-fn pick(messages: &[StoredMessage], now_ms: u64) -> Vec<Picked> {
-    if messages.is_empty() {
-        return Vec::new();
-    }
-
-    let cutoff = now_ms.saturating_sub(WINDOW_HOURS * 60 * 60 * 1000);
-
-    // 从最新往回找"轮数兜底"的起点。一条"轮"= 一条用户消息，
-    // 但我们的上限按**消息条数**算（用户口径"前 10 条"），
-    // 所以直接取最后 FALLBACK_TURNS 条。
-    let fallback_start = messages.len().saturating_sub(FALLBACK_TURNS);
-
-    messages
-        .iter()
-        .enumerate()
-        .filter_map(|(i, m)| {
-            let in_window = m.at >= cutoff;
-            let in_fallback = i >= fallback_start;
-            if !in_window && !in_fallback {
-                return None;
-            }
-            Some(Picked {
-                msg: m.clone(),
-                // 靠兜底进来的（时间窗外）→ 标成 fallback，折叠更狠
-                fallback: !in_window,
-            })
-        })
-        .collect()
+/// 挑出要回灌的消息 —— **全量**（用户 2026-10-07 定案）。
+///
+/// 早先的「时间窗 ∪ 轮数兜底」筛选已删：磁盘顺序原样返回。保留这个函数
+/// 作为唯一的选取入口（`pick_window` / `build_history` 共用），将来若要
+/// 重新引入任何筛选规则，改这一处就够。
+fn pick(messages: &[StoredMessage]) -> Vec<StoredMessage> {
+    messages.to_vec()
 }
 
-/// **下一轮会喂给模型的那段上下文**（就是 [`pick`] 选出来的子集，按原顺序）。
+/// **下一轮会喂给模型的那段上下文**（与 [`build_history`] 同一选取口径）。
 ///
 /// 单独暴露出来是给 `sessions::fork` 用的：分叉的语义是"把下一轮的上下文
-/// 窗口截出来开一条新线"，所以它必须和回灌**共用同一套规则** —— 两边各写一份
-/// 迟早会不一致（改了窗口参数只改一处，分叉出来的上下文就和真实对话不符了）。
+/// 截出来开一条新线"。全量口径下它就是输入的全体 —— 保留这层封装是为了
+/// 让「回灌」与「分叉」继续共用同一份选取规则（两边各写一份迟早不一致）。
 ///
-/// 注意：传入的切片通常是某个前缀（分叉点之前的消息），选出来的最后一条
-/// 一定落在最近 [`FALLBACK_TURNS`] 条之内，所以**分叉点自己必然在里面**。
-pub fn pick_window(messages: &[StoredMessage], now_ms: u64) -> Vec<StoredMessage> {
-    pick(messages, now_ms).into_iter().map(|p| p.msg).collect()
+/// 注意：传入的切片通常是分叉点之前的前缀，所以结果天然以分叉点结尾。
+pub fn pick_window(messages: &[StoredMessage]) -> Vec<StoredMessage> {
+    pick(messages)
 }
 
 /// `StoredMessage` → `ChatMessage`
-fn to_chat_message(p: Picked) -> ChatMessage {
-    let m = p.msg;
-
+fn to_chat_message(m: StoredMessage) -> ChatMessage {
     // 有图的历史消息：**不带图本体**。
     // 历史里的图（截图等）重发代价极高（一张 base64 几百 KB，
     // 而且模型看到的往往是当时的瞬时画面，早过期了）。
@@ -867,7 +828,7 @@ mod tests {
 
     #[test]
     fn empty_history_yields_nothing() {
-        assert!(pick(&[], 100 * HOUR).is_empty());
+        assert!(pick(&[]).is_empty());
     }
 
     #[test]
@@ -877,27 +838,25 @@ mod tests {
             msg("user", "a", now - HOUR),
             msg("assistant", "b", now - HOUR + 1000),
         ];
-        let picked = pick(&msgs, now);
-        assert_eq!(picked.len(), 2, "1 小时前的内容在窗口内，应全带");
-        assert!(picked.iter().all(|p| !p.fallback));
+        let picked = pick(&msgs);
+        assert_eq!(picked.len(), 2, "全量口径：全部带入");
     }
 
     #[test]
-    fn window_excludes_old_but_fallback_keeps_recent_n() {
+    fn old_messages_are_included_too() {
+        // 旧「时间窗外就丢弃」的语义已废弃（2026-10-07 定案）：
+        // 很老的消息也要全量带入 —— 模型查不到才需要 recall_turns，
+        // 在上下文里的东西不该再靠工具捞。
         let now = 100 * HOUR;
-        // 20 条很老的消息（隔夜），时间窗全挡掉
         let mut msgs: Vec<StoredMessage> = (0..20)
             .map(|i| msg("user", &format!("老{i}"), now - 20 * HOUR + i))
             .collect();
-        // 一条刚刚的
         msgs.push(msg("user", "刚说的", now));
 
-        let picked = pick(&msgs, now);
-        // 时间窗带 1 条（刚说的），兜底带最后 10 条
-        assert_eq!(picked.len(), FALLBACK_TURNS, "应为兜底条数 FALLBACK_TURNS");
-        assert_eq!(picked.last().unwrap().msg.text, "刚说的");
-        // 靠兜底进来的应被标记
-        assert!(picked[0].fallback, "时间窗外的应标记 fallback");
+        let picked = pick(&msgs);
+        assert_eq!(picked.len(), 21, "全量口径：一条不丢");
+        assert_eq!(picked.first().unwrap().text, "老0", "最老的也在");
+        assert_eq!(picked.last().unwrap().text, "刚说的");
     }
 
     #[test]
@@ -909,14 +868,14 @@ mod tests {
             .collect();
         msgs.push(msg("assistant", "今天刚问的", now - 60_000));
 
-        let picked = pick(&msgs, now);
+        let picked = pick(&msgs);
         assert!(
-            picked.iter().any(|p| p.msg.text == "今天刚问的"),
+            picked.iter().any(|p| p.text == "今天刚问的"),
             "必须带上今天的消息，否则话题断片"
         );
         assert!(
-            picked.iter().any(|p| p.msg.text.starts_with("昨天")),
-            "兜底应把隔夜的话题拉回来"
+            picked.iter().any(|p| p.text.starts_with("昨天")),
+            "隔夜的话题同样全量带上"
         );
     }
 
@@ -931,7 +890,7 @@ mod tests {
         }];
         assert!(is_already_folded_line(&m.steps), "这形状就是折叠版");
 
-        let cm = to_chat_message(Picked { msg: m, fallback: false });
+        let cm = to_chat_message(m);
         let json = serde_json::to_string(&cm).unwrap();
         assert!(
             json.contains("[已执行：read_file、grep_files（共 2 次工具调用）]"),
@@ -965,7 +924,7 @@ mod tests {
                 detail: "TODO_HIT_MARKER".into(),
             },
         ];
-        let cm = to_chat_message(Picked { msg: m, fallback: false });
+        let cm = to_chat_message(m);
         let json = serde_json::to_string(&cm).unwrap();
         assert!(
             json.contains("FILE_BODY_MARKER"),
@@ -1021,7 +980,7 @@ mod tests {
             name: None,
             detail: "思考内容".into(),
         }];
-        let cm = to_chat_message(Picked { msg: m, fallback: false });
+        let cm = to_chat_message(m);
         let json = serde_json::to_string(&cm).unwrap();
         assert!(!json.contains("已执行"), "无工具调用不应有折叠行: {json}");
         assert!(json.contains("我想了想"));
@@ -1031,8 +990,7 @@ mod tests {
     fn images_become_path_note_not_base64() {
         let mut m = msg("user", "看这个", 100);
         m.images = vec!["D:\\x\\a.png".into(), "D:\\x\\b.png".into()];
-        let p = Picked { msg: m, fallback: false };
-        let cm = to_chat_message(p);
+        let cm = to_chat_message(m);
 
         // ChatMessage 的 content 是 MessageContent，序列化出来看
         let json = serde_json::to_string(&cm).unwrap();
@@ -1053,7 +1011,7 @@ mod tests {
             .as_millis() as u64;
 
         // 造一个会话：一条聊 venera，一条聊 apidash
-        let s = sessions::new_session(&d);
+        let s = sessions::new_session(&d, "standard");
         sessions::append_turn(&d, "改一下 venera 的跳页 bug", &[], "好的", &[]).unwrap();
         sessions::append_turn(&d, "另外 apidash 的构建也看看", &[], "行", &[]).unwrap();
 
@@ -1097,21 +1055,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-
-        let s = sessions::new_session(&d);
+        let s = sessions::new_session(&d, "standard");
         sessions::append_turn(&d, "第一问", &[], "第一答", &[]).unwrap();
 
-        let msgs = build_history(&d, &s.id, now);
+        let msgs = build_history(&d, &s.id);
         assert_eq!(msgs.len(), 2, "一问一答应回灌 2 条");
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
 
         // 不存在的会话 → 空（不能 panic）
-        assert!(build_history(&d, "nope", now).is_empty());
+        assert!(build_history(&d, "nope").is_empty());
 
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1201,12 +1154,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-
-        let s = sessions::new_session(&d);
+        let s = sessions::new_session(&d, "standard");
         sessions::append_turn(&d, "第一问", &[], "第一答", &[]).unwrap();
         sessions::append_turn(&d, "第二问", &[], "第二答", &[]).unwrap();
 
@@ -1216,8 +1164,8 @@ mod tests {
         sess.summary_upto = Some(2);
         sessions::save(&d, &sess).unwrap();
 
-        let msgs = build_history(&d, &s.id, now);
-        // 期望：1 条摘要（system）+ 摘要之后的消息（第二问/第二答，若在窗口内）
+        let msgs = build_history(&d, &s.id);
+        // 期望：1 条摘要（system）+ 摘要之后的消息（第二问/第二答，全量回灌）
         let first = serde_json::to_string(&msgs[0]).unwrap();
         assert!(first.contains("summary") || first.contains("Summary"), "首条应是摘要: {first}");
         assert!(first.contains("第一件事"), "摘要正文应带上: {first}");
@@ -1236,7 +1184,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
 
-        let s = sessions::new_session(&d);
+        let s = sessions::new_session(&d, "standard");
         sessions::append_turn(&d, "q1", &[], "a1", &[]).unwrap();
         sessions::append_turn(&d, "q2", &[], "a2", &[]).unwrap();
 
@@ -1260,7 +1208,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
 
-        let s = sessions::new_session(&d);
+        let s = sessions::new_session(&d, "standard");
         sessions::append_turn(&d, "q1", &[], "a1", &[]).unwrap();
         sessions::append_turn(&d, "q2", &[], "a2", &[]).unwrap();
 

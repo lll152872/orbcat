@@ -154,6 +154,19 @@ pub fn bootstrap_agent_data(data_dir: &Path) -> Result<BootstrapReport, String> 
         created_files.push(crate::modes::MODES_FILE.into());
     }
 
+    // ── 三之三、life.json（数据源定义）──────────────────────────
+    // 与 modes.json 同一条理由：文件不存在时用户看不见有这回事，
+    // 也就不会想到"我可以接一个爬虫快照进来"。落一份**带完整 schema 说明**
+    // 的模板（但 sources 为空 —— 默认不接任何源，不替用户决定读什么）。
+    let life_file = data_dir.join(crate::life::LIFE_FILE);
+    if life_file.exists() {
+        skipped.push(crate::life::LIFE_FILE.into());
+    } else {
+        std::fs::write(&life_file, crate::life::default_file_text())
+            .map_err(|e| format!("写入 {} 失败: {e}", life_file.display()))?;
+        created_files.push(crate::life::LIFE_FILE.into());
+    }
+
     // ── 四、说明性文件（骨架，不覆盖）────────────────────────────
     // 这几个是「给未来的 agent 和用户看的格式说明」，不是人格文件。
     // 人格文件（RULES/SOUL/IDENTITY/USER）故意**不在这里建**：
@@ -451,13 +464,28 @@ mod tests {
         let r = bootstrap_agent_data(&d).expect("二次初始化应成功");
         assert!(r.created_dirs.is_empty(), "不该重复建目录");
         assert!(r.created_files.is_empty(), "不该重复写文件");
-        assert_eq!(
-            r.skipped.len(),
-            21,
-            "8 目录 + 7 骨架/配置文件 + 6 内置技能文件 应全跳过: {:?}",
-            r.skipped
-        );
-        // 用户改过的模式定义同样不能被覆盖（与 settings.json 同一条铁律）
+        // 数**目录**与**已知配置文件**，不写死总数 ——
+        // 写死总数的话每加一个骨架文件都要来改这一行，而改的人很容易
+        // 顺手把数字改对了却没意识到自己可能漏了真正的断言。
+        for name in DIRS {
+            assert!(r.skipped.iter().any(|s| s == name), "目录 {name} 应跳过: {:?}", r.skipped);
+        }
+        for name in [
+            "models.json",
+            "settings.json",
+            "modes.json",
+            crate::life::LIFE_FILE,
+            "memory/MEMORY.md",
+            "skills/README.md",
+            "pending/README.md",
+            "projects/README.md",
+        ] {
+            assert!(
+                r.skipped.iter().any(|s| s == name),
+                "{name} 应进跳过列表: {:?}",
+                r.skipped
+            );
+        }
         assert!(
             r.skipped.iter().any(|s| s == "modes.json"),
             "modes.json 应进跳过列表: {:?}",
@@ -491,7 +519,9 @@ mod tests {
         assert!(p.exists(), "初始化应写出 modes.json");
         let modes = crate::modes::load(&d);
         let ids: Vec<&str> = modes.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["standard", "ptc", "minimal", "creator"]);
+        // 第三个内置模式是「闲聊」（2026-10-08 取代了「极简」：
+        // 机制相同 = 不给外部工具组，闲聊多了发图能力与场景上下文）
+        assert_eq!(ids, vec!["standard", "ptc", "chat", "creator"]);
         // 写出来的文件必须是**能解析回来**的（注释块不能把它弄坏）
         assert!(modes.iter().any(|m| m.id == "ptc" && m.allows_all()));
 

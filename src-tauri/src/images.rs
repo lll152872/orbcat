@@ -69,6 +69,30 @@ fn ext_for_mime(mime: &str) -> &'static str {
     }
 }
 
+/// 可能是**动图**的扩展名。
+///
+/// 这些**不能**走"解码 → 缩放 → 重编码"那条路：`image` crate 对 GIF /
+/// 动态 WebP 只解**第一帧**，动画会整个丢掉。
+///
+/// 只看扩展名、不嗅探内容：多一次解码去判格式反而更贵，而这两种扩展名
+/// 基本就等价于"可能是动的"。
+fn is_animated_ext(p: &Path) -> bool {
+    matches!(
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default()
+            .as_str(),
+        "gif" | "webp"
+    )
+}
+
+/// 动图**原样送**的体积上限（8 MB）。
+///
+/// 超了就退回静态首帧 —— 整份 base64 进 IPC 和 DOM 会把面板拖住，
+/// 那比"动不了"更糟。8 MB 对聊天表情包足够宽裕。
+const ANIM_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
 fn mime_for_ext(path: &Path) -> &'static str {
     match path
         .extension()
@@ -174,20 +198,57 @@ pub fn placeholder_note(paths: &[String], data_dir: &Path) -> String {
     )
 }
 
-/// 缩略图 data URL —— 前端渲染历史消息里的图片用。
+/// 缩略图 / 正文图 data URL —— 前端渲染历史消息、模型回复里的图片用。
 ///
 /// 为什么走命令而不是 asset protocol：省掉 tauri.conf 的 scope 配置与权限坑，
-/// 且缩到 320px 后单张只有几十 KB，IPC 传输无压力。
+/// 且缩到几百 px 后单张只有几十 KB，IPC 传输无压力。
+///
+/// ## 编码格式按**有没有 alpha** 分流（2026-10-08 改）
+///
+/// 以前一律 `to_rgb8()` + JPEG。JPEG 不支持 alpha，所以透明底会被压成**黑色**
+/// —— 用户附图是截图时看不出来，但模型开始发表情包之后，透明底的表情包
+/// 会一片黑，看着像图坏了。
+///
+/// 现在：带 alpha → PNG 保透明；不带 → 仍走 JPEG（同等观感体积只有 PNG 的
+/// 1/6，vision 请求快很多，这条优化不能丢）。
+///
+/// ## 动图**原样送**（2026-10-08）
+///
+/// GIF / 动态 WebP 走一条**不经 `image` crate** 的近路：整个文件的字节直接
+/// base64。因为下面那条路会 `image::open` + `thumbnail` + 重编码，而
+/// `image` crate 对动图**只解第一帧**，动画就没了 —— 表情包大量是动图，
+/// 发出去不动等于废掉一半。
+///
+/// 好消息：**data URL 里的 GIF 浏览器照样播放**，不需要 asset protocol
+/// 或 blob URL，原样 base64 就够。
+///
+/// 代价是不缩放（整份字节进 IPC / DOM），所以用 [`ANIM_MAX_BYTES`] 兜底。
 pub fn thumb_data_url(path: &str, max_edge: u32) -> Result<String, String> {
+    let p = Path::new(path);
+    if is_animated_ext(p)
+        && std::fs::metadata(p)
+            .map(|m| m.len())
+            .unwrap_or(u64::MAX)
+            <= ANIM_MAX_BYTES
+    {
+        let bytes = std::fs::read(p).map_err(|e| format!("读图失败: {e}"))?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        return Ok(format!("data:{};base64,{b64}", mime_for_ext(p)));
+    }
+
     let img = image::open(path).map_err(|e| format!("读图失败: {e}"))?;
     let thumb = img.thumbnail(max_edge, max_edge);
     let mut buf = std::io::Cursor::new(Vec::new());
-    // JPEG 不支持 alpha：先转 RGB 再编码，否则 RGBA 图会编码失败
-    image::DynamicImage::ImageRgb8(thumb.to_rgb8())
-        .write_to(&mut buf, image::ImageFormat::Jpeg)
+    let (fmt, mime) = if thumb.color().has_alpha() {
+        (image::ImageFormat::Png, "png")
+    } else {
+        (image::ImageFormat::Jpeg, "jpeg")
+    };
+    thumb
+        .write_to(&mut buf, fmt)
         .map_err(|e| format!("编码缩略图失败: {e}"))?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
-    Ok(format!("data:image/jpeg;base64,{b64}"))
+    Ok(format!("data:image/{mime};base64,{b64}"))
 }
 
 #[cfg(test)]
@@ -253,6 +314,55 @@ mod tests {
         assert!(parse_data_url("not-a-url").is_none());
         // 非 base64 编码的 data URL 也不收
         assert!(parse_data_url("data:text/plain,hello").is_none());
+    }
+
+    /// 带 alpha 的源图必须编码成 PNG —— JPEG 会把透明底压成黑（2026-10-08）。
+    ///
+    /// 表情包大量是透明 PNG，这条就是"发表情包不变黑"的回归闸门。
+    #[test]
+    fn transparent_source_encodes_as_png() {
+        let d = tmp("alpha");
+        // 全透明红：如果走了 JPEG，解码回来会变成不透明的黑
+        let img = image::RgbaImage::from_fn(64, 64, |_x, _y| image::Rgba([255, 0, 0, 0]));
+        let p = d.join("alpha.png");
+        img.save(&p).unwrap();
+
+        let thumb = thumb_data_url(&p.to_string_lossy(), 320).unwrap();
+        assert!(
+            thumb.starts_with("data:image/png;base64,"),
+            "带 alpha 的源图应输出 PNG，实际前缀 {}",
+            &thumb[..30.min(thumb.len())]
+        );
+
+        // 光看 data URL 前缀不够：解码回来确认真有 alpha 通道
+        let (_, b64) = thumb.split_once(',').unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert!(decoded.color().has_alpha(), "PNG 输出必须保留 alpha 通道");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// GIF 必须**逐字节原样送**，不能被解码重编码。
+    ///
+    /// 走静态那条路的话 `image` crate 只解第一帧 → 动图变静图。
+    /// 这里不造真 GIF（编码器要额外 feature），直接写任意字节 + `.gif` 扩展名：
+    /// 原样分支不看内容，所以"字节完全一致"就证明了它没经过解码。
+    #[test]
+    fn gif_passes_through_byte_for_byte() {
+        let d = tmp("gif");
+        let raw: Vec<u8> = (0u8..=255).collect();
+        let p = d.join("a.gif");
+        std::fs::write(&p, &raw).unwrap();
+
+        let url = thumb_data_url(&p.to_string_lossy(), 320).unwrap();
+        assert!(url.starts_with("data:image/gif;base64,"), "{url}");
+
+        let (_, b64) = url.split_once(',').unwrap();
+        let back = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        assert_eq!(back, raw, "动图必须原样送（解码重编码会丢掉动画帧）");
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

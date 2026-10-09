@@ -15,7 +15,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { mdToHtml } from "./markdown";
+import { mdToHtml, splitStable } from "./markdown";
+import { MAX_BUBBLES, splitBubbles } from "./bubble";
 // 纯格式化/工具函数已抽到 format.ts（2026-09-30 拆模块，见该文件头部说明）。
 // 这里集中 re-import，避免散落各处 import 语句。
 import {
@@ -34,13 +35,13 @@ import {
 import {
   capAppend,
   esc,
-  escMd,
   fmtAuditTime,
   fmtTime,
   fmtTokens,
   isTypingInInput,
   leafName,
   localDateKey,
+  MODELS_INTENT_KEY,
   shortHost,
   stripStepFolds,
   summarizeArgs,
@@ -63,9 +64,9 @@ interface SearchStatus {
   path: string;
 }
 
+/** 模型身份 = (Base URL, 接口 id)；同 id 可跨组共存，显示名已废弃 */
 interface ModelView {
   id: string;
-  name: string;
   vendor: string;
   url: string;
   supportsToolCall: boolean;
@@ -102,6 +103,18 @@ interface AgentStep {
    * （见 `sessions.rs` 的 `attach_steer_images`）。
    */
   images?: string[];
+  /**
+   * 工具返回预览 —— **只有已配对的 `tool_call` 条目**才有这个字段。
+   *
+   * 为什么存在：后端落盘是 `tool_call` + `tool_result` 两条（`agent.rs` 工具循环），
+   * 时间线上就是两行（`🔧 列目录` / `✅ 列目录`）。用户 2026-10-02 要求
+   * **一条工具只占一行**，所以前端读盘 / 收流时用 `pairToolSteps()` 把返回并进
+   * 调用条目里（`detail` 仍是参数），渲染成一行、点开才看参数与返回。
+   *
+   * ⚠️ 只在**前端**合并，不落盘 —— `AgentStep` 的磁盘形态（Rust `StoredStep`）
+   *    保持 kind/name/detail 三条；合并发生在前端的内存条目上。
+   */
+  result?: string;
 }
 
 interface AgentRun {
@@ -269,6 +282,15 @@ interface Session {
   forkedFrom?: string;
   /** 分叉点：源会话里的第几条消息 */
   forkAt?: number;
+  /**
+   * 这条会话**自己的** Agent 模式 id（2026-10-08）。
+   *
+   * 用户定案："模式跟会话走，一个会话模式不能变"。建会话时定死，之后只读。
+   * 老会话（升级前建的）磁盘上没这个字段 → Rust 侧兜到内置默认
+   * （`modes::DEFAULT_MODE_ID` = standard），所以这里在切到老会话后可能短暂是
+   * undefined —— 真正判定模式一律走 `currentModeId()`（它自己带兜底）。
+   */
+  mode?: string;
 }
 
 interface SessionMeta {
@@ -282,6 +304,8 @@ interface SessionMeta {
   kind: "main" | "task" | "fork";
   /** 已挂靠的项目名（右键挂靠后显示） */
   projectName?: string | null;
+  /** 这条会话的模式 id（Rust `SessionMeta.mode` 必给：老会话回退成默认模式） */
+  mode: string;
 }
 
 interface SessionState {
@@ -361,11 +385,14 @@ function sessionToEntries(s: Session): ChatEntry[] {
     ) {
       return;
     }
-    // 时间线条目：给 steer 条目补上插话的图（按 steerId = 条目 name 对齐）
-    const items = m.steps?.map((st) =>
-      st.kind === "steer" && st.name && !(st.images && st.images.length)
-        ? { ...st, images: steerImages.get(st.name) }
-        : st,
+    // 时间线条目：给 steer 条目补上插话的图（按 steerId = 条目 name 对齐）；
+    // 再把 `tool_call` + 同名 `tool_result` 并成一条（2026-10-02：一个工具只占一行）。
+    const items = pairToolSteps(
+      m.steps?.map((st) =>
+        st.kind === "steer" && st.name && !(st.images && st.images.length)
+          ? { ...st, images: steerImages.get(st.name) }
+          : st,
+      ),
     );
     out.push({
       role: m.role,
@@ -412,6 +439,10 @@ async function loadSession(): Promise<void> {
     currentSessionId = st.session.id;
     sessionList = st.list;
     entries = sessionToEntries(st.session);
+    // 模式跟会话走 → 启动时按**当前这条会话**的模式拉一次（而不是全局默认）。
+    // 必须 await：`renderMessagesInner` 里的 `isChattyMode()` 要它 ——
+    // 拿默认模式顶替的话，闲聊会话的历史消息会画成一整块而不是泡泡。
+    await loadModes(currentSessionId);
   } catch (e) {
     console.error("[orbcat] 读取会话失败:", e);
   }
@@ -422,15 +453,28 @@ function ensureSessionLoaded(): Promise<void> {
   return sessionLoaded;
 }
 
-/** 开新会话 → 挂到**当前激活项目**（主对话则不绑） */
-async function newSession(): Promise<void> {
+/**
+ * 开新会话 → 挂到**当前激活项目**（主对话则不绑）。
+ *
+ * `mode` = 这条会话的模式 id（2026-10-08，模式跟会话走）。不传就用
+ * `defaultModeId` —— 它是**编译期常量级别的"标准模式"**，不是用户可配项
+ * （`settings.activeMode` 已删：界面上没有改它的入口，留着就是个会撒谎的死字段）。
+ * 「新建项目…」这类非显式选模式的路径自然也落在标准模式上。
+ *
+ * ⚠️ 模式**只在建的时候**给，建完就钉死（用户定案"一个会话模式不能变"）——
+ * 所以这个参数**没有**对应的"改"接口，别在这里加"切模式"的分支。
+ */
+async function newSession(mode?: string): Promise<void> {
   // 多会话并行 run：新建会话**放行**（后端也不拦）—— 新会话不碰别的会话，
   // 而且你很可能正是因为"这边跑着、我还要开个新任务"才点它。
   try {
-    const s = await invoke<Session>("session_new");
+    const want = mode ?? defaultModeId ?? "standard";
+    const s = await invoke<Session>("session_new", { mode: want });
     currentSessionId = s.id;
     entries = [];
     await refreshSessionList();
+    // 新会话的模式可能跟上一个不同 → 模式缓存（含 MCP 组视图）要跟着这条会话重拉
+    await loadModes(s.id);
     // 只绑**这一条新会话**，不动其它
     if (activeProjectId != null) {
       await invoke("pmem_bind_session", {
@@ -442,6 +486,7 @@ async function newSession(): Promise<void> {
     view = "chat";
     renderBody();
     syncBusyUi();
+    showToast(`已新建「${currentModeName()}」会话`, "ok", 2200);
   } catch (e) {
     pushEntry("error", `新建会话失败：${e}`);
   }
@@ -464,6 +509,10 @@ async function switchSession(id: string): Promise<void> {
       entries.pop();
     }
     await refreshSessionList();
+    // 模式跟会话走 → 切会话可能换了模式，模式缓存（含 MCP 组视图）要重拉。
+    // ⚠️ 必须 `await`：`isChattyMode()` 依赖它，慢了会把上一条会话的
+    //    「闲聊/非闲聊」判定带进这一条（泡泡会画错）。
+    await loadModes(id);
     await loadProjects();
     await refreshSessionProjectTags();
     const meta = sessionList.find((x) => x.id === id);
@@ -754,6 +803,65 @@ function installDeleteHandlers(): void {
 }
 
 /**
+ * 「编辑」按钮的事件委托 —— 与删除同款挂法（document 委托，重绘不用重绑）。
+ */
+function installEditHandlers(): void {
+  document.addEventListener("click", (e) => {
+    const t = e.target as HTMLElement;
+    const btn = t.closest<HTMLElement>(".msg-edit");
+    if (!btn) return;
+    e.stopPropagation();
+    const upto = Number(btn.dataset.upto);
+    if (!Number.isFinite(upto) || upto < 0) return;
+    void editUserMessage(upto);
+  });
+}
+
+/**
+ * 编辑并重发一条用户消息：确认 → 截断（含其后全部回复）→ 原文放回输入框。
+ *
+ * 为什么要确认框：它会连坐删掉后面的 AI 回复且不可恢复 —— 与「删除」同级
+ * 危险，只是多还你一步「原文放回输入框」。`refillInput` 在输入框已有草稿时
+ * 是**追加**不是覆盖，不会吃掉用户正在打的字。
+ */
+async function editUserMessage(upto: number): Promise<void> {
+  if (busy) {
+    showToast("对话进行中，先停止或等它结束再编辑消息", "error");
+    return;
+  }
+  // 要丢弃的条数（磁盘上 [upto..]）；读不到就按"含本条"最少 1 条提示
+  let total = 1;
+  try {
+    const st = await invoke<SessionState>("session_state");
+    total = Math.max(1, st.session.messages.length - upto);
+  } catch {
+    // 读不到会话状态就按最少 1 条提示，不拦操作
+  }
+  const who = entries.find((e) => e.storedIdx === upto);
+  const head = (who?.text ?? "").replace(/\s+/g, " ").slice(0, 40);
+  const ok = await askConfirm(
+    "编辑并重发这条消息？",
+    `「${head}${who && who.text.length > 40 ? "…" : ""}」\n它后面的 ${
+      total - 1
+    } 条回复会被一并丢弃，原文放回输入框。此操作不可恢复。`,
+    "编辑并重发",
+  );
+  if (!ok) return;
+  try {
+    const s = await invoke<Session>("session_truncate", { upto });
+    currentSessionId = s.id;
+    entries = sessionToEntries(s);
+    await refreshSessionList();
+    view = "chat";
+    renderBody();
+    if (who?.text) refillInput(who.text);
+    showToast("已截断，原文已放回输入框（改完回车重发）", "ok");
+  } catch (e) {
+    showToast(`编辑失败：${e}`, "error");
+  }
+}
+
+/**
  * 重新生成：丢掉这条 AI 回复（及其后全部），把上一句用户提问重发一遍。
  *
  * 为什么不新写后端命令：截断用现成的 `session_truncate`（语义一致 + 自带
@@ -931,6 +1039,22 @@ function renderSessionsView(): string {
   const projTag = (name?: string | null): string =>
     name ? `<span class="sess-proj" title="项目：${esc(name)}">📁 ${esc(name)}</span>` : "";
 
+  /**
+   * 这条会话的 Agent 模式标记（2026-10-08 加）。
+   *
+   * 为什么摆在一行 meta 的最后而不是标题行：标题行已经有 分支/项目/当前 三个标，
+   * 再塞一个会把标题挤没（`.sess-title` 是省略号截断的）。
+   * 默认模式**不标** —— 它是绝大多数会话的状态，每条都标等于纯噪声；
+   * 只有"跟默认不一样"的会话才值得一眼看出来。
+   */
+  const modeTag = (id: string): string => {
+    if (!id || id === defaultModeId) return "";
+    const nm = modesCache.find((x) => x.id === id)?.name ?? id;
+    return ` · <span class="sess-mode" title="Agent 模式：${esc(nm)}（建会话时定，不能改）">${
+      MODE_ICON[id] ?? "🧩"
+    } ${esc(nm)}</span>`;
+  };
+
   const itemRow = (s: SessionMeta): string => `
       <div class="sess-item${s.current ? " cur" : ""}" data-id="${esc(s.id)}" title="右键挂靠到项目">
         <button class="sess-open" data-id="${esc(s.id)}" title="切换到该会话">
@@ -940,7 +1064,7 @@ function renderSessionsView(): string {
             ${projTag(s.projectName)}
             ${s.current ? '<span class="sess-cur-tag">当前</span>' : ""}
           </span>
-          <span class="sess-meta">${fmtTime(s.updatedAt)} · ${s.count} 条</span>
+          <span class="sess-meta">${fmtTime(s.updatedAt)} · ${s.count} 条${modeTag(s.mode)}</span>
         </button>
         ${s.kind === "main" ? "" : `<button class="sess-del" data-id="${esc(s.id)}" title="删除该会话">✕</button>`}
       </div>`;
@@ -1025,24 +1149,89 @@ function closeOnOutsideClick(close: () => void): void {
   setTimeout(() => window.addEventListener("click", close, { once: true }), 0);
 }
 
-function showNewMenu(x: number, y: number): void {
+/**
+ * 「＋」菜单 —— **新建会话时选模式**（2026-10-08 从「设置 › 行为」挪过来）。
+ *
+ * 为什么模式住在这里而不是设置页（用户定案：“b 从设置页挪到一个‘新建会话时选模式’
+ * 的入口 默认是标准”）：
+ * - 模式**跟会话走**、建完就钉死（“一个会话模式不能变”）—— 它不是一个能随时
+ *   回来改的“设置”，而是**建会话时的一个参数**。摆在设置页里既放错位置，
+ *   又暗示“随时能改”，用户改完发现当前会话没变才是真疑惑。
+ * - 菜单里显式列出每个模式（而不是“新建会话 + 事后切”），因为**没有事后切**。
+ *
+ * 「新建项目…」建完项目后**原地再弹一次这个菜单**：项目建好了、会话还没建，
+ * 而模式必须在建会话那一刻定 —— 不能替用户默认掉，否则他想开个闲聊项目会话
+ * 就得把刚建的会话删掉重来。
+ *
+ * ⚠️ 菜单里**不能**放“修改默认模式”。默认值 = **标准模式**（`modes::DEFAULT_MODE_ID`，
+ * 编译期常量）：`settings.activeMode` 已删 —— 用户 2026-10-08 看到「闲聊」被标成
+ * 「默认」就是因为那个字段（他早先在设置页切过闲聊），而他要的是"标准是默认"。
+ * 界面上没有了改默认值的入口，就别再把默认值做成可配项。
+ */
+async function showNewMenu(x: number, y: number): Promise<void> {
+  // 打开前重拉一次：`modes.json` 用户是可以手编的（热重载），菜单得跟上
+  await loadModes(currentSessionId);
   document.getElementById("new-ctx")?.remove();
   const menu = document.createElement("div");
   menu.id = "new-ctx";
   menu.className = "ctx-menu";
+
+  // 默认模式排最前并打「默认」标 —— 用户要在列表里一眼看到不选会落到哪
+  const def = defaultModeId;
+  const ordered = [...modesCache].sort((a, b) =>
+    a.id === def ? -1 : b.id === def ? 1 : 0,
+  );
+  const modeItems = ordered.length
+    ? ordered
+        .map((m) => {
+          // 模式里写了 MCP 里不存在的组名 → 这行**必须**看得见。
+          // （2026-10-08 之前这个提示长在「设置 › 行为」的模式卡片上，
+          //   模式选择器搬进菜单后一并跟过来；丢了它就是"手编 modes.json 打错组名
+          //   却毫无反馈"，那种静默失效最难查。）
+          const bad = m.unknownGroups.length
+            ? `<div class="ctx-sub">⚠️ 模式里写了不存在的组：${m.unknownGroups
+                .map((u) => esc(u))
+                .join("、")}</div>`
+            : "";
+          return `
+      <div class="ctx-item" data-act="sess" data-mode="${esc(m.id)}" title="${esc(
+        m.description,
+      )}">
+        <div class="ctx-row"><span class="ctx-item-ico">${
+          MODE_ICON[m.id] ?? "🧩"
+        }</span><span class="ctx-item-name">${esc(m.name)}</span>${
+          m.id === def ? `<span class="ctx-item-note">默认</span>` : ""
+        }</div>${bad}
+      </div>`;
+        })
+        .join("")
+    : // 读不到 modes.json 也得能开新会话 —— mode 传空让后端退回默认模式
+      `<div class="ctx-item" data-act="sess" data-mode="">
+        <div class="ctx-row"><span class="ctx-item-ico">＋</span><span class="ctx-item-name">新建会话</span></div>
+      </div>`;
+
   menu.innerHTML = `
-    <div class="ctx-item" data-act="sess">新建会话</div>
-    <div class="ctx-item" data-act="proj">新建项目…</div>`;
-  menu.style.left = `${Math.min(x, window.innerWidth - 160)}px`;
-  menu.style.top = `${Math.min(y, window.innerHeight - 100)}px`;
+    <div class="ctx-title">新建会话 · 选个模式（建完不能改）</div>
+    ${modeItems}
+    <div class="ctx-sep"></div>
+    <div class="ctx-item" data-act="proj">
+      <div class="ctx-row"><span class="ctx-item-ico">📁</span><span class="ctx-item-name">新建项目…</span></div>
+    </div>`;
   document.body.appendChild(menu);
+  // 宽高要**先入 DOM 再量**：模式数是 JSON 里定的，提前算高度只会在加模式时错位
+  menu.style.left = `${Math.max(4, Math.min(x, window.innerWidth - menu.offsetWidth - 4))}px`;
+  menu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - menu.offsetHeight - 4))}px`;
+
   const close = (): void => menu.remove();
   menu.addEventListener("click", async (e) => {
     const t = (e.target as HTMLElement).closest<HTMLElement>(".ctx-item");
     if (!t) return;
+    const act = t.dataset.act;
+    const mode = t.dataset.mode;
     close();
-    if (t.dataset.act === "sess") {
-      void newSession();
+    if (act === "sess") {
+      // 空串 → undefined → `newSession` 用 `defaultModeId`
+      void newSession(mode || undefined);
       return;
     }
     const got = await askFields(
@@ -1062,9 +1251,10 @@ function showNewMenu(x: number, y: number): void {
       await loadProjects();
       activeProjectId = p.id;
       await invoke("pmem_set_active", { id: p.id }).catch(() => {});
-      await newSession(); // 新会话会绑到 p.id
       await refreshSessionProjectTags();
-      showToast(`已创建「${p.name}」并打开新会话`, "ok");
+      showToast(`已创建「${p.name}」，再选个模式开新会话`, "ok", 2600);
+      // 项目就位、会话还没建 → 原地重开菜单让用户定模式（新会话会绑到 p.id）
+      void showNewMenu(x, y);
     } catch (err) {
       showToast(`创建项目失败：${err}`, "error");
     }
@@ -1079,6 +1269,11 @@ function showNewMenu(x: number, y: number): void {
 // 那三颗 chip 的刷新函数已随之删除 —— 状态由 `renderBehaviorView` 现算，
 // 不再需要"状态变了刷新 chip"的钩子。
 // ⚠️ **不要**重新往输入行塞设置类控件 —— 那正是被否掉的做法。
+//
+// 2026-10-08 二次搬迁：**Agent 模式离开设置页**，挪进「＋」菜单的「新建会话」里
+// （用户定案："b 从设置页挪到一个'新建会话时选模式'的入口 默认是标准"）。
+// 理由：模式跟会话走、建完就钉死 —— 它根本不是一个"设置"，而是**建会话时的一个参数**，
+// 摆在设置页里既放错了地方，又暗示"随时能改"。
 
 /** 切换「后台执行」到指定状态（设置页的复选框用） */
 async function setBgDesk(on: boolean): Promise<void> {
@@ -1093,26 +1288,31 @@ async function setBgDesk(on: boolean): Promise<void> {
   }
 }
 
-/** 切换模式：调后端 → 刷新缓存。失败要说出来（不能静默留在旧模式）。 */
-async function applyModeChange(id: string): Promise<void> {
-  if (id === activeModeId) return;
+/**
+ * 拉一次模式表（启动、切会话后、打开「＋」菜单前都调）。
+ *
+ * `sessionId` 决定 `activeModeId` 是**哪条会话**的模式：
+ * 传了就按它算，没传就用全局默认。模式跟会话走之后（2026-10-08），
+ * 所有"当前是什么模式"的判断都得带上会话，否则会把默认模式当成当前模式。
+ *
+ * ⚠️ `modesStamp` 是**乱序保护**：启动时先发了一条不带会话的（拿默认模式），
+ * 紧接着 `loadSession()` 又发了一条带会话的。两条都是网络往返，回来顺序不保证 ——
+ * 晚到的那条会把 `activeModeId` 覆盖成错的值，然后 `isChattyMode()` 就判错，
+ * 闲聊会话的历史消息会画成一整块。只认最后一次发出的请求。
+ */
+let modesStamp = 0;
+async function loadModes(sessionId?: string): Promise<void> {
+  const my = ++modesStamp;
   try {
-    const saved = await invoke<string>("modes_set", { id });
-    activeModeId = saved || id;
-    const m = modesCache.find((x) => x.id === activeModeId);
-    showToast(`已切到 ${m?.name ?? activeModeId}`, "ok", 2400);
-    // 切模式会改活跃组 → MCP 页/权限卡上显示的组状态跟着变
-    await loadModes();
-  } catch (err) {
-    showToast(`切换模式失败：${err}`, "error");
-  }
-}
-
-/** 拉一次模式表（启动、切模式后、打开菜单前都调） */
-async function loadModes(): Promise<void> {
-  try {
-    const r = await invoke<{ activeMode: string; modes: ModeView[] }>("modes_get");
+    const r = await invoke<{ activeMode: string; defaultMode?: string; modes: ModeView[] }>(
+      "modes_get",
+      // `|| null` 而不是 `?? null`：`currentSessionId` 在会话加载完成前是**空串**，
+      // 空串会被 Rust 当成 `Some("")` 去查一条不存在的会话。统一成 null 走默认模式。
+      { sessionId: sessionId || null },
+    );
+    if (my !== modesStamp) return; // 有更新的请求在飞 → 这条过期，丢掉
     activeModeId = r?.activeMode ?? activeModeId;
+    defaultModeId = r?.defaultMode ?? defaultModeId ?? activeModeId;
     modesCache = Array.isArray(r?.modes) ? r.modes : [];
   } catch (err) {
     // 读不到不是致命错误：chip 退回显示 id，模式本身仍在后端生效
@@ -1431,9 +1631,78 @@ interface McpStatus {
 /** 一条 MCP server 配置（对应 Rust `config::McpServerCfg`，camelCase 序列化） */
 interface McpServerCfg {
   id: string;
+  /** HTTP 形态的网关地址；stdio 形态留空 */
   url: string;
   enabled: boolean;
   label: string;
+  /** "auto" | "http" | "stdio"；缺省按 url / command 推断 */
+  transport?: "auto" | "http" | "stdio";
+  /** stdio 形态：可执行文件 / 脚本路径 */
+  command?: string;
+  /** stdio 形态：argv（逐参传递，不经 shell） */
+  args?: string[];
+  /** stdio 形态：附加环境变量 */
+  env?: Record<string, string>;
+}
+
+/**
+ * MCP server 列表的**前端权威副本**。
+ *
+ * ⚠️ 为什么不再像以前那样"从 DOM 文本里 scrap"：
+ * stdio 形态有 `command` / `args[]` / `env{}` 三类字段，它们**不是**
+ * 一段可读回来的文本 —— 从 `<code>` 的 textContent 取，`args` 的
+ * 参数边界和 `env` 的键值对都会丢。DOM 只负责**画**，数据以这里为准。
+ */
+let mcpServers: McpServerCfg[] = [];
+
+// ---------------- 项目（拼装包，对应 Rust `project.rs`） ----------------
+
+/** 一个项目包（`projects/<id>/project.json`）的清单摘要 */
+interface BundleInfo {
+  id: string;
+  name: string;
+  description: string;
+  active: boolean;
+  /** false = schema 不认识 / 结构不合法（设置页标黄，可看 error） */
+  valid: boolean;
+  error?: string | null;
+  skillCount: number;
+  toolCount: number;
+  /** 带权限预设（导入时要提示用户确认） */
+  hasPermPreset: boolean;
+}
+
+/** `project_list` 的返回 */
+interface ProjectListView {
+  bundles: BundleInfo[];
+  active: string | null;
+  /** 引用解析失败项：`[类别, id, 原因]` */
+  unresolved: [string, string, string][];
+  /** permPreset 被整份丢弃的原因（fail-closed） */
+  permError: string | null;
+  tools: { name: string; description: string; template: string[]; perm: string }[];
+}
+
+/** 设置入口页要的项目摘要（懒加载，进页面时才有） */
+let projectInfo: ProjectListView | null = null;
+
+/** 入口页那一行摘要 */
+function projectSummaryText(): string {
+  if (!projectInfo) return "读取中…";
+  const act = projectInfo.active;
+  if (!act) return `未激活 · 共 ${projectInfo.bundles.length} 个包`;
+  const b = projectInfo.bundles.find((x) => x.id === act);
+  const warn =
+    (projectInfo.permError ? " · ⚠️ 权限预设已丢弃" : "") +
+    (projectInfo.unresolved.length ? ` · ${projectInfo.unresolved.length} 项引用失效` : "");
+  return `已激活「${esc(b?.name ?? act)}」${warn}`;
+}
+
+/** 这条配置实际用哪种传输（与 Rust `resolved_transport` 同规则） */
+function mcpTransportOf(s: McpServerCfg): "http" | "stdio" {
+  if (s.transport === "stdio") return "stdio";
+  if (s.transport === "http") return "http";
+  return (s.command ?? "").trim() ? "stdio" : "http";
 }
 
 // ---------------- 状态 ----------------
@@ -1555,7 +1824,37 @@ function currentOrbState(): OrbState {
 const app = document.getElementById("app")!;
 
 let models: ModelView[] = [];
+/** 当前选中模型的**接口 id**（身份 = (Base URL, id)，配 selectedModelUrl 消歧） */
 let selectedModel: string | null = null;
+let selectedModelUrl: string | null = null;
+
+/** 当前选中的模型条目：接口 id 相同 +（有 url 记录时）同组才算命中 */
+function curModel(): ModelView | undefined {
+  return models.find(
+    (m) =>
+      m.id === selectedModel &&
+      (!selectedModelUrl || sameUrl(m.url, selectedModelUrl)),
+  );
+}
+
+/** Base URL 归一化比较（尾斜杠/大小写不算差异）—— 身份键的一半，必须用同一个口径 */
+function sameUrl(a: string | null | undefined, b: string | null | undefined): boolean {
+  const norm = (s: string | null | undefined) => (s ?? "").trim().replace(/\/+$/, "").toLowerCase();
+  return norm(a) === norm(b);
+}
+
+/**
+ * 「哪一条才是当前」——**唯一**一条。
+ *
+ * 为什么要它（2026-10-02）：`isCurrent` 那种 `id 相同 && (url 为空 || url 相同)`
+ * 的写法，在"设置里只有 id、没记 url"时会命中**所有**同 id 的行 ——
+ * 用户看到的就是「两个 glm-5.3-flash 都画线（都带当前标记）」。
+ * 统一改成"等于 `curModel()` 解析出来的那一条"，最多只标一个。
+ */
+function currentModelRef(): { id: string; url: string } | null {
+  const c = curModel();
+  return c ? { id: c.id, url: c.url } : null;
+}
 
 /**
  * 模型**分组显示名**（键 = Base URL）—— `settings.modelGroupNames`。
@@ -1586,7 +1885,7 @@ let mcpAllGroups = true;
 
 /**
  * 顶栏模型下拉（▾）是否展开 —— **纯模型名列表，只选不管**。
- * 管理入口在卡片本体（点卡片 = 弹独立「模型管理」窗口）。
+ * 开关在整颗 chip（点一下出模型列表）。管理入口已挪到 设置 › 🧩 模型。
  */
 let modelsDropdownOpen = false;
 
@@ -1597,7 +1896,7 @@ let pendingImages: string[] = [];
  * 内容区视图（两级导航）。
  *
  * 「模型管理」不再是面板内子页 —— 它是独立窗口（models.html，见 models.ts），
- * 入口：点顶栏模型卡片本体 / 设置菜单「模型」。面板只负责选模型（▾ 下拉）。
+ * 入口：设置菜单「🧩 模型」。面板上的 chip 只负责**选**模型（出列表）。
  *
  *   settings ─┬─ mcp       MCP 工具组
  *             ├─ perm      文件权限
@@ -1614,8 +1913,11 @@ type View =
   | "sessions"
   | "usage"
   | "recovery"
+
   | "behavior"
-  | "search";
+  | "search"
+  | "life"
+  | "project";
 
 let view: View = "chat";
 
@@ -1646,13 +1948,24 @@ const EXEC_TRUST_LABEL: Record<string, { icon: string; short: string; full: stri
 };
 
 /**
- * Agent 模式（`agent-data/modes.json`）—— 只决定**哪些 MCP 外部工具组对模型可见**。
+ * Agent 模式（`agent-data/modes.json`）—— 管**两件正交的事**：
+ *   1. 哪些 MCP 外部工具组对模型可见（`mcpGroupsPreload`）
+ *   2. 工具以什么形态出现（`toolPresentation`：native 逐个给 / ptc 坍缩成 run_code）
  *
  * 与执行权限（`execTrust`）是两层互不干涉的闸门：
- *   模式 = 哪些工具存在   /   权限 = 用它们时问不问
+ *   模式 = 哪些工具存在、以什么形态存在   /   权限 = 用它们时问不问
  * 所以模式**不碰** `run_command` 的弹卡，`execTrust` 也**不碰**工具可见性。
  */
 let activeModeId = "standard";
+/**
+ * **新建会话的默认模式** —— 就是内置的「标准模式」（`modes_get.defaultMode`）。
+ *
+ * 它是**常量**，不是用户可配项：`settings.activeMode` 已于 2026-10-08 删除
+ * （用户看到「闲聊」被标「默认」就是它干的，而他要的是"标准是默认"）。
+ * 界面上早已没有改默认值的入口 —— 一个改不了的字段还留着，只会变成
+ * "手编也不生效"的困惑源。
+ */
+let defaultModeId = "standard";
 let modesCache: ModeView[] = [];
 
 interface ModeView {
@@ -1665,15 +1978,57 @@ interface ModeView {
   allowedCount: number | null;
   /** 模式里写了、但当前 MCP 里不存在的组 → 菜单里标灰 */
   unknownGroups: string[];
+  /** 工具呈现方式：`native` / `ptc`（老后端不返回时按 native 处理） */
+  toolPresentation?: "native" | "ptc";
+  /**
+   * 正文能不能发图（2026-10-08）。老后端不返回时按 `work` 处理。
+   *
+   * ⚠️ 只用于**显示**，前端不做拦截：工作模式也要渲染产物图（截图/图表），
+   * 按这个值降级会把它一起挡掉。真正的约束在系统提示的措辞里。
+   */
+  imageReplies?: "work" | "free";
+  /** 模式注入的场景上下文（可能为空） */
+  promptExtra?: string;
+  /**
+   * 聊天式呈现（2026-10-08）：一条回复拆成多个气泡、且**不显示过程**。
+   * 只有闲聊模式开 —— 工作模式的结构化长答案切成 5 个泡会非常难读。
+   */
+  chatty?: boolean;
 }
 
 /** 每个内置模式的图标。模式是 JSON 自定义的，认不出来就用通用图标。 */
 const MODE_ICON: Record<string, string> = {
   standard: "🎯",
   ptc: "🚀",
+  // 2026-10-08：「极简」被「闲聊」取代（机制相同 = 不给外部工具组，
+  // 闲聊多了发图能力与场景上下文）。旧 id 的图标留着无害，但新 id 要在这儿。
+  chat: "💬",
   minimal: "🪶",
   creator: "🛠",
 };
+
+/**
+ * 当前会话的模式 id（2026-10-08 起模式跟会话走）。
+ *
+ * ⚠️ 前端**唯一**该用来判断"现在是什么模式"的函数。直接读 `activeModeId`
+ * 只在"它就是当前会话的模式"时才对 —— 而 `activeModeId` 是 `modes_get` 的
+ * 返回值，`loadModes()` 没带会话 id 时它其实是**默认模式**。
+ *
+ * 三层兜底（从可信到保守）：
+ * 1. `sessionList` 里当前那条的 `mode`（Rust 必给，老会话回退成默认模式）
+ * 2. `activeModeId`（最后一次 `loadModes` 的结果）
+ * 3. `"standard"`
+ */
+function currentModeId(): string {
+  const m = sessionList.find((x) => x.id === currentSessionId);
+  return m?.mode || activeModeId || "standard";
+}
+
+/** 当前会话的模式名（给人看的），认不出来就退回 id。 */
+function currentModeName(): string {
+  const id = currentModeId();
+  return modesCache.find((x) => x.id === id)?.name ?? id;
+}
 
 /**
  * 「后台执行」状态（进程级，不落盘）。
@@ -1682,6 +2037,11 @@ const MODE_ICON: Record<string, string> = {
  *
  * ⚠️ 它**不是**一个 agent 模式：模式管"哪些 MCP 工具组可见"，
  * 这个管"在哪儿执行" —— 两个正交维度（用户拍板）。
+ *
+ * 历史：紧挨着这里原来还有一个 `PRESENTATION_LABEL`（native / ptc 的一句话说明）。
+ * 2026-10-08 模式选择器搬进「＋」菜单时删掉了 —— 那句说明只服务"设置页的模式列表"，
+ * 现在那份说明在模式菜单项的 `title`（取模式自己的 `description`）与
+ * 「设置 › 行为」的提示文字里，留着它就是一段没人读的死代码。
  */
 let bgDeskEnabled = false;
 let bgDeskError: string | null = null;
@@ -2111,6 +2471,106 @@ function patchThumb(path: string): void {
   });
 }
 
+// ---------------- 正文图（模型在回复里发的图，2026-10-08）----------------
+//
+// 与上面的「用户附图缩略图」是**两套**，刻意不合并：
+//   - 缩略图：62×62 的小方块，320px 足够，缓存复用率高（同一条消息反复重绘）；
+//   - 正文图：是**内容本身**（截图 / 图表 / 表情包），要看清，取 960px。
+// 共用一份缓存的话，谁先用就把尺寸钉死了 —— 要么图糊、要么小缩略图白烧带宽。
+
+/** 正文图缓存：`图片路径 → data URL`（`""` = 已判定读不出来，别再重试） */
+const bodyImgCache = new Map<string, string>();
+const bodyImgInflight = new Set<string>();
+
+/** 正文图长边上限（px）—— 960 是"看得清"和"base64 不撑爆 IPC"之间的折中 */
+const BODY_IMG_MAX_EDGE = 960;
+
+/**
+ * 同步取正文图缓存；没有就异步加载。
+ *
+ * 两个坑与 `thumbOf` 完全相同（都是血泪）：
+ * 1. 命中判定必须用 `has()` —— 失败时存的是空串，用值判等会让"读不出来"的图
+ *    每次重绘都重新请求，请求失败又触发替换 → 死循环。
+ * 2. 加载完**只换那一个 `<img>` 的 src**，不重绘消息区。
+ */
+function bodyImgOf(path: string): string | null {
+  if (bodyImgCache.has(path)) return bodyImgCache.get(path)!;
+  if (!bodyImgInflight.has(path)) {
+    bodyImgInflight.add(path);
+    void invoke<string>("image_thumb", { path, maxEdge: BODY_IMG_MAX_EDGE })
+      .then((url) => {
+        bodyImgCache.set(path, url);
+      })
+      .catch(() => {
+        bodyImgCache.set(path, "");
+      })
+      .finally(() => {
+        bodyImgInflight.delete(path);
+        patchBodyImg(path);
+      });
+  }
+  return null;
+}
+
+/** 正文图就绪/失败后，就地换上 src（或换成"读不出来"标记） */
+function patchBodyImg(path: string): void {
+  const cached = bodyImgCache.get(path);
+  if (cached === undefined) return;
+  // 用 dataset 比对而不是属性选择器：路径里有反斜杠/空格/引号，
+  // 选择器转义太容易出错（`thumbOf` 那边用的是同一个理由）
+  document.querySelectorAll<HTMLImageElement>("img.md-img-local").forEach((img) => {
+    if (img.dataset.img !== path) return;
+    if (cached) {
+      img.src = cached;
+      // 摘掉标记，等于"这个占位已经兑现"—— hydrate 不会再重复处理它
+      img.classList.remove("md-img-local");
+      img.removeAttribute("data-img");
+    } else {
+      const span = document.createElement("span");
+      span.className = "md-img-bad";
+      span.textContent = "图（读不出来）";
+      span.title = path;
+      img.replaceWith(span);
+    }
+  });
+}
+
+/**
+ * 扫描刚上屏的 HTML，触发其中**本地图占位**的异步加载。
+ *
+ * 必须在每次 `mdToHtml` 输出落到 DOM 之后调用（历史消息重绘、流式正文 patch）。
+ * 只认 `img.md-img-local[data-img]`：外链图（`src` 直接就是 http(s)）和
+ * 已经换好的图都不在范围内，所以重复调用是安全的（幂等）。
+ */
+/**
+ * 这张本地图是不是**表情包** —— 判据是路径里有 `memes` 这一级目录。
+ *
+ * 为什么不用 alt 文本判断：alt 是模型抄的，它可能改写；
+ * 路径是 `send_meme` 直接给的字节，不会撒谎。
+ * 表情包要 QQ 那种**贴纸尺寸**（~160px），和工作产物图（截图/图表，全宽）
+ * 是两种东西，CSS 用 `.md-img-meme` 区分。
+ */
+function isMemePath(path: string): boolean {
+  return /[\\/]memes[\\/]/.test(path);
+}
+
+function hydrateBodyImages(root: ParentNode): void {
+  root.querySelectorAll<HTMLImageElement>("img.md-img-local[data-img]").forEach((img) => {
+    const path = img.dataset.img;
+    if (!path) return;
+    // 表情包走贴纸尺寸 —— 必须在换 src **之前**加类，避免尺寸跳一下
+    if (isMemePath(path)) img.classList.add("md-img-meme");
+    const cached = bodyImgOf(path);
+    // 缓存命中就同步换上，省掉"先占位再替换"的那一下闪
+    if (cached) {
+      img.src = cached;
+      img.classList.remove("md-img-local");
+      img.removeAttribute("data-img");
+    }
+    // 未命中：保持无 src 的占位，等 `patchBodyImg` 加载完来换
+  });
+}
+
 
 // ---------------- 渲染：面板态 ----------------
 
@@ -2123,17 +2583,32 @@ function patchThumb(path: string): void {
  * 看不出"这一步的思考是为了调哪个工具"。现在条目自带顺序，渲染出来就是
  * `💭 思考 → 🔧 调工具 → ✅ 返回 → 💭 思考 → …` 的交错节奏。
  *
- * ## 条目种类
+ * ## 折叠策略（2026-10-02 用户三轮定稿）
  *
- * | kind | 来源 | 显示 |
- * |---|---|---|
- * | `reasoning` | agent.rs 每轮思维链 | 可折叠的 `💭 思考过程（N 字）` |
- * | `tool_call` | 工具调用 | `🔧 调用 <code>名字</code> <i>参数摘要</i>` |
- * | `tool_result` | 工具返回 | `✅ <code>名字</code> 返回 <i>首行</i>` |
- * | `status` | 限流退避等链路状态 | `⏳ …`（灰色，只作说明） |
- * | `tool_error` / `error` | 工具失败 / 本轮失败 | `⚠️ / ✕ …`（红黄） |
- * | `omitted` | 后端省略了太早的步骤 | 灰色说明行 |
- * | `assistant` | 最终答案（正文另有渲染） | 跳过 |
+ * | kind | 来源 | 运行中（live） | 跑完（历史） |
+ * |---|---|---|---|
+ * | `reasoning` | agent.rs 每轮思维链 | 折叠 | 折叠 |
+ * | `tool_call` | 工具调用 | 折叠成一行 `🔧 运行命令` | 折叠成一行 |
+ * | `tool_result` | 工具返回 | 折叠成一行 `✅ 运行命令` | 折叠成一行 |
+ * | `text` / `stream` | **中途正文** | **展开**（要盯着进度） | 在「过程」里，随外壳一起收起 |
+ * | `status` | 限流退避等链路状态 | 常显（灰色说明） | 常显 |
+ * | `tool_error` / `error` | 工具失败 / 本轮失败 | 常显（红黄） | 常显 |
+ * | `omitted` | 后端省略了太早的步骤 | 灰色说明行 | 灰色说明行 |
+ * | `steer` | 用户插话 | 黄边块 | 黄边块（留在「过程」外壳之外） |
+ * | `assistant` | 最终答案（正文另有渲染） | 跳过 | 跳过 |
+ *
+ * ## 两级结构：跑完**整轮收成一行**
+ *
+ * 跑完（历史）时整轮包进 `details.run-process`，摘要就是 `过程 · N 步` ——
+ * 用户 10-02 的最后一句话："这个应该全部压缩掉啊"（此前摊平后回看一条消息
+ * 要占十几行折叠行，正文反被顶下去）。
+ *
+ * - 运行中**不包外壳**：平铺，中途正文摊开（要盯着进度）。
+ * - 跑完包外壳，**默认闭合**：一行搞定；点开才看得到里面的思考 / 工具 / 正文。
+ * - 里面每一条**再各自折叠**（思考、工具行）—— 展开外壳不会一下子哗啦出一屏原文。
+ *
+ * ❌ 别再走回头路：① 外壳**不许默认展开**（10-02 第一轮报的就是它摊开着一堆
+ * 工具参数）；② `reasoning` **不许**在 live 时自动展开（"思考应该让用户选择展开"）。
  *
  * ## 兼容老数据
  *
@@ -2141,9 +2616,11 @@ function patchThumb(path: string): void {
  *   → 整行显示，**不能**当 JSON 解析（会显示成乱码）
  * - 只有 `tool_call`、没有时间线条目的老消息 → 回退成原来的「调用了 N 个工具」
  *
- * @param live 运行中的气泡：思考块**默认展开**（用户就想看它现在在想什么）
+ * @param live 运行中的气泡（中途）→ 平铺；否则收进 `details.run-process`
+ * @param key  本条消息的稳定标识，拼进 `data-open-key` —— 没有它，两条消息里
+ *             同序号的折叠块会共用 key，展开一个就把另一条里的也顶开（旧 bug）
  */
-function renderTimeline(items: AgentStep[] | undefined, live: boolean): string {
+function renderTimeline(items: AgentStep[] | undefined, live: boolean, key = ""): string {
   if (!items || items.length === 0) return "";
 
   // 折叠记录：整轮已被压成一行摘要（老会话数据）
@@ -2156,50 +2633,239 @@ function renderTimeline(items: AgentStep[] | undefined, live: boolean): string {
     return `<div class="steps-folded">${esc(calls[0].detail)}</div>`;
   }
 
-  const body = items.map((s, i) => renderItem(s, live, i)).join("");
+  const body = items.map((s, i) => renderItem(s, i, key)).join("");
   if (!body) return "";
-  // 跑完（历史）：包进默认折叠的「过程」，中间细节不再抢最终答案；
-  // 中途（live）保持摊开 —— 用户要盯着进度。
   if (!live) {
-    return `<details class="run-process" data-open-key="proc-${esc((items[0]?.detail ?? "").slice(0, 12))}-${items.length}">
+    return `<details class="run-process" data-open-key="proc-${esc(key)}">
       <summary>过程 · ${items.length} 步</summary>
       <div class="run-timeline tl-hist">${body}</div>
     </details>`;
   }
-  return `<div class="run-timeline${live ? "" : " tl-hist"}">${body}</div>`;
+  return `<div class="run-timeline">${body}</div>`;
 }
 
-/** 单条时间线条目 → HTML（`renderTimeline` 与 `patchTimeline` 的共同契约） */
-function renderItem(s: AgentStep, live: boolean, idx = -1): string {
+/**
+ * 工具名 → 面向用户的短标签。
+ *
+ * 折叠行上**只给这个**（原始工具名进 `title`）—— 用户不需要看 `grep_files`，
+ * 他需要看「搜内容」。没映射到的（MCP 工具、用户自定义脚本工具）原样显示，
+ * 猜错名字比显示真名更糟。
+ */
+const TOOL_LABELS: Record<string, string> = {
+  read_file: "读取文件",
+  list_dir: "列目录",
+  glob_files: "找文件",
+  grep_files: "搜内容",
+  write_file: "写入文件",
+  edit_file: "改文件",
+  append_file: "追加内容",
+  delete_file: "删除文件",
+  move_file: "移动文件",
+  copy_file: "复制文件",
+  mkdir: "新建目录",
+  file_info: "查文件信息",
+  git: "Git",
+  run_command: "运行命令",
+  run_code: "运行脚本",
+  web_search: "联网搜索",
+  fetch_url: "抓取网页",
+  request_access: "申请权限",
+  capture_screen: "截图",
+  view_image: "看图片",
+  foreground_context: "看前台窗口",
+  current_time: "取当前时间",
+  remember: "记一笔",
+  distill_move: "迁移记忆",
+  life_items: "生活清单",
+  ask_user: "问你",
+  recall_turns: "翻历史",
+  load_skill: "载入技能",
+  save_skill: "保存技能",
+  search_tools: "找工具",
+  list_tool_groups: "列工具组",
+};
+
+/** 工具名 → 折叠行上的短标签（未知工具原样返回，别猜） */
+function toolLabel(name?: string | null): string {
+  const n = (name ?? "").trim();
+  if (!n) return "工具";
+  return TOOL_LABELS[n] ?? n;
+}
+
+/**
+ * 这条工具返回是失败吗？
+ *
+ * 判据是后端 `agent.rs` 工具循环里的约定：工具 `Err` 时**不新增 kind**，
+ * 而是把错误伪装成正常输出文本 `工具执行失败：…`（`tools.rs` 的 `ToolOutput::text`），
+ * 所以磁盘上失败也是 `kind === "tool_result"`。前端要按"失败"给它常显红黄行。
+ */
+function isToolFailure(detail?: string | null): boolean {
+  return (detail ?? "").trimStart().startsWith("工具执行失败");
+}
+
+/**
+ * 把 `tool_call` + 紧跟的同名 `tool_result` **并成一条**（用户 2026-10-02：
+ * "直接变成执行命令一条就行了"）—— 以前一个工具占两行（`🔧 列目录` / `✅ 列目录`）。
+ *
+ * ## 为什么必须在**数据层**合并，不能只改渲染
+ *
+ * 时间线是严格 `1 条目 = 1 个顶层 DOM 节点` 的契约：`patchTimeline` 用
+ * `data-n`（已渲染条目数）和 `data-i`（条目下标）定位节点，`nodeFromHtml`
+ * 又只取 `firstElementChild`。渲染层做「两条目 → 一节点」会让下标与节点错位，
+ * 流式期间就会出现重复/丢失的折叠块。
+ *
+ * ## 配对规则
+ *
+ * - **相邻 + 同名 + 非失败** → 合并成一条（保留 `tool_call` 的 kind 与参数，
+ *   返回塞进 `result`）。后端工具循环天然是"先 push call、执行完 push result"，
+ *   所以同名必相邻。
+ * - **失败** → 不合并，且把 kind 归一成 `tool_error`，让渲染层画出**常显**的红黄行
+ *   （失败被折进一行等于没人看得见，违背既有约定）。live 路径本来就是 `tool_error`，
+ *   这里归一后两条路径形态一致。
+ * - **孤立**（`cap_steps` 截断拆对 / 工具被取消 / 老数据）→ 原样保留：
+ *   `renderItem` 的 `tool_call` 与 `tool_result` 分支都还能画。
+ */
+function pairToolSteps(items: AgentStep[] | undefined): AgentStep[] | undefined {
+  if (!items || items.length === 0) return items;
+  const out: AgentStep[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const s = items[i];
+    const next = items[i + 1];
+    if (
+      s.kind === "tool_call" &&
+      next &&
+      next.kind === "tool_result" &&
+      (next.name ?? "") === (s.name ?? "") &&
+      !isToolFailure(next.detail)
+    ) {
+      out.push({ ...s, result: next.detail });
+      i++; // 返回条目被吃掉，不再单独占一行
+      continue;
+    }
+    if (s.kind === "tool_result" && isToolFailure(s.detail)) {
+      out.push({ ...s, kind: "tool_error" });
+      continue;
+    }
+    out.push(s);
+  }
+  return out;
+}
+
+/**
+ * 单条时间线条目 → HTML（`renderTimeline` 与 `patchTimeline` 的共同契约）。
+ *
+ * `kp`（key prefix）= 本条消息的稳定标识，拼进 `data-open-key`。**必须带**：
+ * 不带的话两条消息里同序号的折叠块共用同一个 key，`paintMessages` 还原展开状态时
+ * 会把另一条消息里的同序号块也一起顶开（"我展开这一个，别的也开了"）。
+ * 运行中的增量 patch 路径（`patchTimeline`）不需要 key，传空串即可。
+ */
+/**
+ * 把流式正文渲染成 HTML：已收尾的块走 markdown，活动尾巴保持纯文本。
+ *
+ * 为什么要切一刀而不是整篇 `mdToHtml`：表格判定依赖"下一行是 `|---|`"，
+ * 流式下同一张表会先被当段落、补上分隔行再突变成 `<table>`，列宽一变
+ * 视线就跳。切开后每个块只在自己收尾时变一次。详见 `markdown.ts` 的 `splitStable`。
+ */
+function renderStreamingMd(src: string): string {
+  const { stable, tail } = splitStable(src);
+  // 两段拼起来：stable 已是安全 HTML，tail 必须 escape
+  return mdToHtml(stable) + esc(tail).replace(/\n/g, "<br>");
+}
+
+/**
+ * 思考块的 markdown **懒渲染**：折叠时不动，展开时才转。
+ *
+ * 幂等 —— 转完打 `data-md="1"`，重复调用直接返回。
+ * 流式期间若用户正展开着看，`patchTimeline` 会带着新内容再调一次。
+ *
+ * ⚠️ 原文存 WeakMap 而不是 `data-raw` 属性：思维链动辄几万字，
+ * 塞进 HTML 属性等于同时持有"转义后的属性值 + 文本节点"两份，
+ * 而且每次 patchTimeline 重建节点都要重新序列化一遍。WeakMap 不进 DOM，
+ * 节点被 GC 就一起回收。
+ */
+const reasonRawText = new WeakMap<HTMLElement, string>();
+
+/** 渲染出一个「待懒渲染」的思考块 */
+function renderReasonBody(detail: string): string {
+  return `<pre class="run-reason-pre">${esc(detail)}</pre>`;
+}
+
+function renderReasonMdInPlace(details: HTMLDetailsElement): void {
+  const pre = details.querySelector<HTMLElement>(".run-reason-pre");
+  if (!pre || pre.dataset.md === "1") return;
+  const raw = reasonRawText.get(pre);
+  if (raw === undefined) return; // 已经是转换后的（或没经过懒渲染路径），不动
+  pre.innerHTML = renderStreamingMd(raw);
+  reasonRawText.delete(pre);
+  pre.dataset.md = "1";
+}
+
+/** 全量重绘后重建 WeakMap（原节点已随 innerHTML 一起没了） */
+function reindexReasonRaw(root: ParentNode, items: AgentStep[]): void {
+  root.querySelectorAll<HTMLElement>(".run-reason-pre").forEach((pre) => {
+    if (pre.dataset.md === "1") return; // 已转换的不用再存
+    const i = Number(pre.closest<HTMLElement>("[data-i]")?.dataset.i ?? "-1");
+    const src = items[i];
+    if (src && src.kind === "reasoning") reasonRawText.set(pre, src.detail);
+  });
+}
+
+function renderItem(s: AgentStep, idx = -1, kp = ""): string {
   // `data-i` 是增量 patch 的锚点（知道"第几条已画"），全量渲染时也要带上，
   // 否则一次全量重绘之后的流式更新会找不到节点、思考块就不再增长
   const di = idx >= 0 ? ` data-i="${idx}"` : "";
   switch (s.kind) {
     case "reasoning":
       if (!s.detail.trim()) return "";
-      return `<details class="run-reason tl-reason"${di}${live ? " open" : ""} data-open-key="r-${esc(s.name || "")}-${idx}">
+      // ⚠️ **永远不自动展开**（2026-10-02 用户要求）：思维链是"想看才点开"的东西，
+      //    不管 live 还是历史。字数进 summary，用户看长度决定要不要点。
+      //    增量 patch 只换 <pre> 文本、**不碰 open**，所以用户展开着不会被顶回去。
+      //
+      // 2026-10-03：正文改走 **markdown 懒渲染** —— 折叠时是纯 <pre>，
+      // 用户点开（`toggle` → `data-md="1"`）才转成 HTML 并打标记。
+      // 为什么不在这里直接 `mdToHtml`：
+      //   ① 思考默认折叠，转不转用户都看不见，转换纯属白做；
+      //   ② 流式期间每 chunk 都要重跑一次转换（正文可到几万字），
+      //      而折叠状态下没人看 —— 白烧 CPU 还会让 patch 变慢。
+      // 详见 `mdToHtml` 上方 `splitStable` 的注释。
+      return `<details class="run-reason tl-reason"${di} data-open-key="r-${esc(kp)}-${esc(s.name || "")}-${idx}">
         <summary>💭 思考过程<span class="run-reason-len">（${s.detail.length} 字）</span></summary>
-        <pre class="run-reason-pre">${esc(s.detail)}</pre>
+        ${renderReasonBody(s.detail)}
       </details>`;
 
-    case "tool_call":
-      return `<div class="tl-line"${di}>🔧 调用 <code>${esc(s.name || "?")}</code>${
-        s.detail ? ` <i>${esc(summarizeArgs(s.detail))}</i>` : ""
-      }${s.tick ? `<span class="tl-tick">${esc(s.tick)}</span>` : ""}</div>`;
+    case "tool_call": {
+      // 工具调用**默认折叠成一行**（2026-10-02 用户要求）：
+      // 以前把参数 JSON 直接铺在时间线上（`🔧 调用 write_file {"content":"# -*- coding…`），
+      // 那是给机器看的东西，不是给用户看的。现在只留「🔧 运行命令」，
+      // 参数进 `title` 与详情块，想看再点。
+      //
+      // 2026-10-02 第二轮：**调用与返回并成一行**（`pairToolSteps` 已把返回塞进 `s.result`），
+      // 所以一个工具只占一行 —— 前缀按有没有返回在 🔧 / ✅ 之间切，
+      // 详情块里先参数后返回，点开一次两样都能看到。
+      const args = s.detail ? summarizeArgs(s.detail) : "";
+      const clip = (t: string) => (t.length > 8 * 1024 ? t.slice(0, 8 * 1024) + "\n…[截断]" : t);
+      const body = [
+        s.detail ? `<pre class="tl-tool-pre">${esc(clip(s.detail))}</pre>` : "",
+        s.result ? `<pre class="tl-tool-pre tl-res-pre">返回：${esc(clip(s.result))}</pre>` : "",
+      ].join("");
+      return `<details class="tl-tool tl-call"${di} data-open-key="tc-${esc(kp)}-${esc(s.name || "")}-${idx}">
+        <summary title="${esc(s.name || "?")}${args ? ` · ${esc(args)}` : ""}">${
+          s.result ? "✅" : "🔧"
+        } ${esc(toolLabel(s.name))}${
+          s.tick ? `<span class="tl-tick">${esc(s.tick)}</span>` : ""
+        }</summary>${body}</details>`;
+    }
 
     case "tool_result": {
+      // ⚠️ 正常路径下**到不了这里** —— 返回已被 `pairToolSteps()` 并进上面那条
+      //    `tool_call`（合成一行）。这里只兜**孤立返回**：`cap_steps` 超限截断把一对拆开、
+      //    或老会话数据里本来就是孤儿。照样折成一行，别让它消失。
       const full = s.detail || "";
-      const preview = full.split("\n")[0].slice(0, 70);
-      const truncated = full.length > 200;
       const bodyFull = full.length > 8 * 1024 ? full.slice(0, 8 * 1024) + "\n…[截断]" : full;
-      if (!truncated) {
-        return `<div class="tl-line"${di}>✅ <code>${esc(s.name || "?")}</code> 返回 <i>${esc(
-          preview,
-        )}</i></div>`;
-      }
-      return `<details class="tl-tool-res"${di}${live ? "" : ""} data-open-key="tr-${esc(s.name || "")}-${idx}">
-        <summary>✅ <code>${esc(s.name || "?")}</code> 返回 <i>${esc(preview)}</i></summary>
-        <pre class="tl-tool-pre">${esc(bodyFull)}</pre>
+      const tip = full.split("\n")[0].slice(0, 90);
+      return `<details class="tl-tool tl-res"${di} data-open-key="tr-${esc(kp)}-${esc(s.name || "")}-${idx}">
+        <summary title="${esc(tip)}">✅ ${esc(toolLabel(s.name))}</summary>
+        ${bodyFull ? `<pre class="tl-tool-pre">${esc(bodyFull)}</pre>` : ""}
       </details>`;
     }
 
@@ -2233,9 +2899,19 @@ function renderItem(s: AgentStep, live: boolean, idx = -1): string {
 
     case "text":
     case "stream":
-      return `<div class="tl-text"${di}>${
+      // **中途正文**：本身不折叠 —— 运行中它就该摊着（用户要盯进度），
+      // 跑完之后整轮已经被「过程」外壳收掉了（见 `renderTimeline`），
+      // 所以这里再套一层折叠只会变成"点两次才读到一句话"。
+      //
+      // 2026-10-03 用户要求：中途正文**按 markdown 渲染**（它跟最终答复同源，
+      // 模型在里面写 `## 分流总览` / 表格 / 代码块很常见，纯文本没法看）。
+      // 走 `splitStable` 切一刀：已收尾的块转 HTML，活动尾巴保持纯文本 ——
+      // 否则表格会在分隔行到达的瞬间整块突变，逐 chunk 看就是闪。
+      // `.tl-text` 带 `md` class 复用 `.msg-body.md` 那套排版（见 styles.css）。
+      if (!s.detail.trim()) return "";
+      return `<div class="tl-text md"${di}>${
         s.name ? `<span class="tl-text-tag">${esc(s.name)}</span>` : ""
-      }${esc(s.detail).replace(/\n/g, "<br>")}</div>`;
+      }${renderStreamingMd(s.detail)}</div>`;
 
     // 最终答案的正文另有渲染（`e.text` → markdown），这里跳过免得重复
     case "assistant":
@@ -2299,17 +2975,32 @@ function paintMessages(el: HTMLElement): void {
     if (key) openKeys.add(key);
   });
   el.innerHTML = renderMessages();
+  // 重建思考块懒渲染的原文索引（WeakMap 不随 innerHTML 存活，新节点要重新登记）
+  // `data-mid` = 该消息在 entries 里的下标，与 renderMessagesInner 的 idx 一致
+  el.querySelectorAll<HTMLElement>(".msg[data-mid]").forEach((box) => {
+    const e = entries[Number(box.dataset.mid)];
+    const tl = box.querySelector<HTMLElement>(".run-timeline");
+    if (e && tl) reindexReasonRaw(tl, e.items ?? []);
+    // 老数据兜底：只有单串 `reasoning`、没有 items 的历史消息
+    const legacy = box.querySelector<HTMLDetailsElement>("details.hist-reason .run-reason-pre");
+    if (legacy && e?.reasoning && !legacy.dataset.md) reasonRawText.set(legacy, e.reasoning);
+  });
   el.querySelectorAll<HTMLDetailsElement>("details").forEach((d) => {
     const key = d.dataset.openKey ?? d.dataset.i ?? d.querySelector("summary")?.textContent?.slice(0, 24) ?? "";
     if (key && openKeys.has(key)) {
       d.open = true;
       d.dataset.userOpen = "1";
     }
-    // 记录用户手动展开（E5/E7）
+    // 记录用户手动展开（E5/E7）；思考块顺带在这里做 markdown 懒渲染
+    // （与 patchTimeline 的增量路径共用 bindReasonToggle，两边行为必须一致）
     d.addEventListener("toggle", () => {
-      if (d.open) d.dataset.userOpen = "1";
-      else delete d.dataset.userOpen;
+      if (d.open) {
+        d.dataset.userOpen = "1";
+        if (d.classList.contains("run-reason")) renderReasonMdInPlace(d);
+      } else delete d.dataset.userOpen;
     });
+    // 重绘后 open 是被程序写回的，**不触发 toggle** —— 展开中的思考块要主动补转换
+    if (d.open && d.classList.contains("run-reason")) renderReasonMdInPlace(d);
   });
   el.querySelectorAll<HTMLButtonElement>("button[data-continue]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -2325,6 +3016,22 @@ function paintMessages(el: HTMLElement): void {
     });
   });
   bindPermButtons(el);
+  // 历史消息里模型发的图（`![说明](本地路径)`）→ 触发异步取图。
+  // 与 `patchRunning` 里那次同源：谁把 HTML 落到 DOM 上，谁就负责 hydrate。
+  hydrateBodyImages(el);
+
+  // 闲聊模式：给**首播**的气泡挂上「逐条出现」动画（样式见 styles.css 的
+  // `.bubble.play` + `bubble-in`）。延迟按序号递增，模拟人一条条发消息的节奏 ——
+  // 这才是"像 QQ"的关键：切成 5 泡但一瞬间全冒出来，看着还是一坨。
+  el.querySelectorAll<HTMLElement>(".msg.chatty[data-mid]").forEach((box) => {
+    const key = `${currentSessionId}:${box.dataset.mid}`;
+    if (bubblePlayed.has(key)) return;
+    bubblePlayed.add(key);
+    box.querySelectorAll<HTMLElement>(".bubble").forEach((b, i) => {
+      b.classList.add("play");
+      b.style.animationDelay = `${Math.min(i, MAX_BUBBLES - 1) * 380}ms`;
+    });
+  });
 }
 
 /**
@@ -2351,6 +3058,26 @@ function patchRunning(el: HTMLElement): void {
     return;
   }
 
+  // 闲聊模式：整块气泡区重画。
+  // 为什么这里不做增量：气泡**数量**会随文本增长而变（多切出一段就多一个），
+  // `data-n` 那套"只 append 新增条目"的锚点对不上号。闲聊正文短，重画代价可忽略。
+  // 仍加一道 `innerHTML` 比较 —— 内容没变就别碰 DOM（否则每帧都在重建节点）。
+  if (box.classList.contains("chatty")) {
+    const bs = splitBubbles(run.streamText ?? "", false);
+    const inner = bs.length
+      ? bs
+          .map(
+            (b, i) =>
+              `<div class="msg-body md bubble${
+                i === bs.length - 1 ? " typing" : ""
+              }">${renderStreamingMd(b)}</div>`,
+          )
+          .join("")
+      : `<div class="msg-body bubble typing">…</div>`;
+    if (box.innerHTML !== inner) box.innerHTML = inner;
+    return;
+  }
+
   const head = box.querySelector<HTMLElement>(".run-head-text");
   if (head && head.textContent !== run.text) head.textContent = run.text;
 
@@ -2361,7 +3088,11 @@ function patchRunning(el: HTMLElement): void {
   const stream = box.querySelector<HTMLElement>(".run-stream");
   if (stream) {
     const t = run.streamText ?? "";
-    const html = t ? esc(t).replace(/\n/g, "<br>") : "";
+    // ⚠️ 必须与 renderMessagesInner 的 running 分支逐字段一致（同一条渲染契约）：
+    //    这里渲染 markdown，中途正文才有标题 / 表格 / 代码块排版。
+    //    `splitStable` 切过的结果与流式长度相关，但两条路径拿的是同一个
+    //    `run.streamText`，切法一致 → 输出必然一致。
+    const html = t ? renderStreamingMd(t) : "";
     if (stream.innerHTML !== html) stream.innerHTML = html;
     stream.hidden = !t;
     stream.classList.toggle("discarded", !!run.streamDiscarded);
@@ -2369,6 +3100,10 @@ function patchRunning(el: HTMLElement): void {
 
   const note = box.querySelector<HTMLElement>(".run-note");
   if (note) note.hidden = !run.streamDiscarded;
+
+  // 本帧可能新冒出来正文图占位（中途正文里的 `![说明](路径)`）→ 触发加载。
+  // 放在最后：前面刚换过 `run-stream` 的 innerHTML，新节点得走一遍才知道要取图。
+  hydrateBodyImages(box);
 }
 
 /**
@@ -2380,16 +3115,19 @@ function patchRunning(el: HTMLElement): void {
  * - `data-i` 锚定条目，最后一条若是思考条目 → 只换 `<pre>` 文本与字数
  *
  * ⚠️ 契约：产出必须与 `renderTimeline(items, true)` 完全一致（共用 `renderItem`）。
- *    唯一例外是思考块的 `open`：全量渲染时默认展开，而 patch **不碰 `open`**
- *    —— 用户手动收起之后不该被下一帧顶开。
+ *    唯一例外是折叠块的 `open`：全量渲染一律闭合（思考/工具/返回都默认折叠），
+ *    而 patch **不碰 `open`** —— 用户手动展开之后不该被下一帧顶回去。
  */
 function patchTimeline(tl: HTMLElement, items: AgentStep[]): void {
   const n = Number(tl.dataset.n ?? "0");
 
   // 状态回退（条数变少 / 被清空 / 出错）→ 老老实实全量重画这一段
   if (!Number.isFinite(n) || n < 0 || n > items.length) {
-    tl.innerHTML = items.map((s, i) => renderItem(s, true, i)).join("");
+    tl.innerHTML = items.map((s, i) => renderItem(s, i)).join("");
     tl.dataset.n = String(items.length);
+    reindexReasonRaw(tl, items);
+    // 同 ②：innerHTML 重建的节点也得补绑 toggle，否则点开不渲染
+    tl.querySelectorAll<HTMLElement>("details.run-reason").forEach(bindReasonToggle);
     return;
   }
 
@@ -2398,18 +3136,30 @@ function patchTimeline(tl: HTMLElement, items: AgentStep[]): void {
     const last = items[n - 1];
     const node = tl.querySelector<HTMLElement>(`[data-i="${n - 1}"]`);
     if (last.kind === "reasoning" && node) {
-      const pre = node.querySelector<HTMLPreElement>(".run-reason-pre");
+      // 2026-10-03：思考块正文可能已转成 markdown（用户展开过）。
+      // 这种情况下 `textContent` 存的是"渲染后的文字"，不再等于 `last.detail`，
+      // 拿它比较会永远不等 → 每帧都重写一遍。这里按 `data-md` 分流：
+      //   未转换 → 只换 <pre> 文本（保持懒渲染的省流式开销）
+      //   已转换 → 重新走一遍 renderStreamingMd，保持 markdown 形态
+      const pre = node.querySelector<HTMLElement>(".run-reason-pre");
       const len = node.querySelector<HTMLElement>(".run-reason-len");
-      if (pre && pre.textContent !== last.detail) {
-        // 用户停在思考块底部时才自动跟随，往回翻就不打扰
+      if (pre) {
+        const rendered = pre.dataset.md === "1";
         const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
-        pre.textContent = last.detail;
+        if (rendered) {
+          const next = renderStreamingMd(last.detail);
+          if (pre.innerHTML !== next) pre.innerHTML = next;
+        } else if (pre.textContent !== last.detail) {
+          pre.textContent = last.detail;
+          // 未转换的块也要登记原文 —— 用户随后点开时才能补渲染
+          reasonRawText.set(pre, last.detail);
+        }
         if (len) len.textContent = `（${last.detail.length} 字）`;
         if (atBottom) pre.scrollTop = pre.scrollHeight;
       }
-    } else if (!node || node.outerHTML !== renderItem(last, true, n - 1)) {
+    } else if (!node || node.outerHTML !== renderItem(last, n - 1)) {
       // 非思考条目照理不会再变；真变了就整条换掉（含首次由空串变成有内容的情况）
-      const fresh = nodeFromHtml(renderItem(last, true, n - 1));
+      const fresh = nodeFromHtml(renderItem(last, n - 1));
       if (fresh) {
         if (node) node.replaceWith(fresh);
         else tl.appendChild(fresh);
@@ -2419,10 +3169,38 @@ function patchTimeline(tl: HTMLElement, items: AgentStep[]): void {
 
   // ② 新增条目：纯 append
   for (let i = n; i < items.length; i++) {
-    const node = nodeFromHtml(renderItem(items[i], true, i));
-    if (node) tl.appendChild(node);
+    const node = nodeFromHtml(renderItem(items[i], i));
+    if (node) {
+      // ⚠️ 增量路径 append 的节点**不经过 paintMessages**，
+      // 那里统一绑的 details 回调这里一个都没有 —— 不单独绑的话，
+      // 运行中点开思考块不会触发懒渲染（`toggle` 无人监听）。
+      if (items[i].kind === "reasoning") {
+        const pre = node.querySelector<HTMLElement>(".run-reason-pre");
+        if (pre) reasonRawText.set(pre, items[i].detail);
+        bindReasonToggle(node);
+      }
+      tl.appendChild(node);
+    }
   }
   tl.dataset.n = String(items.length);
+}
+
+/**
+ * 给思考块绑「展开时懒渲染 markdown」。
+ *
+ * 与 `paintMessages` 里的 details 回调同源，抽出来是为了让全量重绘和
+ * 增量 append 两条路径行为一致 —— 少一处就少一类"点开还是纯文本"的 bug。
+ */
+function bindReasonToggle(node: HTMLElement): void {
+  const d = node as HTMLDetailsElement;
+  if (!(d instanceof HTMLDetailsElement)) return;
+  d.addEventListener("toggle", () => {
+    if (d.open) {
+      d.dataset.userOpen = "1";
+      renderReasonMdInPlace(d);
+    } else delete d.dataset.userOpen;
+  });
+  if (d.open) renderReasonMdInPlace(d);
 }
 
 /** HTML 片段 → 第一个元素节点（取不到就返回 null，调用方跳过即可） */
@@ -2576,6 +3354,27 @@ function bindPermButtons(root: ParentNode): void {
   });
 }
 
+/**
+ * 已经播过「气泡逐条出现」动画的消息（key = `会话id:渲染下标`）。
+ *
+ * 为什么要记：`paintMessages` 在发消息 / 切视图 / 权限卡刷新时都会整块重建 DOM。
+ * 无脑给气泡加动画 class，会让整屏**历史**气泡重新蹦一遍 —— 比不动画更难受。
+ */
+const bubblePlayed = new Set<string>();
+
+/**
+ * 当前会话是不是"聊天式呈现"（2026-10-08）。
+ *
+ * ⚠️ 用的是**当前会话**的模式（`currentModeId()`，2026-10-08 起模式跟会话走），
+ *    不是"生成那条消息时的模式"—— 所以换到另一个模式的会话后回看历史消息，
+ *    观感会跟着变（闲聊的一串气泡变回一大段）。这是刻意的取舍：要做到"按生成时的
+ *    模式渲染"，得在落盘的每条消息上记一个 `chatty` 标记（改 `StoredMsg` 格式 +
+ *    前端解析），收益只有"换会话后回看不变"。换会话是低频操作，不值这个复杂度。
+ */
+function isChattyMode(): boolean {
+  return !!modesCache.find((x) => x.id === currentModeId())?.chatty;
+}
+
 function renderMessagesInner(): string {
   if (entries.length === 0) {
     // 未初始化时，空态要给出**可操作的下一步**，而不是通用引导语。
@@ -2615,6 +3414,13 @@ function renderMessagesInner(): string {
       · 直接把图片拖进来
     </div>`;
   }
+  // 「编辑」只挂在**最后一条已落盘的用户消息**上（2026-10-03 需求）。
+  // 进行中的气泡 / 排队插话没有 storedIdx，自然落选；有比它更新的用户消息也不给。
+  const lastUserStored = entries.reduce(
+    (m, e) =>
+      e.role === "user" && e.storedIdx !== undefined && e.storedIdx > m ? e.storedIdx : m,
+    -1,
+  );
   return entries
     .map((e, idx) => {
       // 进行中的进度气泡
@@ -2624,47 +3430,81 @@ function renderMessagesInner(): string {
       if (e.role === "running") {
         const streamText = e.streamText ?? "";
 
+        // 闲聊模式：流式期间**就**按气泡渲染，而且不显示状态行 / 时间线。
+        // 为什么不在跑完后再切：那样会出现"先是一大段，跑完突然裂成几泡"的跳变。
+        //
+        // ⚠️ 与 `patchRunning` 的 chatty 分支必须**逐字段一致**（同一条渲染契约）。
+        // 流式期间传 `final = false`：不做"太短合并 / 超限合并"——
+        // 那会让已经显示出来的气泡突然消失，看着像 bug。
+        if (isChattyMode()) {
+          const bs = splitBubbles(streamText, false);
+          const inner = bs.length
+            ? bs
+                .map(
+                  (b, i) =>
+                    `<div class="msg-body md bubble${
+                      i === bs.length - 1 ? " typing" : ""
+                    }">${renderStreamingMd(b)}</div>`,
+                )
+                .join("")
+            : `<div class="msg-body bubble typing">…</div>`;
+          return `<div class="msg running chatty">${inner}</div>`;
+        }
+
         return `
         <div class="msg running">
           <div class="run-head"><span class="spinner"></span><span class="run-head-text">${esc(
             e.text,
           )}</span></div>
           <div class="run-timeline" data-n="${(e.items ?? []).length}">${(e.items ?? [])
-            .map((s, i) => renderItem(s, true, i))
+            .map((s, i) => renderItem(s, i))
             .join("")}</div>
-          <div class="run-stream${e.streamDiscarded ? " discarded" : ""}"${
-            streamText ? "" : " hidden"
-          }>${esc(streamText).replace(/\n/g, "<br>")}</div>
+          <div class="run-stream md${
+            e.streamDiscarded ? " discarded" : ""
+          }"${streamText ? "" : " hidden"}>${streamText ? renderStreamingMd(streamText) : ""}</div>
           <div class="run-note"${e.streamDiscarded ? "" : " hidden"}>已改调工具 · 仍可看</div>
         </div>`;
       }
 
-      const cls = `${e.role}${e.queued ? " queued" : ""}`;
+      const chatty = isChattyMode();
+      const cls = `${e.role}${e.queued ? " queued" : ""}${chatty ? " chatty" : ""}`;
       // assistant 的回复按 markdown 渲染（mdToHtml 内部已做 HTML 转义，可安全直插）
       const isMd = e.role === "assistant";
-      const body = isMd
-        ? mdToHtml(e.text)
-        : e.text
-          ? esc(e.text).replace(/\n/g, "<br>")
-          : "";
+      // 闲聊模式：一条 assistant 拆成**多个气泡**（规则见 `bubble.ts`）。
+      // 工作模式照旧一整块 —— 结构化长答案切成 5 个泡会非常难读。
+      const bubbles = chatty && isMd && e.text ? splitBubbles(e.text) : null;
+      const body = bubbles
+        ? bubbles.map((b) => `<div class="msg-body md bubble">${mdToHtml(b)}</div>`).join("")
+        : isMd
+          ? mdToHtml(e.text)
+          : e.text
+            ? esc(e.text).replace(/\n/g, "<br>")
+            : "";
       const imgs =
         e.images && e.images.length
           ? `<div class="thumbs">${e.images.map((s, i) => renderThumb(s, i, false)).join("")}</div>`
           : "";
-      // 历史里的思考过程与步骤：**默认收起**（回看时才展开，别让思维链淹没正文）。
-      // 流式进行中的那个反而默认展开 —— 那时用户就想看它在想什么。
+      // 历史里的思考过程与步骤：整轮收进 `details.run-process`「过程 · N 步」，
+      // **默认闭合**（用户 10-02："这个应该全部压缩掉啊" —— 不留外壳的话，
+      // 一条消息回看时要占十几行折叠行，最终答案被顶到屏幕外）。
+      // 点开外壳之后，里面每条仍各自折叠（思考 / 工具行），不会一次哗啦出一屏。
       //
       // 新数据：`items`（磁盘上的 steps）就是完整时间线，思考与工具按序交错。
       // 老数据：只有单串 `reasoning` + 折叠行 → 回退成"一个思考块 + 一行摘要"。
       const hasReasonItem = (e.items ?? []).some((s) => s.kind === "reasoning");
-      const tl = renderTimeline(e.items, false);
+      // key 用磁盘序号优先（`storedIdx` 跨重绘稳定），退而用本次渲染的下标 ——
+      // 没有它，两条消息里同序号的折叠块会共用 key，展开一个会连带顶开别的消息。
+      const tlKey = e.storedIdx !== undefined ? `s${e.storedIdx}` : `i${idx}`;
+      const tl = renderTimeline(e.items, false, tlKey);
       const legacyReason =
         !hasReasonItem && e.reasoning
-          ? `<details class="run-reason hist-reason"><summary>💭 思考过程<span class="run-reason-len">（${
+          ? `<details class="run-reason hist-reason" data-open-key="lr-${esc(tlKey)}"><summary>💭 思考过程<span class="run-reason-len">（${
               e.reasoning.length
-            } 字）</span></summary><pre class="run-reason-pre">${esc(e.reasoning)}</pre></details>`
+            } 字）</span></summary>${renderReasonBody(e.reasoning)}</details>`
           : "";
-      const reason = `${legacyReason}${tl}`;
+      // 闲聊模式**不带过程**（用户 2026-10-08）：思考块与工具时间线一并收掉，
+      // 只留气泡 —— 否则还是"文档感"，不是聊天。
+      const reason = chatty ? "" : `${legacyReason}${tl}`;
       /** 本轮是否以「失败」收尾（决定要不要显示"已中断"角标） */
       const failed = (e.items ?? []).some((s) => s.kind === "error");
       // 本轮 token 用量角标（只有拿到 usage 的 assistant 消息才有）
@@ -2679,10 +3519,18 @@ function renderMessagesInner(): string {
             }">${fmtTokens(e.usage.total)} tok</span>`
           : "";
       return `
-      <div class="msg ${cls}"${e.steerId ? ` data-steer="${e.steerId}"` : ""}>
+      <div class="msg ${cls}" data-mid="${idx}"${e.steerId ? ` data-steer="${e.steerId}"` : ""}>
         ${imgs}
         ${reason}
-        ${body ? `<div class="msg-body${isMd ? " md" : ""}">${body}</div>` : ""}
+        ${
+          // 闲聊模式下 `body` 已经是**若干个气泡**的 HTML（各自带 .msg-body），
+          // 不能再套一层 .msg-body —— 那会变成"气泡里套气泡"。
+          bubbles
+            ? body
+            : body
+              ? `<div class="msg-body${isMd ? " md" : ""}">${body}</div>`
+              : ""
+        }
         ${
           e.continueRun
             ? `<div class="perm-actions" style="margin-top:6px"><button type="button" class="perm-btn ok" data-continue="1">继续</button></div>`
@@ -2690,7 +3538,7 @@ function renderMessagesInner(): string {
         }
         ${
           e.text || e.storedIdx !== undefined
-            ? `<div class="msg-foot">${tokBadge}${renderForkBtn(e)}${renderRegenBtn(e)}${renderDelBtn(e)}${
+            ? `<div class="msg-foot">${tokBadge}${renderEditBtn(e, lastUserStored)}${renderForkBtn(e)}${renderRegenBtn(e)}${renderDelBtn(e)}${
                 e.text
                   ? `<button type="button" class="msg-copy" data-idx="${idx}" title="复制这条消息">复制</button>`
                   : ""
@@ -3051,9 +3899,40 @@ function installPermHandlers(): void {
     .catch(() => {});
 }
 
+/**
+ * 权限倒计时用的定时器句柄。
+ *
+ * ⚠️ 为什么必须存下来（2026-10 修）：以前是裸 `window.setInterval(...)`，
+ * 句柄直接丢掉 —— 于是**每次 boot() 都留下一个永不停止的 1s 定时器**。
+ * 生产上它一直空转（`querySelectorAll` 找不到 `.perm-timer` 就什么也不做），
+ * 测试里则更糟：多个用例各自 boot 一次 → 一堆定时器在**环境拆掉之后**
+ * 才触发 → `document is not defined` 未捕获异常 → 整个 vitest 进程退出码 1。
+ *
+ * 存句柄 + 重入前先清，让 boot() 幂等。
+ */
+let permTimer: number | null = null;
+
+/// 待拍板条数轮询的定时器句柄（同 `permTimer`：必须存下来，见 boot 里的说明）。
+let pendingPollTimer: number | null = null;
+
 /** 倒计时：只改文本，不重绘整个消息区 */
 function startPermTimer(): void {
-  window.setInterval(() => {
+  if (permTimer !== null) window.clearInterval(permTimer);
+  permTimer = window.setInterval(() => {
+    // ⚠️ 环境已拆掉时**自杀**，不要继续跑（2026-10 修）。
+    // 生产上对应"窗口正在卸载、定时器刚好触发"这一瞬；
+    // 测试里则是 jsdom 环境拆除后定时器仍在队列里 —— 那时 `document`
+    // 和 `window` **都没了**，碰任何一个都是未捕获异常，
+    // 会把整个 vitest 进程的退出码变成 1。
+    //
+    // ⚠️ 连 `clearInterval` 都不能用 `window.` —— 那正是这里踩到的第二个坑
+    //    （第一版写 `window.clearInterval`，于是"自杀"那句自己又炸了）。
+    //    用裸 `clearInterval`：它是全局函数，Node 环境下仍然存在。
+    if (typeof document === "undefined" || !document.body) {
+      if (permTimer !== null) clearInterval(permTimer);
+      permTimer = null;
+      return;
+    }
     document.querySelectorAll<HTMLElement>(".perm-timer").forEach((el) => {
       const deadline = Number(el.dataset.deadline ?? 0);
       if (!deadline) return;
@@ -3097,11 +3976,11 @@ function renderPreview(): void {
 function renderImageHint(): void {
   const el = document.getElementById("img-hint");
   if (!el) return;
-  const m = models.find((x) => x.id === selectedModel);
+  const m = curModel();
   const needHint = pendingImages.length > 0 && m && !m.supportsImages;
   el.style.display = needHint ? "block" : "none";
   if (needHint) {
-    el.textContent = `当前模型 ${m.name || m.id} 不支持图片，将只发送图片路径（不会被识别内容）`;
+    el.textContent = `当前模型 ${m!.id} 不支持图片，将只发送图片路径（不会被识别内容）`;
   }
 }
 
@@ -3128,24 +4007,27 @@ async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T
 function renderPanelRefreshChip(): void {
   const chip = document.getElementById("model-chip");
   if (!chip) return;
-  const cur = models.find((m) => m.name === selectedModel);
+  const cur = curModel();
   const nameEl = chip.querySelector(".mc-name");
-  if (nameEl) nameEl.textContent = cur ? cur.name : selectedModel || "（未选模型）";
+  if (nameEl) nameEl.textContent = cur ? cur.id : selectedModel || "（未选模型）";
   // 上下文 / host / 功能标签都不占版面，只更新 tooltip（chip 已是单行小控件）
   const ctx = cur?.maxInputTokens ? `${Math.round(cur.maxInputTokens / 1000)}K` : "";
   const host = cur?.url ? shortHost(cur.url) : "";
   const tags = `${cur?.supportsToolCall ? "工具" : ""}${
     cur?.supportsImages ? (cur?.supportsToolCall ? " / 视觉" : "视觉") : ""
   }`;
-  chip.title = `模型：${cur ? cur.name : "（未选模型）"}${host ? ` · ${host}` : ""}${
+  chip.title = `模型：${cur ? cur.id : "（未选模型）"}${host ? ` · ${host}` : ""}${
     ctx ? ` · 上下文 ${ctx}` : ""
-  }${tags ? ` · ${tags}` : ""} —— 点卡片管理（${models.length} 个）· 点 ▾ 切换`;
+  }${tags ? ` · ${tags}` : ""} —— 点开选模型（共 ${models.length} 个）`;
   // 下拉开着的话，✓ 的位置可能变了
   paintModelsDropdown();
 }
 
 /**
- * 打开「模型管理」独立窗口 —— **唯一入口**（卡片本体 / 设置菜单 / 空态按钮都走它）。
+ * 打开「模型管理」独立窗口。
+ *
+ * 入口（2026-10-02 改定）：**设置菜单「🧩 模型」**、空态按钮、会话没模型时的兜底。
+ * ❌ 不再是"点模型卡片本体" —— 那一下现在开的是下面这个**模型列表**。
  *
  * 失败时既弹 toast 给用户看，也落盘到 `agent-data/diag.log`：
  * 排查时截图可能拿不到，日志文件是可靠通道。
@@ -3158,53 +4040,92 @@ function openModelsWindow(): void {
   });
 }
 
+/** 「模型列表」底部那颗「添加自定义模型」：开窗口 + 让窗口**直接落在添加表单**上 */
+function openModelsAdd(): void {
+  try {
+    localStorage.setItem(MODELS_INTENT_KEY, "add");
+  } catch {
+    // 拿不到 localStorage（配额/隐私模式）就当普通打开，别让添加流程整个走不通
+  }
+  openModelsWindow();
+}
+
 /**
- * ▾ 纯模型名下拉：**只选不管** —— 点谁切谁，不出现任何管理按钮。
+ * 模型列表（点 chip 本体或 ▾ 都出这个）：**只选不管** —— 谁被点谁成为当前模型。
  *
- * 分工（2026-09-29 定稿）：选择留在面板（轻、快），管理弹到独立窗口
- * （大、全）—— 管理入口是卡片本体，不是这个列表。
+ * ## 条目长相（2026-10-02 用户定稿）
+ *
+ * 每条 = 「组别 + 模型名」两行，与工具栏那颗 chip **同构** —— 用户原话
+ * "就是 [chip] 这个的罗列"。所以组别再按"撞名时才显示"处理，一律显示。
+ * 纯模型名一行（旧形态）看起来像一堆裸 id，认不出是哪个通道的。
+ *
+ * ## 管理入口不在这儿
+ *
+ * 增删改仍然只在独立「模型管理」窗口（设置 › 🧩 模型）。这里唯一多出来的
+ * 是底部那颗 **＋ 添加自定义模型** —— 它分隔线以下单独一行，不参与"选择"这件事。
  */
 function paintModelsDropdown(): void {
   document.getElementById("models-dropdown")?.remove();
   if (!modelsDropdownOpen) return;
   const chip = document.getElementById("model-chip");
   if (!chip) return;
+  // 当前模型解析成**唯一一条**（提到 map 外面：它跟行无关，别每行算一次）
+  const cur = currentModelRef();
+  const rows = models.length
+    ? models
+        .map((m) => {
+          const isCur = cur !== null && m.id === cur.id && sameUrl(m.url, cur.url);
+          return `
+        <button class="mc-mi${isCur ? " cur" : ""}" data-id="${esc(m.id)}" data-url="${esc(
+          m.url,
+        )}" title="${esc(m.id)} @ ${esc(m.url)}">
+          <span class="mc-mi-text">
+            <span class="mc-mi-group">${esc(modelGroupLabel(m.url))}</span>
+            <span class="mc-mi-name">${esc(m.id)}</span>
+          </span>
+          ${isCur ? '<span class="mc-mi-check">✓</span>' : ""}
+        </button>`;
+        })
+        .join("")
+    : '<div class="mc-mi-empty">（还没有模型，点下面添加）</div>';
   const dd = document.createElement("div");
   dd.className = "mc-menu";
   dd.id = "models-dropdown";
-  dd.innerHTML =
-    models.length === 0
-      ? '<div class="mc-mi-empty">（还没有模型）</div>'
-      : models
-          .map(
-            (m) => `
-        <button class="mc-mi${m.name === selectedModel ? " cur" : ""}" data-name="${esc(m.name)}" title="${esc(m.id)}">
-          <span class="mc-mi-name">${esc(m.name)}</span>
-          ${m.name === selectedModel ? '<span class="mc-mi-check">✓</span>' : ""}
-        </button>`,
-          )
-          .join("");
+  dd.innerHTML = `${rows}
+    <div class="mc-menu-sep"></div>
+    <button class="mc-mi mc-mi-add" data-add="1" title="添加一个 OpenAI 兼容的模型（Base URL / 模型 ID / Key）">
+      <span class="mc-mi-text"><span class="mc-mi-name">＋ 添加自定义模型</span></span>
+    </button>`;
   chip.appendChild(dd);
-  dd.querySelectorAll<HTMLButtonElement>(".mc-mi").forEach((b) =>
+  // 只给「模型」条目绑选择：`[data-id]` 把底部那颗添加按钮排除在外
+  dd.querySelectorAll<HTMLButtonElement>(".mc-mi[data-id]").forEach((b) =>
     b.addEventListener("click", async (e) => {
       e.stopPropagation();
-      selectedModel = b.dataset.name!;
+      selectedModel = b.dataset.id!;
+      selectedModelUrl = b.dataset.url ?? null;
       modelsDropdownOpen = false;
       paintModelsDropdown();
       renderPanelRefreshChip();
       renderImageHint(); // 换模型可能改变「支不支持图片」
-      await invoke("set_selected_model", { id: selectedModel }).catch((err) =>
-        pushEntry("error", `保存模型选择失败：${err}`),
+      await invoke("set_selected_model", { id: selectedModel, url: selectedModelUrl }).catch(
+        (err) => pushEntry("error", `保存模型选择失败：${err}`),
       );
     }),
   );
+  dd.querySelector<HTMLButtonElement>(".mc-mi-add")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    modelsDropdownOpen = false;
+    paintModelsDropdown();
+    openModelsAdd();
+  });
 }
 
 function renderPanel(): void {
-  // 当前模型 —— 主界面上的「大号体现区」。
-  // 卡片本体 = 管理入口（弹出独立「模型管理」窗口）；▾ = 纯名称下拉只选不管。
-  const cur = models.find((m) => m.name === selectedModel);
-  const curName = cur ? cur.name : selectedModel || "（未选模型）";
+  // 当前模型 —— 工具栏最右那颗 chip。
+  // 整颗 chip（本体 + ▾）= **模型列表**的开关（组别+模型名的罗列 + 底部添加自定义模型）。
+  // 管理（增删改/测试/分组）在独立窗口，入口是 设置 › 🧩 模型。
+  const cur = curModel();
+  const curName = cur ? cur.id : selectedModel || "（未选模型）";
   const curCtx = cur?.maxInputTokens ? `${Math.round(cur.maxInputTokens / 1000)}K` : "";
   // 分组显示名（用户可在模型管理里给每个 Base URL 起名；取不到回退 host）
   const curGroup = modelGroupLabel(cur?.url);
@@ -3216,9 +4137,7 @@ function renderPanel(): void {
   //   上下文 / host / 功能标签仍全在 title tooltip 里。
   const modelTip = `模型：${curName}${curGroup ? ` · 组别 ${curGroup}` : ""}${
     curCtx ? ` · 上下文 ${curCtx}` : ""
-  }${curTags ? ` · ${curTags}` : ""} —— 点卡片管理（${
-    models.length
-  } 个）· 点 ▾ 切换`;
+  }${curTags ? ` · ${curTags}` : ""} —— 点开选模型（共 ${models.length} 个）`;
   const modelBtn = `
     <button class="model-chip" id="model-chip" title="${esc(modelTip)}">
       ${curGroup ? `<span class="mc-group">${esc(curGroup)}</span>` : ""}
@@ -3263,6 +4182,12 @@ function renderPanel(): void {
 
       <div class="fg-ctx" id="fg-ctx" title="用户当前前台应用（点击复制路径）" style="display:none"></div>
 
+      <!-- 非对话视图的**固定**标题条（2026-10-08）。
+           与 #fg-ctx 同位置、互斥显示：对话视图显示前台应用，其余视图显示
+           当前页标题 + 返回。关键差别是**它在 #panel-body 之外** —— 返回按钮
+           不再跟着内容滚，滚到页面底部也够得着（用户截图报的 bug）。 -->
+      <div class="sub-bar" id="sub-bar" style="display:none"></div>
+
       <!-- 「另一个会话在后台跑」提示条（切走后自动出现，点击切回） -->
       <div class="bg-run" id="bg-run" style="display:none"></div>
 
@@ -3296,34 +4221,32 @@ function renderPanel(): void {
   document.getElementById("btn-close")!.addEventListener("click", () => void collapse());
   document.getElementById("btn-grab")!.addEventListener("click", () => void grabScreen());
   // 「测」「忆」的工具栏入口已删：
-  //   测试连通性 → 模型管理窗口（点顶栏模型卡片弹出，每行一颗「测」）
+  //   测试连通性 → 模型管理窗口（设置 › 🧩 模型，每行一颗「测」）
   //   记忆审批   → 设置入口页「🧠 记忆」
   document.getElementById("btn-new")!.addEventListener("click", (e) => {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    showNewMenu(r.left, r.bottom + 4);
+    void showNewMenu(r.left, r.bottom + 4);
   });
   document.getElementById("btn-sess")!.addEventListener("click", () => void switchView("sessions"));
 
-  // 当前会话标题挂到「史」按钮的 tooltip 上，一眼知道在哪个会话里
+  // 当前会话标题挂到「史」按钮的 tooltip 上，一眼知道在哪个会话/什么模式里
+  // （模式跟会话走后，这里成了"不打开列表也能确认当前模式"的唯一入口）
   const curSess = sessionList.find((s) => s.id === currentSessionId);
   const sessBtn = document.getElementById("btn-sess");
   if (sessBtn && curSess) {
     const tag = curSess.kind === "main" ? "主聊天" : curSess.kind === "fork" ? "分支" : "任务";
-    sessBtn.title = `会话（${tag}：${curSess.title}）`;
+    sessBtn.title = `会话（${tag}：${curSess.title}）· 模式：${currentModeName()}`;
   }
   document.getElementById("btn-gear")!.addEventListener("click", () => void switchView("settings"));
 
-  // 模型卡片分两区（2026-09-29 定稿）：
-  //   卡片本体 → 弹出独立的「模型管理」窗口（增删改/分组/测试都在那边）
-  //   ▾        → 纯模型名下拉，只选不管
+  // 模型 chip（2026-10-02 用户改定）：
+  //   整颗 chip（本体 + ▾）→ 出**模型列表**（组别+模型名的罗列，底部带「添加自定义模型」）
+  //   管理窗口不在这儿了 —— 走 设置 › 🧩 模型
   const chip = document.getElementById("model-chip");
   chip?.addEventListener("click", (e) => {
-    const t = e.target as HTMLElement;
-    if (t.closest(".mc-caret")) return; // ▾ 自己处理
-    openModelsWindow();
-  });
-  chip?.querySelector(".mc-caret")?.addEventListener("click", (e) => {
-    e.stopPropagation();
+    // 菜单就挂在 chip 里面，点菜单内部的按钮由它们各自的 handler 处理，
+    // 这里必须放行，否则会把刚点开的菜单又切掉
+    if ((e.target as HTMLElement).closest(".mc-menu")) return;
     modelsDropdownOpen = !modelsDropdownOpen;
     paintModelsDropdown();
   });
@@ -3407,6 +4330,14 @@ let fgTimer: ReturnType<typeof setTimeout> | undefined;
 async function refreshFgCtx(loop = true): Promise<void> {
   const el = document.getElementById("fg-ctx");
   if (!el) return;
+  // 非对话视图时这一行已经让位给 `#sub-bar`（见 `renderSubBar`）。
+  // **必须在这里拦住**：下面每个分支都会 `el.style.display = "block"`，
+  // 不拦的话它每 3 秒就自己冒一次头，把固定标题条顶下去。
+  // 顺带省掉一次无用的 IPC（前台历史只在对话视图里被看见）。
+  if (view !== "chat") {
+    if (loop) scheduleFgCtx();
+    return;
+  }
   try {
     const list = await withTimeout(
       invoke<FgCtx[]>("foreground_history"),
@@ -3471,6 +4402,13 @@ async function refreshFgCtx(loop = true): Promise<void> {
 function scheduleFgCtx(): void {
   if (fgTimer) clearTimeout(fgTimer);
   fgTimer = setTimeout(() => {
+    // ⚠️ 定时器活过页面卸载是常态（面板一关它照样在队列里）。
+    //   测试环境 teardown 之后 `document` 整个不存在，直接 `getElementById`
+    //   会抛 ReferenceError，被 vitest 记成 unhandled error → **整个文件退出码 1**，
+    //   哪怕断言全绿（2026-10-03 撞过：新增两个用例多花 1.5s，
+    //   就把这个 3s 定时器拖过了 teardown）。
+    //   `typeof` 守卫：无 DOM 时安静退出，不留噪声。
+    if (typeof document === "undefined") return;
     if (mode !== "panel" || !document.getElementById("fg-ctx")) return;
     void refreshFgCtx(true);
   }, 3000);
@@ -3487,6 +4425,9 @@ function scrollToBottom(): void {
 function renderBody(): void {
   const b = document.getElementById("panel-body");
   if (!b) return;
+
+  // 顶部标题条跟着 view 走（对话 → 前台应用条；其余 → 当前页标题 + 返回）
+  renderSubBar();
 
   // 非对话视图下不需要输入区
   const inputArea = document.querySelector(".panel-input") as HTMLElement | null;
@@ -3520,7 +4461,7 @@ function renderBody(): void {
   }
 
   if (view === "sessions") {
-    b.innerHTML = `<div class="mem-head">会话历史<button class="mem-back" id="sub-back">‹ 对话</button></div>`;
+    b.innerHTML = `<div class="mem-head">会话历史</div>`;
     void refreshSessionList().then(() => {
       if (view !== "sessions") return;
       b.innerHTML = renderSessionsView();
@@ -3550,13 +4491,18 @@ function renderBody(): void {
       bd(invoke<UsageRecord[]>("usage_report").catch(() => [] as UsageRecord[]), [] as UsageRecord[]),
       bd(invoke<SearchStatus | null>("search_status").catch(() => null), null),
       bd(invoke<RecoveryState>("recovery_state").catch(() => null), null),
+      bd(invoke<ProjectListView>("project_list").catch(() => null), null),
+      // 数据源：摘要行要显示条数，所以这里拉一次（内部对未启用的源不读取）
+      bd(invoke<LifeStatus>("life_status").catch(() => null), null),
     ])
-      .then(([mcp, pending, autoOn, rules, settings, usage, search, recovery]) => {
+      .then(([mcp, pending, autoOn, rules, settings, usage, search, recovery, proj, life]) => {
         if (view !== "settings") return;
         autostartOn = autoOn;
         blurCollapse = settings?.blurCollapse ?? true;
         permCount = rules.length;
         searchInfo = search;
+        projectInfo = proj;
+        lifeInfo = life;
         const tSum = todayTokenTotal(usage);
         const summary = usage.length ? `今日 ${fmtTokens(tSum)} · 共 ${usage.length} 次问答` : "暂无记录";
         b.innerHTML = renderSettingsMenu(mcp, pending.length, summary, recoverySummaryText(recovery));
@@ -3581,6 +4527,27 @@ function renderBody(): void {
         searchInfo = st;
         b.innerHTML = renderSearchView(st);
         bindSearchView(b);
+      });
+    return;
+  }
+
+  if (view === "life") {
+    b.innerHTML = `<div class="mem-loading">加载中…</div>`;
+    void invoke<LifeStatus>("life_status")
+      .then((st) => {
+        if (view !== "life") return;
+        lifeInfo = st;
+        b.innerHTML = renderLifeView();
+        bindLifeView(b);
+      })
+      .catch((e) => {
+        if (view !== "life") return;
+        b.innerHTML = `${subHeader("数据源")}
+          <div class="mem-empty">读取数据源失败：${esc(String(e))}</div>`;
+        // 返回按钮已挪到滚动区外的 `#sub-bar`，绑定统一在 `renderSubBar` 里做。
+  // ⚠️ 这里**不能**再绑一次：同一个按钮挂两个 handler 会让 `switchView` 跑两遍，
+  //    第二遍撞上它的 toggle 逻辑（再点同一个非 chat 视图 → 回对话），
+  //    表现出来就是"点了返回却回到了对话页"。
       });
     return;
   }
@@ -3649,15 +4616,36 @@ function renderBody(): void {
         // 全局"直接全给"开关（保留键 __all__），组开关本身由后端决定 g.active
         const gs: Record<string, boolean> = grpSettings ?? {};
         mcpAllGroups = gs["__all__"] ?? true;
-        b.innerHTML = renderMcpView(st, servers ?? [], grants ?? []);
+        // 数据源交给 `mcpServers`（DOM 只负责画）—— 见它的注释
+        mcpServers = servers ?? [];
+        b.innerHTML = renderMcpView(st, mcpServers, grants ?? []);
         b.scrollTop = keep;
         bindMcpView(b);
       })
       .catch(() => {
         if (view !== "mcp") return;
+        mcpServers = [];
         b.innerHTML = renderMcpView(null, [], []);
         b.scrollTop = keep;
         bindMcpView(b);
+      });
+    return;
+  }
+
+  if (view === "project") {
+    const keep = b.scrollTop;
+    b.innerHTML = `<div class="mem-loading">加载中…</div>`;
+    void invoke<ProjectListView>("project_list")
+      .then((v) => {
+        if (view !== "project") return;
+        projectInfo = v;
+        b.innerHTML = renderProjectView(v);
+        b.scrollTop = keep;
+        bindProjectView(b);
+      })
+      .catch((e) => {
+        if (view !== "project") return;
+        b.innerHTML = renderProjectView(null) + `<div class="mem-empty">${esc(String(e))}</div>`;
       });
     return;
   }
@@ -3827,6 +4815,7 @@ interface SkillInfo {
   path: string;
 }
 
+
 function renderMemView(
   list: Candidate[],
   files: MemoryFiles | null,
@@ -3864,15 +4853,28 @@ function renderMemView(
       ? `<div class="mem-empty">还没有项目记忆。在 <code>agent-data/projects/&lt;名&gt;/</code> 放 <code>source.ref</code>（项目绝对路径）和 <code>MEMORY.md</code> 即可；对话时前台路径命中会自动注入。</div>`
       : projects
           .map((p) => {
-            const badge = !p.sourceAlive
-              ? `<span style="color:#f0a8a8">源路径不存在</span>`
-              : p.hasMemory
-                ? `<span style="color:#8fd49a">已绑定</span>`
-                : `<span style="color:#f0c674">MEMORY 为空</span>`;
+            // 三态徽标（2026-10-03 修正）：空 source ≠ 路径失效 ——
+            // 从没绑过路径的项目是「未绑定」，不该跟死路径一样标红吓人
+            const badge = !p.source
+              ? `<span style="color:#f0c674">未绑定路径</span>`
+              : !p.sourceAlive
+                ? `<span style="color:#f0a8a8">源路径不存在</span>`
+                : p.hasMemory
+                  ? `<span style="color:#8fd49a">已绑定</span>`
+                  : `<span style="color:#f0c674">MEMORY 为空</span>`;
+            const canFix = !p.source || !p.sourceAlive;
             return `
       <div class="skill-item">
         <div class="skill-name">📁 ${esc(p.name)} ${badge}</div>
         <div class="skill-desc"><code>${esc(p.source || "（无 source.ref）")}</code></div>
+        ${
+          canFix
+            ? `<div class="proj-fix">
+                 <button type="button" class="mem-btn proj-set-src" data-proj="${esc(p.name)}" title="把 source.ref 指到新路径（留空 = 解绑）">改路径</button>
+                 <button type="button" class="mem-btn no proj-archive" data-proj="${esc(p.name)}" title="整个目录挪进 agent-data/.trash/（不硬删，可手工还原）">归档</button>
+               </div>`
+            : ""
+        }
       </div>`;
           })
           .join("");
@@ -3894,7 +4896,7 @@ function renderMemView(
   return `
     <div class="mem-head">待审批 ${list.length} 条</div>
     ${pendingHtml}
-    <div class="mem-head"> 记忆文件族</div>
+    <div class="mem-head"> 记忆文件族<button type="button" class="mem-btn mem-distill" title="打开蒸馏页：把 MEMORY.md 中转站的条目分流到 USER / SOUL / IDENTITY，拿不准的 AI 会向你提问">🧹 蒸馏</button></div>
     <div class="set-hint" style="margin-bottom:8px">
       这些文件都在 <code>agent-data/</code> 下，直接编辑即生效（下次对话），也可用 <code>write_file</code> 改。
     </div>
@@ -3909,7 +4911,9 @@ function renderMemView(
 }
 
 function bindMemButtons(root: HTMLElement): void {
-  root.querySelectorAll<HTMLButtonElement>(".mem-btn.ok").forEach((btn) =>
+  // ⚠️ 选择器必须带 [data-id]：只有「待审批」那两颗按钮有 data-id，
+  //    项目记忆行上的「改路径/归档」也用 mem-btn 配色，别把它们绑成批准/驳回。
+  root.querySelectorAll<HTMLButtonElement>(".mem-btn.ok[data-id]").forEach((btn) =>
     btn.addEventListener("click", async () => {
       await invoke("mem_approve", { id: btn.dataset.id }).catch((e) =>
         pushEntry("error", `批准失败：${e}`),
@@ -3917,7 +4921,7 @@ function bindMemButtons(root: HTMLElement): void {
       renderBody();
     }),
   );
-  root.querySelectorAll<HTMLButtonElement>(".mem-btn.no").forEach((btn) =>
+  root.querySelectorAll<HTMLButtonElement>(".mem-btn.no[data-id]").forEach((btn) =>
     btn.addEventListener("click", async () => {
       await invoke("mem_reject", { id: btn.dataset.id }).catch((e) =>
         pushEntry("error", `驳回失败：${e}`),
@@ -3925,6 +4929,117 @@ function bindMemButtons(root: HTMLElement): void {
       renderBody();
     }),
   );
+
+  // ---- 记忆蒸馏（2026-10-03）：开一条专用会话，剩下的就是常规聊天 ----
+  root.querySelector<HTMLButtonElement>(".mem-distill")?.addEventListener("click", () => {
+    void distillStart();
+  });
+
+  // ---- 项目记忆维护：改路径 / 归档（2026-10-03） ----
+  root.querySelectorAll<HTMLButtonElement>(".proj-set-src").forEach((btn) =>
+    btn.addEventListener("click", () => startProjEdit(btn.dataset.proj ?? "")),
+  );
+
+  root.querySelectorAll<HTMLButtonElement>(".proj-archive").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      const name = btn.dataset.proj ?? "";
+      const ok = await askConfirm(
+        `归档项目记忆「${name}」？`,
+        "整个目录会挪进 agent-data/.trash/（不硬删，可手工还原）。\n归档后该项目的记忆不再注入。",
+        "归档",
+      );
+      if (!ok) return;
+      try {
+        const dest = await invoke<string>("mem_project_archive", { name });
+        showToast(`已归档到 ${dest}`, "ok", 4500);
+      } catch (e) {
+        showToast(`归档失败：${e}`, "error");
+      }
+      renderBody();
+    }),
+  );
+}
+
+/**
+ * 项目记忆「改路径」：把该条目的路径行就地换成输入框 + 保存/取消。
+ *
+ * 为什么不弹独立窗口：面板里没有单行输入弹窗组件（askInput 已随模型管理
+ * 搬进 models 窗口），就地替换最省事，Enter 保存 / Esc 取消也好按。
+ */
+/**
+ * 「蒸馏」入口（2026-10-03 定稿）：开一条**普通聊天**会话，让 agent 自己蒸馏。
+ *
+ * 用户原话：「我说的是思考啊，就常规聊天啊」—— 所以这里**不做任何自定义页面**：
+ * 新会话带 `distill` 标记（`sessions/<id>.distill`），后端 `agent::run` 见到它
+ * 就换蒸馏角色说明 + 注入 `distill_move` 工具，模型在标准循环里读中转站、
+ * 问你、搬条目 —— 思考过程与工具调用全走主对话那套时间线 UI。
+ * 本函数只负责：开会话 → 切到对话 → 填一句开场把它跑起来。
+ */
+async function distillStart(): Promise<void> {
+  try {
+    const s = await invoke<Session>("distill_session_open");
+    currentSessionId = s.id;
+    entries = sessionToEntries(s);
+    view = "chat";
+    renderBody();
+
+    const kickoff =
+      "开始蒸馏：先读 agent-data/memory/MEMORY.md（中转站），把每条分流到 " +
+      "USER.md（只写「人」）/ SOUL.md（语气人格）/ IDENTITY.md（称呼）。" +
+      "逐条引用原文把建议摆出来给我看；拿不准的条目直接问我，我答复后你再用 distill_move 落盘。" +
+      "项目记忆（agent-data/projects/）这轮不碰。";
+    const input = document.getElementById("input") as HTMLTextAreaElement | null;
+    if (input) {
+      input.value = kickoff;
+      draftInput = kickoff;
+    }
+    if (busy) {
+      showToast("蒸馏会话已开好（当前有任务在跑）——等它结束后按回车发出开场", "ok", 4000);
+      return;
+    }
+    void send();
+  } catch (e) {
+    showToast(`开蒸馏会话失败：${e}`, "error");
+  }
+}
+
+function startProjEdit(name: string): void {
+  const item = [...document.querySelectorAll(".skill-item")].find(
+    (el) => el.querySelector(".proj-set-src")?.getAttribute("data-proj") === name,
+  );
+  const desc = item?.querySelector<HTMLElement>(".skill-desc");
+  if (!desc) return;
+  const cur = desc.querySelector("code")?.textContent ?? "";
+  desc.innerHTML = `
+    <input class="proj-src-input" type="text" placeholder="D:\\path\\to\\project（留空 = 解绑）" spellcheck="false" />
+    <button type="button" class="mem-btn ok proj-src-save">保存</button>
+    <button type="button" class="mem-btn no proj-src-cancel">取消</button>`;
+  const input = desc.querySelector<HTMLInputElement>(".proj-src-input");
+  if (!input) return;
+  input.value = cur === "（无 source.ref）" ? "" : cur;
+  input.focus();
+  const save = async (): Promise<void> => {
+    try {
+      await invoke("mem_project_set_source", { name, path: input.value });
+      showToast(`已更新「${name}」的源路径`, "ok");
+      renderBody();
+    } catch (e) {
+      showToast(`保存失败：${e}`, "error");
+    }
+  };
+  desc.querySelector<HTMLButtonElement>(".proj-src-save")?.addEventListener("click", () => {
+    void save();
+  });
+  desc.querySelector<HTMLButtonElement>(".proj-src-cancel")?.addEventListener("click", () => {
+    renderBody();
+  });
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      void save();
+    }
+    if (ev.key === "Escape") renderBody();
+  });
 }
 
 async function switchView(v: View): Promise<void> {
@@ -3951,8 +5066,7 @@ function renderSettingsMenu(
   usageSummary: string,
   recoverySummary: string,
 ): string {
-  const curModel =
-    models.find((m) => m.id === selectedModel)?.name ?? "（未选）";
+  const curModelName = curModel()?.id ?? "（未选）";
 
   const mcpSummary = mcp
     ? mcp.connected
@@ -3983,18 +5097,20 @@ function renderSettingsMenu(
     </button>`;
 
   return `
-    <div class="mem-head">设置<button class="mem-back" id="set-back">返回对话</button></div>
-    ${item("models", "🧩", "模型", `当前 ${curModel} · 共 ${models.length} 个（独立窗口管理）`)}
+    <div class="mem-head">设置</div>
+    ${item("models", "🧩", "模型", `当前 ${curModelName} · 共 ${models.length} 个（独立窗口管理）`)}
     ${item("search", "🌐", "搜索 web_search", searchSummary)}
     ${item("usage", "📊", "Token 用量", usageSummary)}
     ${item("recovery", "♻️", "备份与回收站", recoverySummary)}
     ${item("mcp", "🔌", "MCP 外部工具", mcpSummary)}
+    ${item("life", "📡", "数据源", lifeSummaryText())}
+    ${item("project", "📦", "项目", projectSummaryText())}
     ${item("perm", "📁", "文件权限", `已配置 ${permCount} 条规则`)}
     ${item("cmdpolicy", "⌨️", "命令策略", "白名单 / 硬阻断 / 审计（run_command）")}
     ${item("mem", "🧠", "记忆", "待审批、记忆文件族与项目绑定", pendingCount > 0 ? String(pendingCount) : undefined)}
 
     <div class="mem-head">行为</div>
-    ${item("behavior", "🎛", "执行位置 / 模式 / 权限", behaviorSummary())}
+    ${item("behavior", "🎛", "执行位置 / 权限", behaviorSummary())}
 
     <div class="mem-head">启动与退出</div>
     <label class="set-check set-check-row">
@@ -4013,7 +5129,7 @@ function renderSettingsMenu(
 }
 
 function bindSettingsMenu(root: HTMLElement): void {
-  document.getElementById("set-back")?.addEventListener("click", () => void switchView("chat"));
+  // 同 `sub-back`：设置入口页的返回按钮也归 `renderSubBar` 管了（不再长在内容流里）。
   root.querySelectorAll<HTMLButtonElement>(".set-entry").forEach((b) => {
     // 「模型」不再是面板内子页 —— 弹独立窗口（编辑住在外面，面板只管选）
     if (b.dataset.act === "models") {
@@ -4061,30 +5177,97 @@ function bindSettingsMenu(root: HTMLElement): void {
   });
 }
 
-/** 子页顶部的返回条（统一回设置入口页） */
+/**
+ * 子页内容流里的**节标题**（不含返回按钮）。
+ *
+ * ⚠️ 2026-10-08 变更：返回按钮**从这里拿掉了**，改由滚动区外的
+ * `#sub-bar` 承担（见 `renderSubBar`）。原来按钮写在这儿，跟着
+ * `#panel-body` 一起滚 —— 用户滚到页面下半部分就够不着，必须一路
+ * 滚回顶部才能退出。现在这里只留标题，标题不动也无所谓（顶部条常驻）。
+ */
 function subHeader(title: string): string {
-  return `<div class="mem-head">${title}<button class="mem-back" id="sub-back">‹ 设置</button></div>`;
+  return `<div class="mem-head">${title}</div>`;
 }
 
-// ---------------- 设置 › 行为（执行位置 / 模式 / 权限） ----------------
+/**
+ * 非对话视图的固定顶部条配置（2026-10-08）。
+ *
+ * `back` = 点返回去哪；`backLabel` = 按钮文案。
+ * 两档返回目标：子页回设置入口页、设置与会话历史回对话。
+ */
+const VIEW_BAR: Record<
+  Exclude<View, "chat">,
+  { title: string; icon: string; back: View; backLabel: string }
+> = {
+  settings: { title: "设置", icon: "⚙", back: "chat", backLabel: "返回对话" },
+  sessions: { title: "会话历史", icon: "🕘", back: "chat", backLabel: "返回对话" },
+  mcp: { title: "MCP 外部工具", icon: "🔗", back: "settings", backLabel: "设置" },
+  perm: { title: "文件权限", icon: "🔒", back: "settings", backLabel: "设置" },
+  cmdpolicy: { title: "命令策略", icon: "🛡", back: "settings", backLabel: "设置" },
+  behavior: { title: "行为", icon: "🎛", back: "settings", backLabel: "设置" },
+  mem: { title: "记忆", icon: "🧠", back: "settings", backLabel: "设置" },
+  usage: { title: "Token 用量", icon: "📊", back: "settings", backLabel: "设置" },
+  recovery: { title: "备份与回收站", icon: "♻", back: "settings", backLabel: "设置" },
+  search: { title: "搜索", icon: "🌐", back: "settings", backLabel: "设置" },
+  life: { title: "数据源", icon: "📄", back: "settings", backLabel: "设置" },
+  project: { title: "项目", icon: "📦", back: "settings", backLabel: "设置" },
+};
+
+/**
+ * 画/收顶部标题条 —— 每次 `renderBody()` 都会调（view 一变它就得跟着变）。
+ *
+ * 非对话视图：亮 `#sub-bar`（当前页标题 + 返回），收 `#fg-ctx` ——
+ * 后者是"用户当前在看什么"，在设置页里既没用又白占一行，正好把这一行让给返回。
+ * 对话视图：反过来（前台条的显隐交给 `refreshFgCtx` 自己管，它有
+ * "读取中/空态/失败"三种内容，这里不插手）。
+ */
+function renderSubBar(): void {
+  const bar = document.getElementById("sub-bar");
+  const fg = document.getElementById("fg-ctx");
+  if (!bar || !fg) return;
+
+  if (view === "chat") {
+    bar.style.display = "none";
+    bar.innerHTML = "";
+    return;
+  }
+
+  fg.style.display = "none";
+  const cfg = VIEW_BAR[view];
+  bar.innerHTML =
+    `<span class="sub-bar-title">${cfg.icon} ${esc(cfg.title)}</span>` +
+    // `id="sub-back"` 是**沿用旧锚点**：子页的返回按钮原来长在内容流里就带这个 id，
+    // 现有 UI 测试直接查它来点击（见 tests/ui/flow.behavior.test.ts 等）。
+    // 语义没变（还是"回上一层"），只是挪到了滚动区之外。
+    `<button class="mem-back sub-bar-back" id="sub-back" type="button">‹ ${esc(
+      cfg.backLabel,
+    )}</button>`;
+  bar.style.display = "flex";
+  bar.querySelector<HTMLButtonElement>(".sub-bar-back")?.addEventListener("click", () => {
+    void switchView(cfg.back);
+  });
+}
+
+// ---------------- 设置 › 行为（执行位置 / 执行权限） ----------------
 //
-// 为什么这三样住在这里、而不是输入行：
+// 为什么这些住在这里、而不是输入行：
 //   它们是**设置**（改一次管很久），不是每次发消息都要碰的东西。
 //   2026-10 用户原话："不要设置我这个页面有设置的啊" ——
 //   它们曾以三颗 chip 的形式挤在输入行，占掉约 110~165px，
 //   把输入框压到连一行 placeholder 都放不下。
+//
+// ⚠️ 2026-10-08：**Agent 模式已从这里搬走**（用户定案："b 从设置页挪到一个
+//    '新建会话时选模式'的入口 默认是标准"）。理由见 `showNewMenu` 的注释 ——
+//    一句话：模式跟会话走、**建完不能改**，所以它不是"设置"而是"建会话的参数"。
+//    这里只剩执行位置与执行权限两维。别再往这儿加模式选择器。
 
 /** 设置入口页上那一行摘要 */
 function behaviorSummary(): string {
-  const m = modesCache.find((x) => x.id === activeModeId);
   const trust = EXEC_TRUST_LABEL[execTrust] ?? EXEC_TRUST_LABEL.ask;
-  return (
-    `${bgDeskEnabled ? "后台" : "前台"}执行 · ${m?.name ?? activeModeId} · ${trust.full}`
-  );
+  return `${bgDeskEnabled ? "后台" : "前台"}执行 · ${trust.full}`;
 }
 
 function renderBehaviorView(): string {
-  const m = modesCache.find((x) => x.id === activeModeId);
   const trust = EXEC_TRUST_LABEL[execTrust] ?? EXEC_TRUST_LABEL.ask;
 
   // ── 执行位置 ──
@@ -4109,35 +5292,6 @@ function renderBehaviorView(): string {
         : ""
     }`;
 
-  // ── Agent 模式 ──
-  const modeRows = modesCache.length
-    ? modesCache
-        .map((x) => {
-          const groups =
-            x.allowedCount === null
-              ? `<span class="mg-ok">全部组</span>`
-              : x.allowedCount === 0
-                ? `<span class="mg-off">不预载外部工具组</span>`
-                : `<span class="mg-ok">${x.allowedCount} 组可见</span>`;
-          const unknown = x.unknownGroups.length
-            ? ` · ` +
-              x.unknownGroups
-                .map((u) => `<span class="mg-unknown">${esc(u)}（不存在）</span>`)
-                .join(" · ")
-            : "";
-          return `
-        <label class="set-check set-check-row bh-row">
-          <input type="radio" name="bh-mode" value="${esc(x.id)}" ${
-            x.id === activeModeId ? "checked" : ""
-          }>
-          <b>${MODE_ICON[x.id] ?? "🧩"} ${esc(x.name)}</b>
-          <div class="ctx-sub">${escMd(x.description)}</div>
-          <div class="mg-line"><span class="mg-label">工具组</span>${groups}${unknown}</div>
-        </label>`;
-        })
-        .join("")
-    : `<div class="mem-empty">读不到模式定义（agent-data/modes.json）。</div>`;
-
   // ── 执行权限 ──
   const trustRows = (
     [
@@ -4159,20 +5313,30 @@ function renderBehaviorView(): string {
   return (
     subHeader("行为") +
     `<div class="set-hint" style="margin-bottom:8px">
-       三个维度互不干涉：<b>执行位置</b>管窗口开在哪张桌面、<b>Agent 模式</b>管哪些 MCP
-       工具组对模型可见、<b>执行权限</b>管用它们时问不问。
+       两个维度互不干涉：<b>执行位置</b>管窗口开在哪张桌面、<b>执行权限</b>管调用工具时问不问。
      </div>` +
     `<div class="mem-head">🖥 执行位置</div>${bgRows}` +
-    `<div class="mem-head">🎯 Agent 模式（当前：${esc(m?.name ?? activeModeId)}）</div>${modeRows}` +
-    `<div class="set-hint">模式只能<b>收窄</b>：你在设置 › MCP 里关掉的组，任何模式都开不回来。
-       要加自己的模式：改 <code>agent-data/modes.json</code>，不用重新编译。</div>` +
     `<div class="mem-head">${trust.icon} 执行权限（当前：${esc(trust.full)}）</div>${trustRows}` +
-    `<div class="set-hint">文件权限申请不受这一档影响（那是 permissions.json 三层闸门）。</div>`
+    `<div class="set-hint">文件权限申请不受这一档影响（那是 permissions.json 三层闸门）。</div>` +
+    `<div class="set-hint">
+       <b>Agent 模式不在这里</b>：它跟着<b>会话</b>走、建会话时就定死（一个会话模式不能变），
+       所以入口在工具栏的 <b>「＋」→ 新建会话</b> 里。想看当前会话是什么模式，
+       打开工具栏<b>「史」</b>看列表里每条会话后面的标记。<br>
+       模式管什么：<b>哪些 MCP 工具组对模型可见</b>（只能<b>收窄</b> —— 你在设置 › MCP
+       里关掉的组，任何模式都开不回来）、<b>工具怎么调</b>（native 逐个直接调 /
+       PTC 只给 <code>run_code</code>、其余写成 TypeScript 程序调，中间结果不进上下文）、
+       以及<b>正文能不能发表情包</b>（工作模式只准贴产物图；这条靠提示词约束，
+       不前端硬拦，拦了会连截图一起挡掉）。<br>
+       要加自己的模式：改 <code>agent-data/modes.json</code>，不用重新编译。
+     </div>`
   );
 }
 
 function bindBehaviorView(root: HTMLElement): void {
-  document.getElementById("sub-back")?.addEventListener("click", () => void switchView("settings"));
+  // 返回按钮已挪到滚动区外的 `#sub-bar`，绑定统一在 `renderSubBar` 里做。
+  // ⚠️ 这里**不能**再绑一次：同一个按钮挂两个 handler 会让 `switchView` 跑两遍，
+  //    第二遍撞上它的 toggle 逻辑（再点同一个非 chat 视图 → 回对话），
+  //    表现出来就是"点了返回却回到了对话页"。
 
   root.querySelector<HTMLInputElement>("#bh-bgdesk")?.addEventListener("change", async (e) => {
     const on = (e.currentTarget as HTMLInputElement).checked;
@@ -4180,14 +5344,10 @@ function bindBehaviorView(root: HTMLElement): void {
     renderBody(); // 重绘：要刷新摘要行与"正在跑什么"列表
   });
 
-  root.querySelectorAll<HTMLInputElement>('input[name="bh-mode"]').forEach((el) =>
-    el.addEventListener("change", async () => {
-      if (!el.checked) return;
-      await applyModeChange(el.value);
-      renderBody();
-    }),
-  );
-
+  // ⚠️ 2026-10-08：原来这里还有一坨 'input[name="bh-mode"]' 的 change 监听
+  //    （勾模式 → `applyModeChange`）。模式搬进「＋」菜单后**整块删掉**：
+  //    留着它俩的下场是"改了个不存在的 radio、或者把当前会话的模式偷改了"——
+  //    而用户定案是**一个会话模式不能变**。要改默认模式只能手编 settings.json。
   root.querySelectorAll<HTMLInputElement>('input[name="bh-trust"]').forEach((el) =>
     el.addEventListener("change", async () => {
       if (!el.checked) return;
@@ -4202,6 +5362,179 @@ function bindBehaviorView(root: HTMLElement): void {
       }
     }),
   );
+}
+
+// ---------------- 设置 › 数据源 ----------------
+//
+// 数据源 = 给 agent 的**认知面**注入（与 MCP 的能力面正交）。
+//
+// 为什么单独一页而不是塞进 MCP：MCP 是"模型决定去调"，数据源是
+// "系统决定呈现"。用户问「帮我安排下今天」时模型**没有理由**先去调一个工具，
+// 而「更懂你」的前提恰恰是不用说就知道 —— 这是触发权不同，不是工具多少。
+//
+// 注入策略（用户 2026-10 拍板）：system prompt 里只常驻每个源**一行**
+// （条数 + 新鲜度），细节要模型调 `life_items`。
+
+interface LifeSourceView {
+  id: string;
+  label: string;
+  enabled: boolean;
+  kind: "file" | "command";
+  /** 文件路径或命令 */
+  target: string;
+  itemsPath: string;
+  staleHours: number | null;
+  complete: boolean;
+  ok: boolean;
+  error: string;
+  updatedAt: string;
+  ageHours: number | null;
+  stale: boolean;
+  count: number;
+  preview: string[];
+}
+
+interface LifeStatus {
+  path: string;
+  sources: LifeSourceView[];
+}
+
+let lifeInfo: LifeStatus | null = null;
+
+/** 数据源摘要（设置入口页那一行） */
+function lifeSummaryText(): string {
+  if (!lifeInfo) return "读取中…";
+  const on = lifeInfo.sources.filter((s) => s.enabled);
+  if (lifeInfo.sources.length === 0) return "未配置（可接爬虫快照 / 命令）";
+  if (on.length === 0) return `${lifeInfo.sources.length} 个源 · 全部关闭`;
+  const bad = on.filter((s) => !s.ok).length;
+  const total = on.reduce((a, s) => a + s.count, 0);
+  return `${on.length} 个源启用 · ${total} 条` + (bad ? ` · ⚠️ ${bad} 个读取失败` : "");
+}
+
+function renderLifeView(): string {
+  const st = lifeInfo;
+  if (!st) {
+    return subHeader("数据源") + `<div class="mem-empty">读取中…</div>`;
+  }
+
+  const rows = st.sources.length
+    ? st.sources
+        .map((s) => {
+          // 状态：关闭 / 配置不完整 / 读取失败 / 正常（含过期）
+          let status: string;
+          if (!s.enabled) {
+            status = `<span class="mg-off">已关闭</span>`;
+          } else if (!s.complete) {
+            status = `<span class="mg-unknown">配置不完整</span>`;
+          } else if (!s.ok) {
+            status = `<span class="life-bad">⚠️ ${esc(s.error)}</span>`;
+          } else {
+            const age = s.ageHours === null ? "" : ` · ${s.ageHours} 小时前`;
+            const stale = s.stale ? ` <span class="life-bad">可能已过期</span>` : "";
+            status = `<span class="mg-ok">${s.count} 条${age}</span>${stale}`;
+          }
+
+          const preview = s.enabled && s.ok && s.preview.length
+            ? `<div class="life-preview">${s.preview
+                .map((p) => `· ${esc(p)}`)
+                .join("<br>")}${s.count > s.preview.length ? `<br>…还有 ${s.count - s.preview.length} 条` : ""}</div>`
+            : "";
+
+          return `
+        <div class="set-row life-row">
+          <div class="set-name">
+            <label class="set-check mcp-group-on">
+              <input type="checkbox" class="life-cb" data-id="${esc(s.id)}" ${
+                s.enabled ? "checked" : ""
+              }> 启用
+            </label>
+            <b>${esc(s.label)}</b>
+            <span class="life-kind">${s.kind === "file" ? "📄 文件快照" : "⚙️ 命令"}</span>
+          </div>
+          <div class="set-url"><code>${esc(s.target)}</code></div>
+          <div class="set-url">${status}</div>
+          ${preview}
+        </div>`;
+        })
+        .join("")
+    : `<div class="mem-empty">
+         还没有数据源。下面「怎么加一个」照抄改一行就行 —— 不用写代码。
+       </div>`;
+
+  return (
+    subHeader("数据源") +
+    `<div class="set-hint" style="margin-bottom:8px">
+      数据源让 agent <b>知道你的处境</b>（学习通作业、教务、邮件…），
+      而不只是会调工具。它和 MCP 是两件事：<br>
+      · <b>MCP</b> 是能力面 —— <b>模型</b>决定去调；<br>
+      · <b>数据源</b> 是认知面 —— <b>系统</b>决定要不要呈现给你看。<br>
+      注入方式：对话里每个源只占<b>一行摘要</b>（条数 + 新鲜度），
+      细节要模型调 <code>life_items</code> 才拿 —— 省 token，且快照过期不会被当成事实。
+     </div>` +
+    `<div class="mem-head">已配置（${st.sources.length}）</div>` +
+    `<div class="set-list">${rows}</div>` +
+    `<div class="set-hint" style="margin-top:8px">
+      配置文件：<code>${esc(st.path)}</code>（改完点下面「刷新」即可生效，不用重启）
+     </div>` +
+    `<div class="set-actions" style="margin-top:6px">
+       <button class="set-btn test" id="life-refresh">刷新</button>
+     </div>` +
+    `<div class="mem-head">怎么加一个</div>` +
+    `<div class="set-hint">
+      加一个源 = 在 <code>life.json</code> 的 <code>sources</code> 里加一段 JSON：<br><br>
+      <code>{ "id": "xuexitong", "label": "学习通", "enabled": true,</code><br>
+      <code>&nbsp;&nbsp;"kind": "file",</code><br>
+      <code>&nbsp;&nbsp;"path": "D:/…/campus-monitor/state/xuexitong.json",</code><br>
+      <code>&nbsp;&nbsp;"items": "$.works[*]",</code><br>
+      <code>&nbsp;&nbsp;"map": { "title": "$.work", "group": "$.course", "dueRaw": "$.left" },</code><br>
+      <code>&nbsp;&nbsp;"staleHours": 48 }</code><br><br>
+      <b>kind: file</b> —— 读一个现成的 JSON 快照（你现在的爬虫就属于这种，零代码接入）。<br>
+      <b>kind: command</b> —— 跑一条命令、stdout 当 JSON 收（邮件、任意脚本）。<br>
+      ⚠️ <code>command</code> 类会在<b>后台自动执行</b>（不是模型调才跑），
+      所以默认关闭，要显式打开；有 15 秒超时，失败只会在上面显示一行错误，
+      不会打断对话。
+     </div>`
+  );
+}
+
+function bindLifeView(root: HTMLElement): void {
+  // 返回按钮已挪到滚动区外的 `#sub-bar`，绑定统一在 `renderSubBar` 里做。
+  // ⚠️ 这里**不能**再绑一次：同一个按钮挂两个 handler 会让 `switchView` 跑两遍，
+  //    第二遍撞上它的 toggle 逻辑（再点同一个非 chat 视图 → 回对话），
+  //    表现出来就是"点了返回却回到了对话页"。
+
+  document.getElementById("life-refresh")?.addEventListener("click", async () => {
+    await invoke("life_refresh").catch(() => {});
+    await loadLifeStatus();
+    renderBody();
+    showToast("已重新读取", "ok", 1500);
+  });
+
+  root.querySelectorAll<HTMLInputElement>(".life-cb").forEach((cb) =>
+    cb.addEventListener("change", async () => {
+      const id = cb.dataset.id!;
+      const on = cb.checked;
+      try {
+        await invoke("life_set_enabled", { id, enabled: on });
+        showToast(`${on ? "已启用" : "已关闭"}「${id}」`, "ok", 2000);
+      } catch (e) {
+        pushEntry("error", `${on ? "启用" : "关闭"}「${id}」失败：${e}`);
+      }
+      await loadLifeStatus();
+      renderBody();
+    }),
+  );
+}
+
+/** 拉一次数据源状态（设置入口页与子页都要用） */
+async function loadLifeStatus(): Promise<void> {
+  try {
+    lifeInfo = await invoke<LifeStatus>("life_status");
+  } catch (e) {
+    console.warn("[orbcat] 读数据源失败:", e);
+    lifeInfo = null;
+  }
 }
 
 // ---------------- 设置 › 搜索（web_search） ----------------
@@ -4247,7 +5580,10 @@ function renderSearchView(st: SearchStatus | null): string {
 }
 
 function bindSearchView(_root: HTMLElement): void {
-  document.getElementById("sub-back")?.addEventListener("click", () => void switchView("settings"));
+  // 返回按钮已挪到滚动区外的 `#sub-bar`，绑定统一在 `renderSubBar` 里做。
+  // ⚠️ 这里**不能**再绑一次：同一个按钮挂两个 handler 会让 `switchView` 跑两遍，
+  //    第二遍撞上它的 toggle 逻辑（再点同一个非 chat 视图 → 回对话），
+  //    表现出来就是"点了返回却回到了对话页"。
   const msg = document.getElementById("search-msg");
   const say = (t: string, cls: "run" | "ok" | "bad"): void => {
     if (!msg) return;
@@ -4372,7 +5708,10 @@ function renderPermView(rules: PermRule[]): string {
 }
 
 function bindPermView(root: HTMLElement): void {
-  document.getElementById("sub-back")?.addEventListener("click", () => void switchView("settings"));
+  // 返回按钮已挪到滚动区外的 `#sub-bar`，绑定统一在 `renderSubBar` 里做。
+  // ⚠️ 这里**不能**再绑一次：同一个按钮挂两个 handler 会让 `switchView` 跑两遍，
+  //    第二遍撞上它的 toggle 逻辑（再点同一个非 chat 视图 → 回对话），
+  //    表现出来就是"点了返回却回到了对话页"。
 
   root.querySelectorAll<HTMLButtonElement>(".set-btn.del").forEach((b) =>
     b.addEventListener("click", async () => {
@@ -4516,7 +5855,10 @@ function renderCmdPolicyView(
 }
 
 function bindCmdPolicyView(_root: HTMLElement): void {
-  document.getElementById("sub-back")?.addEventListener("click", () => void switchView("settings"));
+  // 返回按钮已挪到滚动区外的 `#sub-bar`，绑定统一在 `renderSubBar` 里做。
+  // ⚠️ 这里**不能**再绑一次：同一个按钮挂两个 handler 会让 `switchView` 跑两遍，
+  //    第二遍撞上它的 toggle 逻辑（再点同一个非 chat 视图 → 回对话），
+  //    表现出来就是"点了返回却回到了对话页"。
 
   document.getElementById("cp-reload")?.addEventListener("click", () => renderBody());
 
@@ -4588,6 +5930,46 @@ function bindCmdPolicyView(_root: HTMLElement): void {
 
 // ---------------- 设置 › MCP ----------------
 
+/**
+ * 把一行参数文本切成 argv。
+ *
+ * 规则：按空白切分，但**引号内的空白不切**（`"C:\Program Files\x.exe" --flag`）。
+ * 引号本身不进结果 —— 它只是分组手段，真正的参数边界由 argv 表达。
+ *
+ * ⚠️ 这里**只做切分，不做 shell 解析**：没有变量展开、没有通配符、
+ * 没有管道。切出来的每一项会被当作**字面参数**原样传给子进程
+ * （Rust 侧 `Command::args`，不经 shell）—— 所以用户输入永远进不了解释器。
+ */
+function splitArgs(raw: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let quote: '"' | "'" | null = null;
+  let has = false;
+  for (const ch of raw) {
+    if (quote) {
+      if (ch === quote) quote = null;
+      else cur += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      has = true; // 空引号 `""` 也要算一个参数
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (has || cur) {
+        out.push(cur);
+        cur = "";
+        has = false;
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  if (has || cur) out.push(cur);
+  return out;
+}
+
 function renderMcpView(
   mcp: McpStatus | null,
   servers: McpServerCfg[],
@@ -4600,37 +5982,71 @@ function renderMcpView(
     servers.length === 0
       ? `<div class="mem-empty">还没有配置任何 MCP server。下面填一行再点「添加」。</div>`
       : servers
-          .map(
-            (s, i) => `
+          .map((s, i) => {
+            const isStdio = mcpTransportOf(s) === "stdio";
+            const kindTag = isStdio
+              ? `<span class="mcp-kind stdio">stdio</span>`
+              : `<span class="mcp-kind http">http</span>`;
+            // 两种形态显示不同的"地址行"
+            const target = isStdio
+              ? `<code>${esc(s.command ?? "")}</code>${
+                  (s.args ?? []).length
+                    ? ` <span class="mcp-args">${esc((s.args ?? []).join(" "))}</span>`
+                    : ""
+                }${
+                  Object.keys(s.env ?? {}).length
+                    ? ` <span class="mcp-env-n">+${Object.keys(s.env ?? {}).length} 环境变量</span>`
+                    : ""
+                }`
+              : `<code>${esc(s.url)}</code>`;
+            return `
       <div class="set-row mcp-srv-row" data-idx="${i}">
         <div class="set-name">
           <label class="mcp-en"><input type="checkbox" class="mcp-en-cb" data-idx="${i}" ${
             s.enabled ? "checked" : ""
           }> 启用</label>
+          ${kindTag}
           <code class="mcp-srv-id">${esc(s.id)}</code>
           <span class="set-cur">${esc(s.label || s.id)}</span>
         </div>
-        <div class="set-url"><code>${esc(s.url)}</code></div>
+        <div class="set-url">${target}</div>
         <div class="set-actions">
           <button class="set-btn mcp-srv-del" data-idx="${i}">删除</button>
         </div>
-      </div>`,
-          )
+      </div>`;
+          })
           .join("");
 
   const serverBlock = `
     <div class="mem-head">🔗 MCP Server 列表</div>
     <div class="set-hint" style="margin-bottom:8px">
-      可单独添加多个 server（Streamable HTTP）。未启用的保存后不会连接。
+      两种形态：<b>http</b> 连一个已在跑的网关（如 1MCP）；
+      <b>stdio</b> 由 orbcat 自己拉起子进程 —— 一个脚本 + 几行配置就是工具，
+      不必额外起网关。两者在权限卡与执行档位上<b>完全同权</b>。
     </div>
     <div class="set-list" id="mcp-srv-list">${serverRows}</div>
-    <div class="mem-head">➕ 添加一行</div>
+
+    <div class="mem-head">➕ 添加 HTTP 网关</div>
     <div class="set-form mcp-add-form">
       <input id="mcp-new-id" placeholder="id（如 github）" spellcheck="false">
       <input id="mcp-new-label" placeholder="显示名（可空）" spellcheck="false">
       <input id="mcp-new-url" placeholder="http://127.0.0.1:3050/mcp" spellcheck="false">
       <button class="set-btn add" id="mcp-srv-add">添加</button>
     </div>
+
+    <div class="mem-head">➕ 添加 stdio 脚本</div>
+    <div class="set-form mcp-add-form">
+      <input id="mcp-new-sid" placeholder="id（如 my-script）" spellcheck="false">
+      <input id="mcp-new-slabel" placeholder="显示名（可空）" spellcheck="false">
+      <input id="mcp-new-cmd" placeholder="命令（如 node / pwsh / D:\\tools\\x.exe）" spellcheck="false">
+      <input id="mcp-new-args" placeholder="参数，空格分隔（如 server.js --port 1）" spellcheck="false">
+      <button class="set-btn add" id="mcp-stdio-add">添加</button>
+    </div>
+    <div class="set-hint" style="margin-top:-4px">
+      参数按<b>空格切分</b>后逐参传递（不经 shell）。路径含空格时用引号：
+      <code>"C:\\Program Files\\x.exe" --flag</code>
+    </div>
+
     <div class="set-actions" style="margin-top:8px">
       <button class="set-btn ok" id="mcp-srv-save">保存并重连</button>
       <button class="set-btn" id="mcp-refresh">重新拉取工具清单</button>
@@ -4718,41 +6134,84 @@ function renderMcpView(
 }
 
 function bindMcpView(root: HTMLElement): void {
-  document.getElementById("sub-back")?.addEventListener("click", () => void switchView("settings"));
+  // 返回按钮已挪到滚动区外的 `#sub-bar`，绑定统一在 `renderSubBar` 里做。
+  // ⚠️ 这里**不能**再绑一次：同一个按钮挂两个 handler 会让 `switchView` 跑两遍，
+  //    第二遍撞上它的 toggle 逻辑（再点同一个非 chat 视图 → 回对话），
+  //    表现出来就是"点了返回却回到了对话页"。
 
   document.getElementById("mcp-refresh")?.addEventListener("click", async () => {
     await invoke("mcp_refresh").catch((e) => pushEntry("error", `刷新失败：${e}`));
     renderBody();
   });
 
-  // ---- server 列表：从 DOM 收集当前编辑态 ----
+  // ---- server 列表：以 `mcpServers` 为准（DOM 只负责画） ----
+  //
+  // 为什么要改成数据驱动：stdio 的 `args[]` / `env{}` 不是一段可读回来的
+  // 文本，从 DOM 里 scrap 会把参数边界和键值对丢掉（见 `mcpServers` 的注释）。
   const collectServers = (): McpServerCfg[] => {
+    // 把 DOM 上的"启用"勾选状态同步回数据（这是唯一一个纯 UI 态）
     const rows = root.querySelectorAll<HTMLElement>(".mcp-srv-row");
-    return Array.from(rows).map((row) => {
+    rows.forEach((row) => {
       const i = Number(row.dataset.idx ?? "0");
       const cb = row.querySelector<HTMLInputElement>(".mcp-en-cb");
-      const idEl = row.querySelector<HTMLElement>(".mcp-srv-id");
-      const urlEl = row.querySelector<HTMLElement>(".set-url code");
-      // label 从展示名取（set-cur），删掉可能的空白
-      const labelEl = row.querySelector<HTMLElement>(".set-cur");
-      return {
-        id: idEl?.textContent?.trim() || `s${i + 1}`,
-        url: urlEl?.textContent?.trim() || "",
-        enabled: !!cb?.checked,
-        label: labelEl?.textContent?.trim() || "",
-      };
+      if (mcpServers[i] && cb) mcpServers[i].enabled = cb.checked;
     });
+    return mcpServers;
   };
 
-  // 删除一行 → 直接从 DOM 移除并重绘（未保存前只动 UI）
-  root.querySelectorAll<HTMLButtonElement>(".mcp-srv-del").forEach((btn) => {
+  // 删除一行 → 同时从数据与 DOM 移除（未保存前只动内存）
+  const bindDel = (btn: HTMLButtonElement) => {
     btn.addEventListener("click", () => {
-      const row = btn.closest(".mcp-srv-row");
+      const row = btn.closest<HTMLElement>(".mcp-srv-row");
+      const i = Number(row?.dataset.idx ?? "-1");
+      if (i >= 0) mcpServers.splice(i, 1);
       row?.remove();
+      // 删完要重编 idx —— 否则下一次 collect 会把 enabled 写到错的条目上
+      root.querySelectorAll<HTMLElement>(".mcp-srv-row").forEach((r, n) => {
+        r.dataset.idx = String(n);
+        const cb = r.querySelector<HTMLInputElement>(".mcp-en-cb");
+        if (cb) cb.dataset.idx = String(n);
+      });
     });
-  });
+  };
+  root.querySelectorAll<HTMLButtonElement>(".mcp-srv-del").forEach(bindDel);
 
-  // 添加一行：先插进列表（内存/DOM），点「保存并重连」才落盘
+  /** 往列表尾部插一行（只画 DOM，数据已 push） */
+  const appendRow = (idx: number, s: McpServerCfg) => {
+    const list = document.getElementById("mcp-srv-list");
+    if (!list) return;
+    if (list.querySelector(".mem-empty")) list.innerHTML = "";
+    const isStdio = mcpTransportOf(s) === "stdio";
+    const row = document.createElement("div");
+    row.className = "set-row mcp-srv-row";
+    row.dataset.idx = String(idx);
+    row.innerHTML = `
+      <div class="set-name">
+        <label class="mcp-en"><input type="checkbox" class="mcp-en-cb" data-idx="${idx}" ${
+          s.enabled ? "checked" : ""
+        }> 启用</label>
+        <span class="mcp-kind ${isStdio ? "stdio" : "http"}">${isStdio ? "stdio" : "http"}</span>
+        <code class="mcp-srv-id">${esc(s.id)}</code>
+        <span class="set-cur">${esc(s.label || s.id)}</span>
+      </div>
+      <div class="set-url">${
+        isStdio
+          ? `<code>${esc(s.command ?? "")}</code>${
+              (s.args ?? []).length
+                ? ` <span class="mcp-args">${esc((s.args ?? []).join(" "))}</span>`
+                : ""
+            }`
+          : `<code>${esc(s.url)}</code>`
+      }</div>
+      <div class="set-actions">
+        <button class="set-btn mcp-srv-del" data-idx="${idx}">删除</button>
+      </div>`;
+    const del = row.querySelector<HTMLButtonElement>(".mcp-srv-del");
+    if (del) bindDel(del);
+    list.appendChild(row);
+  };
+
+  // 添加 HTTP 一行
   document.getElementById("mcp-srv-add")?.addEventListener("click", () => {
     const id = (document.getElementById("mcp-new-id") as HTMLInputElement | null)?.value.trim() ?? "";
     const label =
@@ -4767,28 +6226,50 @@ function bindMcpView(root: HTMLElement): void {
       if (msg) msg.textContent = "MCP 地址必须是 http/https URL";
       return;
     }
-    const list = document.getElementById("mcp-srv-list");
-    if (!list) return;
-    // 空列表提示先清掉
-    if (list.querySelector(".mem-empty")) list.innerHTML = "";
-    const idx = list.querySelectorAll(".mcp-srv-row").length;
-    const row = document.createElement("div");
-    row.className = "set-row mcp-srv-row";
-    row.dataset.idx = String(idx);
-    row.innerHTML = `
-      <div class="set-name">
-        <label class="mcp-en"><input type="checkbox" class="mcp-en-cb" data-idx="${idx}" checked> 启用</label>
-        <code class="mcp-srv-id">${esc(id || `s${idx + 1}`)}</code>
-        <span class="set-cur">${esc(label || id || `s${idx + 1}`)}</span>
-      </div>
-      <div class="set-url"><code>${esc(url)}</code></div>
-      <div class="set-actions">
-        <button class="set-btn mcp-srv-del" data-idx="${idx}">删除</button>
-      </div>`;
-    row.querySelector(".mcp-srv-del")?.addEventListener("click", () => row.remove());
-    list.appendChild(row);
-    // 清空添加表单
+    const idx = mcpServers.length;
+    const cfg: McpServerCfg = {
+      id: id || `s${idx + 1}`,
+      url,
+      enabled: true,
+      label: label || id || `s${idx + 1}`,
+      transport: "http",
+    };
+    mcpServers.push(cfg);
+    appendRow(idx, cfg);
     for (const fid of ["mcp-new-id", "mcp-new-label", "mcp-new-url"]) {
+      const el = document.getElementById(fid) as HTMLInputElement | null;
+      if (el) el.value = "";
+    }
+    if (msg) msg.textContent = "已加入列表，点「保存并重连」生效";
+  });
+
+  // 添加 stdio 一行
+  document.getElementById("mcp-stdio-add")?.addEventListener("click", () => {
+    const id = (document.getElementById("mcp-new-sid") as HTMLInputElement | null)?.value.trim() ?? "";
+    const label =
+      (document.getElementById("mcp-new-slabel") as HTMLInputElement | null)?.value.trim() ?? "";
+    const cmd = (document.getElementById("mcp-new-cmd") as HTMLInputElement | null)?.value.trim() ?? "";
+    const argsRaw =
+      (document.getElementById("mcp-new-args") as HTMLInputElement | null)?.value.trim() ?? "";
+    const msg = document.getElementById("mcp-srv-msg");
+    if (!cmd) {
+      if (msg) msg.textContent = "命令不能为空";
+      return;
+    }
+    const idx = mcpServers.length;
+    const cfg: McpServerCfg = {
+      id: id || `s${idx + 1}`,
+      url: "",
+      enabled: true,
+      label: label || id || `s${idx + 1}`,
+      transport: "stdio",
+      command: cmd,
+      args: splitArgs(argsRaw),
+      env: {},
+    };
+    mcpServers.push(cfg);
+    appendRow(idx, cfg);
+    for (const fid of ["mcp-new-sid", "mcp-new-slabel", "mcp-new-cmd", "mcp-new-args"]) {
       const el = document.getElementById(fid) as HTMLInputElement | null;
       if (el) el.value = "";
     }
@@ -4861,16 +6342,294 @@ function bindMcpView(root: HTMLElement): void {
   });
 }
 
+// ---------------- 设置 › 项目（拼装包） ----------------
+
+/**
+ * 项目页 —— 列出全部项目包，激活 / 退出 / 编辑 / 导入。
+ *
+ * 页面分四段（顺序即用户的理解顺序）：
+ *   ① 当前状态（激活了什么、有什么警告）
+ *   ② 包列表（可激活 / 删除）
+ *   ③ 当前包声明的脚本工具（只读展示，让用户知道项目带来了什么能力）
+ *   ④ 新建 / 编辑（JSON 文本框，因为 project.json 本来就该能用记事本改）
+ */
+function renderProjectView(v: ProjectListView | null): string {
+  const head = subHeader("项目");
+
+  if (!v) {
+    return head + `<div class="mem-empty">读取项目列表失败。</div>`;
+  }
+
+  // ---- ① 当前状态 ----
+  let statusBlock: string;
+  if (!v.active) {
+    statusBlock = `<div class="mem-empty">当前没有激活任何项目 —— 行为与普通模式完全一致。</div>`;
+  } else {
+    const b = v.bundles.find((x) => x.id === v.active);
+    const lines: string[] = [];
+    if (v.permError) {
+      lines.push(
+        `<div class="proj-warn">⚠️ <b>权限预设已整份丢弃</b>（fail-closed）：${esc(
+          v.permError,
+        )}<br><i>为避免半生效，整个 permPreset 都没应用 —— 当前用的是你自己的权限设置。</i></div>`,
+      );
+    }
+    if (v.unresolved.length) {
+      const items = v.unresolved
+        .map(([kind, id, why]) => `<li><code>${esc(kind)}</code> · ${esc(id)} — ${esc(why)}</li>`)
+        .join("");
+      lines.push(
+        `<div class="proj-warn">⚠️ 有 ${v.unresolved.length} 项引用没解析上（已跳过，不影响其他功能）：<ul>${items}</ul></div>`,
+      );
+    }
+    statusBlock = `
+      <div class="set-row cur">
+        <div class="set-name">📦 ${esc(b?.name ?? v.active)}</div>
+        <div class="set-url">${esc(b?.description ?? "")}</div>
+        <div class="set-url">技能 ${b?.skillCount ?? 0} 项 · 脚本工具 ${v.tools.length} 个${
+          b?.hasPermPreset ? " · 含权限预设" : ""
+        }</div>
+        <div class="set-actions">
+          <button class="set-btn" id="proj-deactivate">退出项目</button>
+        </div>
+      </div>
+      ${lines.join("")}`;
+  }
+
+  // ---- ② 包列表 ----
+  const rows = v.bundles.length
+    ? v.bundles
+        .map(
+          (b) => `
+      <div class="set-row${b.active ? " cur" : ""}${b.valid ? "" : " deny"}">
+        <div class="set-name">
+          ${b.valid ? "" : "⚠️ "}${esc(b.name)}
+          ${b.hasPermPreset ? '<span class="proj-tag perm">含权限预设</span>' : ""}
+        </div>
+        <div class="set-url">${esc(b.description || "（无说明）")}</div>
+        <div class="set-url">${
+          b.valid
+            ? `技能 ${b.skillCount} · 工具 ${b.toolCount}`
+            : `装配失败：${esc(b.error ?? "未知原因")}`
+        }</div>
+        <div class="set-actions">
+          ${
+            b.active
+              ? `<span class="set-cur">当前</span>`
+              : b.valid
+                ? `<button class="set-btn ok proj-activate" data-id="${esc(b.id)}">激活</button>`
+                : // 无效包不给激活按钮：点了必然报错，不如让用户先去修
+                  `<span class="set-cur">先修好才能激活</span>`
+          }
+          <button class="set-btn proj-edit" data-id="${esc(b.id)}">编辑</button>
+          <button class="set-btn del proj-del" data-id="${esc(b.id)}">删除</button>
+        </div>
+      </div>`,
+        )
+        .join("")
+    : `<div class="mem-empty">还没有项目包。项目 = 一套配好的「技能范围 + 模型槽位 + 权限预设 + 脚本工具」，可保存、切换、分享。</div>`;
+
+  // ---- ③ 当前包的脚本工具 ----
+  const toolsBlock = v.tools.length
+    ? `<div class="mem-head">🔧 本项目带来的脚本工具 ${v.tools.length}</div>` +
+      v.tools
+        .map(
+          (t) => `
+      <div class="set-row">
+        <div class="set-name"><code>${esc(t.name)}</code>${
+            t.perm ? `<span class="proj-tag perm">${esc(t.perm)}</span>` : ""
+          }</div>
+        <div class="set-url">${esc(t.description)}</div>
+        <div class="set-url"><code>${esc(t.template.join(" "))}</code></div>
+      </div>`,
+        )
+        .join("") +
+      `<div class="set-hint">
+        脚本工具与 <code>run_command</code> 走<b>同一套闸门</b>：命令策略判定 + 弹卡 + 审计。
+        参数按 argv 逐参传递（不经 shell），所以参数里的 <code>;</code> <code>|</code> 只是普通字符。
+       </div>`
+    : "";
+
+  // ---- ④ 新建 / 编辑 ----
+  const editorBlock = `
+    <div class="mem-head">✏️ 编辑 / 新建项目包</div>
+    <div class="set-hint" style="margin-bottom:6px">
+      <code>project.json</code> 就是这段 JSON。字段说明见
+      <code>docs/compose/spec/composable-project-bundle.md</code>。
+      <b>密钥永远不要写进来</b> —— <code>slots</code> 只写模型/搜索的 id。
+    </div>
+    <div class="set-form" style="margin-bottom:6px">
+      <input id="proj-edit-id" placeholder="项目 id（= 目录名，如 学习助手）" spellcheck="false">
+    </div>
+    <textarea id="proj-edit-body" class="proj-editor" spellcheck="false"
+      placeholder='{"schemaVersion":1,"name":"学习助手","description":"...","skills":[],"tools":[]}'></textarea>
+    <div class="set-actions" style="margin-top:6px">
+      <button class="set-btn ok" id="proj-save">保存</button>
+      <button class="set-btn" id="proj-new-template">填入模板</button>
+      <button class="set-btn" id="proj-validate">只校验不保存</button>
+    </div>
+    <div class="set-hint" id="proj-msg"></div>`;
+
+  return head + statusBlock + `<div class="mem-head">📦 全部项目包</div>` + rows + toolsBlock + editorBlock;
+}
+
+function bindProjectView(root: HTMLElement): void {
+  // 返回按钮已挪到滚动区外的 `#sub-bar`，绑定统一在 `renderSubBar` 里做。
+  // ⚠️ 这里**不能**再绑一次：同一个按钮挂两个 handler 会让 `switchView` 跑两遍，
+  //    第二遍撞上它的 toggle 逻辑（再点同一个非 chat 视图 → 回对话），
+  //    表现出来就是"点了返回却回到了对话页"。
+
+  const msg = () => document.getElementById("proj-msg");
+  const idEl = () => document.getElementById("proj-edit-id") as HTMLInputElement | null;
+  const bodyEl = () => document.getElementById("proj-edit-body") as HTMLTextAreaElement | null;
+
+  // 激活
+  root.querySelectorAll<HTMLButtonElement>(".proj-activate").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        await invoke("project_activate", { id: btn.dataset.id });
+        showToast("已激活项目（下一轮对话生效）", "ok");
+        renderBody();
+      } catch (e) {
+        showToast(`激活失败：${e}`, "error");
+      }
+    });
+  });
+
+  // 退出项目
+  document.getElementById("proj-deactivate")?.addEventListener("click", async () => {
+    try {
+      await invoke("project_activate", { id: null });
+      showToast("已退出项目", "ok");
+      renderBody();
+    } catch (e) {
+      showToast(`退出失败：${e}`, "error");
+    }
+  });
+
+  // 编辑：读原始文本填进编辑器
+  root.querySelectorAll<HTMLButtonElement>(".proj-edit").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.id ?? "";
+      try {
+        const body = await invoke<string>("project_read", { id });
+        const i = idEl();
+        const b = bodyEl();
+        if (i) i.value = id;
+        if (b) b.value = body;
+        const m = msg();
+        if (m) m.textContent = `已载入「${id}」，改完点保存`;
+        b?.scrollIntoView({ block: "center" });
+      } catch (e) {
+        showToast(`读取失败：${e}`, "error");
+      }
+    });
+  });
+
+  // 删除（只删 project.json，保留 MEMORY.md 与脚本）
+  root.querySelectorAll<HTMLButtonElement>(".proj-del").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.id ?? "";
+      if (!confirm(`删除项目包「${id}」的 project.json？\n\n项目记忆（MEMORY.md）与脚本文件都会保留。`)) {
+        return;
+      }
+      try {
+        await invoke("project_delete", { id });
+        showToast("已删除项目包", "ok");
+        renderBody();
+      } catch (e) {
+        showToast(`删除失败：${e}`, "error");
+      }
+    });
+  });
+
+  // 填入模板（降低手写门槛）
+  document.getElementById("proj-new-template")?.addEventListener("click", () => {
+    const b = bodyEl();
+    if (!b) return;
+    b.value = JSON.stringify(
+      {
+        schemaVersion: 1,
+        name: "我的项目",
+        description: "一句话说明这个项目是干什么的",
+        skills: [],
+        slots: { model: "", search: "" },
+        permPreset: {
+          execTrust: "ask",
+          commandAllowExtra: [],
+          fileAllowPaths: [],
+        },
+        tools: [
+          {
+            name: "my_tool",
+            description: "这个脚本工具做什么",
+            params: { type: "object", properties: {} },
+            commandTemplate: ["pwsh", "-NoProfile", "-File", "{project}/tools/my_tool.ps1"],
+            perm: "read-only",
+          },
+        ],
+      },
+      null,
+      2,
+    );
+    const m = msg();
+    if (m) m.textContent = "已填入模板 —— 把 skills 留空 = 不限制技能；不需要的段整段删掉即可";
+  });
+
+  // 只校验不保存：用后端同一套校验器（前端不重复实现，避免两套规则分叉）
+  document.getElementById("proj-validate")?.addEventListener("click", async () => {
+    const id = idEl()?.value.trim() ?? "";
+    const body = bodyEl()?.value ?? "";
+    const m = msg();
+    if (!body.trim()) {
+      if (m) m.textContent = "内容为空";
+      return;
+    }
+    if (!id) {
+      if (m) m.textContent = "先填项目 id（校验要用它当目录名）";
+      return;
+    }
+    // 校验走 `project_save` 会真的写盘 —— 这里用一个临时 id 写进临时目录不可行，
+    // 所以退一步：让用户点保存，后端校验失败时会原样报错且**不会留下坏文件**
+    // （`project_save` 是先解析校验、后写盘）。
+    if (m) m.textContent = "点「保存」即会先校验；校验不过不会写盘、也不会覆盖原文件。";
+  });
+
+  // 保存
+  document.getElementById("proj-save")?.addEventListener("click", async () => {
+    const id = idEl()?.value.trim() ?? "";
+    const body = bodyEl()?.value ?? "";
+    const m = msg();
+    if (!id) {
+      if (m) m.textContent = "项目 id 不能为空（它同时是目录名）";
+      return;
+    }
+    if (!body.trim()) {
+      if (m) m.textContent = "内容为空";
+      return;
+    }
+    try {
+      if (m) m.textContent = "校验并保存中…";
+      await invoke("project_save", { id, body });
+      showToast(`已保存项目包「${id}」`, "ok");
+      renderBody();
+    } catch (e) {
+      // 校验失败的原话直接显示 —— 后端的信息比前端能编的准确
+      if (m) m.textContent = `保存失败：${e}`;
+    }
+  });
+}
+
 // ---------------- 设置 › Token 用量 ----------------
 
 /**
- * 模型 id → 展示名（模型可能已删，那就退回 id）。
+ * 模型展示名 = 接口 id 本身（显示名已废弃；函数留着兼容用量页调用点）。
  *
  * ⚠️ 留在 main.ts 而不是搬进 `usage.ts`：它要读 `models` 这个**模块级状态**
  * （当前模型列表）。纯聚合逻辑才搬得走 —— 判定标准就是"是否引用模块级绑定"。
  */
 function modelName(id: string): string {
-  return models.find((m) => m.id === id)?.name ?? id;
+  return id;
 }
 
 function renderUsageView(records: UsageRecord[]): string {
@@ -4977,7 +6736,10 @@ function renderUsageView(records: UsageRecord[]): string {
 }
 
 function bindUsageView(_root: HTMLElement): void {
-  document.getElementById("sub-back")?.addEventListener("click", () => void switchView("settings"));
+  // 返回按钮已挪到滚动区外的 `#sub-bar`，绑定统一在 `renderSubBar` 里做。
+  // ⚠️ 这里**不能**再绑一次：同一个按钮挂两个 handler 会让 `switchView` 跑两遍，
+  //    第二遍撞上它的 toggle 逻辑（再点同一个非 chat 视图 → 回对话），
+  //    表现出来就是"点了返回却回到了对话页"。
 }
 
 // ---------------- 轻提示（toast） ----------------
@@ -5228,7 +6990,24 @@ function installProgressListener(): void {
         // 新一轮工具调用 / 工具结果落地 → 旧心跳收摊，秒数由新的接棒
         if (p.kind === "toolCall" || p.kind === "toolResult") stopToolTick();
         const item = progressItem(p);
-        if (item) last.items.push(item);
+        if (item) {
+          // 工具返回**并进上一条调用**，不新占一行（2026-10-02）。
+          // ⚠️ 必须是"原地合并"而不是 push 完再重排：条目数一旦先增后减，
+          //    `patchTimeline` 的 `data-n` 就对不上实际节点数，会退回全量重画
+          //    （表现是折叠块被重建、展开状态被冲掉）。
+          const tail = last.items[last.items.length - 1];
+          const pair =
+            item.kind === "tool_result" &&
+            tail &&
+            tail.kind === "tool_call" &&
+            (tail.name ?? "") === (item.name ?? "") &&
+            !isToolFailure(item.detail);
+          if (pair && tail) {
+            tail.result = item.detail;
+          } else {
+            last.items.push(item);
+          }
+        }
         break;
       }
     }
@@ -5347,6 +7126,22 @@ function renderRegenBtn(e: ChatEntry): string {
 function renderDelBtn(e: ChatEntry): string {
   if (e.storedIdx === undefined) return "";
   return `<button type="button" class="msg-del" data-upto="${e.storedIdx}" title="删除这条消息以及它后面的所有消息（不可恢复）">删除</button>`;
+}
+
+/**
+ * 「编辑」按钮 —— 只挂在**最后一条已落盘的用户消息**上（2026-10-03 需求）。
+ *
+ * 语义（ChatGPT 式「编辑并重发」）：把它和它后面的全部回复截掉，
+ * 原文放回输入框，改完重新发送。实现完全复用删除链路
+ * （`session_truncate` + `refillInput`），后端零新增命令。
+ *
+ * busy 时按钮照渲染（渲染态不重算），点击由 `editUserMessage` 的忙碌检查拦截。
+ */
+function renderEditBtn(e: ChatEntry, lastUserStored: number): string {
+  if (e.role !== "user" || e.storedIdx === undefined || e.storedIdx !== lastUserStored) {
+    return "";
+  }
+  return `<button type="button" class="msg-edit" data-upto="${e.storedIdx}" title="编辑并重发：这条消息和它后面的回复会被截掉，原文放回输入框">编辑</button>`;
 }
 
 /** 插话被送达 → 只改那一条气泡的角标（不整块重绘，免得又闪） */
@@ -5492,12 +7287,29 @@ function installFocusRefocus(): void {
 async function loadModels(): Promise<void> {
   try {
     models = await invoke<ModelView[]>("list_models");
-    selectedModel = await invoke<string | null>("get_selected_model");
+    // 身份 = (Base URL, 接口 id)：get_selected_model 返回 {id, url} 双字段
+    const sel = await invoke<{ id: string; url: string | null } | null>("get_selected_model");
+    selectedModel = sel?.id ?? null;
+    selectedModelUrl = sel?.url ?? null;
+    // ⚠️ 消歧回填（2026-10-02）：旧设置里**只有 id、没有 url**（身份键重构之前写的），
+    // 而同 id 可能有多条（不同 Base URL）。不补的话「当前项」判定会命中所有同 id 的行 ——
+    // 用户看到的现象是「两个 glm-5.3-flash 都带当前标记」。这里定死成解析出来的那条并回写。
+    if (selectedModel && !selectedModelUrl) {
+      const resolved = curModel();
+      if (resolved) {
+        selectedModelUrl = resolved.url;
+        await invoke("set_selected_model", { id: selectedModel, url: resolved.url }).catch(
+          () => {},
+        );
+      }
+    }
+    // 旧值失效（后端 list_models 已清过）或本来就没选 → 兜底选第一个
     if (!selectedModel && models.length > 0) {
-      // 唯一键是**显示名**（name），不是接口 id —— 兜底也必须是 name，
-      // 否则 chip / 列表的「当前」高亮永远匹配不上。
-      selectedModel = models[0].name;
-      await invoke("set_selected_model", { id: selectedModel }).catch(() => {});
+      selectedModel = models[0].id;
+      selectedModelUrl = models[0].url;
+      await invoke("set_selected_model", { id: selectedModel, url: selectedModelUrl }).catch(
+        () => {},
+      );
     }
     // 分组显示名：面板的模型卡片要显示「组别 + 模型名」
     // （2026-10 用户："这个是让你放模型的部分啊，组别+模型名"）。
@@ -5531,6 +7343,19 @@ async function loadProjects(): Promise<void> {
   }
 }
 
+/**
+ * 发一条消息：**立刻开跑**（2026-10-09 用户拍板删掉「合并窗口」）。
+ *
+ * 曾经有个 3s 的合并窗口（连发的几条攒起来一次发）。实测两个问题：
+ *   ① 观感上"点了没反应"，还得靠提示条解释；
+ *   ② **致命**：消息进了待发批次时若把面板收起（切悬浮球态、不退出），
+ *      批次没有 DOM 可落，被当成"没地方去"直接丢掉 —— 用户的消息**凭空消失**。
+ * 用户结论："直接删掉这个逻辑，就相当于只多一个发图算了"。
+ * 于是这里回到最朴素的语义：**按下发送 = 立刻发出**，出去就是出去了。
+ * （仍然保留"先同步清空输入框"那一步 —— 它修的是双击回车连发两次的老 bug。）
+ *
+ * 「连发多条」现在只有一条路：run 已经在跑 → `sendSteer()` 进插话队列（原有机制）。
+ */
 async function send(): Promise<void> {
   // 当前会话在跑 → 走「插话」通道（排队），而不是静默吞掉用户打的字。
   // ⚠️ `busy` 是**按会话**算的（多会话并行 run）：别的会话在跑不影响这里开新任务。
@@ -5550,17 +7375,18 @@ async function send(): Promise<void> {
     return;
   }
 
-  // 「做完后提议记忆」：发话前记一下候选数，答完对比，有新增就提示去审批
-  const pendingBefore = await invoke<Candidate[]>("mem_pending").catch(
-    () => [] as Candidate[],
-  );
-
+  // ⚠️ **同步**清空输入框，必须放在第一个 await 之前 ——
+  //    原来清空在 `mem_pending` 之后，机器卡时快速双击回车会把
+  //    同一句话连发两次（Rust 侧 `chat` 没有"这条会话已在跑"的拦截）。
   input.value = "";
   input.style.height = "auto";
   draftInput = ""; // 发出去才算用掉，这时候草稿才能清
   pendingImages = [];
   renderPreview();
 
+  const pendingBefore = await invoke<Candidate[]>("mem_pending").catch(
+    () => [] as Candidate[],
+  );
   pushEntry("user", text || "（仅图片）", undefined, imgs);
 
   // 先放一个「进行中」气泡，进度事件会往里建时间线条目；结束后替换成最终结果
@@ -6033,15 +7859,16 @@ function boot(): void {
   installCopyHandlers();
   installForkHandlers();
   installDeleteHandlers();
+  installEditHandlers();
   installRegenHandlers();
   installProgressListener();
   installModelsListener();
 
-  // 点面板空白处收起 ▾ 模型下拉（点下拉内部或 ▾ 本身不收）
+  // 点面板空白处收起模型列表（点 chip 本身或列表内部不收 —— chip 自己管开关）
   document.addEventListener("mousedown", (e) => {
     if (!modelsDropdownOpen) return;
     const t = e.target as HTMLElement;
-    if (t.closest("#models-dropdown") || t.closest(".mc-caret")) return;
+    if (t.closest("#model-chip")) return;
     modelsDropdownOpen = false;
     paintModelsDropdown();
   });
@@ -6052,8 +7879,22 @@ function boot(): void {
 
   // 待拍板条数（记忆候选 / 权限申请）：启动拉一次 + 每 5s 轮询。
   // 读的是本地小 JSONL，成本可忽略；这是胶囊态"金色 = 有事情等你拍板"的唯一数据源。
+  //
+  // ⚠️ 与 `permTimer` 同一个理由：句柄必须存下来并重入前清掉。
+  // 裸 `setInterval` 会在测试里留下环境拆掉后才触发的定时器
+  // （→ `document is not defined` 未捕获异常）。
   void refreshPendingApprovals();
-  window.setInterval(() => void refreshPendingApprovals(), 5000);
+  if (pendingPollTimer !== null) window.clearInterval(pendingPollTimer);
+  pendingPollTimer = window.setInterval(() => {
+    // 同 `startPermTimer` 的自杀闸：环境拆掉后不再跑。
+    // 注意用裸 `clearInterval`（`window` 那时也没了）。
+    if (typeof document === "undefined" || !document.body) {
+      if (pendingPollTimer !== null) clearInterval(pendingPollTimer);
+      pendingPollTimer = null;
+      return;
+    }
+    void refreshPendingApprovals();
+  }, 5000);
 
   // 执行权限档位：启动拉一次（chip 默认 ask，拉到什么显什么）
   void invoke<{ execTrust?: string }>("get_settings")

@@ -15,16 +15,21 @@ mod command_policy;
 mod config;
 mod context;
 mod disk_assets;
+mod distill;
 mod fetch;
 mod history;
 mod images;
+mod life;
 mod llm;
 mod mcp;
+mod memes;
 mod memory;
 mod modes;
 mod perm_request;
 mod permission;
 mod pmem;
+mod project;
+mod ptc;
 mod recovery;
 mod sessions;
 mod shell;
@@ -330,7 +335,55 @@ impl AppState {
         drop(gate);
         *self.perm_mtime.lock().unwrap() = Some(mtime);
         eprintln!("[orbcat] 权限规则已从文件热加载（{} 条）", f.rules.len());
+        // ⚠️ 整表替换会把「激活项目目录」的动态规则一起冲掉，跟着重建。
+        self.refresh_project_dir_rules();
     }
+
+    /// 重建「激活项目目录」动态授权（用户 2026-10-07 定案）：
+    /// **新建项目时绑定的目录，项目激活期间默认读写；没绑目录就没有。**
+    ///
+    /// 规则形态：label = `项目目录「名」`，权限 ReadWrite，**只活内存**
+    /// （三条硬约束见 [`permission::PROJECT_DIR_LABEL_PREFIX`]：不落盘、
+    /// 不进设置页列表、由本函数在时机点重建）。
+    ///
+    /// 调用点：启动、切项目、建/删/改名项目、改绑定路径、permissions.json
+    /// 热加载之后。全部幂等 —— 先摘全部旧动态规则，再按当前激活项目挂新的。
+    fn refresh_project_dir_rules(&self) {
+        let want = active_project_dir(&self.data_dir);
+        let mut gate = self.gate.lock().unwrap();
+        let removed = gate.retain_rules(|r| !permission::is_dynamic_label(&r.label));
+        if let Some((path, name)) = want {
+            gate.add_rule(
+                &path,
+                permission::Access::ReadWrite,
+                format!("{}{}」", permission::PROJECT_DIR_LABEL_PREFIX, name),
+            );
+            eprintln!(
+                "[orbcat] 项目目录授权: {} => readwrite（项目「{name}」）",
+                path.display()
+            );
+        }
+        if removed > 0 {
+            eprintln!("[orbcat] 已摘除 {removed} 条旧的项目目录授权");
+        }
+    }
+}
+
+/// 当前激活项目绑定的目录 → `(规范路径, 项目名)`。
+///
+/// 三个前置（任一不满足 = `None` = 没有额外授权，fail-closed）：
+/// 项目存在、绑定了非空路径、该路径**真实存在且是目录** —— 绑一个
+/// 不存在的路径不该产生授权（与项目记忆注入的「源路径已死不注入」同语义）。
+fn active_project_dir(data_dir: &Path) -> Option<(PathBuf, String)> {
+    let s = config::load_settings(data_dir);
+    let pid = s.active_project_id?;
+    let all = pmem::list_projects(data_dir).ok()?;
+    let p = all.iter().find(|x| x.id == pid)?;
+    let rp = p.root_path.trim();
+    if rp.is_empty() || !Path::new(rp).is_dir() {
+        return None;
+    }
+    Some((permission::best_effort_canonicalize(Path::new(rp)), p.name.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -516,7 +569,13 @@ fn perm_rules(state: State<'_, AppState>) -> Result<Vec<permission::Rule>, Strin
     // 或从别的入口改了 permissions.json，UI 一直显示旧的 —— 看起来就是「删不掉」。
     state.sync_perm_file();
     let gate = state.gate.lock().map_err(|e| format!("锁失败: {e}"))?;
-    Ok(gate.export_rules())
+    // 动态规则（激活项目目录授权）不进设置页列表：它由项目切换自动重建，
+    // 用户在设置页删不掉，摆出来只会让人困惑；项目面板里看绑定路径更直观。
+    Ok(gate
+        .export_rules()
+        .into_iter()
+        .filter(|r| !permission::is_dynamic_label(&r.label))
+        .collect())
 }
 
 #[tauri::command]
@@ -735,17 +794,55 @@ fn perm_cmd_audit_tail(
 // Tauri 命令 —— 模型
 // ---------------------------------------------------------------------------
 
-/// 列出可用模型（**不含 apiKey**）
+/// 列出可用模型（**不含 apiKey**）。
+///
+/// 顺带做一次性迁移：`settings.selected_model` 存的若已不是任何接口 id
+/// （2026-10-02 起身份 = (Base URL, 接口 id)，旧显示名全部失效）→ 清空，
+/// 让前端兜底自动选第一个。
 #[tauri::command]
 fn list_models(state: State<'_, AppState>) -> Result<Vec<config::ModelView>, String> {
     let models = config::load_models(&state.data_dir)?;
+    let mut s = config::load_settings(&state.data_dir);
+    if let Some(sel) = s.selected_model.clone() {
+        if !models.iter().any(|m| m.id == sel) {
+            s.selected_model = None;
+            s.selected_model_url = None;
+            config::save_settings(&state.data_dir, &s)?;
+        }
+    }
     Ok(models.iter().map(config::ModelView::from).collect())
 }
 
-/// 当前选中的模型 id
+/// 当前选中的模型（身份 = (Base URL, 接口 id)）。
+///
+/// `url` 为 None 表示旧数据只存了 id —— 前端按裸 id 匹配即可。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectedModelView {
+    id: String,
+    url: Option<String>,
+}
+
 #[tauri::command]
-fn get_selected_model(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    Ok(config::load_settings(&state.data_dir).selected_model)
+fn get_selected_model(state: State<'_, AppState>) -> Result<Option<SelectedModelView>, String> {
+    let s = config::load_settings(&state.data_dir);
+    Ok(s.selected_model.map(|id| SelectedModelView {
+        id,
+        url: s.selected_model_url.clone(),
+    }))
+}
+
+/// 按 (url, id) 定位模型：url 有值先精确匹配，失配回落裸 id 兜底。
+fn locate_model(
+    state: &State<'_, AppState>,
+    id: &str,
+    url: &Option<String>,
+) -> Result<config::ModelConfig, String> {
+    match url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(u) => config::find_model_by_url_id(&state.data_dir, u, id)
+            .or_else(|_| config::find_model(&state.data_dir, id)),
+        None => config::find_model(&state.data_dir, id),
+    }
 }
 
 #[tauri::command]
@@ -753,11 +850,13 @@ fn set_selected_model(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     id: String,
+    url: Option<String>,
 ) -> Result<(), String> {
-    // 先确认这个 id 真的存在
-    let _ = config::find_model(&state.data_dir, &id)?;
+    // 先确认这个 (url, id) 真的存在（url 失配回落裸 id 校验）
+    let resolved = locate_model(&state, &id, &url)?;
     let mut s = config::load_settings(&state.data_dir);
-    s.selected_model = Some(id);
+    s.selected_model = Some(resolved.id);
+    s.selected_model_url = Some(resolved.url);
     config::save_settings(&state.data_dir, &s)?;
     // 在模型管理窗口里切了「当前模型」→ 面板顶部的模型卡片也要跟上
     let _ = app.emit("models-changed", ());
@@ -766,8 +865,12 @@ fn set_selected_model(
 
 /// 连通性自检：确认 key / url / 模型名都对
 #[tauri::command]
-async fn test_model(state: State<'_, AppState>, id: String) -> Result<String, String> {
-    let cfg = config::find_model(&state.data_dir, &id)?;
+async fn test_model(
+    state: State<'_, AppState>,
+    id: String,
+    url: Option<String>,
+) -> Result<String, String> {
+    let cfg = locate_model(&state, &id, &url)?;
     eprintln!(
         "[orbcat] 测试模型 {} @ {}（key {}）",
         cfg.id,
@@ -798,17 +901,15 @@ fn parse_headers(text: &str) -> Result<std::collections::BTreeMap<String, String
     Ok(map)
 }
 
-/// 新增（或按 **显示名** 覆盖）一个模型。
+/// 新增（或覆盖）一个模型。**身份 = (Base URL, 接口 id)**。
 ///
-/// - **显示名唯一**；**接口 model（`id`）允许重复**（官方 / 火山可同时调 `deepseek-v4.1-flash`）
-/// - 同显示名 = 更新这一条；不再因为接口 id 相同而拦截
-/// - Key 可空（Ollama / 本地）
+/// - 同组同接口 id = 更新这一条；跨组同名（glm-5.3-flash 进两个火山组）完全合法
+/// - Key 可空（Ollama / 本地）；**留空时自动继承**：同组已有 Key → 直接用
 #[tauri::command]
 fn models_add(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     id: String,
-    name: String,
     url: String,
     api_key: Option<String>,
     supports_tool_call: bool,
@@ -818,32 +919,35 @@ fn models_add(
     max_output_tokens: Option<u64>,
     overwrite: Option<bool>,
 ) -> Result<String, String> {
-    let _ = overwrite; // 同显示名即更新，不再需要「覆盖」确认
+    let _ = overwrite; // 同组同 id 即更新，不再需要「覆盖」确认
     let id = id.trim().to_string();
-    let display = if name.trim().is_empty() {
-        id.clone()
-    } else {
-        name.trim().to_string()
-    };
-    if display.is_empty() {
-        return Err("显示名不能为空".into());
-    }
     if id.is_empty() {
         return Err("接口模型 ID 不能为空".into());
     }
     let url = config::normalize_base_url(&url)?;
 
-    // 按显示名找旧配置（保留 vendor / max / key 兜底）
-    let existing = config::find_model(&state.data_dir, &display).ok();
+    // 按 (url, id) 找旧配置（保留 vendor / max / key 兜底）
+    let existing = config::load_models(&state.data_dir)
+        .ok()
+        .and_then(|all| {
+            let want = config::url_key(&url);
+            all.into_iter()
+                .find(|m| m.id == id && config::url_key(&m.url) == want)
+        });
 
     let key_in = api_key.unwrap_or_default().trim().to_string();
-    let api_key = if key_in.is_empty() {
-        existing
-            .as_ref()
-            .map(|m| m.api_key.clone())
-            .unwrap_or_default()
-    } else {
+    // Key 留空时的继承顺序：本条旧 Key → 同组（同 Base URL）已有 Key。
+    // 用户心智"一个提供商一个 Key"：组里加模型不该要求再粘一遍 Key。
+    let api_key = if !key_in.is_empty() {
         key_in
+    } else if existing
+        .as_ref()
+        .is_some_and(|m| !m.api_key.trim().is_empty())
+    {
+        existing.as_ref().unwrap().api_key.clone()
+    } else {
+        let all = config::load_models(&state.data_dir)?;
+        config::group_key_for_url(&all, &url)
     };
 
     let vendor = existing_vendor_or_custom(&existing);
@@ -857,10 +961,9 @@ fn models_add(
     };
 
     let m = config::ModelConfig {
-        id,
-        name: display.clone(),
+        id: id.clone(),
         vendor,
-        url,
+        url: url.clone(),
         api_key,
         supports_tool_call,
         supports_images,
@@ -870,10 +973,10 @@ fn models_add(
     };
 
     config::add_model(&state.data_dir, m)?;
-    eprintln!("[orbcat] 已保存模型（显示名={display}）");
+    eprintln!("[orbcat] 已保存模型（id={id} @ {url}）");
     // 模型列表变了 → 面板顶部的模型卡片要跟着刷（独立窗口里改的，面板看不到 DOM）
     let _ = app.emit("models-changed", ());
-    Ok(display)
+    Ok(id)
 }
 
 fn existing_vendor_or_custom(existing: &Option<config::ModelConfig>) -> String {
@@ -883,10 +986,10 @@ fn existing_vendor_or_custom(existing: &Option<config::ModelConfig>) -> String {
     }
 }
 
-/// 编辑已有模型（按 **显示名** 定位）。
+/// 编辑已有模型（按 **(Base URL, 接口 id)** 定位）。
 ///
-/// - `name`：显示名（唯一键）
-/// - `new_id`：发给提供商的 `model` 字段，**允许与别的条目相同**
+/// - `url`：定位用的组 Base URL（前端从列表条目带上）；None 回落裸 id
+/// - `new_id`：改发给提供商的 `model` 字段；**组内查重**（跨组同名合法）
 /// - `apiKey` 空 = 保持原 Key；`clear_key` = 清空
 #[tauri::command]
 fn models_edit(
@@ -894,7 +997,6 @@ fn models_edit(
     state: State<'_, AppState>,
     id: String,
     new_id: Option<String>,
-    name: Option<String>,
     url: Option<String>,
     api_key: Option<String>,
     clear_key: Option<bool>,
@@ -910,23 +1012,18 @@ fn models_edit(
         None => None,
     };
 
-    // 显示名变更（唯一）；接口 id 单独改、不查重
-    let new_name = name
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let rename_to = new_name.filter(|n| n != &key);
+    let target = locate_model(&state, &key, &url)?;
+    let old_id = target.id.clone();
+    let old_url = target.url.clone();
+    let nid_trimmed = new_id
+        .clone()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
-    if let Some(nn) = &rename_to {
-        config::rename_model(&state.data_dir, &key, nn)?;
-    }
-
-    let target = rename_to.clone().unwrap_or_else(|| key.clone());
     config::update_model(
         &state.data_dir,
-        &target,
-        None,
+        &old_url,
+        &old_id,
         url,
         api_key,
         clear_key.unwrap_or(false),
@@ -935,33 +1032,39 @@ fn models_edit(
         extra_headers,
         Some(max_input_tokens),
         Some(max_output_tokens),
-        new_id.filter(|s| !s.trim().is_empty()),
+        nid_trimmed.clone(),
     )?;
 
-    if let Some(nn) = &rename_to {
-        let mut s = config::load_settings(&state.data_dir);
-        if s.selected_model.as_deref() == Some(key.as_str()) {
-            s.selected_model = Some(nn.clone());
-            config::save_settings(&state.data_dir, &s)?;
+    // 改了接口 id 且当前选中项就是这条 → 同步 selected（身份含 id）
+    if let Some(nid) = nid_trimmed {
+        if nid != old_id {
+            let mut s = config::load_settings(&state.data_dir);
+            let sel_matches = s.selected_model.as_deref() == Some(old_id.as_str())
+                && s
+                    .selected_model_url
+                    .as_deref()
+                    .map(|u| config::url_key(u) == config::url_key(&old_url))
+                    .unwrap_or(true);
+            if sel_matches {
+                s.selected_model = Some(nid);
+                config::save_settings(&state.data_dir, &s)?;
+            }
         }
     }
 
-    eprintln!(
-        "[orbcat] 已编辑模型（显示名 {}{}）",
-        key,
-        rename_to
-            .as_ref()
-            .map(|n| format!(" → {n}"))
-            .unwrap_or_default()
-    );
+    eprintln!("[orbcat] 已编辑模型（{old_id} @ {old_url}）");
     let _ = app.emit("models-changed", ());
     Ok(())
 }
 
 /// 编辑表单回填（**不含完整 Key**，只有掩码预览）
 #[tauri::command]
-fn models_get_edit(state: State<'_, AppState>, id: String) -> Result<config::ModelEditView, String> {
-    let m = config::find_model(&state.data_dir, id.trim())?;
+fn models_get_edit(
+    state: State<'_, AppState>,
+    id: String,
+    url: Option<String>,
+) -> Result<config::ModelEditView, String> {
+    let m = locate_model(&state, id.trim(), &url)?;
     Ok(config::ModelEditView::from(&m))
 }
 
@@ -994,8 +1097,9 @@ async fn models_fetch_remote(
 async fn models_fetch_remote_using(
     state: State<'_, AppState>,
     id: String,
+    url: Option<String>,
 ) -> Result<Vec<llm::RemoteModelInfo>, String> {
-    let cfg = config::find_model(&state.data_dir, id.trim())?;
+    let cfg = locate_model(&state, id.trim(), &url)?;
     eprintln!(
         "[orbcat] 用已配置模型 {} 拉取列表（key {}）",
         cfg.id,
@@ -1023,6 +1127,7 @@ fn models_import_remote(
     state: State<'_, AppState>,
     ids: Vec<String>,
     source_id: Option<String>,
+    source_url: Option<String>,
     url: Option<String>,
     api_key: Option<String>,
     headers: Option<String>,
@@ -1033,7 +1138,12 @@ fn models_import_remote(
     context_lengths: Option<std::collections::HashMap<String, u64>>,
 ) -> Result<ImportModelsResult, String> {
     let source = if let Some(sid) = source_id.filter(|s| !s.trim().is_empty()) {
-        config::find_model(&state.data_dir, sid.trim())?
+        // 按 (url, id) 精确找来源（同 id 可跨组共存）；url 缺失回落裸 id
+        match source_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(su) => config::find_model_by_url_id(&state.data_dir, su, sid.trim())
+                .or_else(|_| config::find_model(&state.data_dir, sid.trim()))?,
+            None => config::find_model(&state.data_dir, sid.trim())?,
+        }
     } else {
         let url = url.unwrap_or_default();
         let url = url.trim().trim_end_matches('/').to_string();
@@ -1050,7 +1160,6 @@ fn models_import_remote(
         };
         config::ModelConfig {
             id: "__import__".into(),
-            name: String::new(),
             vendor: "Custom".into(),
             url,
             api_key: key,
@@ -1082,18 +1191,27 @@ fn models_import_remote(
     }
     Ok(ImportModelsResult { added, skipped })
 }
-/// 删除一个模型。若删的是当前选中项，顺带清除选中状态。
+/// 删除一个模型（按 **(Base URL, 接口 id)** 定位）。
+/// 若删的是当前选中项，顺带清除选中状态。
 #[tauri::command]
 fn models_remove(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     id: String,
+    url: Option<String>,
 ) -> Result<(), String> {
-    config::remove_model(&state.data_dir, &id)?;
+    let target = locate_model(&state, &id, &url)?;
+    config::remove_model(&state.data_dir, &target.url, &target.id)?;
 
     let mut s = config::load_settings(&state.data_dir);
-    if s.selected_model.as_deref() == Some(id.as_str()) {
+    let sel_matches = s.selected_model.as_deref() == Some(target.id.as_str())
+        && s.selected_model_url
+            .as_deref()
+            .map(|u| config::url_key(u) == config::url_key(&target.url))
+            .unwrap_or(true);
+    if sel_matches {
         s.selected_model = None;
+        s.selected_model_url = None;
         config::save_settings(&state.data_dir, &s)?;
     }
     let _ = app.emit("models-changed", ());
@@ -1199,6 +1317,151 @@ async fn search_test(state: State<'_, AppState>) -> Result<String, String> {
     search::ping(&cfg).await
 }
 
+// ---------------------------------------------------------------------------
+// Tauri 命令 —— 数据源（认知面注入，见 life.rs）
+// ---------------------------------------------------------------------------
+
+/// 一个数据源给前端看的形态：声明 + **实时读一次的结果**。
+///
+/// 为什么把"读一次"和声明一起返回：设置页要显示每个源的健康状况
+/// （几条、多久没更新、读没读到）。分两次命令会让前端要自己对时序，
+/// 而这里一次读完（源数量是个位数，成本可接受）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LifeSourceView {
+    id: String,
+    label: String,
+    enabled: bool,
+    kind: String,
+    /// 文件路径或命令（原样给前端展示与编辑）
+    target: String,
+    items_path: String,
+    stale_hours: Option<f64>,
+    /// 配置是否完整（缺 path/command 的会在 UI 标出来）
+    complete: bool,
+    /// 本次读取结果
+    ok: bool,
+    error: String,
+    updated_at: String,
+    age_hours: Option<f64>,
+    stale: bool,
+    count: usize,
+    /// 明细预览（前几条标题，让用户一眼确认接对了）
+    preview: Vec<String>,
+}
+
+#[tauri::command]
+async fn life_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let f = life::load(&state.data_dir);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| state.data_dir.clone());
+    let mut views: Vec<LifeSourceView> = Vec::new();
+
+    for s in &f.sources {
+        // 未启用的源**不读**（尤其 command 类：那等于偷偷跑命令）。
+        // 前端仍要看到它，所以给一份"未读取"的占位。
+        let snap = if s.enabled {
+            life::read_source(s, &cwd).await
+        } else {
+            life::Snapshot {
+                id: s.id.clone(),
+                label: s.name().to_string(),
+                ok: false,
+                error: String::new(), // 空 = "没读"（前端据此显示"已关闭"而不是"失败"）
+                updated_at: String::new(),
+                age_hours: None,
+                stale: false,
+                items: Vec::new(),
+            }
+        };
+        views.push(LifeSourceView {
+            id: s.id.clone(),
+            label: s.name().to_string(),
+            enabled: s.enabled,
+            kind: match s.kind {
+                life::Kind::File => "file".into(),
+                life::Kind::Command => "command".into(),
+            },
+            target: match s.kind {
+                life::Kind::File => s.path.clone(),
+                life::Kind::Command => s.command.clone(),
+            },
+            items_path: s.items.clone(),
+            stale_hours: s.stale_hours,
+            complete: s.is_complete(),
+            ok: snap.ok,
+            error: snap.error,
+            updated_at: snap.updated_at,
+            age_hours: snap.age_hours,
+            stale: snap.stale,
+            count: snap.items.len(),
+            preview: snap
+                .items
+                .iter()
+                .take(5)
+                .map(|i| {
+                    if i.group.is_empty() {
+                        i.title.clone()
+                    } else {
+                        format!("[{}] {}", i.group, i.title)
+                    }
+                })
+                .collect(),
+        });
+    }
+
+    Ok(serde_json::json!({
+        "path": life::life_path(&state.data_dir).display().to_string(),
+        "sources": views,
+    }))
+}
+
+/// 切换一个数据源的启用状态（落盘）。
+///
+/// 为什么单独一条命令而不是让前端整份覆写：整份覆写要求前端把
+/// `map` / `items` 等字段原样带回来，任何一个字段丢了都是**静默损坏**。
+/// 这里只改一个布尔，其余字段保持磁盘上的原样。
+#[tauri::command]
+fn life_set_enabled(
+    state: State<'_, AppState>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut f = life::load(&state.data_dir);
+    let Some(s) = f.sources.iter_mut().find(|s| s.id == id.trim()) else {
+        return Err(format!("没有 id 为「{id}」的数据源"));
+    };
+    if enabled && !s.is_complete() {
+        return Err(format!(
+            "「{}」的配置不完整（缺 {}），补全后再打开。",
+            s.name(),
+            match s.kind {
+                life::Kind::File => "path",
+                life::Kind::Command => "command",
+            }
+        ));
+    }
+    s.enabled = enabled;
+    life::save(&state.data_dir, &f)?;
+    // 立刻失效摘要缓存，否则下次构建 prompt 还会用旧摘要
+    life::invalidate_cache();
+    eprintln!("[orbcat] 数据源「{id}」→ {}", if enabled { "启用" } else { "关闭" });
+    Ok(())
+}
+
+/// 重新读一遍全部源（设置页的「刷新」按钮）。
+#[tauri::command]
+fn life_refresh(state: State<'_, AppState>) -> Result<(), String> {
+    life::invalidate_cache();
+    let _ = state;
+    Ok(())
+}
+
+/// 在文件管理器里打开 `life.json`（用户要自己加源时）。
+#[tauri::command]
+fn life_config_path(state: State<'_, AppState>) -> String {
+    life::life_path(&state.data_dir).display().to_string()
+}
+
 #[tauri::command]
 fn set_blur_collapse(state: State<'_, AppState>, enable: bool) -> Result<(), String> {
     let mut s = config::load_settings(&state.data_dir);
@@ -1263,6 +1526,187 @@ fn skills_list(state: State<'_, AppState>) -> Vec<serde_json::Value> {
             })
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tauri 命令 —— 拼装项目（project.rs）
+// ---------------------------------------------------------------------------
+
+/// 项目包列表 + 当前激活项。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectListView {
+    /// 全部 bundle（含**无效**的 —— 设置页要标黄让用户能修）
+    bundles: Vec<project::BundleInfo>,
+    /// 当前激活的 id（`None` = 无项目）
+    active: Option<String>,
+    /// 当前项目的引用解析失败项（`(类别, id, 原因)`，设置页标黄）
+    unresolved: Vec<(String, String, String)>,
+    /// 当前项目的 permPreset 被丢弃的原因（fail-closed；`None` = 没丢）
+    perm_error: Option<String>,
+    /// 当前项目声明的脚本工具（设置页展示）
+    tools: Vec<serde_json::Value>,
+}
+
+#[tauri::command]
+fn project_list(state: State<'_, AppState>) -> ProjectListView {
+    let active_id = config::load_settings(&state.data_dir).active_bundle;
+    let bundles = project::list_bundles(&state.data_dir, active_id.as_deref());
+    let active = project::active(&state.data_dir);
+    ProjectListView {
+        bundles,
+        active: active_id,
+        unresolved: project::unresolved_refs(&state.data_dir),
+        perm_error: active.as_ref().and_then(|a| a.perm_error.clone()),
+        tools: active
+            .as_ref()
+            .map(|a| {
+                a.bundle
+                    .tools
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "template": t.command_template,
+                            "perm": t.perm,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// 激活 / 退出一个拼装项目（`id = null` → 退出项目）。
+///
+/// ⚠️ **只改 `settings.json`，不重启、不重连 MCP**：项目影响的是
+/// **新轮次**的 prompt / 工具面 / 权限判定，这些都在每轮现算
+/// （`tool_specs` / `effective_policy` / `effective_exec_trust` 都是读盘函数）。
+/// 所以切项目是**即时生效、零重启**的。
+#[tauri::command]
+fn project_activate(
+    state: State<'_, AppState>,
+    id: Option<String>,
+) -> Result<(), String> {
+    let id = id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+    // 激活前先校验：坏包不该被设成激活项（否则用户会看到一个
+    // "激活了但什么也没生效"的诡异状态，且日志里才有原因）。
+    if let Some(ref want) = id {
+        project::load_bundle(&state.data_dir, want)
+            .map_err(|e| format!("项目「{want}」装配失败，未激活：{e}"))?;
+    }
+
+    let mut s = config::load_settings(&state.data_dir);
+    s.active_bundle = id.clone();
+    config::save_settings(&state.data_dir, &s)?;
+
+    match id {
+        Some(i) => eprintln!("[orbcat] 已激活项目: {i}"),
+        None => eprintln!("[orbcat] 已退出项目（回到无项目）"),
+    }
+    Ok(())
+}
+
+/// 保存一个项目包（设置页编辑 / 导入）。
+///
+/// `body` 是 `project.json` 的**文本**，在这里解析 + 校验后再落盘 ——
+/// 不合法就拒绝写入（避免把坏文件留在磁盘上，下次启动才发现）。
+#[tauri::command]
+fn project_save(
+    state: State<'_, AppState>,
+    id: String,
+    body: String,
+) -> Result<(), String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("项目 id 不能为空".into());
+    }
+    // id 会当目录名用 —— 挡掉路径分隔符与上跳
+    if id.contains(['/', '\\']) || id == "." || id == ".." {
+        return Err(format!("项目 id「{id}」不合法（不能含路径分隔符）"));
+    }
+
+    // 先解析校验（不落盘），再写 —— 顺序不能反
+    let bundle: project::ProjectBundle = serde_json::from_str(&body)
+        .map_err(|e| format!("不是合法的项目包 JSON: {e}"))?;
+    if bundle.schema_version != project::SCHEMA_VERSION {
+        return Err(format!(
+            "schemaVersion={} 不认识（本版本支持 {}）",
+            bundle.schema_version,
+            project::SCHEMA_VERSION
+        ));
+    }
+
+    let dir = project::bundle_dir(&state.data_dir, id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("建项目目录失败: {e}"))?;
+    let path = dir.join(project::BUNDLE_FILE);
+    std::fs::write(&path, &body).map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
+
+    // 写回后立刻复验一次 —— 校验器与写盘必须一致，
+    // 否则会出现"保存成功但激活时才报错"的割裂体验。
+    project::load_bundle(&state.data_dir, id)
+        .map_err(|e| format!("已写入但复验失败（请检查文件）: {e}"))?;
+    eprintln!("[orbcat] 项目包已保存: {}", path.display());
+    Ok(())
+}
+
+/// 删除一个项目包（**只删 `project.json`**，保留 MEMORY.md 等项目记忆）。
+///
+/// 为什么不整个目录删：目录里可能还有用户的项目记忆与脚本，
+/// 那些不是 bundle 的产物，不该被"退出项目"顺手带走。
+#[tauri::command]
+fn project_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let id = id.trim();
+    let path = project::bundle_dir(&state.data_dir, id).join(project::BUNDLE_FILE);
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("删除失败: {e}"))?;
+    }
+    // 删的正好是激活项 → 顺手退出，避免留下一个指向不存在包的 active_bundle
+    let mut s = config::load_settings(&state.data_dir);
+    if s.active_bundle.as_deref() == Some(id) {
+        s.active_bundle = None;
+        config::save_settings(&state.data_dir, &s)?;
+    }
+    Ok(())
+}
+
+/// 读一个项目包的原始文本（设置页编辑用）
+#[tauri::command]
+fn project_read(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    let path = project::bundle_dir(&state.data_dir, id.trim()).join(project::BUNDLE_FILE);
+    std::fs::read_to_string(&path).map_err(|e| format!("读不到 {}: {e}", path.display()))
+}
+
+/// 搜索是否可用（`web_search` 工具是否暴露给模型）。
+///
+/// 抽成一个函数是因为有**两个**判据要一致地看：
+/// 1. `search.json` 里配了后端且有 key（既有逻辑）
+/// 2. 拼装项目的 `slots.search` 若声明了，必须**就是**当前配置的那个后端
+///
+/// 第 2 条是"槽位"语义：项目说"我要用 tavily"，而用户配的是 exa →
+/// 该项目下**不暴露** `web_search`（而不是偷偷用 exa）。这与
+/// `slot_model` 的 fail-open 不同 —— 模型可以回落到用户选的，
+/// 但搜索后端回落到"另一个服务商"意味着**把查询发给用户没预期的服务商**，
+/// 那是隐私问题，所以这里选择不暴露。
+pub(crate) fn web_search_ready_for(data_dir: &std::path::Path) -> bool {
+    if !search::is_ready(data_dir) {
+        return false;
+    }
+    match project::active(data_dir).and_then(|a| a.bundle.slots.search) {
+        Some(want) => {
+            let want = want.trim().to_ascii_lowercase();
+            if want.is_empty() {
+                return true;
+            }
+            match search::load_config(data_dir) {
+                Ok(cfg) => cfg.provider_norm() == want,
+                Err(_) => false,
+            }
+        }
+        None => true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,6 +1852,11 @@ fn allowed_for_dir(state: &AppState) -> std::collections::HashSet<String> {
 }
 
 /// 同 [`allowed_for_dir`]，但接收裸参数（启动期还没有 `State` 时用）
+///
+/// ⚠️ 2026-10-08：模式**跟会话走**了，所以这里不能再读 `settings.activeMode`
+/// —— 那现在是"新建会话的默认模式"，跟正在用的这个会话没关系。
+/// 改成问 `sessions::effective_mode`（当前会话 → 它自带的模式）。
+/// 漏改的表现：切到「闲聊」后重新拉一次 MCP 快照，工具组又满血复活。
 fn allowed_for_dir_of(
     data_dir: &std::path::Path,
     mcp: &std::sync::Arc<tokio::sync::Mutex<mcp::ToolRegistry>>,
@@ -1421,8 +1870,32 @@ fn allowed_for_dir_of(
         Ok(reg) => reg.groups().iter().map(|g| g.name.clone()).collect(),
         Err(_) => Vec::new(),
     };
-    let s = config::load_settings(data_dir);
-    modes::allowed_groups_for(data_dir, Some(&s.active_mode), &available).as_registry_set()
+    // ⚠️ 用 `current_or_main` 而不是 `current_id`：后者只看指针文件，
+    //    指针缺失（真实发生过：`sessions/current` 不存在）会返回 None →
+    //    兜到内置默认模式，而界面/agent 走 `ensure_current` 落到的是另一条会话
+    //    → "界面在闲聊会话里、MCP 工具组却按标准模式算"。两边都说得通，极难排查。
+    //    也刻意不用 `ensure_current`：那条路径会**写盘**（自愈/落指针），
+    //    而这里跑在后台线程里，不该有副作用。
+    let cur = crate::sessions::current_or_main(data_dir);
+    let mode = crate::sessions::effective_mode(data_dir, Some(&cur.id));
+    modes::allowed_groups_for(data_dir, Some(&mode.id), &available).as_registry_set()
+}
+
+/// 换了会话 → 它自带模式 → **MCP 活跃组必须跟着重算**（2026-10-08）。
+///
+/// 为什么非得显式做一次：`allowed_for_dir` 只在"新快照 / 改设置 / 手动刷新"三条
+/// 路径上跑，切会话一条都不触发。少了这一步，从「标准」切到「闲聊」后工具组
+/// 还是满的 —— 表现出来就是"切了闲聊它照样能调 MCP"，而工具表里
+/// `send_meme` 之类按模式走的闸门又是对的，两处不一致最难查。
+///
+/// 与 `mcp_set_all_groups` / `resync_mode_groups` 用的是同一套（`allowed_for_dir` +
+/// `restore_active_from_settings`），所以"模式只能收窄、用户关掉的组开不回来"
+/// 这条语义自动成立。
+async fn resync_mode_groups(state: &AppState) -> usize {
+    let allowed = allowed_for_dir(state);
+    let s = config::load_settings(&state.data_dir);
+    let mut reg = state.mcp.lock().await;
+    reg.restore_active_from_settings(&s, Some(allowed))
 }
 
 #[derive(serde::Serialize)]
@@ -1512,10 +1985,31 @@ async fn mcp_servers_save(
     state: State<'_, AppState>,
     servers: Vec<config::McpServerCfg>,
 ) -> Result<(), String> {
-    // 规整：id 空则生成；url 去空白
+    // 规整：id 空则生成；url / command 去空白；args / env 去空条目
     let mut cleaned: Vec<config::McpServerCfg> = Vec::new();
     for (i, mut s) in servers.into_iter().enumerate() {
         s.url = s.url.trim().to_string();
+        s.command = s.command.trim().to_string();
+        // args 里的空白项没有意义（空参数在多数 CLI 里是错误来源），就地剔除
+        s.args = s
+            .args
+            .into_iter()
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect();
+        // env 的 key 去空白；key 空的条目直接丢（没法 setenv）
+        s.env = s
+            .env
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let k = k.trim().to_string();
+                if k.is_empty() {
+                    None
+                } else {
+                    Some((k, v))
+                }
+            })
+            .collect();
         if s.id.trim().is_empty() {
             s.id = format!("s{}", i + 1);
         }
@@ -1714,7 +2208,7 @@ fn bg_desk_shot(title: Option<String>, out_dir: String) -> Result<String, String
 }
 
 // ---------------------------------------------------------------------------
-// Tauri 命令 —— Agent 模式（标准 / PTC / 极简 / 创造）
+// Tauri 命令 —— Agent 模式（标准 / PTC / 闲聊 / 创造）
 // ---------------------------------------------------------------------------
 
 /// 一个模式给前端看的形态（见 `modes::Mode` 的说明）。
@@ -1730,6 +2224,19 @@ struct ModeView {
     allowed_count: Option<usize>,
     /// 模式点名了、但当前 MCP 里不存在的组（前端**标灰**）
     unknown_groups: Vec<String>,
+    /// 工具呈现方式：`native` / `ptc`（前端据此说明"这个模式怎么干活"）
+    tool_presentation: String,
+    /// 正文能不能发图：`work`（只贴产物图）/ `free`（含表情包）。
+    ///
+    /// ⚠️ 前端拿它**只做展示**（在模式行上标一句），不做拦截 ——
+    /// 工作模式也要渲染产物图，拦了会连截图一起挡掉。真正的约束是
+    /// `agent.rs` 按这个值注入的那段措辞（见 `modes::ImageReplies`）。
+    image_replies: String,
+    /// 这个模式注入的场景上下文（可能为空，空则前端不显示这一行）
+    prompt_extra: String,
+    /// 聊天式呈现（2026-10-08）：一条回复拆成多个气泡 + **不显示「过程」**。
+    /// 前端据此决定走 `bubble.ts` 的切分。只有闲聊模式为 true。
+    chatty: bool,
 }
 
 /// 当前注册表里的组名（锁最多等 2 秒 —— 与 `mcp_status` 同一条保险丝）
@@ -1745,9 +2252,19 @@ async fn registry_group_names(state: &AppState) -> Vec<String> {
 /// 前端只用这一条命令就能画完整个模式选择器：
 /// 每个模式的说明与"允许的组"、以及每组在当前模式下的状态
 /// （`allowed` 给模型 / `denied` 被本模式收起 / `unknown` 模式里写了但不存在）。
+///
+/// ## `session_id`（2026-10-08，模式改跟会话走）
+///
+/// 传了就按**那条会话**的模式回 `activeMode`；没传（启动早期 / 老前端）给内置默认。
+/// 另外单给一个 `defaultMode` —— 那**不是**"当前模式"，而是**新建会话时的默认值**，
+/// 新建菜单拿它标「默认」。它是**编译期常量** `modes::DEFAULT_MODE_ID`，
+/// 不再来自 `settings.activeMode`（那个字段已删，理由见
+/// `sessions::effective_mode` 的说明 —— 用户看到「闲聊」被标成「默认」就是它干的）。
 #[tauri::command]
-async fn modes_get(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let s = config::load_settings(&state.data_dir);
+async fn modes_get(
+    state: State<'_, AppState>,
+    session_id: Option<String>,
+) -> Result<serde_json::Value, String> {
     let available = registry_group_names(&state).await;
     let modes = modes::load(&state.data_dir);
 
@@ -1763,11 +2280,22 @@ async fn modes_get(state: State<'_, AppState>) -> Result<serde_json::Value, Stri
                     .unwrap_or(serde_json::Value::Null),
                 allowed_count: if a.all { None } else { Some(a.allowed.len()) },
                 unknown_groups: a.unknown.iter().cloned().collect(),
+                tool_presentation: if m.is_ptc() { "ptc" } else { "native" }.to_string(),
+                image_replies: if m.freestyle_images() { "free" } else { "work" }.to_string(),
+                prompt_extra: m.prompt_extra.clone(),
+                chatty: m.chatty,
             }
         })
         .collect();
 
-    let active = modes::resolve(&state.data_dir, Some(&s.active_mode));
+    // ⚠️ 走 `effective_mode` 这个唯一入口 —— 别在这儿再写一遍"读 settings + resolve"。
+    let active = crate::sessions::effective_mode(&state.data_dir, session_id.as_deref());
+    // 「新建会话的默认模式」= 内置默认那个模式**解析后**的 id。
+    // 为什么不是直接回 `DEFAULT_MODE_ID` 常量：用户完全可能手编 modes.json 把
+    // `standard` 删了 —— 那时常量就指向一个不存在的 id，新建菜单里**没有一项**
+    // 会带上「默认」标（看似小，但那是"界面在撒谎"）。`resolve` 会把这种情况
+    // 兜到文件里真实存在的某个模式上。
+    let default_mode = modes::resolve(&state.data_dir, None);
     let active_allowed = modes::allowed_groups_for_with(&active, &available);
     let groups: Vec<serde_json::Value> = available
         .iter()
@@ -1779,6 +2307,7 @@ async fn modes_get(state: State<'_, AppState>) -> Result<serde_json::Value, Stri
 
     Ok(serde_json::json!({
         "activeMode": active.id,
+        "defaultMode": default_mode.id,
         "modes": views,
         "groups": groups,
         "unknownGroups": active_allowed.unknown.iter().cloned().collect::<Vec<_>>(),
@@ -1786,28 +2315,17 @@ async fn modes_get(state: State<'_, AppState>) -> Result<serde_json::Value, Stri
     }))
 }
 
-/// 切换 agent 模式：落 `settings.json` → **立刻**重算活跃组（不等下次快照）。
-///
-/// 不接受不存在的 id：否则用户点了模式、界面提示成功、实际静默退回标准
-/// —— 那种"设置不生效"最难查。
-#[tauri::command]
-async fn modes_set(state: State<'_, AppState>, id: String) -> Result<String, String> {
-    let id = id.trim().to_string();
-    if !modes::exists(&state.data_dir, &id) {
-        return Err(format!(
-            "没有 id 为「{id}」的模式。改 agent-data/{} 可加自己的模式。",
-            modes::MODES_FILE
-        ));
-    }
-    let mut s = config::load_settings(&state.data_dir);
-    s.active_mode = id.clone();
-    config::save_settings(&state.data_dir, &s)?;
-    let allowed = allowed_for_dir(&state);
-    let mut reg = state.mcp.lock().await;
-    let n = reg.restore_active_from_settings(&s, Some(allowed));
-    eprintln!("[orbcat] 模式切换为 {id}（MCP 活跃组 {n} 个）");
-    Ok(id)
-}
+// 历史（2026-10-08 删）：这里原来有 `modes_set(id)` —— 改"当前 agent 模式"。
+// 它的三级演变值得留着，免得有人又想加回来：
+//   ① 全局"当前模式" → ② 模式跟会话走后降级成"新建会话的默认模式"
+//   → ③ **彻底删掉**。
+// 删它的触发点：用户看到「＋」菜单里**「闲聊」被标成「默认」**，而他要的是
+// "标准是默认"。那个标读的就是 `modes_set` 写进 `settings.json` 的 `activeMode`
+// （用户早先在设置页切过闲聊，值就留在文件里成了"默认"）。
+// 教训：**界面上没有了改它的入口之后，任何"用户可配的默认值"都会变成一个
+// 会撒谎的死字段**（手编也不生效）。所以默认值只能是编译期常量
+// （`modes::DEFAULT_MODE_ID`），而"要哪个模式"只能在**建会话时**选。
+// 另外 `modes::exists()` 也只剩测试在用 —— 留着无害（它是个合理的公共 API）。
 
 /// 写 MCP 全局开关：默认全给 / 回到按需加载
 #[tauri::command]
@@ -1896,11 +2414,12 @@ fn models_remove_group(state: State<'_, AppState>, url: String) -> Result<usize,
         return Err("这个 Base URL 下没有模型".into());
     }
     config::save_models(&state.data_dir, &all)?;
-    // 选中的模型被删了就清掉选中
+    // 选中的模型被删了就清掉选中（组删光后该 id 也不存在了）
     let mut s = config::load_settings(&state.data_dir);
     if let Some(cur) = s.selected_model.clone() {
-        if !all.iter().any(|m| m.name == cur) {
+        if !all.iter().any(|m| m.id == cur) {
             s.selected_model = None;
+            s.selected_model_url = None;
             config::save_settings(&state.data_dir, &s)?;
         }
     }
@@ -2217,11 +2736,28 @@ async fn chat(
     input: String,
     images: Option<Vec<String>>,
 ) -> Result<agent::AgentRun, String> {
-    let model_id = config::load_settings(&state.data_dir)
-        .selected_model
-        .ok_or_else(|| "尚未选择模型，请先在设置里选一个".to_string())?;
+    // 模型选择：**项目槽位优先**（`project.rs::slot_model`）。
+    //
+    // fail-open 语义：槽位引用的 id 在当前 `models.json` 里不存在时
+    // `slot_model` 返回 `None`，自动回落到用户选的模型 —— 分享来的 bundle
+    // 引用了别人机器上的模型名是常态，不该因此整个项目不能用。
+    let s = config::load_settings(&state.data_dir);
+    let (model_id, model_url) = match project::slot_model(&state.data_dir) {
+        Some(m) => (m, None),
+        None => (
+            s.selected_model
+                .clone()
+                .ok_or_else(|| "尚未选择模型，请先在设置里选一个".to_string())?,
+            s.selected_model_url.clone(),
+        ),
+    };
 
-    let cfg = config::find_model(&state.data_dir, &model_id)?;
+    // 身份 = (Base URL, 接口 id)：带 url 精确定位；槽位/旧数据没 url 时裸 id 兜底
+    let cfg = match model_url.as_deref() {
+        Some(u) => config::find_model_by_url_id(&state.data_dir, u, &model_id)
+            .or_else(|_| config::find_model(&state.data_dir, &model_id))?,
+        None => config::find_model(&state.data_dir, &model_id)?,
+    };
 
     // ⚠️ MutexGuard 不能跨 await，所以先把 gate clone 出来
     let gate: PermissionGate = {
@@ -2385,6 +2921,32 @@ async fn chat(
     }
 
     persist_run(&state, &session_id, &cfg.id, &input, &imgs_for_store, &run);
+
+    // ---- 轮末自动蒸馏（2026-10-07 用户定案：不靠模型自觉调 remember）----
+    //
+    // 后台发一个小请求，从本轮问答里提取 0~3 条记忆条目：
+    // 激活项目 → 直写项目 MEMORY.md；主对话 → 进全局待审批候选。
+    // 三条纪律：
+    //   1. **后台**：tauri::async_runtime::spawn，不阻塞本轮返回给前端；
+    //   2. **失败无害**：只打日志，蒸馏挂了不影响对话；
+    //   3. **省调用**：中断轮、太短的轮（合计 < 60 字，寒暄）不蒸馏。
+    // Err 分支（本轮失败）不蒸馏 —— 半截产物提不出可靠记忆。
+    if !run.interrupted {
+        let merged_chars = input.chars().count() + run.answer.chars().count();
+        if merged_chars >= memory::AUTO_DISTILL_MIN_CHARS {
+            let dd = state.data_dir.clone();
+            let cfg2 = cfg.clone();
+            let q = input.clone();
+            let a = sessions::strip_step_folds(&run.answer);
+            tauri::async_runtime::spawn(async move {
+                match memory::auto_distill(&cfg2, &dd, &q, &a).await {
+                    Ok(n) if n > 0 => eprintln!("[orbcat] 轮末自动蒸馏: 写入 {n} 条记忆"),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[orbcat] 轮末自动蒸馏失败（不影响对话）: {e}"),
+                }
+            });
+        }
+    }
 
     Ok(run)
 }
@@ -2648,16 +3210,33 @@ fn bootstrap_data(state: State<'_, AppState>) -> Result<bootstrap::BootstrapRepo
 ///
 /// 多会话并行 run 下**放行**：新建不碰别的会话，落盘各自带着自己的 `session_id`。
 /// 仍然**禁止**的只剩"改动某个会话本身"的动作（删除/截断/分叉**该会话**），见各自命令。
+///
+/// `mode` = 用户在「新建会话」菜单里选的模式 id（2026-10-08）。
+/// 会话**建的时候**就把模式钉死，之后不再改 —— 用户定案："一个会话模式不能变"。
+/// 不传 → 内置默认 `modes::DEFAULT_MODE_ID`（`standard`）；传了无效 id →
+/// 由 `modes::resolve` 兜到同一处。**没有"用户可配的默认模式"这回事**
+/// （`settings.activeMode` 已删，理由见 `sessions::effective_mode` 的说明）。
 #[tauri::command]
-fn session_new(state: State<'_, AppState>) -> Result<sessions::Session, String> {
-    let s = sessions::new_session(&state.data_dir);
-    eprintln!("[orbcat] 新会话 {}", s.id);
+async fn session_new(
+    state: State<'_, AppState>,
+    mode: Option<String>,
+) -> Result<sessions::Session, String> {
+    let fallback = modes::DEFAULT_MODE_ID;
+    let s = sessions::new_session(&state.data_dir, mode.as_deref().unwrap_or(fallback));
+    eprintln!(
+        "[orbcat] 新会话 {}（模式 {}）",
+        s.id,
+        s.mode.as_deref().unwrap_or(fallback)
+    );
     // 新会话没有历史授权 —— 顺手清掉上一段残留的（尤其 `Once`/`Turn`）。
     // ⚠️ 但**有 run 在跑时跳过**：`reload_grants_for_session` 会把内存授权换成新会话的，
     //    正在跑的任务会当场丢权限（工具调用全被拒）。
     if !state.runs.any_active() {
         reload_grants_for_session(&state, &s.id);
     }
+    // 新会话可能选了另一个模式（`new_session` 已把它设为当前）→ MCP 活跃组跟着重算
+    let n = resync_mode_groups(&state).await;
+    eprintln!("[orbcat] 新会话后重算 MCP 活跃组：{n} 个");
     Ok(s)
 }
 
@@ -2668,14 +3247,31 @@ fn session_new(state: State<'_, AppState>) -> Result<sessions::Session, String> 
 ///
 /// ⚠️ 但**有任意 run 在跑时不重载授权**：`reload_grants_for_session` 会把内存里那份
 /// 换成"目标会话"的，正在跑的任务会因此**当场丢权限**（它的工具调用全被拒）。
+///
+/// ⚠️ 2026-10-08：模式跟会话走 → 切会话 = **换模式** → MCP 活跃组必须跟着重算
+/// （见 [`resync_mode_groups`]）。这一步**刻意不加"有 run 在跑就跳过"的闸**：
+/// 加了的话，你切到「闲聊」时它在后台跑着任务，闲聊会话就会**一直**带着满组的
+/// MCP 工具（没有任何后续事件会补算这次），比"在跑的那条会话下一轮少几个工具"
+/// 黏得多。已知残留：多会话并行且模式不同时，活跃集只跟当前会话走
+/// —— 这与改动前（全局模式）同级，没有恶化。
 #[tauri::command]
-fn session_switch(state: State<'_, AppState>, id: String) -> Result<sessions::Session, String> {
+async fn session_switch(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<sessions::Session, String> {
     // 换会话 = 上一段「整个任务」结束。不清的话，A 任务批的授权会漏到 B 任务里去；
     // 同时把新会话自己落盘的那份装回来。
     if !state.runs.any_active() {
         reload_grants_for_session(&state, &id);
     }
-    sessions::switch(&state.data_dir, &id)
+    let s = sessions::switch(&state.data_dir, &id)?;
+    let n = resync_mode_groups(&state).await;
+    eprintln!(
+        "[orbcat] 切到会话 {}（模式 {}，MCP 活跃组 {n} 个）",
+        s.id,
+        s.mode.as_deref().unwrap_or("-")
+    );
+    Ok(s)
 }
 
 /// **从主聊天的某条消息处分叉**出一条新会话（并自动切过去）。
@@ -2745,10 +3341,16 @@ async fn session_compact(
     if state.runs.is_active(&cur.id) {
         return Err("该会话正在运行，先停止或等它结束再压缩上下文".into());
     }
-    let model_id = config::load_settings(&state.data_dir)
+    let s = config::load_settings(&state.data_dir);
+    let model_id = s
         .selected_model
+        .clone()
         .ok_or_else(|| "尚未选择模型，无法生成摘要".to_string())?;
-    let cfg = config::find_model(&state.data_dir, &model_id)?;
+    let cfg = match s.selected_model_url.as_deref() {
+        Some(u) => config::find_model_by_url_id(&state.data_dir, u, &model_id)
+            .or_else(|_| config::find_model(&state.data_dir, &model_id))?,
+        None => config::find_model(&state.data_dir, &model_id)?,
+    };
     history::compact(
         &cfg,
         &state.data_dir,
@@ -2762,7 +3364,7 @@ async fn session_compact(
 
 /// 删除会话
 #[tauri::command]
-fn session_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
+async fn session_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     // 只拦"**这条会话**正在跑" —— 它的 run 还在往这个文件里写，
     // 删掉之后 `append_run_in` 会复活/写坏一份已被删的会话。
     // 其它会话在跑不影响删除。
@@ -2776,6 +3378,10 @@ fn session_delete(state: State<'_, AppState>, id: String) -> Result<(), String> 
     if !state.runs.any_active() {
         reload_grants_for_session(&state, &cur);
     }
+    // 删掉的是当前会话时，`ensure_current` 可能把当前切到**另一个模式**的会话上
+    // → MCP 活跃组跟着重算（与 `session_switch` 同一理由）。
+    let n = resync_mode_groups(&state).await;
+    eprintln!("[orbcat] 删除会话 {id} 后重算 MCP 活跃组：{n} 个");
     Ok(())
 }
 
@@ -2877,6 +3483,52 @@ fn mem_propose(state: State<'_, AppState>, content: String) -> Result<memory::Ca
 }
 
 // ---------------------------------------------------------------------------
+// Tauri 命令 —— 记忆蒸馏（2026-10-03）
+// ---------------------------------------------------------------------------
+
+/// 开一条「记忆蒸馏」会话：新建会话 + 打 `sessions/<id>.distill` 标记 + 命名。
+///
+/// 之后就是**一条普通聊天**：`agent::run` 见到标记会追加蒸馏角色说明并注入
+/// `distill_move` 工具，模型在标准循环里读中转站、问用户、搬条目，
+/// 思考与工具调用全走主对话那套时间线（用户 2026-10-03 明确要求）。
+#[tauri::command]
+fn distill_session_open(state: State<'_, AppState>) -> Result<sessions::Session, String> {
+    // 蒸馏会话**固定用标准模式**：它要的是完整工具集（`tool_specs_for_distill`
+    // = 标准工具 + `distill_move`），换成闲聊模式反而拿不到改文件的工具。
+    let s = sessions::new_session(&state.data_dir, crate::modes::DEFAULT_MODE_ID);
+    sessions::set_distill(&state.data_dir, &s.id)?;
+    let _ = sessions::set_title(&state.data_dir, &s.id, "记忆蒸馏");
+    eprintln!("[orbcat] 蒸馏会话 {}", s.id);
+    if !state.runs.any_active() {
+        reload_grants_for_session(&state, &s.id);
+    }
+    Ok(sessions::load(&state.data_dir, &s.id).unwrap_or(s))
+}
+
+// ---------------------------------------------------------------------------
+// Tauri 命令 —— 项目记忆维护（改路径 / 归档）
+// ---------------------------------------------------------------------------
+
+/// 改/清项目的 source.ref（`path` 为空 = 解绑，显示「未绑定路径」）
+#[tauri::command]
+fn mem_project_set_source(
+    state: State<'_, AppState>,
+    name: String,
+    path: String,
+) -> Result<(), String> {
+    state.memory.set_project_source(&name, &path)?;
+    // 绑定路径变了 → 项目目录授权跟着变（改的是激活项目时才实际生效）
+    state.refresh_project_dir_rules();
+    Ok(())
+}
+
+/// 归档一个项目记忆目录（挪进 `agent-data/.trash/`，不硬删）
+#[tauri::command]
+fn mem_project_archive(state: State<'_, AppState>, name: String) -> Result<String, String> {
+    state.memory.archive_project(&name)
+}
+
+// ---------------------------------------------------------------------------
 // Tauri 命令 —— 项目索引（仿 WB：SQLite 索引 + md 记忆）
 // ---------------------------------------------------------------------------
 
@@ -2903,6 +3555,8 @@ fn pmem_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
         s.active_project_id = None;
         config::save_settings(&state.data_dir, &s)?;
     }
+    // 删掉的项目可能挂着目录授权 → 重建（被删项不再挂）
+    state.refresh_project_dir_rules();
     Ok(())
 }
 
@@ -2918,6 +3572,8 @@ fn pmem_set_active(state: State<'_, AppState>, id: Option<i64>) -> Result<(), St
     let mut s = config::load_settings(&state.data_dir);
     s.active_project_id = id;
     config::save_settings(&state.data_dir, &s)?;
+    // 切项目 → 项目目录授权跟着换（旧项目摘掉、新项目挂上）
+    state.refresh_project_dir_rules();
     Ok(())
 }
 
@@ -2967,7 +3623,10 @@ fn pmem_session_map(
 
 #[tauri::command]
 fn pmem_rename(state: State<'_, AppState>, id: i64, name: String) -> Result<(), String> {
-    pmem::rename_project(&state.data_dir, id, &name)
+    pmem::rename_project(&state.data_dir, id, &name)?;
+    // 规则 label 里带着项目名，改名后重建让标签对上（路径不变、纯标签修正）
+    state.refresh_project_dir_rules();
+    Ok(())
 }
 
 /// 清空项目 MEMORY.md（项目保留）
@@ -3464,7 +4123,35 @@ pub fn run() {
             // 前台应用轮询线程（记录「用户上一个在看的应用」，对话时注入上下文）
             context::spawn_watcher();
 
-            let gate = permission::load_gate(&data_dir, &app_dir);
+            let mut gate = permission::load_gate(&data_dir, &app_dir);
+            // 拼装项目的文件授权**增量**（最长前缀加法，canonicalize 后加）。
+            //
+            // ⚠️ 三条纪律，与 spec S2.6 一致：
+            //   1. **只做加法** —— 用户在设置里的规则一条都不删、不改；
+            //   2. 判定前 canonicalize（决策 7 原样适用）；
+            //   3. 只影响**新轮次**的判定，`permissions.json` **不写回** ——
+            //      切走项目即恢复（这也是"切项目不改历史会话"的一部分）。
+            for (path, access, label) in project::extra_file_rules(&data_dir) {
+                eprintln!(
+                    "[orbcat] 项目授权路径: {} => {:?} ({label})",
+                    path.display(),
+                    access
+                );
+                gate.add_rule(&path, access, label);
+            }
+            // 激活项目绑定目录的动态授权（用户 2026-10-07 定案：项目激活期间
+            // 默认读写其绑定目录；没绑目录就没有）。只活内存，切项目时重建。
+            if let Some((path, name)) = active_project_dir(&data_dir) {
+                gate.add_rule(
+                    &path,
+                    permission::Access::ReadWrite,
+                    format!("{}{}」", permission::PROJECT_DIR_LABEL_PREFIX, name),
+                );
+                eprintln!(
+                    "[orbcat] 项目目录授权: {} => readwrite（项目「{name}」）",
+                    path.display()
+                );
+            }
             for r in gate.rules() {
                 eprintln!(
                     "[orbcat] 权限规则: {} => {:?} ({})",
@@ -3688,6 +4375,9 @@ pub fn run() {
             mem_approve,
             mem_reject,
             mem_propose,
+            distill_session_open,
+            mem_project_set_source,
+            mem_project_archive,
             pmem_list,
             pmem_create,
             pmem_delete,
@@ -3705,10 +4395,13 @@ pub fn run() {
             search_status,
             search_set,
             search_test,
+            life_status,
+            life_set_enabled,
+            life_refresh,
+            life_config_path,
             set_blur_collapse,
             set_exec_trust,
             modes_get,
-            modes_set,
             bg_desk_status,
             bg_desk_set,
             bg_desk_shot,
@@ -3716,6 +4409,11 @@ pub fn run() {
             foreground_history,
             image_thumb,
             skills_list,
+            project_list,
+            project_activate,
+            project_save,
+            project_delete,
+            project_read,
             chat_cancel,
             chat_steer,
             session_state,
