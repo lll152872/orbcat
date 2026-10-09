@@ -15,7 +15,7 @@ body {
   overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
-  font-family: "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif;
+  font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
   /* 避免拖动时出现文本选择光标 */
   cursor: default;
 }
@@ -26,6 +26,72 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/* ============================================================
+   设计令牌
+   ------------------------------------------------------------
+   视觉来源：悬浮球本身—— 深蓝玻璃壳 + 冷白高光 + 奶油猫毛。
+   面板继承这套语言： 暖黑夜墨做底 / 冷玻璃做结构 / 琥珀做动作。
+
+   ⚠️ 两条硬约束，改动时务必保留：
+     1. html/body 必须保持 transparent —— Tauri 透明窗口要求，
+        填不透明底色会让悬浮球背后出现黑方块。
+     2. .panel 必须完全不透明且不能用 backdrop-filter ——
+        WebView2 透明窗口下 backdrop-filter 不生效。
+   ============================================================ */
+
+:root {
+  /* 夜墨：底色四级（越靠后越浮起） */
+  --ink-900: #14120f; /* 面板底 */
+  --ink-800: #1b1815; /* 卡片 / 消息底 */
+  --ink-700: #241f1a; /* 浮起层：菜单、输入框 */
+  --ink-600: #2e2822; /* hover / 选中 */
+
+  /* 玻璃：抄球壳的冷高光，只用在描边与顶光，不铺面 */
+  --glass-line: rgba(168, 230, 207, 0.14);
+  --glass-hi: rgba(168, 230, 207, 0.08);
+  --overlay-1: rgba(168, 230, 207, 0.04);
+  --overlay-2: rgba(168, 230, 207, 0.08);
+  --overlay-3: rgba(168, 230, 207, 0.14);
+
+  /* 奶油：文字三级 */
+  --cream-1: #f0f4ee;
+  --cream-2: #bcc4ba;
+  --cream-3: #7c8479;
+
+  /* 强调色：纯白。
+     原来是琥珀（#a8e6cf → #a8e6cf 两轮降饱和都还是"屎黄"）。
+     换成白之后反而更对 —— 猫本身就是奶油白，球壳上那道高光也是白的，
+     面板和球因此是同一套语言。 */
+  --accent-1: #a8e6cf;
+  --accent-2: #86c9b0;
+  --accent-wash: rgba(168, 230, 207, 0.1);
+  --accent-wash-2: rgba(168, 230, 207, 0.18);
+
+  /* 语义色 */
+  --ok: #a8e6cf;
+  --warn: #f5e6a8;
+  --danger: #f5b8a8;
+
+  /* 字阶：5 档，消灭全部半像素 */
+  --fs-1: 11px;
+  --fs-2: 12px;
+  --fs-3: 13px;
+  --fs-4: 15px;
+  --fs-5: 18px;
+
+  /* 圆角 4 档 */
+  --r-xs: 4px;
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-full: 999px;
+
+  /* 间距 4 基准 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
 }
 
 /* ---------------- 胶囊态：悬浮球（猫球） ---------------- */
@@ -48,7 +114,7 @@ body {
 
 .orb:hover {
   transform: scale(1.08);
-  box-shadow: 0 0 0 4px rgba(91, 110, 245, 0.18);
+  box-shadow: 0 0 0 4px rgba(168, 230, 207, 0.18);
 }
 
 .orb:active {
@@ -210,7 +276,7 @@ body {
   position: absolute;
   inset: -6px;
   border-radius: 50%;
-  border: 1.5px solid rgba(120, 137, 255, 0.5);
+  border: 1.5px solid rgba(168, 230, 207, 0.5);
   opacity: 0;
   animation: breathe 3.2s ease-in-out infinite;
   pointer-events: none;
@@ -279,12 +345,12 @@ body {
      如果这里再留 alpha，后面的窗口内容会直接透出来（很脏）。
      另外 backdrop-filter 在 WebView2 + 透明窗口下**不生效**，
      指望它模糊背景是无效的，所以干脆用纯色。 */
-  background: #171a26;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: #12171a;
+  border: 1px solid rgba(168, 230, 207, 0.12);
   box-shadow:
     0 12px 40px rgba(0, 0, 0, 0.45),
-    inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  color: #e8eaf2;
+    inset 0 1px 0 rgba(168, 230, 207, 0.08);
+  color: #F2F2F4;
 }
 
 .panel-header {
@@ -292,7 +358,7 @@ body {
   align-items: center;
   gap: 8px;
   padding: 10px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid rgba(168, 230, 207, 0.08);
   cursor: move;
   flex-shrink: 0;
 }
@@ -310,8 +376,8 @@ body {
   height: 22px;
   border: none;
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.08);
-  color: #cdd2e6;
+  background: rgba(168, 230, 207, 0.08);
+  color: #B4B4BA;
   font-size: 14px;
   line-height: 1;
   cursor: pointer;
@@ -319,7 +385,7 @@ body {
 }
 
 .panel-btn:hover {
-  background: rgba(255, 255, 255, 0.18);
+  background: rgba(168, 230, 207, 0.18);
 }
 
 .panel-body {
@@ -332,7 +398,7 @@ body {
 }
 
 .panel-hint {
-  color: #8b93b0;
+  color: #7C7C82;
   font-size: 12px;
 }
 
@@ -341,7 +407,7 @@ body {
   width: 6px;
 }
 .panel-body::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.14);
+  background: rgba(168, 230, 207, 0.14);
   border-radius: 3px;
 }
 
@@ -366,13 +432,13 @@ body {
   gap: 0;
   padding: 3px 8px;
   border-radius: 8px;
-  border: 1px solid rgba(120, 137, 255, 0.34);
+  border: 1px solid rgba(168, 230, 207, 0.34);
   background: linear-gradient(
     180deg,
-    rgba(120, 137, 255, 0.2),
-    rgba(120, 137, 255, 0.08)
+    rgba(168, 230, 207, 0.2),
+    rgba(168, 230, 207, 0.08)
   );
-  color: #e8eaf2;
+  color: #F2F2F4;
   cursor: pointer;
   text-align: left;
   line-height: 1.15;
@@ -384,16 +450,16 @@ body {
 .model-chip:hover {
   background: linear-gradient(
     180deg,
-    rgba(120, 137, 255, 0.3),
-    rgba(120, 137, 255, 0.14)
+    rgba(168, 230, 207, 0.3),
+    rgba(168, 230, 207, 0.14)
   );
-  border-color: rgba(120, 137, 255, 0.55);
+  border-color: rgba(168, 230, 207, 0.55);
 }
 
 /* 组别行：小一号、弱化，给"模型名"当上下文 */
 .mc-group {
   font-size: 9.5px;
-  color: #8f98ba;
+  color: #707076;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -403,7 +469,7 @@ body {
 .mc-name {
   font-size: 12px;
   font-weight: 600;
-  color: #eef1fa;
+  color: #F2F2F4;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -412,7 +478,7 @@ body {
 
 .mc-caret {
   font-size: 9px;
-  color: #8f98ba;
+  color: #707076;
   position: absolute;
   right: 6px;
   top: 50%;
@@ -423,16 +489,16 @@ body {
   display: flex;
   gap: 6px;
   padding: 8px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid rgba(168, 230, 207, 0.08);
   flex-shrink: 0;
 }
 
 .panel-toolbar select {
   flex: 1;
   min-width: 0;
-  background: rgba(255, 255, 255, 0.07);
-  color: #dfe3f0;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(168, 230, 207, 0.07);
+  color: #DEDEE2;
+  border: 1px solid rgba(168, 230, 207, 0.12);
   border-radius: 7px;
   padding: 5px 8px;
   font-size: 12px;
@@ -446,28 +512,28 @@ body {
 }
 
 .panel-toolbar select option {
-  background: #1c1f2e;
-  color: #dfe3f0;
+  background: #17171A;
+  color: #DEDEE2;
 }
 
 /* 技能清单项 */
 .skill-item {
   padding: 6px 8px;
   margin-bottom: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(168, 230, 207, 0.08);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(168, 230, 207, 0.03);
 }
 
 .skill-name {
   font-size: 12px;
   font-weight: 600;
-  color: #dfe3f0;
+  color: #DEDEE2;
 }
 
 .skill-desc {
   font-size: 11px;
-  color: #9aa3c0;
+  color: #8E8E94;
   margin-top: 2px;
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -478,8 +544,8 @@ body {
 /* 前台应用指示条：可翻列表（折叠 1 条 + ▾更多，展开最多 6 条） */
 .fg-ctx {
   padding: 4px 10px;
-  background: rgba(120, 160, 255, 0.06);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(168, 230, 207, 0.06);
+  border-bottom: 1px solid rgba(168, 230, 207, 0.06);
   flex-shrink: 0;
   user-select: none;
   max-height: 84px;
@@ -503,8 +569,8 @@ body {
   justify-content: space-between;
   gap: 8px;
   padding: 5px 10px;
-  background: rgba(120, 160, 255, 0.06);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(168, 230, 207, 0.06);
+  border-bottom: 1px solid rgba(168, 230, 207, 0.06);
   flex-shrink: 0;
   user-select: none;
 }
@@ -512,7 +578,7 @@ body {
 .sub-bar-title {
   font-size: 12px;
   font-weight: 500;
-  color: #cdd6f4;
+  color: #BEBEC4;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -528,9 +594,9 @@ body {
 .bg-run {
   padding: 5px 12px;
   font-size: 11.5px;
-  color: #cdd6f4;
-  background: rgba(120, 137, 255, 0.14);
-  border-bottom: 1px solid rgba(120, 137, 255, 0.28);
+  color: #BEBEC4;
+  background: rgba(168, 230, 207, 0.14);
+  border-bottom: 1px solid rgba(168, 230, 207, 0.28);
   cursor: pointer;
   flex-shrink: 0;
   user-select: none;
@@ -540,7 +606,7 @@ body {
 }
 
 .bg-run:hover {
-  background: rgba(120, 137, 255, 0.24);
+  background: rgba(168, 230, 207, 0.24);
 }
 
 /* 「▾ 更多 N / ▴ 收起」翻牌按钮 */
@@ -552,15 +618,15 @@ body {
   border: none;
   border-radius: 4px;
   background: transparent;
-  color: #8b93b8;
+  color: #7C7C82;
   font-size: 10px;
   text-align: left;
   cursor: pointer;
 }
 
 .fg-toggle:hover {
-  color: #dfe3f0;
-  background: rgba(120, 160, 255, 0.14);
+  color: #DEDEE2;
+  background: rgba(168, 230, 207, 0.14);
 }
 
 .fg-label {
@@ -575,7 +641,7 @@ body {
   align-items: baseline;
   font-size: 11px;
   line-height: 16px;
-  color: #9aa3c0;
+  color: #8E8E94;
   padding: 1px 2px;
   border-radius: 4px;
   white-space: nowrap;
@@ -585,8 +651,8 @@ body {
 }
 
 .fg-row:hover {
-  color: #dfe3f0;
-  background: rgba(120, 160, 255, 0.12);
+  color: #DEDEE2;
+  background: rgba(168, 230, 207, 0.12);
 }
 
 .fg-eye {
@@ -596,29 +662,29 @@ body {
 
 .fg-empty {
   cursor: default;
-  color: #6b7391;
+  color: #5C5C62;
   font-style: italic;
 }
 
 .fg-empty:hover {
   background: transparent;
-  color: #6b7391;
+  color: #5C5C62;
 }
 
 .mini-btn {
   flex-shrink: 0;
   width: 30px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(168, 230, 207, 0.12);
   border-radius: 7px;
-  background: rgba(255, 255, 255, 0.07);
-  color: #cdd2e6;
+  background: rgba(168, 230, 207, 0.07);
+  color: #B4B4BA;
   font-size: 12px;
   cursor: pointer;
   transition: background 140ms ease;
 }
 
 .mini-btn:hover {
-  background: rgba(120, 137, 255, 0.25);
+  background: rgba(168, 230, 207, 0.25);
 }
 
 /* ---------------- 消息 ---------------- */
@@ -628,7 +694,7 @@ body {
 }
 
 .empty {
-  color: #7c85a3;
+  color: #6C6C72;
   font-size: 12px;
   text-align: center;
   margin-top: 28px;
@@ -654,10 +720,10 @@ body {
 }
 
 .msg.user .msg-body {
-  background: linear-gradient(135deg, #5b6ef5, #4655d6);
-  color: #fff;
+  background: linear-gradient(135deg, #a8e6cf, #86c9b0);
+  color: #a8e6cf;
   max-width: 88%;
-  box-shadow: 0 2px 8px rgba(70, 85, 214, 0.35);
+  box-shadow: 0 2px 8px rgba(199, 126, 30, 0.35);
 }
 
 /* 执行中「插话」的排队气泡：虚线框 + 淡一点，送达后由前端就地复位 */
@@ -667,38 +733,38 @@ body {
 
 .msg.user.queued .msg-body {
   background: transparent;
-  border: 1px dashed rgba(120, 137, 255, 0.65);
-  color: #cdd4ff;
+  border: 1px dashed rgba(168, 230, 207, 0.65);
+  color: #dce2da;
   box-shadow: none;
 }
 
 .queued-tag {
   margin-top: 3px;
   font-size: 10.5px;
-  color: #8b93b0;
+  color: #7C7C82;
 }
 
 .queued-tag.done {
-  color: #7fd1a3;
+  color: #9ee2c6;
 }
 
 .msg.assistant .msg-body {
-  background: rgba(255, 255, 255, 0.07);
-  color: #e8eaf2;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(168, 230, 207, 0.07);
+  color: #F2F2F4;
+  border: 1px solid rgba(168, 230, 207, 0.08);
 }
 
 .msg.error .msg-body {
-  background: rgba(220, 70, 70, 0.16);
-  border: 1px solid rgba(220, 70, 70, 0.35);
-  color: #ffb3b3;
+  background: rgba(245, 184, 168, 0.16);
+  border: 1px solid rgba(245, 184, 168, 0.35);
+  color: #f9d0c6;
   font-size: 12px;
 }
 
 .msg.system .msg-body {
-  background: rgba(120, 137, 255, 0.1);
-  border: 1px solid rgba(120, 137, 255, 0.22);
-  color: #aab4dd;
+  background: rgba(168, 230, 207, 0.1);
+  border: 1px solid rgba(168, 230, 207, 0.22);
+  color: #9C9CA2;
   font-size: 12px;
 }
 
@@ -708,7 +774,7 @@ body {
 .steps-folded {
   margin-top: 6px;
   font-size: 11px;
-  color: #737b96;
+  color: #61695f;
   line-height: 1.5;
   word-break: break-all;
 }
@@ -727,18 +793,18 @@ body {
 .init-title {
   font-size: 14px;
   font-weight: 600;
-  color: #c8d2f0;
+  color: #B4B4BA;
 }
 
 .init-body {
   font-size: 12px;
-  color: #8b94b3;
+  color: #78787E;
   line-height: 1.7;
 }
 
 .init-body code {
-  color: #9fb0ff;
-  background: rgba(120, 137, 255, 0.12);
+  color: #dce2da;
+  background: rgba(168, 230, 207, 0.12);
   padding: 0 4px;
   border-radius: 4px;
 }
@@ -748,8 +814,8 @@ body {
   padding: 7px 20px;
   font-size: 13px;
   font-weight: 600;
-  color: #eef1fb;
-  background: linear-gradient(135deg, #5b6cff, #7a5cff);
+  color: #F2F2F4;
+  background: linear-gradient(135deg, #a8e6cf, #a8e6cf);
   border: none;
   border-radius: 8px;
   cursor: pointer;
@@ -771,12 +837,12 @@ body {
 
 .init-hint {
   font-size: 11px;
-  color: #6d7694;
+  color: #57575D;
   line-height: 1.7;
 }
 
 .init-hint b {
-  color: #9aa5c5;
+  color: #85858B;
 }
 
 /* ---------------- 输入区 ---------------- */
@@ -786,7 +852,7 @@ body {
   gap: 8px;
   align-items: flex-end;
   padding: 10px 12px;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-top: 1px solid rgba(168, 230, 207, 0.08);
   flex-shrink: 0;
 }
 
@@ -794,10 +860,10 @@ body {
   flex: 1;
   min-width: 0;
   resize: none;
-  background: rgba(255, 255, 255, 0.07);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(168, 230, 207, 0.07);
+  border: 1px solid rgba(168, 230, 207, 0.12);
   border-radius: 9px;
-  color: #e8eaf2;
+  color: #F2F2F4;
   padding: 8px 10px;
   font-size: 13px;
   font-family: inherit;
@@ -808,11 +874,11 @@ body {
 }
 
 .panel-input textarea:focus {
-  border-color: rgba(120, 137, 255, 0.55);
+  border-color: rgba(168, 230, 207, 0.55);
 }
 
 .panel-input textarea::placeholder {
-  color: #6c7593;
+  color: #5C5C62;
 }
 
 /* Windows 上 WebView2 的默认滚动条带箭头，很碍眼 —— 直接隐藏（文本区高度会自动增长） */
@@ -827,8 +893,8 @@ body {
   height: 36px;
   border: none;
   border-radius: 9px;
-  background: linear-gradient(135deg, #5b6ef5, #4655d6);
-  color: #fff;
+  background: linear-gradient(135deg, #a8e6cf, #86c9b0);
+  color: #a8e6cf;
   font-size: 15px;
   cursor: pointer;
   transition: filter 140ms ease, transform 120ms ease;
@@ -853,10 +919,10 @@ body {
   flex-shrink: 0;
   width: 36px;
   height: 36px;
-  border: 1px solid rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(168, 230, 207, 0.18);
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.08);
-  color: #ffb4b4;
+  background: rgba(168, 230, 207, 0.08);
+  color: #f9d1c7;
   font-size: 13px;
   cursor: pointer;
   transition: filter 140ms ease, transform 120ms ease;
@@ -895,7 +961,7 @@ body {
   height: 62px;
   border-radius: 8px;
   overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(168, 230, 207, 0.16);
   background: rgba(0, 0, 0, 0.3);
   flex-shrink: 0;
 }
@@ -916,7 +982,7 @@ body {
   border: none;
   border-radius: 50%;
   background: rgba(0, 0, 0, 0.7);
-  color: #fff;
+  color: #a8e6cf;
   font-size: 12px;
   line-height: 1;
   cursor: pointer;
@@ -926,7 +992,7 @@ body {
 }
 
 .thumb-x:hover {
-  background: rgba(220, 70, 70, 0.9);
+  background: rgba(245, 184, 168, 0.9);
 }
 
 /* ---------------- 消息里的图片 ---------------- */
@@ -967,8 +1033,8 @@ body {
 }
 
 .msg.assistant .md {
-  background: rgba(255, 255, 255, 0.07);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(168, 230, 207, 0.07);
+  border: 1px solid rgba(168, 230, 207, 0.08);
 }
 
 /* ---------------- 闲聊模式：一条回复拆成多个气泡（2026-10-08） ----------------
@@ -1034,7 +1100,7 @@ body {
   height: auto;
   margin: 6px 0;
   border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(168, 230, 207, 0.12);
   background: rgba(0, 0, 0, 0.2);
   object-fit: contain;
 }
@@ -1057,10 +1123,10 @@ body {
   max-width: 100%;
   padding: 2px 8px;
   font-size: 11px;
-  color: #8b6b6b;
-  border: 1px solid rgba(255, 120, 120, 0.25);
+  color: #8B7070;
+  border: 1px solid rgba(247, 202, 190, 0.25);
   border-radius: 8px;
-  background: rgba(255, 120, 120, 0.08);
+  background: rgba(247, 202, 190, 0.08);
 }
 
 /* 首个/末个子元素不要多余外边距 */
@@ -1078,7 +1144,7 @@ body {
 .md h5,
 .md h6 {
   margin: 12px 0 6px;
-  color: #f0f2fa;
+  color: #F2F2F4;
   line-height: 1.35;
   font-weight: 600;
 }
@@ -1086,7 +1152,7 @@ body {
 .md h1 {
   font-size: 16px;
   padding-bottom: 4px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  border-bottom: 1px solid rgba(168, 230, 207, 0.12);
 }
 .md h2 {
   font-size: 14.5px;
@@ -1105,12 +1171,12 @@ body {
 }
 
 .md strong {
-  color: #fff;
+  color: #a8e6cf;
   font-weight: 600;
 }
 
 .md em {
-  color: #c9cfec;
+  color: #AFAFB5;
 }
 
 .md del {
@@ -1118,21 +1184,21 @@ body {
 }
 
 .md a {
-  color: #8fa4ff;
+  color: #d6dcd4;
   text-decoration: none;
-  border-bottom: 1px solid rgba(143, 164, 255, 0.4);
+  border-bottom: 1px solid rgba(168, 230, 207, 0.4);
 }
 
 .md a:hover {
-  color: #a8b8ff;
+  color: #dce2da;
 }
 
 /* 行内代码 */
 .md code {
-  font-family: "Cascadia Mono", "Consolas", "JetBrains Mono", monospace;
+  font-family: "Cascadia Mono", Consolas, "Cascadia Mono", Consolas, ui-monospace, monospace;
   font-size: 11.5px;
-  color: #9fb0ff;
-  background: rgba(120, 137, 255, 0.14);
+  color: #dce2da;
+  background: rgba(168, 230, 207, 0.14);
   padding: 1px 5px;
   border-radius: 4px;
 }
@@ -1143,14 +1209,14 @@ body {
   padding: 9px 11px;
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.35);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(168, 230, 207, 0.08);
   overflow-x: auto;
 }
 
 .md pre.md-code code {
   background: none;
   padding: 0;
-  color: #cfd6f5;
+  color: #BEBEC4;
   font-size: 11.5px;
   line-height: 1.6;
   white-space: pre;
@@ -1159,7 +1225,7 @@ body {
 /* ---- 代码块外壳：语言标签 + 复制按钮 ---- */
 .md .md-code-wrap {
   margin: 8px 0;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(168, 230, 207, 0.08);
   border-radius: 8px;
   overflow: hidden;
   background: rgba(0, 0, 0, 0.35);
@@ -1171,13 +1237,13 @@ body {
   justify-content: space-between;
   gap: 8px;
   padding: 3px 9px;
-  background: rgba(255, 255, 255, 0.045);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(168, 230, 207, 0.045);
+  border-bottom: 1px solid rgba(168, 230, 207, 0.07);
 }
 
 .md .md-code-lang {
   font-size: 10.5px;
-  color: #7f88a8;
+  color: #66666C;
   letter-spacing: 0.03em;
   text-transform: lowercase;
   user-select: none;
@@ -1193,10 +1259,10 @@ body {
 .code-copy,
 .msg-copy,
 .msg-fork {
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(168, 230, 207, 0.14);
   border-radius: 5px;
-  background: rgba(255, 255, 255, 0.06);
-  color: #aab4dd;
+  background: rgba(168, 230, 207, 0.06);
+  color: #9C9CA2;
   font-size: 10.5px;
   line-height: 1;
   padding: 3px 7px;
@@ -1208,14 +1274,14 @@ body {
 .code-copy:hover,
 .msg-copy:hover,
 .msg-fork:hover {
-  background: rgba(120, 137, 255, 0.2);
-  color: #dfe3f0;
+  background: rgba(168, 230, 207, 0.2);
+  color: #DEDEE2;
 }
 
 .code-copy.copied,
 .msg-copy.copied {
-  color: #7ee2a8;
-  border-color: rgba(126, 226, 168, 0.4);
+  color: #9ee2c6;
+  border-color: rgba(190, 236, 218, 0.4);
 }
 
 /* 整条消息的复制/分叉按钮。
@@ -1238,8 +1304,8 @@ body {
   line-height: 1;
   padding: 2px 6px;
   border-radius: 7px;
-  background: rgba(120, 160, 255, 0.14);
-  color: #9aa3c0;
+  background: rgba(168, 230, 207, 0.14);
+  color: #8E8E94;
   font-variant-numeric: tabular-nums;
   cursor: help;
   white-space: nowrap;
@@ -1270,22 +1336,22 @@ body {
   align-items: center;
   justify-content: center;
   font-size: 11px;
-  color: #6b7391;
-  background: rgba(255, 255, 255, 0.05);
+  color: #5C5C62;
+  background: rgba(168, 230, 207, 0.05);
 }
 
 .thumb-bad {
-  color: #8b6b6b;
-  background: rgba(255, 120, 120, 0.08);
+  color: #8B7070;
+  background: rgba(247, 202, 190, 0.08);
 }
 
 /* 模型不支持图片时的提示条 */
 .img-hint {
   padding: 4px 12px;
   font-size: 10.5px;
-  color: #e0b070;
-  background: rgba(224, 176, 112, 0.1);
-  border-top: 1px solid rgba(224, 176, 112, 0.2);
+  color: #e8d6a8;
+  background: rgba(230, 214, 162, 0.1);
+  border-top: 1px solid rgba(230, 214, 162, 0.2);
   flex-shrink: 0;
 }
 
@@ -1301,27 +1367,27 @@ body {
   padding: 10px 11px;
   margin-bottom: 4px;
   border-radius: 10px;
-  border: 1px solid rgba(120, 137, 255, 0.3);
+  border: 1px solid rgba(168, 230, 207, 0.3);
   background: linear-gradient(
     180deg,
-    rgba(120, 137, 255, 0.16),
-    rgba(120, 137, 255, 0.07)
+    rgba(168, 230, 207, 0.16),
+    rgba(168, 230, 207, 0.07)
   );
-  color: #dfe3f0;
+  color: #DEDEE2;
   cursor: pointer;
 }
 
 .sess-main:hover {
   background: linear-gradient(
     180deg,
-    rgba(120, 137, 255, 0.24),
-    rgba(120, 137, 255, 0.12)
+    rgba(168, 230, 207, 0.24),
+    rgba(168, 230, 207, 0.12)
   );
-  border-color: rgba(120, 137, 255, 0.45);
+  border-color: rgba(168, 230, 207, 0.45);
 }
 
 .sess-main.cur {
-  border-color: rgba(120, 137, 255, 0.6);
+  border-color: rgba(168, 230, 207, 0.6);
 }
 
 .sess-main-icon {
@@ -1345,7 +1411,7 @@ body {
 .sess-main-text i {
   font-size: 10.5px;
   font-style: normal;
-  color: #8b93b3;
+  color: #7C7C82;
 }
 
 .sess-main-cur {
@@ -1353,8 +1419,8 @@ body {
   font-size: 10px;
   padding: 1px 6px;
   border-radius: 999px;
-  background: rgba(120, 137, 255, 0.28);
-  color: #c3cbff;
+  background: rgba(168, 230, 207, 0.28);
+  color: #dce2da;
 }
 
 /* 主聊天与任务列表之间的分隔标题 */
@@ -1362,8 +1428,8 @@ body {
   margin: 12px 0 7px;
   font-size: 10.5px;
   letter-spacing: 0.04em;
-  color: #7f88a8;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  color: #66666C;
+  border-bottom: 1px solid rgba(168, 230, 207, 0.07);
   padding-bottom: 5px;
 }
 
@@ -1383,15 +1449,15 @@ body {
   text-align: left;
   padding: 7px 9px;
   border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.03);
-  color: #dfe3f0;
+  border: 1px solid rgba(168, 230, 207, 0.08);
+  background: rgba(168, 230, 207, 0.03);
+  color: #DEDEE2;
   cursor: pointer;
 }
 
 .sess-open:hover {
-  background: rgba(120, 137, 255, 0.14);
-  border-color: rgba(120, 137, 255, 0.3);
+  background: rgba(168, 230, 207, 0.14);
+  border-color: rgba(168, 230, 207, 0.3);
 }
 
 .sess-title {
@@ -1407,36 +1473,36 @@ body {
   padding: 0 5px;
   border-radius: 4px;
   font-size: 9.5px;
-  color: #b9c2ff;
-  background: rgba(120, 137, 255, 0.18);
-  border: 1px solid rgba(120, 137, 255, 0.35);
+  color: #dce2da;
+  background: rgba(168, 230, 207, 0.18);
+  border: 1px solid rgba(168, 230, 207, 0.35);
 }
 
 .sess-meta {
   font-size: 10.5px;
-  color: #7f88a8;
+  color: #66666C;
 }
 
 .sess-item.cur .sess-open {
-  border-color: rgba(120, 137, 255, 0.45);
-  background: rgba(120, 137, 255, 0.1);
+  border-color: rgba(168, 230, 207, 0.45);
+  background: rgba(168, 230, 207, 0.1);
 }
 
 .sess-del {
   flex-shrink: 0;
   width: 28px;
   border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.03);
-  color: #8b93b3;
+  border: 1px solid rgba(168, 230, 207, 0.08);
+  background: rgba(168, 230, 207, 0.03);
+  color: #7C7C82;
   cursor: pointer;
   font-size: 11px;
 }
 
 .sess-del:hover {
-  background: rgba(255, 92, 92, 0.18);
-  border-color: rgba(255, 92, 92, 0.35);
-  color: #ff9a9a;
+  background: rgba(247, 194, 180, 0.18);
+  border-color: rgba(247, 194, 180, 0.35);
+  color: #f9bdb0;
 }
 
 /* 消息区右键复制菜单 */
@@ -1446,8 +1512,8 @@ body {
   min-width: 132px;
   padding: 4px;
   border-radius: 8px;
-  background: #1b1e2c;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #181f22;
+  border: 1px solid rgba(168, 230, 207, 0.14);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   display: flex;
   flex-direction: column;
@@ -1459,19 +1525,19 @@ body {
   border: none;
   border-radius: 5px;
   background: transparent;
-  color: #cdd2e6;
+  color: #B4B4BA;
   font-size: 11.5px;
   padding: 6px 9px;
   cursor: pointer;
 }
 
 .copy-menu button:hover:not(:disabled) {
-  background: rgba(120, 137, 255, 0.22);
-  color: #fff;
+  background: rgba(168, 230, 207, 0.22);
+  color: #a8e6cf;
 }
 
 .copy-menu button:disabled {
-  color: #5c6480;
+  color: #494f47;
   cursor: default;
 }
 
@@ -1488,10 +1554,10 @@ body {
 .md blockquote {
   margin: 8px 0;
   padding: 6px 11px;
-  border-left: 2px solid rgba(120, 137, 255, 0.5);
-  background: rgba(120, 137, 255, 0.07);
+  border-left: 2px solid rgba(168, 230, 207, 0.5);
+  background: rgba(168, 230, 207, 0.07);
   border-radius: 0 7px 7px 0;
-  color: #b9c1de;
+  color: #A8A8AE;
 }
 
 .md blockquote > *:first-child {
@@ -1503,7 +1569,7 @@ body {
 
 .md hr {
   border: none;
-  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  border-top: 1px solid rgba(168, 230, 207, 0.12);
   margin: 11px 0;
 }
 
@@ -1517,20 +1583,20 @@ body {
 
 .md table.md-table th,
 .md table.md-table td {
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(168, 230, 207, 0.12);
   padding: 5px 8px;
   text-align: left;
   vertical-align: top;
 }
 
 .md table.md-table th {
-  background: rgba(120, 137, 255, 0.15);
-  color: #e8eaf2;
+  background: rgba(168, 230, 207, 0.15);
+  color: #F2F2F4;
   font-weight: 600;
 }
 
 .md table.md-table tr:nth-child(even) td {
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(168, 230, 207, 0.03);
 }
 
 /* ---------------- 记忆审批视图 ---------------- */
@@ -1540,43 +1606,43 @@ body {
   align-items: center;
   justify-content: space-between;
   font-size: 12px;
-  color: #aab4dd;
+  color: #9C9CA2;
   margin-bottom: 10px;
 }
 
 .mem-back {
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(168, 230, 207, 0.14);
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.07);
-  color: #cdd2e6;
+  background: rgba(168, 230, 207, 0.07);
+  color: #B4B4BA;
   font-size: 11px;
   padding: 3px 8px;
   cursor: pointer;
 }
 
 .mem-back:hover {
-  background: rgba(120, 137, 255, 0.25);
+  background: rgba(168, 230, 207, 0.25);
 }
 
 .mem-item {
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(168, 230, 207, 0.1);
   border-radius: 10px;
   padding: 9px 11px;
   margin-bottom: 9px;
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(168, 230, 207, 0.05);
 }
 
 .mem-text {
   font-size: 12.5px;
   line-height: 1.55;
-  color: #e8eaf2;
+  color: #F2F2F4;
   overflow-wrap: anywhere;
 }
 
 .mem-meta {
   margin-top: 4px;
   font-size: 10.5px;
-  color: #7c85a3;
+  color: #6C6C72;
 }
 
 .mem-actions {
@@ -1594,27 +1660,27 @@ body {
 }
 
 .mem-btn.ok {
-  background: rgba(80, 200, 130, 0.18);
-  border-color: rgba(80, 200, 130, 0.4);
-  color: #9ee6bb;
+  background: rgba(168, 230, 207, 0.18);
+  border-color: rgba(168, 230, 207, 0.4);
+  color: #a8e6cf;
 }
 
 .mem-btn.ok:hover {
-  background: rgba(80, 200, 130, 0.3);
+  background: rgba(168, 230, 207, 0.3);
 }
 
 .mem-btn.no {
-  background: rgba(220, 70, 70, 0.14);
-  border-color: rgba(220, 70, 70, 0.35);
-  color: #f0a8a8;
+  background: rgba(245, 184, 168, 0.14);
+  border-color: rgba(245, 184, 168, 0.35);
+  color: #f7c2b4;
 }
 
 .mem-btn.no:hover {
-  background: rgba(220, 70, 70, 0.28);
+  background: rgba(245, 184, 168, 0.28);
 }
 
 .mem-loading {
-  color: #7c85a3;
+  color: #6C6C72;
   font-size: 12px;
   text-align: center;
   margin-top: 28px;
@@ -1643,13 +1709,13 @@ body {
 .perm-title {
   font-size: 12.5px;
   font-weight: 600;
-  color: #f5c46b;
+  color: #f7e3a4;
 }
 
 /* 倒计时：数字用等宽，秒数跳动时不会左右抖 */
 .perm-timer {
   font-size: 11px;
-  color: #9aa3c4;
+  color: #8E8E94;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1663,32 +1729,32 @@ body {
 
 .perm-k {
   flex: 0 0 30px;
-  color: #7c85a3;
+  color: #6C6C72;
 }
 
 .perm-v {
-  color: #e8eaf2;
+  color: #F2F2F4;
   overflow-wrap: anywhere;
 }
 
 /* 路径可能很长（D:\a\b\c\...），必须能断行，否则把卡片撑破 */
 .perm-path {
-  color: #cdd2e6;
+  color: #B4B4BA;
   font-size: 11.5px;
   overflow-wrap: anywhere;
-  font-family: ui-monospace, Consolas, monospace;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, "Cascadia Mono", Consolas, ui-monospace, monospace;
 }
 
 /* 范围比被拒路径宽 —— 用户点「批准」前必须看到这行 */
 .perm-widen {
   margin: 0 0 6px 38px;
   font-size: 11px;
-  color: #f5c46b;
+  color: #f7e3a4;
 }
 
 .perm-widen code {
   font-size: 11px;
-  color: #ffe0a8;
+  color: #fbf1cf;
 }
 
 .perm-actions {
@@ -1700,23 +1766,23 @@ body {
 
 /* 基样式 = 中性灰（"取消"这类次要动作直接用它，不给修饰类） */
 .perm-btn {
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(168, 230, 207, 0.14);
   border-radius: 6px;
   padding: 4px 11px;
   font-size: 11.5px;
   cursor: pointer;
-  background: rgba(255, 255, 255, 0.07);
-  color: #cdd2e6;
+  background: rgba(168, 230, 207, 0.07);
+  color: #B4B4BA;
 }
 
 .perm-btn:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.13);
+  background: rgba(168, 230, 207, 0.13);
 }
 
 /* ✎「拒绝并说明」：只占一个字宽，别跟三个主按钮抢地方 */
 .perm-btn.why {
   padding: 4px 8px;
-  color: #9aa3c4;
+  color: #8E8E94;
 }
 
 .perm-btn:disabled {
@@ -1726,20 +1792,20 @@ body {
 
 /* 批准：沿用记忆审批的绿，保持"同意"的视觉语言一致 */
 .perm-btn.ok {
-  background: rgba(80, 200, 130, 0.18);
-  border-color: rgba(80, 200, 130, 0.4);
-  color: #9ee6bb;
+  background: rgba(168, 230, 207, 0.18);
+  border-color: rgba(168, 230, 207, 0.4);
+  color: #a8e6cf;
 }
 
 .perm-btn.ok:hover:not(:disabled) {
-  background: rgba(80, 200, 130, 0.3);
+  background: rgba(168, 230, 207, 0.3);
 }
 
 /* 收窄：琥珀色描边 —— 视觉上比"全批"弱，暗示"这是更保守的那个选项" */
 .perm-btn.narrow {
   background: rgba(245, 165, 36, 0.14);
   border-color: rgba(245, 165, 36, 0.4);
-  color: #f5c46b;
+  color: #f7e3a4;
 }
 
 .perm-btn.narrow:hover:not(:disabled) {
@@ -1747,19 +1813,19 @@ body {
 }
 
 .perm-btn.no {
-  background: rgba(220, 70, 70, 0.14);
-  border-color: rgba(220, 70, 70, 0.35);
-  color: #f0a8a8;
+  background: rgba(245, 184, 168, 0.14);
+  border-color: rgba(245, 184, 168, 0.35);
+  color: #f7c2b4;
 }
 
 .perm-btn.no:hover:not(:disabled) {
-  background: rgba(220, 70, 70, 0.28);
+  background: rgba(245, 184, 168, 0.28);
 }
 
 .perm-hint {
   margin-top: 7px;
   font-size: 10.5px;
-  color: #6f7893;
+  color: #525a50;
 }
 
 /* 拒绝理由输入框：跟卡片同宽，别把按钮挤到换行外面去 */
@@ -1768,10 +1834,10 @@ body {
   box-sizing: border-box;
   margin-bottom: 2px;
   padding: 5px 9px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(168, 230, 207, 0.16);
   border-radius: 6px;
   background: rgba(0, 0, 0, 0.25);
-  color: #e8eaf2;
+  color: #F2F2F4;
   font-size: 11.5px;
   font-family: inherit;
 }
@@ -1782,44 +1848,44 @@ body {
 }
 
 .perm-reason::placeholder {
-  color: #6f7893;
+  color: #525a50;
 }
 
 /* ---------------- 命令权限卡（决策 9.1） ---------------- */
 
 /* 命令卡：青色描边，与文件卡（琥珀）区分 —— 一眼看出"这是要跑命令" */
 .perm-card-cmd {
-  border-color: rgba(90, 170, 235, 0.45);
-  background: rgba(90, 170, 235, 0.07);
+  border-color: rgba(195, 183, 232, 0.45);
+  background: rgba(195, 183, 232, 0.07);
 }
 
 .perm-card-cmd .perm-title {
-  color: #8fc6f0;
+  color: #c3b7e8;
 }
 
 /* 命令原文 / 归一化：可能很长，必须能断行 */
 .perm-cmd {
-  color: #cdd2e6;
+  color: #B4B4BA;
   font-size: 11.5px;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
-  font-family: ui-monospace, Consolas, monospace;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, "Cascadia Mono", Consolas, ui-monospace, monospace;
 }
 
 /* 归一化（实际执行）比原文弱一档 —— 原文是"模型想干什么"，
    归一化才是"真会执行什么"（别名/缩写已展开），信息密度更高 */
 .perm-cmd-norm {
-  color: #9aa3c4;
+  color: #8E8E94;
 }
 
 /* 风险标色：高风险转红，让用户在点「批准」前先看到 */
 .perm-card-cmd.perm-risk-high {
-  border-color: rgba(220, 70, 70, 0.5);
-  background: rgba(220, 70, 70, 0.07);
+  border-color: rgba(245, 184, 168, 0.5);
+  background: rgba(245, 184, 168, 0.07);
 }
 
 .perm-card-cmd.perm-risk-high .perm-title {
-  color: #f0a8a8;
+  color: #f7c2b4;
 }
 
 .perm-card-cmd.perm-risk-medium {
@@ -1828,11 +1894,11 @@ body {
 
 /* ask_user 问题卡（模型向用户提问） */
 .perm-card-ask {
-  border-color: rgba(90, 140, 255, 0.5);
+  border-color: rgba(168, 230, 207, 0.5);
 }
 
 .perm-card-ask .perm-title {
-  color: #9db9ff;
+  color: #dce2da;
 }
 
 .perm-card-ask .ask-input {
@@ -1845,7 +1911,7 @@ body {
   display: block;
   margin: 2px 0 0 1.6em;
   font-size: 11px;
-  color: rgba(150, 200, 255, 0.75);
+  color: rgba(250, 220, 180, 0.75);
   animation: tl-tick-pulse 2s ease-in-out infinite;
 }
 
@@ -1866,8 +1932,8 @@ body {
   height: 100%;
   box-sizing: border-box;
   /* 必须不透明 —— 透明窗口下半透明背景会看不清 */
-  background: #1f2331;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: #222a2d;
+  border: 1px solid rgba(168, 230, 207, 0.16);
   border-radius: 12px;
   box-shadow:
     0 10px 30px rgba(0, 0, 0, 0.62),
@@ -1885,7 +1951,7 @@ body {
   gap: 9px;
   border: none;
   background: transparent;
-  color: #dfe3f0;
+  color: #DEDEE2;
   text-align: left;
   font-size: 12.5px;
   padding: 0 11px;
@@ -1900,24 +1966,24 @@ body {
 }
 
 .ctx-card button:hover {
-  background: rgba(120, 137, 255, 0.22);
+  background: rgba(168, 230, 207, 0.22);
 }
 
 /* 危险项（退出） */
 .ctx-card button.danger {
-  color: #f0a8a8;
+  color: #f7c2b4;
 }
 
 .ctx-card button.danger:hover {
-  background: rgba(220, 70, 70, 0.3);
+  background: rgba(245, 184, 168, 0.3);
 }
 
 /* 设置页里整行的勾选项 */
 .set-check-row {
   padding: 9px 11px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(168, 230, 207, 0.1);
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(168, 230, 207, 0.05);
   font-size: 12.5px;
   margin-bottom: 8px;
 }
@@ -1968,14 +2034,14 @@ body {
 }
 
 .lm-group {
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(168, 230, 207, 0.1);
   border-radius: 10px;
   margin-bottom: 8px;
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(168, 230, 207, 0.03);
 }
 
 .lm-group.cur {
-  border-color: rgba(120, 137, 255, 0.45);
+  border-color: rgba(168, 230, 207, 0.45);
 }
 
 /* 组头行：折叠按钮 + 齿轮。齿轮绝对定位在右侧，不参与折叠点击区 */
@@ -1995,7 +2061,7 @@ body {
   border: none;
   border-radius: 10px 10px 0 0;
   background: transparent;
-  color: #e8eaf2;
+  color: #F2F2F4;
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
@@ -2003,12 +2069,12 @@ body {
 }
 
 .lm-head:hover {
-  background: rgba(120, 137, 255, 0.14);
+  background: rgba(168, 230, 207, 0.14);
 }
 
 .lm-chev {
   font-size: 10px;
-  color: #7c85a3;
+  color: #6C6C72;
   width: 10px;
   flex: 0 0 auto;
 }
@@ -2024,8 +2090,8 @@ body {
 .lm-count {
   font-size: 10px;
   font-weight: 500;
-  color: #7c85a3;
-  background: rgba(255, 255, 255, 0.07);
+  color: #6C6C72;
+  background: rgba(168, 230, 207, 0.07);
   border-radius: 8px;
   padding: 1px 6px;
   flex: 0 0 auto;
@@ -2042,7 +2108,7 @@ body {
   border: none;
   border-radius: 6px;
   background: none;
-  color: #8f98ba;
+  color: #707076;
   font-size: 12px;
   line-height: 1;
   cursor: pointer;
@@ -2050,8 +2116,8 @@ body {
 
 .lm-gear:hover,
 .lm-gear.on {
-  background: rgba(255, 255, 255, 0.14);
-  color: #e8eaf2;
+  background: rgba(168, 230, 207, 0.14);
+  color: #F2F2F4;
 }
 
 /* 组菜单：贴在齿轮下方 */
@@ -2063,8 +2129,8 @@ body {
   min-width: 148px;
   padding: 4px;
   border-radius: 9px;
-  background: #232739;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: #262f32;
+  border: 1px solid rgba(168, 230, 207, 0.16);
   box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
   display: flex;
   flex-direction: column;
@@ -2073,7 +2139,7 @@ body {
 .lm-mi {
   border: none;
   background: none;
-  color: #dfe3f0;
+  color: #DEDEE2;
   font-size: 12px;
   text-align: left;
   padding: 7px 9px;
@@ -2082,26 +2148,26 @@ body {
 }
 
 .lm-mi:hover {
-  background: rgba(120, 137, 255, 0.22);
+  background: rgba(168, 230, 207, 0.22);
 }
 
 .lm-mi.danger {
-  color: #ff9a9a;
+  color: #f9bdb0;
 }
 
 .lm-mi.danger:hover {
-  background: rgba(255, 107, 107, 0.2);
+  background: rgba(247, 194, 180, 0.2);
 }
 
 .lm-sep {
   height: 1px;
   margin: 3px 4px;
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(168, 230, 207, 0.1);
 }
 
 /* 表体 */
 .lm-body {
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-top: 1px solid rgba(168, 230, 207, 0.08);
   padding-bottom: 3px;
 }
 
@@ -2117,14 +2183,14 @@ body {
 .lm-th {
   padding: 6px 11px 4px 24px;
   font-size: 10px;
-  color: #6f7899;
+  color: #525a50;
   letter-spacing: 0.03em;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  border-bottom: 1px solid rgba(168, 230, 207, 0.05);
 }
 
 .lm-row {
   padding: 9px 11px 9px 24px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid rgba(168, 230, 207, 0.04);
 }
 
 .lm-row:last-child {
@@ -2132,7 +2198,7 @@ body {
 }
 
 .lm-row.cur {
-  background: rgba(120, 137, 255, 0.1);
+  background: rgba(168, 230, 207, 0.1);
 }
 
 /* 名称列：◎ + 显示名 + 接口 id（同一行，超长省略，不再换行重叠） */
@@ -2146,7 +2212,7 @@ body {
 .lm-eye {
   border: none;
   background: none;
-  color: #565e78;
+  color: #40483e;
   font-size: 13px;
   line-height: 1;
   padding: 0 2px;
@@ -2155,17 +2221,17 @@ body {
 }
 
 .lm-eye:hover {
-  color: #9aa4c8;
+  color: #85858B;
 }
 
 .lm-eye.on {
-  color: #6ee7a0;
+  color: #96e0bd;
 }
 
 .lm-label {
   font-size: 12.5px;
   font-weight: 500;
-  color: #e8eaf2;
+  color: #F2F2F4;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2175,8 +2241,8 @@ body {
 
 .lm-api {
   font-size: 10px;
-  color: #7c85a3;
-  font-family: ui-monospace, Consolas, monospace;
+  color: #6C6C72;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, "Cascadia Mono", Consolas, ui-monospace, monospace;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2187,8 +2253,8 @@ body {
 
 .lm-nokey {
   font-size: 9.5px;
-  color: #d8b46a;
-  border: 1px solid rgba(216, 180, 106, 0.35);
+  color: #e3d3a0;
+  border: 1px solid rgba(228, 212, 158, 0.35);
   border-radius: 5px;
   padding: 0 4px;
   flex: 0 0 auto;
@@ -2197,7 +2263,7 @@ body {
 /* 上下文大小列：手填值，右对齐数字 */
 .lm-ctx {
   font-size: 11px;
-  color: #a3accb;
+  color: #9A9AA0;
   font-variant-numeric: tabular-nums;
   text-align: left;
 }
@@ -2210,8 +2276,8 @@ body {
 
 .lm-tag {
   font-size: 9.5px;
-  color: #a9b2d6;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  color: #9C9CA2;
+  border: 1px solid rgba(168, 230, 207, 0.16);
   border-radius: 5px;
   padding: 0 5px;
   line-height: 15px;
@@ -2246,15 +2312,15 @@ body {
 }
 
 .lm-tools .set-btn.add {
-  background: rgba(255, 255, 255, 0.09);
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  color: #e2e6f5;
+  background: rgba(168, 230, 207, 0.09);
+  border: 1px solid rgba(168, 230, 207, 0.16);
+  color: #D8D8DC;
   padding: 6px 11px;
   font-size: 11.5px;
 }
 
 .lm-tools .set-btn.add:hover {
-  background: rgba(120, 137, 255, 0.28);
+  background: rgba(168, 230, 207, 0.28);
 }
 
 /* ---------------- 模型大面板（外弹层） ----------------
@@ -2267,7 +2333,7 @@ body {
   z-index: 60;
   display: flex;
   flex-direction: column;
-  background: #171a26;
+  background: #12171a;
   border-radius: 14px;
   overflow: hidden;
 }
@@ -2296,7 +2362,7 @@ body {
   align-items: center;
   justify-content: center;
   padding: 12px;
-  background: rgba(8, 10, 16, 0.68);
+  background: rgba(10, 9, 8, 0.68);
   border-radius: 14px; /* fixed 逃出 .panel 的 overflow:hidden，圆角自己补 */
 }
 
@@ -2306,8 +2372,8 @@ body {
   width: 100%;
   max-height: 100%;
   border-radius: 12px;
-  background: #1e2231; /* 必须不透明：窗口 transparent */
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #1F1F23; /* 必须不透明：窗口 transparent */
+  border: 1px solid rgba(168, 230, 207, 0.14);
   box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55);
   overflow: hidden;
 }
@@ -2318,8 +2384,8 @@ body {
   gap: 8px;
   flex: 0 0 auto;
   padding: 9px 11px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.09);
-  background: rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid rgba(168, 230, 207, 0.09);
+  background: rgba(168, 230, 207, 0.04);
 }
 
 /* 类型选择弹窗（图 8 那步）：不需要表单那么宽 */
@@ -2341,15 +2407,15 @@ body {
   text-align: left;
   padding: 10px 11px;
   border-radius: 9px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(255, 255, 255, 0.05);
-  color: #e8eaf2;
+  border: 1px solid rgba(168, 230, 207, 0.14);
+  background: rgba(168, 230, 207, 0.05);
+  color: #F2F2F4;
   cursor: pointer;
 }
 
 .mm-type:hover {
-  background: rgba(120, 137, 255, 0.22);
-  border-color: rgba(120, 137, 255, 0.45);
+  background: rgba(168, 230, 207, 0.22);
+  border-color: rgba(168, 230, 207, 0.45);
 }
 
 .mm-type b {
@@ -2360,7 +2426,7 @@ body {
 .mm-type i {
   font-size: 11px;
   font-style: normal;
-  color: #9aa4c8;
+  color: #85858B;
 }
 
 /* askInput 的单行输入框（prompt() 在 WebView 里被禁用，自己画） */
@@ -2370,23 +2436,23 @@ body {
   margin: 2px 0 4px;
   padding: 8px 10px;
   border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(168, 230, 207, 0.18);
   background: rgba(0, 0, 0, 0.28);
-  color: #eef1fa;
+  color: #F2F2F4;
   font-size: 12.5px;
   outline: none;
   font-family: inherit;
 }
 
 .confirm-input:focus {
-  border-color: rgba(120, 137, 255, 0.6);
+  border-color: rgba(168, 230, 207, 0.6);
 }
 
 .mm-title {
   flex: 1;
   font-size: 12.5px;
   font-weight: 600;
-  color: #e8eaf2;
+  color: #F2F2F4;
 }
 
 .mm-x {
@@ -2395,15 +2461,15 @@ body {
   border: none;
   border-radius: 5px;
   background: none;
-  color: #9aa4c8;
+  color: #85858B;
   font-size: 11px;
   line-height: 1;
   cursor: pointer;
 }
 
 .mm-x:hover {
-  background: rgba(255, 255, 255, 0.14);
-  color: #e8eaf2;
+  background: rgba(168, 230, 207, 0.14);
+  color: #F2F2F4;
 }
 
 /* 内容区：继续用 .set-form 的控件样式，但去掉外框（弹窗就是那张框）。
@@ -2425,7 +2491,7 @@ body {
 }
 
 .set-form.mm-body::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.14);
+  background: rgba(168, 230, 207, 0.14);
   border-radius: 3px;
 }
 
@@ -2435,8 +2501,8 @@ body {
   gap: 7px;
   flex: 0 0 auto;
   padding: 9px 11px;
-  border-top: 1px solid rgba(255, 255, 255, 0.09);
-  background: rgba(255, 255, 255, 0.03);
+  border-top: 1px solid rgba(168, 230, 207, 0.09);
+  background: rgba(168, 230, 207, 0.03);
 }
 
 .set-list {
@@ -2444,29 +2510,29 @@ body {
 }
 
 .set-row {
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(168, 230, 207, 0.1);
   border-radius: 10px;
   padding: 8px 11px;
   margin-bottom: 8px;
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(168, 230, 207, 0.05);
 }
 
 .set-row.cur {
-  border-color: rgba(120, 137, 255, 0.5);
-  background: rgba(120, 137, 255, 0.1);
+  border-color: rgba(168, 230, 207, 0.5);
+  background: rgba(168, 230, 207, 0.1);
 }
 
 .set-name {
   font-size: 12.5px;
-  color: #e8eaf2;
+  color: #F2F2F4;
   font-weight: 600;
 }
 
 .set-cur {
   font-size: 10px;
-  color: #9ee6bb;
-  background: rgba(80, 200, 130, 0.15);
-  border: 1px solid rgba(80, 200, 130, 0.35);
+  color: #a8e6cf;
+  background: rgba(168, 230, 207, 0.15);
+  border: 1px solid rgba(168, 230, 207, 0.35);
   border-radius: 5px;
   padding: 1px 5px;
   margin-left: 5px;
@@ -2474,7 +2540,7 @@ body {
 
 .set-url {
   font-size: 10.5px;
-  color: #7c85a3;
+  color: #6C6C72;
   margin: 3px 0 6px;
   overflow-wrap: anywhere;
 }
@@ -2485,27 +2551,27 @@ body {
 }
 
 .set-btn {
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(168, 230, 207, 0.14);
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.07);
-  color: #cdd2e6;
+  background: rgba(168, 230, 207, 0.07);
+  color: #B4B4BA;
   font-size: 11px;
   padding: 3px 10px;
   cursor: pointer;
 }
 
 .set-btn:hover {
-  background: rgba(120, 137, 255, 0.25);
+  background: rgba(168, 230, 207, 0.25);
 }
 
 .set-btn.del:hover {
-  background: rgba(220, 70, 70, 0.3);
+  background: rgba(245, 184, 168, 0.3);
 }
 
 .set-btn.add {
-  background: linear-gradient(135deg, #5b6ef5, #4655d6);
+  background: linear-gradient(135deg, #a8e6cf, #86c9b0);
   border: none;
-  color: #fff;
+  color: #a8e6cf;
   padding: 6px 14px;
   font-size: 12px;
 }
@@ -2514,10 +2580,10 @@ body {
   display: flex;
   flex-direction: column;
   gap: 7px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(168, 230, 207, 0.1);
   border-radius: 10px;
   padding: 10px;
-  background: rgba(255, 255, 255, 0.04);
+  background: rgba(168, 230, 207, 0.04);
 }
 
 #project-select {
@@ -2531,19 +2597,19 @@ body {
   position: fixed;
   z-index: 4000;
   min-width: 160px;
-  background: #1c1f2e;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #17171A;
+  border: 1px solid rgba(168, 230, 207, 0.14);
   border-radius: 8px;
   padding: 4px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   font-size: 12px;
-  color: #dfe3f0;
+  color: #DEDEE2;
 }
 
 .ctx-title {
   padding: 4px 8px 6px;
   font-size: 10.5px;
-  color: #8a93b8;
+  color: #78787E;
 }
 
 .ctx-item {
@@ -2553,7 +2619,7 @@ body {
 }
 
 .ctx-item:hover {
-  background: rgba(120, 137, 255, 0.22);
+  background: rgba(168, 230, 207, 0.22);
 }
 
 /* 「＋」新建会话菜单：模式项 = 图标 + 名字（有「默认」标时右对齐）
@@ -2584,8 +2650,8 @@ body {
   border-radius: 4px;
   font-size: 9.5px;
   line-height: 15px;
-  color: #aab4d8;
-  background: rgba(255, 255, 255, 0.1);
+  color: #9C9CA2;
+  background: rgba(168, 230, 207, 0.1);
 }
 
 /* 新建会话菜单比会话右键菜单宽：模式名 + 「默认」标 + 可能的组名警告一行放不下 */
@@ -2602,7 +2668,7 @@ body {
 
 /* 会话列表里那条 sess-meta 尾部的模式标记（默认模式不显示） */
 .sess-mode {
-  color: #9aa3c8;
+  color: #8E8E94;
 }
 
 .ctx-item.danger {
@@ -2610,34 +2676,34 @@ body {
 }
 
 .ctx-item.danger:hover {
-  background: rgba(255, 80, 80, 0.18);
+  background: rgba(243, 170, 152, 0.18);
 }
 
 .ctx-sep {
   height: 1px;
   margin: 4px 6px;
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(168, 230, 207, 0.1);
 }
 
 /* 执行权限档位菜单：副标题一行说明 + 当前档高亮 */
 .ctx-sub {
   margin-top: 2px;
   font-size: 10px;
-  color: #8a93b8;
+  color: #78787E;
   line-height: 1.4;
 }
 
 .ctx-item.checked {
-  background: rgba(120, 137, 255, 0.26);
+  background: rgba(168, 230, 207, 0.26);
 }
 
 .ctx-item.checked .ctx-sub {
-  color: #aab4d8;
+  color: #9C9CA2;
 }
 
 /* 组影响那一行：允许 / 收起 / 写了但不存在（标灰）—— 现在只在「设置 › 行为」页出现 */
 .mg-label {
-  color: #7c85a6;
+  color: #6C6C72;
   margin-right: 5px;
 }
 .mg-line {
@@ -2647,27 +2713,27 @@ body {
 }
 
 .mg-ok {
-  color: #7fd6c9;
+  color: #bfe6d8;
 }
 
 .mg-off {
-  color: #8a93b8;
+  color: #78787E;
 }
 
 .mg-unknown {
-  color: #6b7290;
-  text-decoration: line-through dotted rgba(255, 255, 255, 0.25);
+  color: #57575D;
+  text-decoration: line-through dotted rgba(168, 230, 207, 0.25);
 }
 
 /* 呈现方式那一行：native 是常态（弱化），ptc 是**行为差异**（强调）——
    用户切到 PTC 后能直接调的工具会整个变掉，界面必须说明白，
    否则看起来像"工具全没了"。 */
 .mg-label2 {
-  color: #8a93b8;
+  color: #78787E;
 }
 
 .mg-ptc {
-  color: #c9a7ff;
+  color: #d2d2d6;
   font-weight: 600;
 }
 
@@ -2677,7 +2743,7 @@ body {
 }
 
 .life-kind {
-  color: #8a93b8;
+  color: #78787E;
   font-size: 10px;
   margin-left: 6px;
 }
@@ -2685,12 +2751,12 @@ body {
 /* 读取失败 / 快照过期：用暖色，与 .mg-off（中性灰）区分 ——
    「关闭」是用户的选择，「失败」是要处理的问题。 */
 .life-bad {
-  color: #ff9d8e;
+  color: #f9bfae;
 }
 
 .life-preview {
   margin-top: 4px;
-  color: #9aa3c4;
+  color: #8E8E94;
   font-size: 10px;
   line-height: 1.6;
   word-break: break-all;
@@ -2740,14 +2806,14 @@ body {
   padding: 1px 6px;
   border-radius: 5px;
   background: rgba(255, 200, 60, 0.12);
-  color: #f0d080;
+  color: #f5e7ac;
   white-space: nowrap;
 }
 
 .sess-cur-tag {
   flex: 0 0 auto;
   font-size: 10.5px;
-  color: #8fd0ff;
+  color: #c9c0ec;
   white-space: nowrap;
 }
 
@@ -2759,7 +2825,7 @@ body {
 }
 
 .sess-group.cur-proj {
-  border-left: 2px solid rgba(120, 137, 255, 0.45);
+  border-left: 2px solid rgba(168, 230, 207, 0.45);
   padding-left: 6px;
 }
 
@@ -2772,7 +2838,7 @@ body {
 
 .fld > span {
   font-size: 10.5px;
-  color: #8a93b8;
+  color: #78787E;
   letter-spacing: 0.02em;
 }
 
@@ -2782,10 +2848,10 @@ body {
 }
 
 .fld input {
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(168, 230, 207, 0.06);
+  border: 1px solid rgba(168, 230, 207, 0.1);
   border-radius: 7px;
-  color: #e8eaf2;
+  color: #F2F2F4;
   padding: 7px 9px;
   font-size: 12px;
   outline: none;
@@ -2794,8 +2860,8 @@ body {
 }
 
 .fld input:focus {
-  border-color: rgba(120, 137, 255, 0.55);
-  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(168, 230, 207, 0.55);
+  background: rgba(168, 230, 207, 0.08);
 }
 
 button.fetch-id {
@@ -2816,27 +2882,27 @@ button.fetch-id {
   flex-direction: column;
   gap: 3px;
   font-size: 11px;
-  color: #aab4dd;
+  color: #9C9CA2;
 }
 
 .ask-field input {
-  background: rgba(255, 255, 255, 0.07);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(168, 230, 207, 0.07);
+  border: 1px solid rgba(168, 230, 207, 0.12);
   border-radius: 7px;
-  color: #e8eaf2;
+  color: #F2F2F4;
   padding: 7px 9px;
   font-size: 12px;
   outline: none;
 }
 
 .ask-field input:focus {
-  border-color: rgba(120, 137, 255, 0.55);
+  border-color: rgba(168, 230, 207, 0.55);
 }
 
 .form-err {
-  background: rgba(255, 90, 90, 0.12);
-  border: 1px solid rgba(255, 90, 90, 0.35);
-  color: #ffb4b4;
+  background: rgba(247, 194, 180, 0.12);
+  border: 1px solid rgba(247, 194, 180, 0.35);
+  color: #f9d1c7;
   border-radius: 7px;
   padding: 7px 9px;
   font-size: 12px;
@@ -2856,7 +2922,7 @@ button.fetch-id {
 }
 
 .adv-box {
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(168, 230, 207, 0.08);
   border-radius: 7px;
   padding: 6px 8px;
 }
@@ -2864,16 +2930,16 @@ button.fetch-id {
 .adv-box summary {
   cursor: pointer;
   font-size: 11.5px;
-  color: #aab4dd;
+  color: #9C9CA2;
   user-select: none;
 }
 
 .id-picker {
   margin-top: 8px;
-  border: 1px solid rgba(120, 137, 255, 0.35);
+  border: 1px solid rgba(168, 230, 207, 0.35);
   border-radius: 8px;
   padding: 8px;
-  background: rgba(40, 48, 90, 0.35);
+  background: rgba(60, 42, 18, 0.35);
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -2885,7 +2951,7 @@ button.fetch-id {
   align-items: center;
   gap: 8px;
   font-size: 11.5px;
-  color: #c6d0f5;
+  color: #B4B4BA;
 }
 
 .id-picker-list {
@@ -2901,10 +2967,10 @@ button.fetch-id {
   justify-content: space-between;
   align-items: center;
   gap: 8px;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(168, 230, 207, 0.06);
+  border: 1px solid rgba(168, 230, 207, 0.08);
   border-radius: 6px;
-  color: #e8eaf2;
+  color: #F2F2F4;
   padding: 6px 8px;
   font-size: 12px;
   cursor: pointer;
@@ -2912,7 +2978,7 @@ button.fetch-id {
 }
 
 .id-pick:hover {
-  border-color: rgba(120, 137, 255, 0.5);
+  border-color: rgba(168, 230, 207, 0.5);
 }
 
 .id-pick.already {
@@ -2921,16 +2987,16 @@ button.fetch-id {
 
 .id-pick .remote-meta {
   font-size: 11px;
-  color: #8a93b8;
+  color: #78787E;
 }
 
 .set-form input[type="text"],
 .set-form input[type="password"],
 .set-form input:not([type]) {
-  background: rgba(255, 255, 255, 0.07);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(168, 230, 207, 0.07);
+  border: 1px solid rgba(168, 230, 207, 0.12);
   border-radius: 7px;
-  color: #e8eaf2;
+  color: #F2F2F4;
   padding: 7px 9px;
   font-size: 12px;
   outline: none;
@@ -2939,7 +3005,7 @@ button.fetch-id {
 }
 
 .set-form input:focus {
-  border-color: rgba(120, 137, 255, 0.55);
+  border-color: rgba(168, 230, 207, 0.55);
 }
 
 .set-check {
@@ -2947,13 +3013,13 @@ button.fetch-id {
   align-items: center;
   gap: 6px;
   font-size: 11.5px;
-  color: #aab4dd;
+  color: #9C9CA2;
   cursor: pointer;
 }
 
 .set-hint {
   font-size: 10.5px;
-  color: #8b93b0;
+  color: #7C7C82;
   line-height: 1.5;
 }
 
@@ -2963,29 +3029,29 @@ button.fetch-id {
   overflow-wrap: anywhere;
   font-size: 11.5px;
   line-height: 1.6;
-  color: #cdd2e6;
+  color: #B4B4BA;
   background: rgba(0, 0, 0, 0.25);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(168, 230, 207, 0.08);
   border-radius: 9px;
   padding: 9px 11px;
   margin: 0;
-  font-family: Consolas, monospace;
+  font-family: "Cascadia Mono", Consolas, "Cascadia Mono", Consolas, ui-monospace, monospace;
   max-height: 260px;
   overflow-y: auto;
 }
 
 .mem-empty {
   font-size: 11.5px;
-  color: #7c85a3;
+  color: #6C6C72;
   line-height: 1.6;
   margin-bottom: 12px;
 }
 
 /* 记忆文件族（RULES/SOUL/IDENTITY/USER/MEMORY 可折叠全文） */
 .mem-file {
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(168, 230, 207, 0.08);
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.04);
+  background: rgba(168, 230, 207, 0.04);
   margin-bottom: 8px;
   overflow: hidden;
 }
@@ -2993,7 +3059,7 @@ button.fetch-id {
   cursor: pointer;
   padding: 9px 11px;
   font-size: 12px;
-  color: #cdd2e6;
+  color: #B4B4BA;
   list-style: none;
   display: flex;
   gap: 8px;
@@ -3003,27 +3069,27 @@ button.fetch-id {
 .mem-file summary i {
   font-style: normal;
   font-size: 10.5px;
-  color: #7c85a3;
+  color: #6C6C72;
 }
 .mem-file pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font-size: 11px;
   line-height: 1.55;
-  color: #cdd2e6;
+  color: #B4B4BA;
   background: rgba(0, 0, 0, 0.25);
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-top: 1px solid rgba(168, 230, 207, 0.08);
   padding: 9px 11px;
   margin: 0;
-  font-family: Consolas, monospace;
+  font-family: "Cascadia Mono", Consolas, "Cascadia Mono", Consolas, ui-monospace, monospace;
   max-height: 240px;
   overflow-y: auto;
 }
 .mem-file-empty {
   padding: 8px 11px;
   font-size: 11.5px;
-  color: #7c85a3;
-  border: 1px dashed rgba(255, 255, 255, 0.12);
+  color: #6C6C72;
+  border: 1px dashed rgba(168, 230, 207, 0.12);
   border-radius: 9px;
   margin-bottom: 8px;
 }
@@ -3041,7 +3107,7 @@ button.fetch-id {
 .mcp-budget-bar {
   height: 5px;
   border-radius: 3px;
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(168, 230, 207, 0.1);
   overflow: hidden;
   margin-bottom: 5px;
 }
@@ -3050,13 +3116,13 @@ button.fetch-id {
   display: block;
   height: 100%;
   border-radius: 3px;
-  background: linear-gradient(90deg, #5b6ef5, #7b8cff);
+  background: linear-gradient(90deg, #a8e6cf, #d6dcd4);
   transition: width 240ms ease;
 }
 
 .mcp-budget span {
   font-size: 10.5px;
-  color: #8b93b0;
+  color: #7C7C82;
 }
 
 /* MCP 网关地址行（设置页） */
@@ -3069,7 +3135,7 @@ button.fetch-id {
 
 .mcp-url-label {
   font-size: 11px;
-  color: #8b93b0;
+  color: #7C7C82;
   flex: none;
 }
 
@@ -3077,22 +3143,22 @@ button.fetch-id {
   flex: 1;
   min-width: 0;
   font-size: 11.5px;
-  font-family: Consolas, Menlo, monospace;
-  color: #dfe5f5;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  font-family: "Cascadia Mono", Consolas, "Cascadia Mono", Consolas, ui-monospace, monospace;
+  color: #DEDEE2;
+  background: rgba(168, 230, 207, 0.06);
+  border: 1px solid rgba(168, 230, 207, 0.12);
   border-radius: 6px;
   padding: 5px 8px;
   outline: none;
 }
 
 .mcp-url-input:focus {
-  border-color: #5b6ef5;
-  background: rgba(255, 255, 255, 0.09);
+  border-color: #a8e6cf;
+  background: rgba(168, 230, 207, 0.09);
 }
 
 .mcp-url-input::placeholder {
-  color: #5b637e;
+  color: #45454B;
 }
 
 /* 多 server 列表 */
@@ -3122,14 +3188,14 @@ button.fetch-id {
   border: 1px solid transparent;
 }
 .mcp-kind.http {
-  color: #8fb8f0;
-  background: rgba(90, 140, 220, 0.15);
-  border-color: rgba(90, 140, 220, 0.35);
+  color: #bfb5e6;
+  background: rgba(228, 152, 48, 0.15);
+  border-color: rgba(228, 152, 48, 0.35);
 }
 .mcp-kind.stdio {
-  color: #a6d9a0;
-  background: rgba(90, 190, 110, 0.15);
-  border-color: rgba(90, 190, 110, 0.35);
+  color: #a4e0c2;
+  background: rgba(168, 230, 207, 0.15);
+  border-color: rgba(168, 230, 207, 0.35);
 }
 /* stdio 的参数与 env 计数：次要信息，压低对比度 */
 .mcp-args,
@@ -3150,9 +3216,9 @@ button.fetch-id {
   border: 1px solid transparent;
 }
 .proj-tag.perm {
-  color: #f0c98a;
-  background: rgba(230, 170, 70, 0.15);
-  border-color: rgba(230, 170, 70, 0.35);
+  color: #f5e3b0;
+  background: rgba(245, 230, 168, 0.15);
+  border-color: rgba(245, 230, 168, 0.35);
 }
 
 /* 警告块：权限预设被丢弃 / 引用失效 —— 必须显眼，不能只是灰字 */
@@ -3162,9 +3228,9 @@ button.fetch-id {
   border-radius: 6px;
   font-size: 12px;
   line-height: 1.55;
-  color: #f0c98a;
-  background: rgba(230, 170, 70, 0.12);
-  border: 1px solid rgba(230, 170, 70, 0.3);
+  color: #f5e3b0;
+  background: rgba(245, 230, 168, 0.12);
+  border: 1px solid rgba(245, 230, 168, 0.3);
 }
 .proj-warn ul {
   margin: 4px 0 0;
@@ -3176,7 +3242,7 @@ button.fetch-id {
   width: 100%;
   min-height: 200px;
   box-sizing: border-box;
-  font-family: ui-monospace, Consolas, monospace;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, "Cascadia Mono", Consolas, ui-monospace, monospace;
   font-size: 12px;
   line-height: 1.5;
   padding: 8px;
@@ -3184,11 +3250,11 @@ button.fetch-id {
   resize: vertical;
   color: inherit;
   background: rgba(0, 0, 0, 0.18);
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(168, 230, 207, 0.14);
 }
 .proj-editor:focus {
   outline: none;
-  border-color: rgba(120, 170, 240, 0.5);
+  border-color: rgba(168, 230, 207, 0.5);
 }
 
 .mcp-add-form {
@@ -3204,35 +3270,35 @@ button.fetch-id {
 
 .set-warn {
   font-size: 10px;
-  color: #f0c98a;
-  background: rgba(230, 170, 70, 0.15);
-  border: 1px solid rgba(230, 170, 70, 0.35);
+  color: #f5e3b0;
+  background: rgba(245, 230, 168, 0.15);
+  border: 1px solid rgba(245, 230, 168, 0.35);
   border-radius: 5px;
   padding: 1px 5px;
   margin-left: 5px;
 }
 
 .set-btn.unload {
-  border-color: rgba(230, 170, 70, 0.4);
-  color: #f0c98a;
+  border-color: rgba(245, 230, 168, 0.4);
+  color: #f5e3b0;
 }
 
 .set-btn.unload:hover {
-  background: rgba(230, 170, 70, 0.25);
+  background: rgba(245, 230, 168, 0.25);
 }
 
 /* 权限规则里的「拒绝」项 */
 .set-row.deny {
-  border-color: rgba(220, 70, 70, 0.4);
-  background: rgba(220, 70, 70, 0.08);
+  border-color: rgba(245, 184, 168, 0.4);
+  background: rgba(245, 184, 168, 0.08);
 }
 
 /* 设置表单里的下拉框 */
 .set-form select {
-  background: rgba(255, 255, 255, 0.07);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(168, 230, 207, 0.07);
+  border: 1px solid rgba(168, 230, 207, 0.12);
   border-radius: 7px;
-  color: #e8eaf2;
+  color: #F2F2F4;
   padding: 7px 9px;
   font-size: 12px;
   outline: none;
@@ -3242,18 +3308,18 @@ button.fetch-id {
 }
 
 .set-form select option {
-  background: #1c1f2e;
-  color: #dfe3f0;
+  background: #17171A;
+  color: #DEDEE2;
 }
 
 .set-form textarea {
-  background: rgba(255, 255, 255, 0.07);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(168, 230, 207, 0.07);
+  border: 1px solid rgba(168, 230, 207, 0.12);
   border-radius: 7px;
-  color: #e8eaf2;
+  color: #F2F2F4;
   padding: 7px 9px;
   font-size: 11.5px;
-  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-family: "Cascadia Mono", Consolas, "Cascadia Mono", Consolas, ui-monospace, monospace;
   line-height: 1.55;
   outline: none;
   width: 100%;
@@ -3262,18 +3328,18 @@ button.fetch-id {
 }
 
 .set-form textarea:focus {
-  border-color: rgba(120, 137, 255, 0.55);
-  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(168, 230, 207, 0.55);
+  background: rgba(168, 230, 207, 0.1);
 }
 
 .set-form textarea::placeholder {
-  color: #6c7593;
+  color: #5C5C62;
   font-family: inherit;
 }
 
 .set-hint code {
-  color: #9fb0ff;
-  background: rgba(120, 137, 255, 0.12);
+  color: #dce2da;
+  background: rgba(168, 230, 207, 0.12);
   padding: 0 4px;
   border-radius: 4px;
 }
@@ -3298,7 +3364,7 @@ button.fetch-id {
   gap: 4px;
   max-height: 220px;
   overflow-y: auto;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(168, 230, 207, 0.1);
   border-radius: 8px;
   padding: 6px 8px;
   background: rgba(0, 0, 0, 0.18);
@@ -3309,7 +3375,7 @@ button.fetch-id {
   align-items: center;
   gap: 8px;
   font-size: 11.5px;
-  color: #cdd2e6;
+  color: #B4B4BA;
   cursor: pointer;
   padding: 2px 0;
 }
@@ -3328,11 +3394,11 @@ button.fetch-id {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: Consolas, monospace;
+  font-family: "Cascadia Mono", Consolas, "Cascadia Mono", Consolas, ui-monospace, monospace;
 }
 
 .remote-meta {
-  color: #8b93b0;
+  color: #7C7C82;
   font-size: 10px;
   flex-shrink: 0;
 }
@@ -3345,8 +3411,8 @@ button.fetch-id {
 }
 
 .set-id {
-  color: #9fb0ff;
-  font-family: Consolas, monospace;
+  color: #dce2da;
+  font-family: "Cascadia Mono", Consolas, "Cascadia Mono", Consolas, ui-monospace, monospace;
   font-size: 10px;
 }
 
@@ -3357,9 +3423,9 @@ button.fetch-id {
   display: flex;
   align-items: center;
   gap: 11px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(168, 230, 207, 0.1);
   border-radius: 11px;
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(168, 230, 207, 0.05);
   padding: 12px 13px;
   margin-bottom: 9px;
   cursor: pointer;
@@ -3368,8 +3434,8 @@ button.fetch-id {
 }
 
 .set-entry:hover {
-  background: rgba(120, 137, 255, 0.14);
-  border-color: rgba(120, 137, 255, 0.4);
+  background: rgba(168, 230, 207, 0.14);
+  border-color: rgba(168, 230, 207, 0.4);
 }
 
 .set-entry-icon {
@@ -3389,13 +3455,13 @@ button.fetch-id {
 
 .set-entry-text b {
   font-size: 13px;
-  color: #e8eaf2;
+  color: #F2F2F4;
   font-weight: 600;
 }
 
 .set-entry-text i {
   font-size: 10.5px;
-  color: #8b93b0;
+  color: #7C7C82;
   font-style: normal;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3407,8 +3473,8 @@ button.fetch-id {
   min-width: 17px;
   height: 17px;
   border-radius: 9px;
-  background: rgba(230, 170, 70, 0.9);
-  color: #241a06;
+  background: rgba(245, 230, 168, 0.9);
+  color: #1E1E22;
   font-size: 10.5px;
   font-weight: 700;
   display: grid;
@@ -3419,7 +3485,7 @@ button.fetch-id {
 .set-entry-arrow {
   flex-shrink: 0;
   font-size: 17px;
-  color: #6c7593;
+  color: #5C5C62;
 }
 
 /* ---------------- 实时进度气泡 ---------------- */
@@ -3429,19 +3495,19 @@ button.fetch-id {
   align-items: center;
   gap: 8px;
   font-size: 12.5px;
-  color: #aab4dd;
+  color: #9C9CA2;
   padding: 8px 12px;
   border-radius: 10px;
-  background: rgba(120, 137, 255, 0.09);
-  border: 1px solid rgba(120, 137, 255, 0.2);
+  background: rgba(168, 230, 207, 0.09);
+  border: 1px solid rgba(168, 230, 207, 0.2);
 }
 
 .spinner {
   width: 11px;
   height: 11px;
   border-radius: 50%;
-  border: 2px solid rgba(120, 137, 255, 0.3);
-  border-top-color: #7b8cff;
+  border: 2px solid rgba(168, 230, 207, 0.3);
+  border-top-color: #d6dcd4;
   animation: spin 700ms linear infinite;
   flex-shrink: 0;
 }
@@ -3462,7 +3528,7 @@ button.fetch-id {
   margin-top: 6px;
   font-size: 11.5px;
   line-height: 1.75;
-  color: #8b93b0;
+  color: #7C7C82;
 }
 
 .run-timeline .tl-line {
@@ -3472,29 +3538,29 @@ button.fetch-id {
 }
 
 .run-timeline .tl-line code {
-  color: #9fb0ff;
-  background: rgba(120, 137, 255, 0.12);
+  color: #dce2da;
+  background: rgba(168, 230, 207, 0.12);
   padding: 0 4px;
   border-radius: 4px;
 }
 
 .run-timeline .tl-line i {
   font-style: normal;
-  color: #7c85a3;
+  color: #6C6C72;
 }
 
 /* 链路状态（限流退避重试）：只作说明，比工具行更淡 */
 .tl-line.tl-status {
-  color: #7c85a3;
+  color: #6C6C72;
 }
 
 /* 工具执行失败：黄；本轮失败（error 条目）：红 */
 .tl-line.tl-warn {
-  color: #d8b25a;
+  color: #e2d199;
 }
 
 .tl-line.tl-error {
-  color: #e8767a;
+  color: #f3aa9c;
   white-space: pre-wrap;
 }
 
@@ -3512,9 +3578,9 @@ button.fetch-id {
   margin-top: 8px;
   padding: 9px 12px;
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.07);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  color: #e8eaf2;
+  background: rgba(168, 230, 207, 0.07);
+  border: 1px solid rgba(168, 230, 207, 0.08);
+  color: #F2F2F4;
   font-size: 13px;
   line-height: 1.65;
   overflow-wrap: anywhere;
@@ -3531,7 +3597,7 @@ button.fetch-id {
 
 .run-note {
   font-size: 10.5px;
-  color: #7c85a3;
+  color: #6C6C72;
   margin-top: 5px;
 }
 
@@ -3540,7 +3606,7 @@ button.fetch-id {
    点开之后里面每条仍各自折叠（思考 / 工具行），不会一次哗啦出一屏原文。 */
 details.run-process {
   margin-top: 8px;
-  border: 1px solid rgba(140, 150, 180, 0.22);
+  border: 1px solid rgba(168, 230, 207, 0.22);
   border-radius: 8px;
   padding: 4px 8px;
 }
@@ -3548,7 +3614,7 @@ details.run-process > summary {
   cursor: pointer;
   user-select: none;
   font-size: 11.5px;
-  color: #9aa3c0;
+  color: #8E8E94;
 }
 
 /* 工具调用 / 工具返回：**默认折叠成一行**（2026-10-02 用户拍板）。
@@ -3561,15 +3627,15 @@ details.tl-tool {
 details.tl-tool > summary {
   cursor: pointer;
   user-select: none;
-  color: #8b93b0;
+  color: #7C7C82;
   overflow-wrap: anywhere;
 }
 details.tl-tool > summary:hover {
-  color: #b9c0d8;
+  color: #A8A8AE;
 }
 /* 返回行比调用行更淡一点：一调一返回是同一件事 */
 details.tl-tool.tl-res > summary {
-  color: #7c85a3;
+  color: #6C6C72;
 }
 .tl-tool-pre {
   margin: 4px 0 0;
@@ -3587,10 +3653,10 @@ details.tl-tool.tl-res > summary {
 .tl-steer {
   margin: 6px 0;
   padding: 6px 8px;
-  border-left: 2px solid #d8b25a;
-  background: rgba(216, 178, 90, 0.08);
+  border-left: 2px solid #e2d199;
+  background: rgba(226, 209, 153, 0.08);
   font-size: 12px;
-  color: #e8eaf2;
+  color: #F2F2F4;
 }
 
 /* 插话附带的图（插话不铺气泡，图只画在时间线这条条目上）。
@@ -3607,11 +3673,11 @@ details.tl-tool.tl-res > summary {
 .tl-text {
   margin: 6px 0;
   padding: 6px 8px;
-  border-left: 2px solid rgba(140, 150, 180, 0.45);
-  background: rgba(140, 150, 180, 0.08);
+  border-left: 2px solid rgba(168, 230, 207, 0.45);
+  background: rgba(168, 230, 207, 0.08);
   font-size: 12px;
   line-height: 1.6;
-  color: #e8eaf2;
+  color: #F2F2F4;
   /* ⚠️ **不要** pre-wrap（2026-10-03）：正文已按 markdown 渲染成 HTML，
      pre-wrap 会把标签之间的换行/缩进当可见空白，表格和列表之间凭空多出空行。
      换行由 `mdToHtml` 产出的 `<br>` / 块级元素负责。 */
@@ -3622,7 +3688,7 @@ details.tl-tool.tl-res > summary {
   display: inline-block;
   margin-right: 6px;
   font-size: 10.5px;
-  color: #9aa3c0;
+  color: #8E8E94;
 }
 
 /* 思维链折叠块 */
@@ -3661,7 +3727,7 @@ details.tl-tool.tl-res > summary {
 .interrupted-tag {
   margin-top: 4px;
   font-size: 10.5px;
-  color: #d8b25a;
+  color: #e2d199;
 }
 
 /* 未跑完的轮（进程在轮内被关掉，"退出不丢轮"保下来的半截）：
@@ -3669,13 +3735,13 @@ details.tl-tool.tl-res > summary {
 .partial-tag {
   margin-top: 4px;
   font-size: 10.5px;
-  color: #e0736d;
+  color: #f2a795;
 }
 
 .run-reason summary {
   cursor: pointer;
   user-select: none;
-  color: #8b93b0;
+  color: #7C7C82;
   padding: 2px 0;
 }
 
@@ -3683,7 +3749,7 @@ details.tl-tool.tl-res > summary {
 .run-reason-len {
   margin-left: 4px;
   font-size: 10.5px;
-  color: #6f778f;
+  color: #4E4E54;
 }
 
 /* 思考块正文容器。
@@ -3697,9 +3763,9 @@ details.tl-tool.tl-res > summary {
   overflow-wrap: anywhere;
   font-size: 11px;
   line-height: 1.6;
-  color: #8b93b0;
+  color: #7C7C82;
   background: rgba(0, 0, 0, 0.22);
-  border-left: 2px solid rgba(120, 137, 255, 0.4);
+  border-left: 2px solid rgba(168, 230, 207, 0.4);
   border-radius: 6px;
   padding: 7px 9px;
   margin: 4px 0 0;
@@ -3741,10 +3807,10 @@ details.tl-tool.tl-res > summary {
   line-height: 1.55;
   padding: 8px 11px;
   border-radius: 9px;
-  background: #1e2231;
-  border: 1px solid rgba(255, 255, 255, 0.13);
-  border-left: 3px solid rgba(150, 160, 190, 0.6);
-  color: #dfe3f0;
+  background: #1F1F23;
+  border: 1px solid rgba(168, 230, 207, 0.13);
+  border-left: 3px solid rgba(160, 200, 185, 0.6);
+  color: #DEDEE2;
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45);
   overflow-wrap: anywhere;
   max-height: 140px;
@@ -3760,36 +3826,36 @@ details.tl-tool.tl-res > summary {
 }
 
 .toast-ok {
-  border-left-color: rgba(80, 200, 130, 0.85);
+  border-left-color: rgba(168, 230, 207, 0.85);
 }
 
 .toast-error {
-  border-left-color: rgba(255, 92, 92, 0.9);
-  color: #ffc9c9;
+  border-left-color: rgba(247, 194, 180, 0.9);
+  color: #fadcd6;
 }
 
 /* 模型行里的测试结果（就地显示，不重绘整页） */
 .set-test-msg {
   margin-top: 6px;
   padding-top: 6px;
-  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+  border-top: 1px dashed rgba(168, 230, 207, 0.1);
   font-size: 10.5px;
   line-height: 1.6;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
-  color: #9aa5c5;
+  color: #85858B;
 }
 
 .set-test-msg.run {
-  color: #9aa5c5;
+  color: #85858B;
 }
 
 .set-test-msg.ok {
-  color: #9ee6bb;
+  color: #a8e6cf;
 }
 
 .set-test-msg.bad {
-  color: #ff9a9a;
+  color: #f9bdb0;
 }
 
 .set-btn:disabled {
@@ -3803,10 +3869,10 @@ details.tl-tool.tl-res > summary {
    ⑂ 只出现在 assistant 消息（完整轮次边界）；user 消息只有 [删除][复制]。 */
 
 .msg-del {
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(168, 230, 207, 0.14);
   border-radius: 5px;
-  background: rgba(255, 255, 255, 0.06);
-  color: #aab4dd;
+  background: rgba(168, 230, 207, 0.06);
+  color: #9C9CA2;
   font-size: 10.5px;
   line-height: 1;
   padding: 3px 7px;
@@ -3818,9 +3884,9 @@ details.tl-tool.tl-res > summary {
 }
 
 .msg-del:hover {
-  background: rgba(220, 70, 70, 0.3);
-  border-color: rgba(220, 70, 70, 0.5);
-  color: #ffd6d6;
+  background: rgba(245, 184, 168, 0.3);
+  border-color: rgba(245, 184, 168, 0.5);
+  color: #fae2dd;
 }
 
 .msg:hover .msg-del {
@@ -3833,10 +3899,10 @@ details.tl-tool.tl-res > summary {
    位置：AI 消息上排成 [tok][⑂][↻][删除][复制]，复制保持在最右。 */
 
 .msg-regen {
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(168, 230, 207, 0.14);
   border-radius: 5px;
-  background: rgba(255, 255, 255, 0.06);
-  color: #aab4dd;
+  background: rgba(168, 230, 207, 0.06);
+  color: #9C9CA2;
   font-size: 11px;
   line-height: 1;
   padding: 3px 7px;
@@ -3848,9 +3914,9 @@ details.tl-tool.tl-res > summary {
 }
 
 .msg-regen:hover {
-  background: rgba(90, 140, 220, 0.32);
-  border-color: rgba(90, 140, 220, 0.55);
-  color: #d6e6ff;
+  background: rgba(228, 152, 48, 0.32);
+  border-color: rgba(228, 152, 48, 0.55);
+  color: #ececf0;
 }
 
 .msg:hover .msg-regen {
@@ -3869,7 +3935,7 @@ details.tl-tool.tl-res > summary {
   align-items: center;
   justify-content: center;
   padding: 18px;
-  background: rgba(10, 12, 20, 0.72);
+  background: rgba(12, 10, 9, 0.72);
   /* fixed 会逃出 .panel 的 overflow:hidden，圆角得自己补，否则遮罩会露出方角 */
   border-radius: 14px;
 }
@@ -3879,22 +3945,22 @@ details.tl-tool.tl-res > summary {
   max-width: 340px;
   padding: 13px 14px;
   border-radius: 12px;
-  background: #1e2231; /* 必须不透明：窗口 transparent，留 alpha 会透出桌面 */
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #1F1F23; /* 必须不透明：窗口 transparent，留 alpha 会透出桌面 */
+  border: 1px solid rgba(168, 230, 207, 0.14);
   box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55);
 }
 
 .confirm-title {
   font-size: 12.5px;
   font-weight: 600;
-  color: #e8eaf2;
+  color: #F2F2F4;
   margin-bottom: 7px;
 }
 
 .confirm-body {
   font-size: 11.5px;
   line-height: 1.6;
-  color: #a7aecb;
+  color: #9A9AA0;
   overflow-wrap: anywhere;
   white-space: pre-wrap; /* askConfirm 的说明文本里带 \n，别被折成一行 */
   max-height: 180px;
@@ -3909,13 +3975,13 @@ details.tl-tool.tl-res > summary {
 }
 
 .set-btn.danger {
-  background: rgba(220, 70, 70, 0.85);
-  border-color: rgba(220, 70, 70, 0.9);
-  color: #fff;
+  background: rgba(245, 184, 168, 0.85);
+  border-color: rgba(245, 184, 168, 0.9);
+  color: #a8e6cf;
 }
 
 .set-btn.danger:hover {
-  background: rgba(235, 90, 90, 0.95);
+  background: rgba(247, 194, 180, 0.95);
 }
 
 /* ---------------------------------------------------------------------------
@@ -3931,9 +3997,9 @@ details.tl-tool.tl-res > summary {
 .usage-card {
   flex: 1;
   padding: 10px 8px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(168, 230, 207, 0.06);
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.04);
+  background: rgba(168, 230, 207, 0.04);
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -3942,14 +4008,14 @@ details.tl-tool.tl-res > summary {
 
 .usage-card b {
   font-size: 17px;
-  color: #e8eaf2;
+  color: #F2F2F4;
   font-variant-numeric: tabular-nums;
 }
 
 .usage-card i {
   font-style: normal;
   font-size: 11px;
-  color: #8b93b0;
+  color: #7C7C82;
 }
 
 .usage-list {
@@ -3961,7 +4027,7 @@ details.tl-tool.tl-res > summary {
 .usage-day {
   padding: 9px 10px 6px;
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(168, 230, 207, 0.03);
 }
 
 .usage-day-head {
@@ -3973,13 +4039,13 @@ details.tl-tool.tl-res > summary {
 
 .usage-date {
   font-size: 12.5px;
-  color: #dfe3f0;
+  color: #DEDEE2;
   font-variant-numeric: tabular-nums;
 }
 
 .usage-total {
   font-size: 12px;
-  color: #9aa3c0;
+  color: #8E8E94;
   font-variant-numeric: tabular-nums;
   cursor: help;
 }
@@ -3988,7 +4054,7 @@ details.tl-tool.tl-res > summary {
   height: 6px;
   margin-bottom: 7px;
   border-radius: 3px;
-  background: rgba(255, 255, 255, 0.07);
+  background: rgba(168, 230, 207, 0.07);
   overflow: hidden;
 }
 
@@ -3996,7 +4062,7 @@ details.tl-tool.tl-res > summary {
   display: block;
   height: 100%;
   border-radius: 3px;
-  background: linear-gradient(90deg, #5b8cff, #7aa2ff);
+  background: linear-gradient(90deg, #a8e6cf, #d6dcd4);
 }
 
 .usage-model {
@@ -4004,7 +4070,7 @@ details.tl-tool.tl-res > summary {
   justify-content: space-between;
   padding: 2px 0 2px 2px;
   font-size: 11.5px;
-  color: #9aa3c0;
+  color: #8E8E94;
 }
 
 .usage-model span {
@@ -4019,7 +4085,7 @@ details.tl-tool.tl-res > summary {
 .usage-model b {
   flex-shrink: 0;
   margin-left: 8px;
-  color: #cdd2e6;
+  color: #B4B4BA;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
@@ -4032,8 +4098,8 @@ details.tl-tool.tl-res > summary {
   margin: -4px 0 12px;
   padding: 8px 10px;
   border-radius: 10px;
-  border: 1px solid rgba(91, 140, 255, 0.28);
-  background: rgba(91, 140, 255, 0.09);
+  border: 1px solid rgba(168, 230, 207, 0.28);
+  background: rgba(168, 230, 207, 0.09);
 }
 
 .usage-cache--warn {
@@ -4047,18 +4113,18 @@ details.tl-tool.tl-res > summary {
   align-items: baseline;
   gap: 8px;
   font-size: 12px;
-  color: #c7cee6;
+  color: #AFAFB5;
 }
 
 .usage-cache-head b {
-  color: #e8eaf2;
+  color: #F2F2F4;
   font-variant-numeric: tabular-nums;
 }
 
 .usage-cache-miss {
   flex-shrink: 0;
   font-size: 11px;
-  color: #9aa3c0;
+  color: #8E8E94;
   font-variant-numeric: tabular-nums;
   cursor: help;
 }
@@ -4067,18 +4133,18 @@ details.tl-tool.tl-res > summary {
   margin-top: 3px;
   font-size: 10.5px;
   line-height: 1.45;
-  color: #8b93b0;
+  color: #7C7C82;
 }
 
 .usage-cache-day {
   margin-left: 8px;
   font-size: 10.5px;
-  color: #8b93b0;
+  color: #7C7C82;
   cursor: help;
 }
 
 .usage-cache-day.is-warn {
-  color: #f0b34a;
+  color: #f3dd96;
 }
 
 .usage-cache-badge {
@@ -4089,13 +4155,13 @@ details.tl-tool.tl-res > summary {
   font-style: normal;
   font-size: 10px;
   line-height: 15px;
-  color: #8fb0ff;
-  background: rgba(91, 140, 255, 0.14);
+  color: #d6dcd4;
+  background: rgba(168, 230, 207, 0.14);
   cursor: help;
 }
 
 .usage-cache-badge.is-warn {
-  color: #f0b34a;
+  color: #f3dd96;
   background: rgba(245, 165, 36, 0.16);
 }
 
@@ -4112,7 +4178,7 @@ details.tl-tool.tl-res > summary {
 /* models.html 的 body：普通实底窗口（transparent:false），覆盖
    html/body 的悬浮球透明底 —— 不覆盖会闪出透明窗口。 */
 body.models-page {
-  background: #151722;
+  background: #0E0E10;
   overflow: hidden;
   height: 100%;
 }
@@ -4128,8 +4194,8 @@ body.models-page {
   height: 100%;
   display: flex;
   flex-direction: column;
-  background: #171926;
-  border: 1px solid rgba(120, 137, 255, 0.35);
+  background: #0F0F11;
+  border: 1px solid rgba(168, 230, 207, 0.35);
   border-radius: 10px;
   overflow: hidden;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
@@ -4142,8 +4208,8 @@ body.models-page {
   gap: 10px;
   height: 42px;
   padding: 0 8px 0 14px;
-  background: linear-gradient(180deg, rgba(120, 137, 255, 0.16), rgba(120, 137, 255, 0.05));
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: linear-gradient(180deg, rgba(168, 230, 207, 0.16), rgba(168, 230, 207, 0.05));
+  border-bottom: 1px solid rgba(168, 230, 207, 0.08);
   cursor: default;
   user-select: none; /* 整窗可拖，见 models.ts bindWindowDrag() */
 }
@@ -4151,7 +4217,7 @@ body.models-page {
 .mw-title {
   font-size: 13.5px;
   font-weight: 700;
-  color: #eef1fa;
+  color: #F2F2F4;
   flex-shrink: 0;
 }
 
@@ -4159,7 +4225,7 @@ body.models-page {
   flex: 1;
   min-width: 0;
   font-size: 11px;
-  color: #9aa4c8;
+  color: #85858B;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4173,15 +4239,15 @@ body.models-page {
   border: none;
   border-radius: 7px;
   background: transparent;
-  color: #aab3d4;
+  color: #9C9CA2;
   font-size: 13px;
   cursor: pointer;
   line-height: 1;
 }
 
 .mw-close:hover {
-  background: rgba(255, 255, 255, 0.12);
-  color: #fff;
+  background: rgba(168, 230, 207, 0.12);
+  color: #a8e6cf;
 }
 
 .mw-body {
@@ -4214,23 +4280,23 @@ body.models-page {
   border-radius: 8px;
   font-size: 12.5px;
   line-height: 1.5;
-  background: #262a3d;
-  border: 1px solid rgba(120, 137, 255, 0.4);
-  color: #e8eaf2;
+  background: #26262B;
+  border: 1px solid rgba(168, 230, 207, 0.4);
+  color: #F2F2F4;
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
   animation: mw-toast-in 160ms ease;
 }
 
 .mw-toast.ok {
-  border-color: rgba(94, 200, 136, 0.55);
+  border-color: rgba(168, 230, 207, 0.55);
 }
 
 .mw-toast.error {
-  border-color: rgba(230, 108, 108, 0.6);
+  border-color: rgba(245, 196, 180, 0.6);
 }
 
 .mw-toast.info {
-  border-color: rgba(120, 137, 255, 0.5);
+  border-color: rgba(168, 230, 207, 0.5);
 }
 
 @keyframes mw-toast-in {
@@ -4263,8 +4329,8 @@ body.models-page {
   z-index: 4000; /* 与既有 overlay 惯例对齐 */
   max-height: 300px;
   overflow-y: auto;
-  background: #1e2233;
-  border: 1px solid rgba(120, 137, 255, 0.4);
+  background: #1F1F23;
+  border: 1px solid rgba(168, 230, 207, 0.4);
   border-radius: 9px;
   padding: 4px;
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
@@ -4277,7 +4343,7 @@ body.models-page {
   width: 100%;
   border: none;
   background: transparent;
-  color: #dfe3f0;
+  color: #DEDEE2;
   font-size: 12.5px;
   padding: 6px 9px;
   border-radius: 6px;
@@ -4286,11 +4352,11 @@ body.models-page {
 }
 
 .mc-mi:hover {
-  background: rgba(120, 137, 255, 0.18);
+  background: rgba(168, 230, 207, 0.18);
 }
 
 .mc-mi.cur {
-  background: rgba(120, 137, 255, 0.26);
+  background: rgba(168, 230, 207, 0.26);
 }
 
 /* 两行文本列：组别在上（小、淡），模型名在下（亮） */
@@ -4305,7 +4371,7 @@ body.models-page {
 
 .mc-mi-group {
   font-size: 9.5px;
-  color: #8f98ba;
+  color: #707076;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4315,7 +4381,7 @@ body.models-page {
   min-width: 0;
   font-size: 12.5px;
   font-weight: 600;
-  color: #eef1fa;
+  color: #F2F2F4;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4323,14 +4389,14 @@ body.models-page {
 
 .mc-mi-check {
   flex-shrink: 0;
-  color: #8fa4ff;
+  color: #d6dcd4;
   font-size: 12px;
 }
 
 .mc-mi-empty {
   padding: 10px 9px;
   font-size: 12px;
-  color: #8b93b0;
+  color: #7C7C82;
   text-align: center;
 }
 
@@ -4338,12 +4404,12 @@ body.models-page {
 .mc-menu-sep {
   height: 1px;
   margin: 4px 6px;
-  background: rgba(140, 150, 180, 0.28);
+  background: rgba(168, 230, 207, 0.28);
 }
 
 .mc-mi-add .mc-mi-name {
   font-weight: 500;
-  color: #9fb0ff;
+  color: #dce2da;
 }
 
 /* ---------------- 备份与回收站（2026-09-30） ----------------
@@ -4362,7 +4428,7 @@ body.models-page {
   gap: 8px;
   padding: 6px 8px;
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.035);
+  background: rgba(168, 230, 207, 0.035);
 }
 
 .rec-row--gone {
@@ -4379,7 +4445,7 @@ body.models-page {
 
 .rec-name {
   font-size: 11.5px;
-  color: #dfe3f0;
+  color: #DEDEE2;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4388,20 +4454,20 @@ body.models-page {
 .rec-main i {
   font-style: normal;
   font-size: 10px;
-  color: #8b93b0;
+  color: #7C7C82;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .rec-unknown {
-  color: #f0b34a !important;
+  color: #f3dd96 !important;
 }
 
 .rec-meta {
   flex-shrink: 0;
   font-size: 10px;
-  color: #7d85a3;
+  color: #6C6C72;
   font-variant-numeric: tabular-nums;
 }
 
@@ -4419,7 +4485,7 @@ body.models-page {
   flex-wrap: wrap;
   margin-top: 6px;
   font-size: 11.5px;
-  color: #9aa3c0;
+  color: #8E8E94;
 }
 
 .rec-prune label {
@@ -4432,19 +4498,19 @@ body.models-page {
   width: 68px;
   padding: 3px 6px;
   border-radius: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(168, 230, 207, 0.12);
   background: rgba(0, 0, 0, 0.25);
-  color: #e8eaf2;
+  color: #F2F2F4;
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
 }
 
 .rec-ok {
-  color: #5fd39a;
+  color: #8ed9bb;
 }
 
 .rec-err {
-  color: #ff8a8a;
+  color: #f7b0a4;
 }
 
 /* ---------------- 消息「编辑」按钮（2026-10-03） ----------------
@@ -4452,10 +4518,10 @@ body.models-page {
    不是纯破坏）。只出现在最后一条已落盘的用户消息上。 */
 
 .msg-edit {
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(168, 230, 207, 0.14);
   border-radius: 5px;
-  background: rgba(255, 255, 255, 0.06);
-  color: #aab4dd;
+  background: rgba(168, 230, 207, 0.06);
+  color: #9C9CA2;
   font-size: 10.5px;
   line-height: 1;
   padding: 3px 7px;
@@ -4467,11 +4533,802 @@ body.models-page {
 }
 
 .msg-edit:hover {
-  background: rgba(80, 180, 120, 0.3);
-  border-color: rgba(80, 180, 120, 0.5);
-  color: #d6ffe6;
+  background: rgba(168, 230, 207, 0.3);
+  border-color: rgba(168, 230, 207, 0.5);
+  color: #d8f5e9;
 }
 
 .msg:hover .msg-edit {
   opacity: 1;
+}
+
+/* ============================================================
+   2026-10-09 视觉改版 —— 覆盖层
+   ------------------------------------------------------------
+   写在文件末尾是为了不改动前面 4400 行里任何一条选择器名。
+   所有被vitest 断言的 class / id 都保持原样，只改它们长什么样。
+
+   ⚠️ .panel 必须仍然完全不透明、不能加 backdrop-filter
+      （WebView2 透明窗口下 backdrop-filter 不生效）。
+   ============================================================ */
+
+/* ---- 签名元素：球沿 ----------------------------------------
+   面板顶部 2px 的琥珀渐变 —— 球体边缘反光落在面板上的投影。
+   整个改版里唯一的装饰性元素，其余地方一律不加投影/渐变。 */
+.panel::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 2px;
+  z-index: 30;
+  pointer-events: none;
+  background: linear-gradient(90deg, var(--accent-1), rgba(168, 230, 207, 0) 62%);
+  opacity: 0.55;
+}
+
+/* ---- 标题条：合并后的唯一 chrome ---------------------------- */
+.panel-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  min-height: 42px;
+  flex-shrink: 0;
+  cursor: move;
+  background: rgba(0, 0, 0, 0.18);
+  border-bottom: 1px solid var(--glass-line);
+}
+
+/* 项目 select：宽度吃满剩余空间的左侧，但不超过 150px，
+   免得把三个入口按钮和模型 chip 挤没 */
+.panel-header #project-select {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 150px;
+  height: 26px;
+  padding: 0 6px;
+  border-radius: var(--r-sm);
+  border: 1px solid rgba(168, 230, 207, 0.1);
+  background: rgba(168, 230, 207, 0.05);
+  color: var(--cream-1);
+  font-family: inherit;
+  font-size: var(--fs-3);
+  cursor: pointer;
+  outline: none;
+}
+.panel-header #project-select:hover {
+  border-color: rgba(168, 230, 207, 0.4);
+  background: rgba(168, 230, 207, 0.08);
+}
+
+.ph-flex {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* 标题条里的三颗入口按钮：26px 方，比原来 30px 省下 12px 给输入框以外的余量 */
+.panel-header .mini-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: var(--r-sm);
+  border-color: rgba(168, 230, 207, 0.1);
+  background: rgba(168, 230, 207, 0.05);
+  color: var(--cream-2);
+  font-size: var(--fs-2);
+}
+.panel-header .mini-btn:hover {
+  background: var(--accent-wash-2);
+  border-color: rgba(168, 230, 207, 0.45);
+  color: var(--accent-1);
+}
+
+/* 模型 chip 在标题条里不再抢剩余空间（原来是 flex:1 1 auto，会吃掉一整行宽度） */
+.panel-header .model-chip {
+  flex: 0 1 auto;
+  max-width: 138px;
+  padding: 2px 20px 2px 8px;
+  border-radius: var(--r-sm);
+  border: 1px solid rgba(168, 230, 207, 0.3);
+  background: rgba(168, 230, 207, 0.07);
+}
+.panel-header .model-chip .mc-name {
+  font-size: var(--fs-2);
+}
+.panel-header .panel-btn {
+  width: 24px;
+  height: 24px;
+  border-radius: var(--r-sm);
+  color: var(--cream-2);
+}
+
+/* ---- 第二行：fg-ctx / sub-bar / bg-run 三选一 --------------
+   从「三条各占一行的带」变成「一个行内容器」。
+   三个子元素各自 getElementById 单独切 display，
+   全隐藏时本容器高度为 0 —— 正文立刻顶上来。 */
+.panel-sub {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 0;
+  min-height: 0;
+  border-bottom: 1px solid rgba(168, 230, 207, 0.06);
+  background: rgba(0, 0, 0, 0.12);
+}
+/* 容器里一个都没显示时，连那条分隔线一起收掉，不留 1px 空带 */
+.panel-sub:empty {
+  display: none;
+}
+
+.panel-sub .fg-ctx {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-height: 72px;
+  padding: 5px 10px;
+  background: transparent;
+  border-bottom: none;
+  font-size: var(--fs-1);
+}
+.panel-sub .sub-bar {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 5px 10px;
+  background: transparent;
+  border-bottom: none;
+}
+.panel-sub .bg-run {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 46%;
+  padding: 5px 10px;
+  border-bottom: none;
+  border-left: 1px solid rgba(168, 230, 207, 0.28);
+  border-radius: 0;
+  font-size: var(--fs-1);
+}
+
+/* ---- 面板本体 ------------------------------------------------ */
+.panel {
+  background: var(--ink-900);
+  color: var(--cream-1);
+  border: 1px solid var(--glass-line);
+  box-shadow:
+    0 14px 44px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 var(--glass-hi);
+}
+
+/* ---- 输入行：整行让宽 --------------------------------------
+   🎛 留在输入行（flow.behavior.test.ts:68 断言了它在），
+   宽度从别处省：按钮收窄 + 间距收紧 + 输入框底色提亮一档。 */
+.panel-input {
+  gap: 6px;
+  padding: 10px;
+  border-top: 1px solid var(--glass-line);
+  background: rgba(0, 0, 0, 0.2);
+}
+.panel-input .behavior-btn {
+  width: 28px;
+  height: 34px;
+  border-radius: var(--r-sm);
+}
+.panel-input textarea {
+  background: rgba(168, 230, 207, 0.05);
+  border: 1px solid rgba(168, 230, 207, 0.1);
+  border-radius: var(--r-sm);
+  color: var(--cream-1);
+  font-size: var(--fs-3);
+  line-height: 1.55;
+}
+.panel-input textarea:focus {
+  border-color: rgba(168, 230, 207, 0.5);
+  background: rgba(168, 230, 207, 0.07);
+}
+#btn-send {
+  width: 38px;
+  height: 34px;
+  border-radius: var(--r-sm);
+  background: linear-gradient(180deg, var(--accent-1), var(--accent-2));
+  color: #141a1b;
+  font-weight: 700;
+}
+
+/* ---- 正文区 -------------------------------------------------- */
+.panel-body {
+  padding: 12px;
+  font-size: var(--fs-3);
+  line-height: 1.66;
+}
+
+/* ---- 焦点环：以前全靠浏览器默认，在深底上几乎看不见 ------ */
+:where(button, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent-1);
+  outline-offset: 2px;
+  border-radius: var(--r-xs);
+}
+
+/* ---- 降低动态效果 ------------------------------------------
+   13 个 keyframes 里orb-breathe / badge-pulse 是常驻的，
+   前庭敏感用户需要一个明确的退出通道。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* ---- 消息气泡：一条"谁在说话"的规则胜过一块底色 ----------------
+   原来助手气泡是整块 rgba(168, 230, 207,0.07) 填充，而 .msg-body 把
+   过程时间线也包在里面 —— 结果是一大块灰底把正文压住。
+   改成编辑式：助手用左侧细线 + 无填充，正文直接落在面板底上。 */
+.msg.assistant .msg-body {
+  background: transparent;
+  border: none;
+  border-left: 2px solid rgba(168, 230, 207, 0.12);
+  border-radius: 0;
+  padding: 2px 0 2px 12px;
+  color: var(--cream-1);
+}
+
+/* 用户消息：面板里唯一的高饱和块，作为"这是我说的话"的锚点。
+   降一点饱和度，避免在长会话里连续几屏全是橙块。 */
+.msg.user .msg-body {
+  background: linear-gradient(180deg, #a8e6cf, #86c9b0);
+  color: #141a1b;
+  border: none;
+  border-radius: var(--r-md);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+  font-weight: 500;
+}
+.msg.error .msg-body,
+.msg.system .msg-body {
+  border-radius: var(--r-md);
+}
+
+/* ---- 权限卡：全面板唯一有实边的元素 ----------------------------
+   它要你拍板，不能和普通消息长得一样。琥珀顶边 + 更实的底，
+   在长对话流里一眼能捞出来。 */
+.perm-card {
+  position: relative;
+  border: 1px solid rgba(168, 230, 207, 0.42);
+  border-top: 2px solid var(--accent-1);
+  border-radius: var(--r-md);
+  background: rgba(168, 230, 207, 0.09);
+  padding: 10px 12px;
+  margin: 12px 0 4px;
+}
+.perm-title {
+  color: var(--accent-1);
+  font-weight: 600;
+}
+.perm-timer {
+  color: var(--cream-2);
+  font-variant-numeric: tabular-nums;
+}
+.perm-btn {
+  border-radius: var(--r-sm);
+  font-size: var(--fs-2);
+  padding: 5px 10px;
+}
+.perm-btn.ok {
+  background: var(--accent-1);
+  border-color: var(--accent-1);
+  color: #141a1b;
+  font-weight: 600;
+}
+.perm-hint {
+  color: var(--cream-3);
+  font-size: var(--fs-1);
+}
+
+/* ---- 过程折叠块 ------------------------------------------------ */
+.run-process {
+  border: 1px solid rgba(168, 230, 207, 0.08);
+  border-radius: var(--r-sm);
+  background: rgba(0, 0, 0, 0.18);
+  margin-top: 8px;
+}
+.run-process > summary {
+  color: var(--cream-2);
+  font-size: var(--fs-2);
+  padding: 6px 10px;
+  cursor: pointer;
+  list-style: none;
+}
+.run-process > summary::marker { content: ""; }
+.run-process > summary:hover { color: var(--accent-1); }
+.tl-text { color: var(--cream-2); }
+.tl-tool > summary { color: var(--cream-2); }
+.tl-tool > summary:hover { color: var(--accent-1); }
+
+/* ---- 设置入口：emoji 换成线性图标后，行高等和留白重新配 ------ */
+.set-entry {
+  border-radius: var(--r-md);
+  background: rgba(168, 230, 207, 0.04);
+  border: 1px solid rgba(168, 230, 207, 0.07);
+  margin-bottom: 8px;
+}
+.set-entry:hover {
+  background: var(--accent-wash);
+  border-color: rgba(168, 230, 207, 0.32);
+}
+.set-entry-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  color: var(--cream-2);
+}
+.set-entry-icon svg {
+  width: 17px;
+  height: 17px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.set-entry:hover .set-entry-icon { color: var(--accent-1); }
+.set-entry-text b { color: var(--cream-1); font-weight: 600; }
+.set-entry-text i { color: var(--cream-3); font-style: normal; }
+.set-entry-badge {
+  background: var(--accent-1);
+  color: #141a1b;
+  border-radius: var(--r-full);
+  font-weight: 700;
+}
+.mem-head {
+  color: var(--cream-3);
+  font-size: var(--fs-1);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin: 14px 0 8px;
+}
+
+/* ---- 消息操作键：悬停才现形 ------------------------------------
+   原来每条消息下面常驻「107k tok ↻ 删除 复制」四个元素，
+   其中「删除」是红字，视觉权重比正文还高，而它恰恰是低频且破坏性的操作。
+
+   现在：token 徽标常驻（那是这条消息的成本，有用），
+   操作键整组默认隐身，悬停/键盘聚焦时滑入。
+   按钮仍在 DOM 里（class/data-* 未变），只是看不见 —— 不是"被删了"。 */
+.msg-foot {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 22px;
+}
+.msg-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-4px);
+  transition:
+    opacity 130ms ease,
+    transform 130ms ease;
+}
+.msg-foot:hover .msg-more,
+.msg-foot:focus-within .msg-more {
+  opacity: 1;
+  pointer-events: auto;
+  transform: none;
+}
+/* 触屏/无悬停设备上没有 hover，藏起来就等于永远点不到 —— 直接常驻 */
+@media (hover: none) {
+  .msg-more {
+    opacity: 1;
+    pointer-events: auto;
+    transform: none;
+  }
+}
+.msg-foot .msg-del,
+.msg-foot .msg-copy,
+.msg-foot .msg-edit,
+.msg-foot .msg-regen,
+.msg-foot .msg-fork {
+  font-size: var(--fs-1);
+  color: var(--cream-3);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-xs);
+  padding: 2px 6px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.msg-foot .msg-del:hover,
+.msg-foot .msg-copy:hover,
+.msg-foot .msg-edit:hover,
+.msg-foot .msg-regen:hover,
+.msg-foot .msg-fork:hover {
+  color: var(--accent-1);
+  background: var(--accent-wash);
+}
+/* 破坏性操作：常态彻底不抢眼，悬停那颗才转红 */
+.msg-foot .msg-del:hover {
+  color: var(--danger);
+  background: rgba(245, 184, 168, 0.14);
+}
+
+/* ---- 设置入口的线性图标 -------------------------------------- */
+.set-entry-icon svg {
+  display: block;
+  width: 17px;
+  height: 17px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* ---- 令牌徽标 -------------------------------------------------- */
+.tok-badge,
+.msg-foot .tok {
+  font-size: var(--fs-1);
+  color: var(--cream-3);
+  font-variant-numeric: tabular-nums;
+  background: rgba(168, 230, 207, 0.05);
+  border: 1px solid rgba(168, 230, 207, 0.08);
+  border-radius: var(--r-full);
+  padding: 1px 8px;
+}
+
+/* ---- 超长时间线：按需往前取 ---------------------------------- */
+.tl-more {
+  display: block;
+  width: 100%;
+  margin: 0 0 6px;
+  padding: 4px 8px;
+  border: 1px dashed rgba(168, 230, 207, 0.4);
+  border-radius: var(--r-sm);
+  background: rgba(168, 230, 207, 0.07);
+  color: var(--accent-1);
+  font-family: inherit;
+  font-size: var(--fs-1);
+  cursor: pointer;
+}
+.tl-more:hover {
+  background: var(--accent-wash-2);
+  border-style: solid;
+}
+
+/* ---- 输入行那颗「行为」按钮：emoji → 线性图标 ------------------ */
+.panel-input .behavior-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--cream-3);
+}
+.panel-input .behavior-btn:hover {
+  color: var(--accent-1);
+}
+.panel-input .behavior-btn svg {
+  display: block;
+  width: 15px;
+  height: 15px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* ---- 折叠块的展开指示 ----------------------------------------
+   上一条规则用 list-style:none 去掉了 <summary> 的默认三角，
+   必须自己补一个 —— 不然「过程 · N 步」看不出能不能点。 */
+.run-process > summary,
+details.tl-tool > summary,
+details.run-reason > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  list-style: none;
+}
+.run-process > summary::before,
+details.tl-tool > summary::before,
+details.run-reason > summary::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0;
+  height: 0;
+  border-left: 4px solid currentColor;
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  opacity: 0.65;
+  transition: transform 140ms ease;
+}
+details[open] > summary::before {
+  transform: rotate(90deg);
+}
+details.tl-tool > summary,
+details.run-reason > summary {
+  padding: 5px 8px;
+  border-radius: var(--r-xs);
+  cursor: pointer;
+}
+details.tl-tool > summary:hover,
+details.run-reason > summary:hover {
+  background: rgba(168, 230, 207, 0.05);
+  color: var(--accent-1);
+}
+details[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+/* ============================================================
+   2026-10-09 第二轮：把琥珀从"大面积"收回"点睛"
+   ------------------------------------------------------------
+   上一版把用户气泡整个刷成饱和琥珀，460px 的面板里那��块橙色直接压过
+   了所有内容 —— 主色用在了不该用的面积上。
+   现在：琥珀只出现在**小面积、高信息量**的位置（发送键、焦点环、
+   权限卡顶边、超时提示）。用户气泡退回中性面，靠对齐方向和一点暖灰
+   底与助手区分，不再靠颜色区分。
+   ============================================================ */
+
+/* ============================================================
+   2026-10-09 第三轮：琥珀 → 纯白
+   ------------------------------------------------------------
+   前两轮试过两档琥珀（#a8e6cf 饱和橙 → #a8e6cf 暖沙），都被否掉了。
+   换成纯白之后反而更对：猫本身是奶油白，球壳上那道高光也是白的 ——
+   面板和球从此是同一套语言，而不是"面板配了个不像它的强调色"。
+
+   原则不变：**强调色只出现在小面积、高信息量的位置。**
+   用户气泡退回中性面，与助手的区分交给排版（右对齐 vs 左侧细线）。
+
+   语义色不在此列 —— 绿=成功 / 红=危险 / 警告琥珀是"这里有问题"的信号，
+   那是信息，不是装饰。
+   ============================================================ */
+
+/* 用户消息：中性面。不再用颜色当区分手段。 */
+.msg.user .msg-body {
+  background: var(--ink-700);
+  border: 1px solid rgba(168, 230, 207, 0.09);
+  color: var(--cream-1);
+  box-shadow: none;
+  font-weight: 400;
+  max-width: 88%;
+}
+
+/* 助手消息：左细线 + 无底 —— 与用户形成"排版"上的区分，不靠色块 */
+.msg.assistant .msg-body {
+  border-left-color: rgba(168, 230, 207, 0.16);
+}
+
+/* 强调统一到白色令牌 */
+.panel::before { opacity: 0.5; }
+.panel-header .mini-btn:hover {
+  background: var(--accent-wash-2);
+  border-color: rgba(168, 230, 207, 0.4);
+  color: var(--accent-1);
+}
+.panel-header .model-chip {
+  background: rgba(168, 230, 207, 0.06);
+  border-color: rgba(168, 230, 207, 0.26);
+}
+#btn-send {
+  background: linear-gradient(180deg, #a8e6cf, #8fd3b8);
+  color: #141a1b;
+}
+.run-process > summary:hover,
+.tl-tool > summary:hover,
+details.tl-tool > summary:hover,
+details.run-reason > summary:hover { color: var(--accent-1); }
+.perm-card {
+  background: rgba(168, 230, 207, 0.07);
+  border-color: rgba(168, 230, 207, 0.32);
+  border-top-color: var(--accent-1);
+}
+.perm-title { color: var(--accent-1); }
+.perm-btn.ok { background: var(--accent-1); color: #141a1b; }
+.tl-more {
+  border-color: rgba(168, 230, 207, 0.32);
+  background: rgba(168, 230, 207, 0.06);
+  color: var(--accent-1);
+}
+.set-entry:hover {
+  background: var(--accent-wash);
+  border-color: rgba(168, 230, 207, 0.26);
+}
+.set-entry:hover .set-entry-icon { color: var(--accent-1); }
+.set-entry-badge { background: var(--accent-1); color: #141a1b; }
+.panel-sub .bg-run {
+  border-left-color: rgba(168, 230, 207, 0.24);
+  background: rgba(168, 230, 207, 0.09);
+}
+.msg-foot .msg-del:hover { background: rgba(245, 184, 168, 0.14); }
+
+/* ============================================================
+   2026-10-09 第四轮：把时间线的块间距压紧
+   ------------------------------------------------------------
+   用户原话："这个框之间间距大"。
+   原来一步 12px 的文字上下能空出 ~60px，展开「过程」后整块被撑得很高，
+   真正有用的信息被空白稀释。
+
+   这一层**只在末尾强制覆盖**，不改前面任何选择器名。
+   用 !important 是因为要压过 `.tl-text` / `.md p` 等多条既有规则，
+   它们的优先级和本层相同，只能靠书写顺序 + important 决胜。
+   ============================================================ */
+
+/* 步骤之间：只留 2px，一行贴一行 */
+.run-timeline > *,
+.run-timeline .tl-line,
+.run-timeline .tl-text,
+.run-timeline details.tl-tool,
+.run-timeline details.run-reason {
+  margin-top: 0 !important;
+  margin-bottom: 2px !important;
+}
+
+/* 「过程」外壳：内边距收到最小 */
+.run-process {
+  padding: 0 !important;
+  margin-top: 6px !important;
+}
+.run-process > summary {
+  padding: 5px 8px !important;
+  line-height: 1.4 !important;
+}
+.run-timeline {
+  margin: 0 !important;
+  padding: 0 8px 4px !important;
+  line-height: 1.5 !important;
+  font-size: 11.5px !important;
+}
+
+/* 文字步骤：内边距砍半 */
+.tl-text {
+  padding: 4px 7px !important;
+  line-height: 1.5 !important;
+}
+/* 文字步骤里的 markdown 段落也吃紧 —— .md 的 6px 外边距是空白的主因之一 */
+.tl-text.md p {
+  margin: 2px 0 !important;
+}
+.tl-text.md > *:first-child { margin-top: 0 !important; }
+.tl-text.md > *:last-child { margin-bottom: 0 !important; }
+
+/* 工具折叠行：收起时就是一行，不该再撑出空白 */
+details.tl-tool > summary,
+details.run-reason > summary {
+  padding: 3px 7px !important;
+  line-height: 1.45 !important;
+  margin: 0 !important;
+}
+details.tl-tool,
+details.run-reason {
+  margin: 0 0 2px !important;
+  padding: 0 !important;
+}
+
+/* ============================================================
+   2026-10-09 第五轮：三个实机 bug
+   ============================================================ */
+
+/* ---- ① 卡死：流式期间给思考块限高（第二道防线） ----------------
+   第一道防线在 main.ts::patchTimeline（折叠时不读 scrollHeight，
+   不触发强制排版）。这一道是样式层的兜底：
+
+   `.run-reason pre` 在 2026-09-26 被去掉了限高
+   （styles.css:3776 `max-height: none`），因为用户报过
+   「展开内容比标注字数少」—— 200px 太小，只能看到一截。
+
+   两个需求是对立的，用**只在流式期间限高**来同时满足：
+     · 跑的过程中：限高 360px + 内部滚动 —— 内容**一点没少**，
+       照样能滚到底看完，只是文档不会无限长高。
+     · 跑完之后：`.msg.running` 消失，这条规则自动失效，
+       限高解除，正文按内容自然完整展开 —— 就是用户要的那个行为。
+
+   关键是这个 `!important` 只在 `.msg.running` 作用域内生效，
+   不会影响历史消息里展开的思考块。 */
+.msg.running .run-reason pre {
+  max-height: 360px !important;
+  overflow-y: auto !important;
+}
+
+/* ---- ② 下拉项看不见：option 不会继承 select 的色 -------------
+   项目/模型这些原生 <select> 的下拉浮层由浏览器绘制，
+   **底色走系统浅色**，而文字色继承了我给 select 设的
+   --cream-1（接近白）→ 浅底白字，基本看不见。
+   必须给 option 显式指定深底 + 浅字。 */
+select option,
+datalist option {
+  background-color: var(--ink-700);
+  color: var(--cream-1);
+}
+select option:checked {
+  background-color: var(--ink-600);
+  color: #a8e6cf;
+}
+/* 选中项在 Windows 上会拿到系统高亮色，强制覆盖掉 */
+select option:checked,
+select option:hover {
+  background-color: var(--ink-600);
+  color: #a8e6cf;
+}
+
+/* ---- ③ 模型窗口那个白浮层：关掉浏览器自动填充 ---------------
+   「保存的信息」那块白底浮层**不在代码里**，是 WebView2 自己的
+   自动填充下拉（它记着用户以前填过的 URL）。那是浏览器 UI，
+   CSS 管不了，只能不让它弹 —— autocomplete="off"（见 models.ts）。
+   这里只兜住万一还有别的原生浮层。 */
+input::-webkit-calendar-picker-indicator {
+  filter: invert(1);
+  opacity: 0.5;
+}
+
+/* ============================================================
+   2026-10-09 第七轮：把薄荷绿还回面板
+   ------------------------------------------------------------
+   用户看到真机截图后的原话："你这个根本没有绿色"。
+
+   上一轮的判断没错（强调色不能压内容），但**收过头了**：
+   原则是"强调色只放小面积"，我把它落实成了"只放一个点"——
+   460×600 的面板里，真正的薄荷绿只剩右下角发送键。
+   整屏读下来是纯黑，薄荷这个色相等于白选。
+
+   这一轮**不改色相，只改面积**。铺开的四类位置全是低透明度染色
+   （≤ 0.17），不是实心色块 —— 上一轮被否掉的正是实心琥珀块，
+   「那��块橙色直接压过了所有内容」。染色和色块的区别在于：
+   底下的文字对比度不变，所以它读作"空气里有绿"，不是"这里被涂了"。
+
+     ① 用户气泡   —— 面板最大的一块面积，一眼能看见绿
+     ② 标题条     —— 顶到底一条淡渐层 + 底边细线
+     ③ 助手左细线 —— 0.16 → 0.30，与①成对，"左右"同时有颜色线索
+     ④ 时间线     —— 「过程」外壳染色 + 折叠三角着色
+
+   实心色块（发送键 / 权限卡顶边 / 焦点环）**保持不变** ——
+   那是"点一下"的位置。染色和实心混在一起会读不出层级：
+   到处都是绿的，就等于没有一处是绿的。
+   ============================================================ */
+
+/* ---- ① 用户气泡：中性面 → 淡薄荷染色 ------------------------
+   第 5089 行那版把气泡退回 `--ink-700` 中性面，靠右对齐区分。
+   现在保留右对齐（那是主要的区分手段），但把底换成薄荷染色 ——
+   右对齐管"谁在说"，底色管"这是我说的那一半"。 */
+.msg.user .msg-body {
+  background: linear-gradient(
+    180deg,
+    rgba(168, 230, 207, 0.17),
+    rgba(168, 230, 207, 0.10)
+  );
+  border: 1px solid rgba(168, 230, 207, 0.26);
+  color: var(--cream-1);
+}
+
+/* ---- ② 标题条：一条淡薄荷渐层 ------------------------------- */
+.panel-header {
+  background:
+    linear-gradient(
+      180deg,
+      rgba(168, 230, 207, 0.10),
+      rgba(168, 230, 207, 0) 92%
+    ),
+    rgba(0, 0, 0, 0.18);
+  border-bottom-color: rgba(168, 230, 207, 0.22);
+}
+
+/* 球沿：0.55 在真机深底上几乎读不出来，加到 0.85 */
+.panel::before { opacity: 0.85; }
+
+/* ---- ③ 助手左细线：与①成对 --------------------------------- */
+.msg.assistant .msg-body {
+  border-left-color: rgba(168, 230, 207, 0.3);
+}
+
+/* ---- ④ 时间线：「过程」外壳与折叠三角 ----------------------- */
+.run-process > summary {
+  color: var(--cream-2);
+  background: rgba(168, 230, 207, 0.06);
+}
+details.tl-tool > summary::before,
+details.run-reason > summary::before,
+.run-process > summary::before {
+  color: var(--accent-1);
 }

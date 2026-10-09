@@ -2620,6 +2620,12 @@ function hydrateBodyImages(root: ParentNode): void {
  * @param key  本条消息的稳定标识，拼进 `data-open-key` —— 没有它，两条消息里
  *             同序号的折叠块会共用 key，展开一个就把另一条里的也顶开（旧 bug）
  */
+/** 超过这个步数就只渲染尾部，前面的点「展开更早的 N 步」现取 */
+const TIMELINE_TAIL = 40;
+
+/** openKey → 那一轮完整的 AgentStep[]，供「展开更早的 N 步」回头取 */
+const timelineStore = new Map<string, AgentStep[]>();
+
 function renderTimeline(items: AgentStep[] | undefined, live: boolean, key = ""): string {
   if (!items || items.length === 0) return "";
 
@@ -2633,6 +2639,29 @@ function renderTimeline(items: AgentStep[] | undefined, live: boolean, key = "")
     return `<div class="steps-folded">${esc(calls[0].detail)}</div>`;
   }
 
+  // 超长轮次：只出尾部，前面的按需现取。
+  //
+  // 为什么值得做：`renderItem` 会把每一步的 detail 拼成 HTML 字符串，而
+  // `paintMessages` 在流式过程中会**反复**重绘 —— 221 步的长轮次等于
+  // 每帧把整轮（含最长的 38,689 字符那一步）重拼一遍。
+  // 折叠的 <details> 已经让浏览器跳过了布局和绘制，所以要省的是
+  // **拼字符串和建节点**，不是渲染。
+  //
+  // 为什么是阈值而不是虚拟滚动：阈值以下的轮次（绝大多数）走原路径，
+  // 一行代码不变，patch 逻辑也不用动；虚拟滚动要接管滚动容器高度，
+  // 会和 patchTimeline 的 data-n 增量追加打架，得不偿失。
+  if (!live && items.length > TIMELINE_TAIL) {
+    const head = items.length - TIMELINE_TAIL;
+    timelineStore.set(key, items);
+    return `<details class="run-process" data-open-key="proc-${esc(key)}">
+      <summary>过程 · ${items.length} 步</summary>
+      <div class="run-timeline tl-hist" data-open-key="${esc(key)}" data-head="${head}">
+        <button type="button" class="tl-more" title="再往前取 ${TIMELINE_TAIL} 步">展开更早的 ${head} 步</button>
+        ${items.slice(head).map((s, i) => renderItem(s, head + i, key)).join("")}
+      </div>
+    </details>`;
+  }
+
   const body = items.map((s, i) => renderItem(s, i, key)).join("");
   if (!body) return "";
   if (!live) {
@@ -2642,6 +2671,47 @@ function renderTimeline(items: AgentStep[] | undefined, live: boolean, key = "")
     </details>`;
   }
   return `<div class="run-timeline">${body}</div>`;
+}
+
+/**
+ * 「展开更早的 N 步」—— **prepend**，不整段重画。
+ *
+ * 整段重画会把 <details> 的展开状态、里面每个 details.tl-tool 的开合、
+ * 以及思考块的 markdown 懒渲染状态全部打回原形；
+ * prepend 只往前面插新节点，已有的那 40 步原封不动。
+ */
+function installTimelineMore(root: ParentNode = document): void {
+  root.addEventListener("click", (ev) => {
+    const btn = (ev.target as HTMLElement).closest<HTMLElement>(".tl-more");
+    if (!btn) return;
+    const tl = btn.closest<HTMLElement>(".tl-hist");
+    const openKey = tl?.dataset.openKey ?? "";
+    const items = timelineStore.get(openKey);
+    const cur = Number(tl?.dataset.head ?? "0");
+    if (!tl || !items || !Number.isFinite(cur) || cur <= 0) return;
+
+    const take = Math.min(TIMELINE_TAIL, cur);
+    const from = cur - take;
+    const html = items
+      .slice(from, cur)
+      .map((s, i) => renderItem(s, from + i, openKey))
+      .join("");
+
+    // ⚠️ 顺序要紧：必须**先插入再决定按钮去留**。
+    //    反过来写（先 remove 再 insertAdjacentHTML）时，按钮已经脱离文档，
+    //    "beforebegin" 在无父节点的情况下是空操作 —— 那 20 步会静默丢失。
+    tl.dataset.head = String(from);
+    btn.insertAdjacentHTML("beforebegin", html);
+    if (from > 0) {
+      btn.textContent = `展开更早的 ${from} 步`;
+    } else {
+      btn.remove();
+    }
+
+    // 新插入的思考块同样要登记原文并补绑 toggle，否则点开不渲染
+    reindexReasonRaw(tl, items);
+    tl.querySelectorAll<HTMLElement>("details.run-reason").forEach(bindReasonToggle);
+  });
 }
 
 /**
@@ -3145,7 +3215,22 @@ function patchTimeline(tl: HTMLElement, items: AgentStep[]): void {
       const len = node.querySelector<HTMLElement>(".run-reason-len");
       if (pre) {
         const rendered = pre.dataset.md === "1";
-        const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+        // ⚠️⚠️ 2026-10-09 **卡死修复**。
+        //
+        // 原来这里无条件读 `pre.scrollHeight` 来判断"是否贴底"，
+        // 而读 scrollHeight / clientHeight 会**强制浏览器排版这个 <pre>** ——
+        // 哪怕它此刻折叠着、内容根本看不见。
+        // 模型在思考里连续吐字时，这个 <pre> 越长，
+        // 每帧被强制排版的代价就越大 → 平方级增长 → 整个面板卡死。
+        // （用户实测：让模型在思考里输出 100 个 "100" 就卡住了。）
+        //
+        // 现在：折叠时**不读**任何布局属性（`details.open` 是纯属性查询，不触发布局），
+        // 只在真看得见的时候才判断贴底。
+        const det = pre.closest<HTMLDetailsElement>("details");
+        const visible = !det || det.open;
+        const atBottom = visible
+          ? pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24
+          : true;
         if (rendered) {
           const next = renderStreamingMd(last.detail);
           if (pre.innerHTML !== next) pre.innerHTML = next;
@@ -3155,7 +3240,10 @@ function patchTimeline(tl: HTMLElement, items: AgentStep[]): void {
           reasonRawText.set(pre, last.detail);
         }
         if (len) len.textContent = `（${last.detail.length} 字）`;
-        if (atBottom) pre.scrollTop = pre.scrollHeight;
+        // ⚠️ 自动跟随滚动**只在看得见时做**。
+        //    `pre.scrollTop = pre.scrollHeight` 右边那个读取同样会强制排版，
+        //    折叠时做它等于每帧排版一次看不见的长文本 —— 卡死的另一半来源。
+        if (visible && atBottom) pre.scrollTop = pre.scrollHeight;
       }
     } else if (!node || node.outerHTML !== renderItem(last, n - 1)) {
       // 非思考条目照理不会再变；真变了就整条换掉（含首次由空串变成有内容的情况）
@@ -3537,12 +3625,19 @@ function renderMessagesInner(): string {
             : ""
         }
         ${
+          // 操作键整组包在 .msg-more 里，**按钮本身一个不少**（class / data-* 全不变，
+          // 委托处理器因此零改动，flow.timeline.test.ts 对 .msg.assistant .msg-regen
+          // 的断言也照过）。显隐纯由 CSS 控制：悬停/聚焦才现形。
+          //
+          // 为什么不给它加一颗「⋯」按钮：项目里有过"只有 markup 没有 listener、
+          // 点了毫无反应"的前科（flow.behavior.test.ts:70 的注释），
+          // 宁可不加，也不摆一个假的。
           e.text || e.storedIdx !== undefined
-            ? `<div class="msg-foot">${tokBadge}${renderEditBtn(e, lastUserStored)}${renderForkBtn(e)}${renderRegenBtn(e)}${renderDelBtn(e)}${
+            ? `<div class="msg-foot">${tokBadge}<span class="msg-more">${renderEditBtn(e, lastUserStored)}${renderForkBtn(e)}${renderRegenBtn(e)}${renderDelBtn(e)}${
                 e.text
                   ? `<button type="button" class="msg-copy" data-idx="${idx}" title="复制这条消息">复制</button>`
                   : ""
-              }</div>`
+              }</span></div>`
             : ""
         }
         ${
@@ -4162,34 +4257,40 @@ function renderPanel(): void {
 
   app.innerHTML = `
     <div class="panel">
-      <div class="panel-header" id="panel-header">
-        <span class="panel-title">orbcat</span>
-        <button class="panel-btn" id="btn-gear" title="设置 / 模型">⚙</button>
-        <button class="panel-btn" id="btn-close" title="收起">—</button>
-      </div>
+      <!-- 标题条 = 面板里**唯一**一条 chrome（2026-10-09 合并）。
+           原来 header / toolbar / fg-ctx / sub-bar / bg-run 是五条各自独立的带，
+           最多同时出现四条 —— 在 600px 高的窗口里正文还没开始就被吃掉 ~130px。
+           现在：项目 select + 三个入口 + 模型 chip 全收进这一行；
+           fg-ctx / sub-bar / bg-run 移进第二行容器，三者各自独立显隐，
+           **全隐藏时容器高度为 0**，不给正文留任何空高度。
 
-      <!-- 工具栏 = 单行（2026-09-29 二次压缩）：项目 / 截 / ＋ / 史 + 右侧模型 chip。
-           模型原来独占上面一整行，现在压到这一行最右，工具栏两行 → 一行。 -->
-      <div class="panel-toolbar">
+           ⚠️ 高度是 flex 分配的（.panel-body flex:1），所以这三块从"带"变成
+           "行内元素"不需要动任何 JS —— 它们本来就是各自 getElementById
+           单独切 display 的。 -->
+      <div class="panel-header" id="panel-header">
         <select id="project-select" title="当前：${esc(projTitle)} · 切项目看该项目会话">
           ${projOpts}
         </select>
         <button class="mini-btn" id="btn-grab" title="截取当前屏幕">截</button>
         <button class="mini-btn" id="btn-new" title="新建会话 / 项目">＋</button>
         <button class="mini-btn" id="btn-sess" title="会话（主聊天 / 任务）">史</button>
+        <span class="ph-flex"></span>
         ${modelBtn}
+        <button class="panel-btn" id="btn-gear" title="设置 / 模型">⚙</button>
+        <button class="panel-btn" id="btn-close" title="收起">—</button>
       </div>
 
-      <div class="fg-ctx" id="fg-ctx" title="用户当前前台应用（点击复制路径）" style="display:none"></div>
-
-      <!-- 非对话视图的**固定**标题条（2026-10-08）。
-           与 #fg-ctx 同位置、互斥显示：对话视图显示前台应用，其余视图显示
-           当前页标题 + 返回。关键差别是**它在 #panel-body 之外** —— 返回按钮
-           不再跟着内容滚，滚到页面底部也够得着（用户截图报的 bug）。 -->
-      <div class="sub-bar" id="sub-bar" style="display:none"></div>
-
-      <!-- 「另一个会话在后台跑」提示条（切走后自动出现，点击切回） -->
-      <div class="bg-run" id="bg-run" style="display:none"></div>
+      <!-- 第二行：有内容才占高度。前台应用 / 子页标题 / 后台任务。 -->
+      <div class="panel-sub">
+        <div class="fg-ctx" id="fg-ctx" title="用户当前前台应用（点击复制路径）" style="display:none"></div>
+        <!-- 非对话视图的**固定**标题条（2026-10-08）。
+             与 #fg-ctx 同位置、互斥显示：对话视图显示前台应用，其余视图显示
+             当前页标题 + 返回。关键差别是**它在 #panel-body 之外** —— 返回按钮
+             不再跟着内容滚，滚到页面底部也够得着（用户截图报的 bug）。 -->
+        <div class="sub-bar" id="sub-bar" style="display:none"></div>
+        <!-- 「另一个会话在后台跑」提示条（切走后自动出现，点击切回） -->
+        <div class="bg-run" id="bg-run" style="display:none"></div>
+      </div>
 
       <div class="panel-body" id="panel-body"></div>
 
@@ -4201,7 +4302,7 @@ function renderPanel(): void {
              2026-10 用户拍板：执行位置/模式/权限是设置，不该占输入行；
              但行为本身是高频入口，所以留一颗图标当门，点开进设置 › 行为页。
              与之前"三颗 chip 挤掉输入框宽度"是两回事：一颗图标约 30px。 -->
-        <button id="btn-behavior" class="mini-btn behavior-btn" title="行为：执行位置 / Agent 模式 / 执行权限">🎛</button>
+        <button id="btn-behavior" class="mini-btn behavior-btn" title="行为：执行位置 / Agent 模式 / 执行权限">${setIcon("behavior")}</button>
         <textarea id="input" rows="1" placeholder="问点什么…"
           title="Enter 发送 / Shift+Enter 换行 / Ctrl+V 贴图"></textarea>
         <button id="btn-stop" title="停止生成" hidden>■</button>
@@ -5060,6 +5161,46 @@ async function switchView(v: View): Promise<void> {
  * 设置入口页 —— **只列入口和状态摘要**，内容点进去再看。
  * （早先把模型/MCP/记忆全平铺在一页，滚半天找不到东西）
  */
+/**
+ * 设置入口的线性图标（24×24 描边，跟随 currentColor）。
+ *
+ * 原来是 13 个 emoji（🧩🌐📊♻️🔌📡📦📁⌨️🧠🎛）。Windows 会把它们彩色渲染，
+ * 一屏五颜六色，和面板冷暖统一的底色打架 —— 单色描边才能融进去。
+ * 离线 + 不能加依赖，所以路径手写。
+ */
+const ICONS: Record<string, string> = {
+  // 模型：四宫格 = 一张模型清单
+  models:
+    '<rect x="3" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.6"/>',
+  // 搜索：地球
+  search:
+    '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><path d="M12 3.5c2.6 2.3 4 5.3 4 8.5s-1.4 6.2-4 8.5c-2.6-2.3-4-5.3-4-8.5s1.4-6.2 4-8.5z"/>',
+  // Token 用量：柱状图
+  usage: '<path d="M3 20.5h18"/><path d="M6.5 20.5v-5"/><path d="M12 20.5V5.5"/><path d="M17.5 20.5v-8"/>',
+  // 备份与回收站：还原箭头
+  recovery: '<path d="M3.5 12a8.5 8.5 0 1 0 2.9-6.4"/><path d="M3 3.5v5h5"/>',
+  // MCP 外部工具：插头
+  mcp: '<path d="M9 3v5.5"/><path d="M15 3v5.5"/><path d="M6 8.5h12v2.6a6 6 0 0 1-12 0z"/><path d="M12 17.1V21"/>',
+  // 数据源：信号
+  life: '<path d="M4.5 12a7.5 7.5 0 0 1 15 0"/><path d="M8 12a4 4 0 0 1 8 0"/><circle cx="12" cy="16" r="1.8"/>',
+  // 项目：包裹
+  project:
+    '<path d="M3 7.5l9-4 9 4v9l-9 4-9-4z"/><path d="M3 7.5l9 4 9-4"/><path d="M12 11.5v9"/>',
+  // 文件权限：文件夹
+  perm: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2.2h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  // 命令策略：终端
+  cmdpolicy: '<rect x="2.5" y="4.5" width="19" height="15" rx="2.2"/><path d="M6.5 9.5l2.4 2.5-2.4 2.5"/><path d="M12.5 14.5h5"/>',
+  // 记忆：灯泡
+  mem: '<path d="M12 3a6 6 0 0 0-3.4 10.9V17h6.8v-3.1A6 6 0 0 0 12 3z"/><path d="M10 20.2h4"/>',
+  // 行为：滑杆
+  behavior:
+    '<path d="M3.5 8.5h9"/><path d="M17.5 8.5h3"/><circle cx="15" cy="8.5" r="2.2"/><path d="M3.5 15.5h3"/><path d="M11.5 15.5h9"/><circle cx="9" cy="15.5" r="2.2"/>',
+};
+
+function setIcon(name: string): string {
+  return `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] ?? ""}</svg>`;
+}
+
 function renderSettingsMenu(
   mcp: McpStatus | null,
   pendingCount: number,
@@ -5087,7 +5228,7 @@ function renderSettingsMenu(
     badge?: string,
   ) => `
     <button class="set-entry" data-act="${act}">
-      <span class="set-entry-icon">${icon}</span>
+      <span class="set-entry-icon">${setIcon(icon)}</span>
       <span class="set-entry-text">
         <b>${title}</b>
         <i>${esc(summary)}</i>
@@ -5096,21 +5237,22 @@ function renderSettingsMenu(
       <span class="set-entry-arrow">›</span>
     </button>`;
 
+  // 页内不再重复「设置」标题 —— 固定标题条（#sub-bar）已经写了"⚙ 设置 + 返回"。
+  // 之前两处都写，屏上就出现两个"设置"。
   return `
-    <div class="mem-head">设置</div>
-    ${item("models", "🧩", "模型", `当前 ${curModelName} · 共 ${models.length} 个（独立窗口管理）`)}
-    ${item("search", "🌐", "搜索 web_search", searchSummary)}
-    ${item("usage", "📊", "Token 用量", usageSummary)}
-    ${item("recovery", "♻️", "备份与回收站", recoverySummary)}
-    ${item("mcp", "🔌", "MCP 外部工具", mcpSummary)}
-    ${item("life", "📡", "数据源", lifeSummaryText())}
-    ${item("project", "📦", "项目", projectSummaryText())}
-    ${item("perm", "📁", "文件权限", `已配置 ${permCount} 条规则`)}
-    ${item("cmdpolicy", "⌨️", "命令策略", "白名单 / 硬阻断 / 审计（run_command）")}
-    ${item("mem", "🧠", "记忆", "待审批、记忆文件族与项目绑定", pendingCount > 0 ? String(pendingCount) : undefined)}
+    ${item("models", "models", "模型", `当前 ${curModelName} · 共 ${models.length} 个（独立窗口管理）`)}
+    ${item("search", "search", "搜索 web_search", searchSummary)}
+    ${item("usage", "usage", "Token 用量", usageSummary)}
+    ${item("recovery", "recovery", "备份与回收站", recoverySummary)}
+    ${item("mcp", "mcp", "MCP 外部工具", mcpSummary)}
+    ${item("life", "life", "数据源", lifeSummaryText())}
+    ${item("project", "project", "项目", projectSummaryText())}
+    ${item("perm", "perm", "文件权限", `已配置 ${permCount} 条规则`)}
+    ${item("cmdpolicy", "cmdpolicy", "命令策略", "白名单 / 硬阻断 / 审计（run_command）")}
+    ${item("mem", "mem", "记忆", "待审批、记忆文件族与项目绑定", pendingCount > 0 ? String(pendingCount) : undefined)}
 
     <div class="mem-head">行为</div>
-    ${item("behavior", "🎛", "执行位置 / 权限", behaviorSummary())}
+    ${item("behavior", "behavior", "执行位置 / 权限", behaviorSummary())}
 
     <div class="mem-head">启动与退出</div>
     <label class="set-check set-check-row">
@@ -7857,6 +7999,7 @@ function boot(): void {
   installFocusRefocus();
   installContextMenu();
   installCopyHandlers();
+  installTimelineMore();
   installForkHandlers();
   installDeleteHandlers();
   installEditHandlers();

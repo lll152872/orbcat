@@ -508,10 +508,16 @@ function renderModelsBody(): string {
           : ""
       }
       <label class="fld"><span>Base URL</span>
-        <input id="f-url" placeholder="提供商 Base URL（含 /v1 等）" value="${esc(f.url)}" />
+        <!-- autocomplete="off"：关掉 WebView2 的自动填充下拉。
+             那个浮层**不在我们的代码里**（"保存的信息"全仓库搜不到），
+             是浏览器自己记着用户以前填过的 URL 弹出来的。
+             底色由浏览器按系统浅色主题画，CSS 管不了，
+             在深色窗口里就是一块刺眼的白板 —— 只能不让它弹。 -->
+        <input id="f-url" placeholder="提供商 Base URL（含 /v1 等）" value="${esc(f.url)}"
+          autocomplete="off" autocorrect="off" spellcheck="false" />
       </label>
       <label class="fld"><span>API Key</span>
-        <input id="f-key" type="password" placeholder="${
+        <input id="f-key" type="password" autocomplete="off" autocorrect="off" spellcheck="false" placeholder="${
           editing
             ? f.clearKey
               ? "保存后将清空 Key"
@@ -528,7 +534,8 @@ function renderModelsBody(): string {
       }
       <div class="form-row-2">
         <label class="fld grow"><span>接口模型 ID（发给提供商的 model）</span>
-          <input id="f-id" placeholder="deepseek-v4.1-flash" value="${esc(f.id)}" />
+          <input id="f-id" placeholder="deepseek-v4.1-flash" value="${esc(f.id)}"
+          autocomplete="off" autocorrect="off" spellcheck="false" />
         </label>
         <button type="button" class="set-btn fetch-id" id="f-fetch-ids" title="GET ${esc(
           f.url.trim() ? modelsEndpointPreview(f.url.trim()) : "{Base URL}/models",
@@ -564,7 +571,8 @@ function renderModelsBody(): string {
   return `
     <div class="mw-body">
       <div class="set-form lm-tools">
-        <input id="model-search" placeholder="键入以搜索…（名称 / 模型 ID / Base URL）" value="${esc(modelSearch)}" />
+        <input id="model-search" placeholder="键入以搜索…（名称 / 模型 ID / Base URL）" value="${esc(modelSearch)}"
+          autocomplete="off" autocorrect="off" spellcheck="false" />
         <button type="button" class="set-btn add" id="model-add-open">添加模型</button>
       </div>
       <div class="lm-list">${
