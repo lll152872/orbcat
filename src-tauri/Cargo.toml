@@ -1,6 +1,6 @@
 [package]
 name = "orbcat"
-version = "0.2.0"
+version = "1.0.0"
 description = "悬浮球形态的私人 agent（Windows 桌面）"
 authors = ["lll152"]
 edition = "2021"
