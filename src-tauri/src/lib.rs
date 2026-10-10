@@ -38,7 +38,7 @@ mod skills;
 mod tools;
 mod search;
 
-#[cfg(windows)]
+mod platform;
 mod win32;
 #[cfg(windows)]
 mod win32desk;
@@ -1513,6 +1513,94 @@ fn foreground_history() -> Vec<context::ForegroundContext> {
     }
     // 缓存空（刚启动 / 一直被自身占前台）→ 现场采一次兜底
     context::current_excluding_self().into_iter().collect()
+}
+
+// ---------------------------------------------------------------------------
+// macOS 前台上下文：渐进式授权
+// ---------------------------------------------------------------------------
+
+/// 前台上下文当前能采到哪一级。
+///
+/// 前端据此决定要不要显示「让它读我的窗口」这类授权引导。
+/// Windows 上恒为 `full`（`GetForegroundWindow` 不需要任何授权），
+/// 所以这段逻辑在 Windows 上是死代码，不会被触发。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextCapabilityInfo {
+    level: &'static str,
+    /// 人类可读的一句说明，直接用于 UI 文案
+    detail: String,
+    /// 是否可以主动弹窗请求授权（Windows 恒为 false）
+    can_request: bool,
+    /// 授权后是否还需要用户去系统设置手动勾选（macOS 的辅助功能是）
+    needs_system_settings: bool,
+}
+
+#[tauri::command]
+fn context_capability() -> ContextCapabilityInfo {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::platform::{context_capability as cap, ContextCapability};
+        return match cap() {
+            ContextCapability::Full => ContextCapabilityInfo {
+                level: "full",
+                detail: "已获辅助功能权限，能读到当前窗口的文件名".into(),
+                can_request: false,
+                needs_system_settings: false,
+            },
+            ContextCapability::AppOnly => ContextCapabilityInfo {
+                level: "appOnly",
+                detail: "只能读到你在用哪个 App。授权后我能知道你正在编辑哪个文件".into(),
+                can_request: true,
+                needs_system_settings: true,
+            },
+            ContextCapability::Unavailable => ContextCapabilityInfo {
+                level: "unavailable",
+                detail: "拿不到前台信息".into(),
+                can_request: false,
+                needs_system_settings: false,
+            },
+        };
+    }
+    #[cfg(not(target_os = "macos"))]
+    ContextCapabilityInfo {
+        level: "full",
+        detail: "Windows 上无需任何系统权限即可读取前台窗口".into(),
+        can_request: false,
+        needs_system_settings: false,
+    }
+}
+
+/// 请求辅助功能授权（**仅 macOS 有效**，会弹系统授权框）。
+///
+/// ⚠️ **只应在用户主动点击「让它自己看」时调用**，不要在启动时自动调。
+/// 渐进解锁的完整流程见 `platform/macos.rs` 的 [`ensure_accessibility`]。
+///
+/// 返回值刻意区分「点了允许」和「真的生效了」：
+/// macOS 的辅助功能授权分两步 —— 先弹窗点允许，**再去系统设置里勾选 orbcat**。
+/// 所以这里返回的是「是否已生效」，前端应当继续轮询 [`context_capability`]
+/// 直到 `level == "full"`，或用户主动放弃。
+#[tauri::command]
+fn request_context_permission() -> Result<ContextCapabilityInfo, String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::macos::ensure_accessibility()?;
+        return Ok(context_capability());
+    }
+    #[cfg(not(target_os = "macos"))]
+    Err("当前平台不需要授权即可读取前台窗口".to_string())
+}
+
+/// 打开「系统设置 → 隐私与安全性 → 辅助功能」。
+///
+/// 用户点了「允许」但 `context_capability()` 仍不是 `full` 时，多半是忘了手动勾选，
+/// 这个命令把他直接送到那个面板。
+#[tauri::command]
+fn open_accessibility_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return crate::platform::macos::open_accessibility_settings();
+    #[cfg(not(target_os = "macos"))]
+    Err("当前平台没有该设置项".to_string())
 }
 
 /// 图片缩略图（历史消息里的图渲染用）—— 返回 data URL。
@@ -4424,6 +4512,9 @@ pub fn run() {
             bg_desk_shot,
             foreground_context,
             foreground_history,
+            context_capability,
+            request_context_permission,
+            open_accessibility_settings,
             image_thumb,
             skills_list,
             project_list,

@@ -19,19 +19,28 @@ use std::ffi::c_void;
 use base64::Engine;
 
 // ---------------------------------------------------------------------------
-// Win32 FFI
+// Win32 FFI —— 仅 Windows
 // ---------------------------------------------------------------------------
 
+#[cfg(windows)]
 type Hdc = *mut c_void;
+#[cfg(windows)]
 type Hbitmap = *mut c_void;
+#[cfg(windows)]
 type Hgdiobj = *mut c_void;
 
+#[cfg(windows)]
 const HORZRES: i32 = 8;
+#[cfg(windows)]
 const VERTRES: i32 = 10;
+#[cfg(windows)]
 const SRCCOPY: u32 = 0x00CC_0020;
+#[cfg(windows)]
 const BI_RGB: u32 = 0;
+#[cfg(windows)]
 const DIB_RGB_COLORS: u32 = 0;
 
+#[cfg(windows)]
 #[repr(C)]
 struct BitmapInfoHeader {
     bi_size: u32,
@@ -47,18 +56,21 @@ struct BitmapInfoHeader {
     bi_clr_important: u32,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct BitmapInfo {
     bmi_header: BitmapInfoHeader,
     bmi_colors: [u32; 3],
 }
 
+#[cfg(windows)]
 #[link(name = "user32")]
 extern "system" {
     fn GetDC(hwnd: *mut c_void) -> Hdc;
     fn ReleaseDC(hwnd: *mut c_void, hdc: Hdc) -> i32;
 }
 
+#[cfg(windows)]
 #[link(name = "gdi32")]
 extern "system" {
     fn CreateCompatibleDC(hdc: Hdc) -> Hdc;
@@ -124,6 +136,18 @@ impl ShotFormat {
 // ---------------------------------------------------------------------------
 
 /// 抓主屏幕，返回 RGBA 图像
+///
+/// ## 平台支持
+///
+/// 只有 Windows 走 GDI `BitBlt`。macOS 需要 `ScreenCaptureKit` 且必须用户授予
+/// **屏幕录制**权限（比辅助功能权限更敏感，弹窗文案更重），第一版不接 ——
+/// 见 `platform/macos.rs` 的说明。其余平台同理。
+#[cfg(not(windows))]
+pub fn capture_primary_screen() -> Result<image::RgbaImage, String> {
+    Err("屏幕截图暂不支持当前平台（Windows 走 GDI；macOS 需 ScreenCaptureKit + 录屏授权，尚未接入）".to_string())
+}
+
+#[cfg(windows)]
 pub fn capture_primary_screen() -> Result<image::RgbaImage, String> {
     unsafe {
         let hdc_screen = GetDC(std::ptr::null_mut());

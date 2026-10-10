@@ -171,37 +171,43 @@ fn resolve_dir_file(app: &str, title: &str) -> (Option<String>, Option<String>) 
     result
 }
 
-/// 采集当前前台上下文（非 Windows / 拿不到时 None）
+/// 采集当前前台上下文（拿不到时 `None`）
+///
+/// 平台实现在 [`crate::platform`]：
+/// - Windows：`GetForegroundWindow` + `GetWindowTextW`（无权限门槛）
+/// - macOS：`osascript` 取 app 名（免授权）+ 窗口标题（需辅助功能授权，未授权时标题为空）
+/// - 其他：`None`
 pub fn current() -> Option<ForegroundContext> {
-    #[cfg(windows)]
-    {
-        let (exe, title) = crate::win32::foreground_window_info()?;
-        let stem = std::path::Path::new(&exe)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
+    let (exe, title) = crate::win32::foreground_window_info()?;
 
-        let app = match stem.as_str() {
-            "code" | "code-insiders" | "codium" => "VSCode",
-            "typora" => "Typora",
-            "idea64" | "idea" => "IntelliJ IDEA",
-            "explorer" => "文件资源管理器",
-            other => other,
-        };
+    // 把「可执行文件名」归一成展示用的应用名。
+    //
+    // macOS 上 `platform/macos.rs` 已经返回 bundle id 的最后一段（如
+    // `com.microsoft.VSCode` → `VSCode`），所以这里对它走 `raw` 分支。
+    let stem = std::path::Path::new(&exe)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
 
-        let (dir, file) = resolve_dir_file(&app, &title);
+    let app = match stem.as_str() {
+        "code" | "code-insiders" | "codium" => "VSCode",
+        "typora" => "Typora",
+        "idea64" | "idea" => "IntelliJ IDEA",
+        "explorer" => "文件资源管理器",
+        // macOS：已是可读名（VSCode / Typora / Safari …），保留原样
+        "" => exe.as_str(),
+        _ if !stem.chars().next().is_some_and(|c| c.is_lowercase()) => exe.as_str(),
+        other => other,
+    };
 
-        Some(ForegroundContext {
-            app: app.to_string(),
-            title,
-            dir,
-            file,
-        })
-    }
-    #[cfg(not(windows))]
-    {
-        None
-    }
+    let (dir, file) = resolve_dir_file(app, &title);
+
+    Some(ForegroundContext {
+        app: app.to_string(),
+        title,
+        dir,
+        file,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -400,8 +406,31 @@ fn recent_lnk_target(name: &str) -> Option<String> {
 // 工具
 // ---------------------------------------------------------------------------
 
+/// 应用数据根目录。
+///
+/// - Windows：`%APPDATA%`（VSCode 的配置在 `%APPDATA%\Code\User\...`）
+/// - macOS：`~/Library/Application Support`（VSCode 在
+///   `~/Library/Application Support/Code/User/...` —— **同名**，
+///   所以下面的 `join("Code").join("User")` 逻辑两端通用）
+/// - 其他平台：`None`
+#[cfg(windows)]
 fn appdata_dir() -> Option<std::path::PathBuf> {
     std::env::var("APPDATA").ok().map(std::path::PathBuf::from)
+}
+
+#[cfg(target_os = "macos")]
+fn appdata_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        std::path::PathBuf::from(home)
+            .join("Library")
+            .join("Application Support"),
+    )
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn appdata_dir() -> Option<std::path::PathBuf> {
+    None
 }
 
 #[cfg(test)]
