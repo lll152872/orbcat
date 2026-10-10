@@ -4889,12 +4889,21 @@ Write-Output "ARG=[$msg]"
     }
 
     /// GBK 文件不再被静默跳过（中文 Windows 的 .md/.txt 常见）。
+    ///
+    /// ⚠️ **这个用例依赖运行机器的系统 ACP**：只有 ACP=936（简体中文 Windows）
+    /// 才能把 GBK 字节解成「数据」。GitHub 的 `windows-latest` runner 是英文
+    /// en-US（ACP=1252），GBK 字节会解成乱码 → 搜不到 → 失败。
+    /// 2026-10-10 由 CI 抓出：本地中文系统一直通过，单机测试看不出问题。
     #[cfg(windows)]
-    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
-    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
-    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn grep_files_reads_gbk_files() {
+        // 运行时探测 ACP，而不是硬编码平台判断 —— 这样中文机器上它**照常验证**，
+        // 英文 runner 上才跳过。静默通过会让人误以为「GBK 兼容性被 CI 验证过了」。
+        if crate::win32::decode_acp(&[0xCA, 0xFD, 0xBE, 0xDD]) != "数据" {
+            eprintln!("skip: 本机 ACP 不是 GBK(936)（CI runner 为 en-US），该用例仅在中文 Windows 上有意义");
+            return;
+        }
+
         let dir = fresh_tmp("grep_gbk_e2e");
         // "数据.md" 的 GBK 字节（数=CAFD 据=BEDD）—— 严格 UTF-8 解不开
         let gbk: &[u8] = &[0xCA, 0xFD, 0xBE, 0xDD, 0x2E, 0x6D, 0x64];

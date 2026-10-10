@@ -590,7 +590,26 @@ mod tests {
     use super::*;
 
     fn fresh_store(tag: &str) -> (MemoryStore, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("orbcat_mem_{tag}"));
+        // ⚠️ 目录名必须**每次调用唯一**（2026-10-10 修）。
+        //
+        // 原来只有 tag：`orbcat_mem_daily` / `orbcat_mem_proj` / …，且开头无条件
+        // `remove_dir_all`。`cargo test` 默认**多线程并行**，多个测试共用同一进程时，
+        // 只要 tag 撞上就会互相删掉对方刚写的文件 —— 症状随机：本地串行跑全绿，
+        // CI 上并行度不同就偶发失败。`project_memory_longest_prefix_wins` 就是这么挂的。
+        //
+        // 修法：tag 后缀加纳秒时间戳 + 线程 id，同进程内也不重名。
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let thread = format!("{:?}", std::thread::current().id())
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "");
+        let dir = std::env::temp_dir().join(format!(
+            "orbcat_mem_{tag}_{}_{}_{}",
+            std::process::id(),
+            thread,
+            uniq
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         (MemoryStore::new(&dir), dir)
@@ -667,7 +686,15 @@ mod tests {
     #[test]
     fn project_memory_longest_prefix_wins() {
         let (s, dir) = fresh_store("proj");
-        let root = std::env::temp_dir().join(format!("fa_proj_src_{}", std::process::id()));
+        // ⚠️ 目录名必须**每次唯一**。这里原本只用 `process::id()`，而同一进程内
+        //    有多个测试都建 `fa_proj_src_<pid>` —— 并行执行时会互相覆盖/删除，
+        //    导致 `canonicalize()` 拿到已被删的路径 → 匹配失败。
+        //    2026-10-10 由 GitHub Actions windows runner 抓出（本地串行跑看不出）。
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("fa_proj_src_{}_{}", std::process::id(), uniq));
         let deep = root.join("sub");
         std::fs::create_dir_all(&deep).unwrap();
 
