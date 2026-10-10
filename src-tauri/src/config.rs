@@ -1510,6 +1510,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 🔴 回归闸门（2026-10-09 用户报"baseurl 改不了"）。
+    ///
+    /// 改 Base URL = 把这条模型**移到另一个组**。以前 `models_edit` 把
+    /// 「定位用的旧 url」和「新 url」塞进同一个参数，前端又只发旧值 ——
+    /// 输入框里改了 Base URL、保存后**静默丢弃**，不报错也不生效。
+    /// 这条钉死：换组真的落地，且 API Key 等其它字段跟着搬过去。
+    #[test]
+    fn update_model_can_move_model_to_another_group() {
+        let dir = std::env::temp_dir().join(format!("fa-move-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("models.json"), "[]").unwrap();
+        add_model(
+            &dir,
+            ModelConfig {
+                id: "gpt-x".into(),
+                url: "https://old.example.com/v1".into(),
+                api_key: "sk-KEEPME123456".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        update_model(
+            &dir,
+            "https://old.example.com/v1",
+            "gpt-x",
+            Some("https://new.example.com/v1".into()), // ← 新 Base URL
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(None),
+            Some(None),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            find_model_by_url_id(&dir, "https://new.example.com/v1", "gpt-x").is_ok(),
+            "换组后应在新 Base URL 下"
+        );
+        assert!(
+            find_model_by_url_id(&dir, "https://old.example.com/v1", "gpt-x").is_err(),
+            "旧组下不该还留着"
+        );
+        let moved = find_model_by_url_id(&dir, "https://new.example.com/v1", "gpt-x").unwrap();
+        assert_eq!(moved.api_key, "sk-KEEPME123456", "Key 必须跟着搬过去");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn import_skips_existing_and_reuses_source_creds() {
         let dir = std::env::temp_dir().join(format!("fa-import-{}", std::process::id()));

@@ -341,6 +341,53 @@ async function reloadModels(): Promise<void> {
 // 渲染
 // ---------------------------------------------------------------------------
 
+/**
+ * 八个缩放手柄。
+ *
+ * ⚠️ 为什么必须自己画（2026-10-09 用户报「可以拖拽的范围奇小」）：
+ * 后端这个窗口是 `resizable(true)` + `min_inner_size` + 尺寸写进 settings，
+ * 缩放显然是设计内功能。但 Windows 的边缘 resize 命中测试要求 mousedown
+ * 能落到窗口**边框那一圈**；而 `bindWindowDrag()` 几乎对整个客户区都做了
+ * `preventDefault()` + `startDragging()` —— 客户区里根本没剩下能触发 resize
+ * 的地方，只剩最外侧一条几乎抓不住的细缝。
+ *
+ * 所以显式画 8 条手柄，mousedown 直接调 `startResizeDragging(dir)`。
+ * 它们是 `.mw-window` 的**兄弟**而不是子元素 —— `.mw-window` 有
+ * `overflow:hidden` + 圆角，放里面会被裁掉。
+ *
+ * `dir` 用小写是为了 CSS 类名好写；传给 Tauri 前要换成首字母大写的枚举值
+ * （`ResizeDirection` 是 `@tauri-apps/api/window` 的**模块内私有类型**，
+ *  外部 import 不到，所以这里自己维护这张映射表）。
+ */
+const RESIZE_HANDLES = [
+  { dir: "n", api: "North" },
+  { dir: "s", api: "South" },
+  { dir: "w", api: "West" },
+  { dir: "e", api: "East" },
+  { dir: "nw", api: "NorthWest" },
+  { dir: "ne", api: "NorthEast" },
+  { dir: "sw", api: "SouthWest" },
+  { dir: "se", api: "SouthEast" },
+] as const;
+
+function bindResize(): void {
+  if (!app) return;
+  const apiByDir = new Map<string, string>(RESIZE_HANDLES.map((h) => [h.dir, h.api]));
+  app.querySelectorAll<HTMLElement>(".mw-rz").forEach((el) => {
+    el.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      // 必须 stopPropagation：否则冒泡到 .mw-window 的整窗拖动，
+      // 一次操作会同时"移动窗口"和"缩放窗口"。
+      e.preventDefault();
+      e.stopPropagation();
+      const api = apiByDir.get(el.dataset.dir ?? "");
+      if (!api) return;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      void (getCurrentWindow() as any).startResizeDragging(api).catch(() => {});
+    });
+  });
+}
+
 function renderModelsBody(): string {
   const q = (modelSearch || "").trim().toLowerCase();
   const filtered = q
@@ -605,7 +652,8 @@ function renderApp(): void {
         <button class="mw-close" id="mw-close" title="关闭（Esc）">✕</button>
       </div>
       ${renderModelsBody()}
-    </div>`;
+    </div>
+    ${RESIZE_HANDLES.map((h) => `<div class="mw-rz mw-rz-${h.dir}" data-dir="${h.dir}"></div>`).join("")}`;
 
   // 还原（写 scrollTop 会强制 layout，不用等下一帧）
   for (const [sel, top] of kept) {
@@ -615,6 +663,7 @@ function renderApp(): void {
 
   bindApp();
   bindWindowDrag();
+  bindResize();
 }
 
 /**
@@ -1128,9 +1177,16 @@ function bindApp(): void {
     try {
       if (editing) {
         // 身份 = (Base URL, 接口 id)：编辑前条目按 editId + editUrl 精确定位
+        //
+        // ⚠️ `url` 与 `newUrl` 是**两个不同的东西**，别合并（2026-10-09 修）：
+        //   url    = 定位用的**旧** Base URL（哪一条要改）
+        //   newUrl = 表单里填的**新** Base URL（= 换组）
+        // 以前只发 url=f.editUrl（新值根本没上线），于是输入框里能改 Base URL、
+        // 保存后静默丢弃 —— 用户看不到任何报错，以为改了其实没改。
         await invoke("models_edit", {
           id: f.editId,
           url: f.editUrl,
+          newUrl: url,
           newId,
           apiKey: key || null,
           clearKey: f.clearKey,
@@ -1141,12 +1197,16 @@ function bindApp(): void {
           maxOutputTokens: maxOut,
         });
         showToast(`已保存 ${newId}`);
-        // 选中项就是这条（id+url 匹配）且改了 id → selected 跟随新 id
+        // 选中项就是这条（id+url 匹配）→ 改了 id 跟随新 id，改了 Base URL 跟随新 url
         if (
           selectedModel === f.editId &&
           (!selectedModelUrl || sameUrl(f.editUrl ?? "", selectedModelUrl))
         ) {
           selectedModel = newId;
+          selectedModelUrl = url;
+        } else if (selectedModelUrl && sameUrl(f.editUrl ?? "", selectedModelUrl)) {
+          // id 没改但 url 改了：当前选中项的分组也要跟着走
+          selectedModelUrl = url;
         }
         modelForm = emptyModelForm();
       } else {

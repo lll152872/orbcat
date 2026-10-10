@@ -62,7 +62,7 @@ async function openLife(): Promise<HTMLElement> {
 }
 
 describe("设置 › 数据源", () => {
-  it("设置入口页有「数据源」，未配置时摘要说明可接什么", async () => {
+  it("功能暂缓：入口行在 DOM 里但带 hidden，且摘要为空（幽灵函数返回 null）", async () => {
     await bootApp();
     await openPanel();
     document.getElementById("btn-gear")!.click();
@@ -70,10 +70,11 @@ describe("设置 › 数据源", () => {
     const entry = Array.from(document.querySelectorAll<HTMLElement>(".set-entry")).find(
       (b) => b.dataset.act === "life",
     )!;
-    expect(entry, "设置里应有数据源入口").toBeTruthy();
-    expect(entry.textContent).toContain("数据源");
-    // 空表时摘要不该说"0 个源启用"这种没信息量的话
-    expect(entry.textContent).toContain("未配置");
+    // 行保留在 DOM 里 —— 页面代码与后面 10 个用例都还依赖它，用户看不见而已
+    expect(entry, "「数据源」行应当仍在 DOM 中").toBeTruthy();
+    expect(entry.hasAttribute("hidden"), "但它必须带 hidden 属性").toBe(true);
+    // 摘要函数是幽灵函数（返回 null）→ 不该渲染出那行 <i>
+    expect(entry.querySelector("i"), "暂缓期间不该有摘要文本").toBeNull();
   });
 
   it("空表时画出「还没有数据源」+ 怎么加的说明", async () => {

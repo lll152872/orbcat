@@ -1683,11 +1683,41 @@ interface ProjectListView {
   tools: { name: string; description: string; template: string[]; perm: string }[];
 }
 
-/** 设置入口页要的项目摘要（懒加载，进页面时才有） */
+/**
+ * 设置入口页要的项目摘要（懒加载，进页面时才有）。
+ *
+ * ⚠️ 拼装包功能暂缓后，`projectSummaryText` 成了幽灵函数（返回 null），
+ * 于是这里暂时没人读了 → TS6133。**故意不删**：`renderProjectView` / `project_list`
+ * 命令 / 那一整套 vitest 都还在，恢复功能时立刻要用。下面的 `void` 引用
+ * 把它钉在编译期可见，免得被当成死代码清掉。
+ */
 let projectInfo: ProjectListView | null = null;
+void projectInfo;
 
-/** 入口页那一行摘要 */
-function projectSummaryText(): string {
+/**
+ * 技能清单缓存 —— 设置入口页的「记忆」摘要要显示技能数。
+ *
+ * 为什么缓存而不是每次现扫：`skills_list` 是热扫描目录（Rust 侧每次现读
+ * `agent-data/skills` 下每个技能的 SKILL.md），设置入口页每次打开都拉一次没问题，
+ * 但**摘要和记忆页会各拉一次** —— 同一个数据同一屏要两遍。
+ * 记忆页渲染完顺手回填这里，两处共用一份。
+ */
+let skillsCache: SkillInfo[] = [];
+
+/**
+ * 🔶 幽灵函数 —— 「项目」（拼装包）功能整体暂缓。
+ *
+ * 2026-10-09 用户拍板：这个功能未来再说，本轮不发布。签名保留、调用点保留、
+ * 返回 `null`（= 没有摘要文本）。设置入口页那一行同时带 `hidden`，用户看不见。
+ *
+ * 为什么留个空壳而不是整段删掉：这一页（`renderProjectView`）和它的整套 vitest
+ * 都是**活的**，删掉入口会让这些测试一起红。留着幽灵函数，恢复功能时只需
+ * ① 按下面注释里的原实现写回来 ② 去掉那行 `item()` 的 `true`。删代码更省事，
+ * 但下次做的时候得从头重建一遍页面。
+ */
+function projectSummaryText(): null {
+  return null;
+  /* ↓↓↓ 恢复功能时把这段实现放回来（2026-10-10 暂缓前的原样） ----------
   if (!projectInfo) return "读取中…";
   const act = projectInfo.active;
   if (!act) return `未激活 · 共 ${projectInfo.bundles.length} 个包`;
@@ -1696,6 +1726,7 @@ function projectSummaryText(): string {
     (projectInfo.permError ? " · ⚠️ 权限预设已丢弃" : "") +
     (projectInfo.unresolved.length ? ` · ${projectInfo.unresolved.length} 项引用失效` : "");
   return `已激活「${esc(b?.name ?? act)}」${warn}`;
+  -------------------------------------------------------------------- */
 }
 
 /** 这条配置实际用哪种传输（与 Rust `resolved_transport` 同规则） */
@@ -1708,6 +1739,16 @@ function mcpTransportOf(s: McpServerCfg): "http" | "stdio" {
 // ---------------- 状态 ----------------
 
 let mode: Mode = "orb";
+
+/**
+ * `applyMode` 正在切换窗口形态。
+ *
+ * 存在的理由：`set_window_mode` 改 bounds 时 Windows 会触发一次激活状态变化，
+ * WebView 随之抛 `blur`。若那一下被当成"用户点到别处去了"来处理，就会在
+ * 切换半路把窗口又收回球大小（见 `applyMode` 开头那段注释的完整事故）。
+ * 这个标志让切换期间的 blur 一律放行。
+ */
+let modeSwitching = false;
 /** 当前会话是否在跑 —— 决定「发送」还是「插话」、显不显示 ■。**按会话**算（并行 run） */
 let busy = false;
 let thinking = false;
@@ -4595,8 +4636,10 @@ function renderBody(): void {
       bd(invoke<ProjectListView>("project_list").catch(() => null), null),
       // 数据源：摘要行要显示条数，所以这里拉一次（内部对未启用的源不读取）
       bd(invoke<LifeStatus>("life_status").catch(() => null), null),
+      // 技能：同样只为摘要里的个数（skills_list 是热扫描目录，失败退化成空）
+      bd(invoke<SkillInfo[]>("skills_list").catch(() => [] as SkillInfo[]), [] as SkillInfo[]),
     ])
-      .then(([mcp, pending, autoOn, rules, settings, usage, search, recovery, proj, life]) => {
+      .then(([mcp, pending, autoOn, rules, settings, usage, search, recovery, proj, life, skills]) => {
         if (view !== "settings") return;
         autostartOn = autoOn;
         blurCollapse = settings?.blurCollapse ?? true;
@@ -4604,6 +4647,7 @@ function renderBody(): void {
         searchInfo = search;
         projectInfo = proj;
         lifeInfo = life;
+        skillsCache = skills;
         const tSum = todayTokenTotal(usage);
         const summary = usage.length ? `今日 ${fmtTokens(tSum)} · 共 ${usage.length} 次问答` : "暂无记录";
         b.innerHTML = renderSettingsMenu(mcp, pending.length, summary, recoverySummaryText(recovery));
@@ -4923,6 +4967,8 @@ function renderMemView(
   skills: SkillInfo[],
   projects: ProjectMemoryView[],
 ): string {
+  // 回填缓存：设置入口页的「记忆」摘要要显示技能数，别让它白拉一遍
+  skillsCache = skills;
   const pendingHtml =
     list.length === 0
       ? `<div class="mem-empty">没有待审批的记忆。模型认为值得长期记住的信息会通过 <code>remember</code> 提交到这里。</div>`
@@ -5201,6 +5247,21 @@ function setIcon(name: string): string {
   return `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] ?? ""}</svg>`;
 }
 
+/**
+ * 「记忆」入口摘要。
+ *
+ * ⚠️ 必须**显式提到技能**（2026-10-09 用户反馈"skills 没找到在哪能打开"）：
+ * 技能列表在记忆页最底下，而旧文案只写了「待审批、记忆文件族与项目绑定」——
+ * 设置入口页上根本看不出这页里有技能，于是等于找不到。
+ * 技能数进摘要后才看得出"哦有 N 个技能"。
+ */
+function memSummaryText(pendingCount: number): string {
+  const n = skillsCache.length;
+  const parts = [`技能 ${n} 个`, "记忆文件", "项目绑定"];
+  if (pendingCount > 0) parts.unshift(`待审批 ${pendingCount}`);
+  return parts.join(" · ");
+}
+
 function renderSettingsMenu(
   mcp: McpStatus | null,
   pendingCount: number,
@@ -5224,14 +5285,17 @@ function renderSettingsMenu(
     act: string, // "models" 不是 View（它弹独立窗口），所以这里放宽成 string
     icon: string,
     title: string,
-    summary: string,
+    /** `null` = 幽灵摘要（功能暂缓的幽灵函数会返回它）→ 不渲染那行 `<i>` */
+    summary: string | null,
     badge?: string,
+    /** 暂时下线的行：渲染但 `hidden`（CSS 里 `.set-entry[hidden]{display:none!important}`） */
+    off?: boolean,
   ) => `
-    <button class="set-entry" data-act="${act}">
+    <button class="set-entry" data-act="${act}"${off ? " hidden" : ""}>
       <span class="set-entry-icon">${setIcon(icon)}</span>
       <span class="set-entry-text">
         <b>${title}</b>
-        <i>${esc(summary)}</i>
+        ${summary === null ? "" : `<i>${esc(summary)}</i>`}
       </span>
       ${badge ? `<span class="set-entry-badge">${badge}</span>` : ""}
       <span class="set-entry-arrow">›</span>
@@ -5239,17 +5303,27 @@ function renderSettingsMenu(
 
   // 页内不再重复「设置」标题 —— 固定标题条（#sub-bar）已经写了"⚙ 设置 + 返回"。
   // 之前两处都写，屏上就出现两个"设置"。
+  //
+  // ⚠️ 减法（2026-10-09 用户拍板）——**下面 return 的是模板字符串，模板里的
+  // `//` 不是注释，是会被原样渲染到页面上的字面文本**（踩过一次：把「减法说明」
+  // 写在 `${item(...)}` 之间，结果整段注释直接显示在设置页上）。
+  // 所以这个函数的注释一律写在 `return` **外面**。
+  //
+  // 两个暂时下线的行（第 6 个参数 `true` = 渲染但隐藏）：
+  // - 「项目」：讲的是**拼装包**（projects/<名>/project.json），不是项目记忆。
+  // - 「数据源」：life.json 的生活清单源。
+  // 两者都只是**入口**隐藏：页面渲染、摘要函数、后端命令、vitest 全套测试
+  // 都原地保留，功能恢复时把那两处的 `true` 去掉即可，不用重写任何东西。
   return `
     ${item("models", "models", "模型", `当前 ${curModelName} · 共 ${models.length} 个（独立窗口管理）`)}
     ${item("search", "search", "搜索 web_search", searchSummary)}
     ${item("usage", "usage", "Token 用量", usageSummary)}
     ${item("recovery", "recovery", "备份与回收站", recoverySummary)}
     ${item("mcp", "mcp", "MCP 外部工具", mcpSummary)}
-    ${item("life", "life", "数据源", lifeSummaryText())}
-    ${item("project", "project", "项目", projectSummaryText())}
-    ${item("perm", "perm", "文件权限", `已配置 ${permCount} 条规则`)}
-    ${item("cmdpolicy", "cmdpolicy", "命令策略", "白名单 / 硬阻断 / 审计（run_command）")}
-    ${item("mem", "mem", "记忆", "待审批、记忆文件族与项目绑定", pendingCount > 0 ? String(pendingCount) : undefined)}
+    ${item("life", "life", "数据源", lifeSummaryText(), undefined, true)}
+    ${item("project", "project", "项目", projectSummaryText(), undefined, true)}
+    ${item("perm", "perm", "安全闸门", `文件 ${permCount} 条规则 · 命令白名单/硬阻断/审计`)}
+    ${item("mem", "mem", "记忆", memSummaryText(pendingCount), pendingCount > 0 ? String(pendingCount) : undefined)}
 
     <div class="mem-head">行为</div>
     ${item("behavior", "behavior", "执行位置 / 权限", behaviorSummary())}
@@ -5543,8 +5617,16 @@ interface LifeStatus {
 
 let lifeInfo: LifeStatus | null = null;
 
-/** 数据源摘要（设置入口页那一行） */
-function lifeSummaryText(): string {
+/**
+ * 🔶 幽灵函数 —— 「数据源」（`life.json` 生活清单）功能整体暂缓。
+ *
+ * 2026-10-09 用户拍板：这个功能未来再说，本轮不发布。理由与
+ * [`projectSummaryText`] 完全一样 —— 页面与它那 11 个 vitest 用例都还是活的，
+ * 留个返回 `null` 的空壳，恢复时把实现放回去即可，不用重建。
+ */
+function lifeSummaryText(): null {
+  return null;
+  /* ↓↓↓ 恢复功能时把这段实现放回来（2026-10-10 暂缓前的原样） ----------
   if (!lifeInfo) return "读取中…";
   const on = lifeInfo.sources.filter((s) => s.enabled);
   if (lifeInfo.sources.length === 0) return "未配置（可接爬虫快照 / 命令）";
@@ -5552,6 +5634,7 @@ function lifeSummaryText(): string {
   const bad = on.filter((s) => !s.ok).length;
   const total = on.reduce((a, s) => a + s.count, 0);
   return `${on.length} 个源启用 · ${total} 条` + (bad ? ` · ⚠️ ${bad} 个读取失败` : "");
+  -------------------------------------------------------------------- */
 }
 
 function renderLifeView(): string {
@@ -5817,7 +5900,13 @@ function renderPermView(rules: PermRule[]): string {
     .join("");
 
   return `
-    ${subHeader("文件权限")}
+    ${subHeader("安全闸门")}
+    <div class="set-hint" style="margin-bottom:8px">
+      这是 agent 能碰什么的<b>全部</b>开关。另一面是<b>命令策略</b>（白名单 / 硬阻断 / 审计）——
+      <a href="#" class="goto-cmdpolicy">去命令策略 ›</a>
+    </div>
+
+    <div class="mem-head">文件权限 ${rules.length} 条</div>
     <div class="set-hint" style="margin-bottom:8px">
       <b>最长前缀匹配</b>：越具体的路径优先。没命中任何规则 = <b>拒绝</b>。<br>
       规则保存在本地 <code>agent-data/permissions.json</code>，可手工编辑。
@@ -5867,6 +5956,15 @@ function bindPermView(root: HTMLElement): void {
       renderBody();
     }),
   );
+
+  // 「安全闸门」是两个页面合并后的入口：文件权限页顶部要能跳到命令策略，
+  // 否则设置入口页只留一行之后，命令策略就没有可达路径了。
+  document
+    .querySelector(".goto-cmdpolicy")
+    ?.addEventListener("click", (e) => {
+      e.preventDefault();
+      void switchView("cmdpolicy");
+    });
 
   document.getElementById("p-add")?.addEventListener("click", async () => {
     const path = (document.getElementById("p-path") as HTMLInputElement).value.trim();
@@ -7812,6 +7910,22 @@ async function applyMode(next: Mode): Promise<void> {
   //    （早先这里 `if (busy) return` 导致"请求中收不起面板"）
   if (next === mode) return;
 
+  // ⚠️🔴 切换期间必须**先写 `mode` 再 await**（下面两个分支都这么做）。
+  //
+  //    踩过的坑（2026-10-10 用户报「右键球 → 点记忆 → 面板缩成一小块且回不去」）：
+  //    panel 分支原先是 `await invoke(...)` 之后才 `mode = next`，
+  //    而 orb/menu 分支是先赋值。于是点「记忆」时 `mode` 在整个 IPC 往返里
+  //    **一直是旧的 "menu"**；`set_bounds` 把窗口从 196×214 拉到 460×600
+  //    会触发一次激活状态变化 → WebView 抛 `blur` → blur 处理器看见
+  //    `mode === "menu"` 就调 `applyMode("orb")` 把窗口收回球大小。
+  //    外层 await 回来后又把 `mode` 写成 "panel" —— **`mode` 说面板、
+  //    窗口实际是球**。再点球时 `if (next === mode) return` 直接返回，
+  //    于是再也回不去。
+  //
+  //    下面 `modeSwitching` 是第二道保险：自己触发的 resize 引来的 blur
+  //    一律不处理，避免再出现"半路被自己的 blur 打断"。
+  modeSwitching = true;
+
   // ⚠️ 顺序铁律（收起/切菜单）：必须**先换 DOM，再缩窗口**。
   //    `set_window_mode` 是一次 IPC 往返 —— 窗口在 Rust 侧当场就缩好了，
   //    而 renderOrb 要等 promise 回来才执行。复杂任务刚跑完时主线程正忙
@@ -7840,6 +7954,7 @@ async function applyMode(next: Mode): Promise<void> {
       console.error("[orbcat] 切换窗口形态失败:", e);
     } finally {
       app.style.visibility = "";
+      modeSwitching = false;
     }
     if (next === "orb") void refreshPendingApprovals(); // 异步补正金色，不等它
     return;
@@ -7847,8 +7962,21 @@ async function applyMode(next: Mode): Promise<void> {
 
   // 展开成面板：窗口先放大再拉数据 —— renderPanel 依赖会话/模型数据，
   // 换不成"DOM 先行"；旧 DOM 是球，窗口透明，放大空档无残影。
-  await invoke("set_window_mode", { mode: next });
+  // 🔴 `mode = next` 必须在 await **之前**（与上面的 orb/menu 分支一致）——
+  //    理由见函数开头那段注释：await 期间 mode 若是旧值，自己 resize 引来的
+  //    blur 会把它当成"还在菜单态"而把窗口收回球大小。
   mode = next;
+  try {
+    await invoke("set_window_mode", { mode: next });
+  } catch (e) {
+    // 窗口没改成不算失败内容，但 `mode` 已经写了 —— 立刻写回去，
+    // 否则又落进"mode 与窗口实际尺寸不一致"那个不可恢复的状态。
+    mode = next === "panel" ? "menu" : "orb";
+    console.error("[orbcat] 展开面板失败:", e);
+    modeSwitching = false;
+    return;
+  }
+  modeSwitching = false;
 
   // 打开面板 = 必然看到对话流 → 红球使命结束
   unseenError = false;
@@ -7956,11 +8084,16 @@ function installContextMenu(): void {
   document.addEventListener("mousedown", (e) => {
     const t = e.target as HTMLElement;
     if (copyMenuEl && !t.closest(".copy-menu")) closeCopyMenu();
+    if (modeSwitching) return; // 切换期间不判定"点外面了"（同 blur 那条理由）
     if (mode !== "menu") return;
     if (!t.closest(".ctx-card")) void applyMode("orb");
   });
 
   window.addEventListener("blur", () => {
+    // ⚠️🔴 自己触发的形态切换会引来一次 blur（见 applyMode 的注释）。
+    //    切换期间**必须放行**，否则面板在半路被收回球大小，且 mode 与窗口
+    //    实际尺寸就此不一致 → 之后点球也回不去（2026-10-10 用户报的 bug）。
+    if (modeSwitching) return;
     if (mode === "menu") void applyMode("orb");
     // 面板失焦自动收起 —— 悬浮球的本分是用完让路，不该一直挡着屏幕。
     // 展开后 500ms 内的 blur 忽略（展开动画/set_focus 时序抖动）。

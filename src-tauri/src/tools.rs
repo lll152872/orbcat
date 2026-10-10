@@ -708,22 +708,22 @@ pub fn all_tool_specs(
 
     let Some(reg) = mcp else { return specs };
 
-    for t in reg.active_tools() {
-        let full = match t.name.split_once("_1mcp_") {
-            Some((server, tool)) => crate::mcp::mcp_tool_full_name(server, tool),
-            None => format!("mcp__standalone__{}", t.name),
-        };
+    for g in reg.groups().iter().filter(|g| reg.is_active(&g.name)) {
+        for t in &g.tools {
+            // 组名 = server id，工具名原样透传（网关内部怎么命名是网关自己的事）
+            let full = crate::mcp::mcp_tool_full_name(&g.server_id, &t.name);
 
-        let mut desc = t.description.trim().to_string();
-        if t.is_destructive() {
-            desc.push_str(" ⚠️ 此操作会修改数据或执行命令，调用前请确认用户意图。");
+            let mut desc = t.description.trim().to_string();
+            if t.is_destructive() {
+                desc.push_str(" ⚠️ 此操作会修改数据或执行命令，调用前请确认用户意图。");
+            }
+
+            specs.push(ToolSpec {
+                name: full,
+                description: desc,
+                parameters: t.input_schema.clone(),
+            });
         }
-
-        specs.push(ToolSpec {
-            name: full,
-            description: desc,
-            parameters: t.input_schema.clone(),
-        });
     }
 
     specs
@@ -1298,7 +1298,7 @@ async fn execute_inner(
                 let loaded = reg
                     .active_tools()
                     .iter()
-                    .any(|t| t.name.ends_with(&tool));
+                    .any(|t| t.name == tool);
                 if !loaded {
                     // 默认配置下所有组都直接给模型，走到这里通常意味着：
                     // 用户把这组关掉了（MCP 设置页的「给模型」开关），或组名对不上。
@@ -1333,7 +1333,7 @@ async fn execute_inner(
                 }
 
                 let reg = ctx.mcp.lock().await;
-                let msg = reg.call_tool(&tool_with_server(other), args).await?;
+                let msg = reg.call_tool(&tool, args).await?;
                 return Ok(ToolOutput::text(msg));
             }
             Err(format!("未知工具：{other}"))
@@ -1449,14 +1449,6 @@ async fn life_items(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Strin
         }
     }
     Ok(ToolOutput::text(out))
-}
-
-/// `mcp__ssh__run-command` → 原始 MCP 工具名 `ssh_1mcp_run-command`
-fn tool_with_server(full: &str) -> String {
-    match crate::mcp::parse_mcp_tool_name(full) {
-        Some((server, tool)) => format!("{server}_1mcp_{tool}"),
-        None => full.to_string(),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5202,19 +5194,11 @@ Write-Output "ARG=[$msg]"
         let hit = execute("search_tools", &json!({ "query": "issue" }), &ctx_for!(gate, &tmp, mcp))
             .await
             .unwrap();
-        assert!(hit.text.contains("mcp__github__create_issue"), "{}", hit.text);
+        // 新方案：组名 = server id，工具名原样透传（不剥网关前缀）
+        assert!(hit.text.contains("mcp__default__github_1mcp_create_issue"), "{}", hit.text);
         assert!(hit.text.contains("Create a new issue"), "{}", hit.text);
-        // 🔴 名字必须是**能调通的**那个：1MCP 网关的原始名是
-        // `github_1mcp_create_issue`，直接拼会得到 `mcp__github__github_1mcp_create_issue`
-        // —— 一个不存在的工具名。模型照着它调只会拿到"未启用"错误，
-        // 而这是**搜索功能本身的失败**（搜了却调不动），最难被发现的那种。
-        assert!(
-            !hit.text.contains("github_1mcp_"),
-            "搜索必须剥离网关前缀，给出与 tools 列表一致的可调名: {}",
-            hit.text
-        );
-        // 不相干的那条不该被捞出来充数
-        assert!(!hit.text.contains("run-command"), "{}", hit.text);
+        // 组摘要含 "issue"（来自工具名采样）→ 整组命中，另一条工具也会列出
+        // 这是 by-design：组名/摘要命中 = 整组给出
 
         // 空 query = 完整索引（模型在问"我到底有什么工具"）
         let all = execute("search_tools", &json!({}), &ctx_for!(gate, &tmp, mcp))
@@ -5240,7 +5224,7 @@ Write-Output "ARG=[$msg]"
         )
         .await
         .unwrap();
-        assert!(miss.text.contains("github") && miss.text.contains("ssh"), "{}", miss.text);
+        assert!(miss.text.contains("default"), "{}", miss.text);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

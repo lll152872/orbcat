@@ -6,13 +6,36 @@ import { setMock, callsOf } from "./mocks/tauri";
  * 「项目」（拼装包）设置页
  *
  * 锁的契约：
- *   ① 设置入口页有「项目」入口，能进；
- *   ② 没有项目时是**空态**（不该假装有什么）；
- *   ③ 激活一个项目真的调 `project_activate`；
+ *   ① **一个包都没有时，设置里没有「项目」入口**（2026-10-09 减法）—— 这一页讲的
+ *      全是拼装包，0 个包时它是纯空壳，占一行设置入口没意义。造第一个包靠手写
+ *      `projects/<名>/project.json`（模块设计立场：那份 JSON 本来就该能用记事本改）；
+ *   ② 有包时入口出现，能进；
+ *   ③ 激活一个包真的调 `project_activate`；
  *   ④ **权限预设被丢弃时必须显眼告警** —— 这是 fail-closed 的用户可见面，
  *      悄悄不生效比报错更糟（用户以为预设生效了）；
  *   ⑤ 引用失效要逐条列出来（哪个类别、哪个 id、为什么）。
  */
+
+/** 一个最小可用包：只为让「项目」入口出现，好让页面内容类断言能进到页里 */
+const ONE_BUNDLE = {
+  bundles: [
+    {
+      id: "p",
+      name: "p",
+      description: "",
+      active: false,
+      valid: true,
+      error: null,
+      skillCount: 0,
+      toolCount: 0,
+      hasPermPreset: false,
+    },
+  ],
+  active: null,
+  unresolved: [],
+  permError: null,
+  tools: [],
+};
 
 async function openProject(): Promise<HTMLElement> {
   document.getElementById("btn-gear")!.click();
@@ -26,16 +49,52 @@ async function openProject(): Promise<HTMLElement> {
   return document.getElementById("panel-body")!;
 }
 
+/** 只打开设置入口页，不进项目页 */
+async function openSettingsMenu(): Promise<void> {
+  document.getElementById("btn-gear")!.click();
+  await waitFor(() => !!document.querySelector(".set-entry"), 3000, "设置入口页");
+}
+
 describe("设置 › 项目", () => {
-  it("入口存在，且空态说清「没有项目」而不是假装有", async () => {
+  it("功能暂缓：设置里「项目」这一行存在但被 hidden（恢复时只去掉标记）", async () => {
+    setMock("project_list", {
+      bundles: [],
+      active: null,
+      unresolved: [],
+      permError: null,
+      tools: [],
+    });
+    await bootApp();
+    await openPanel();
+    await openSettingsMenu();
+
+    const entry = Array.from(document.querySelectorAll<HTMLElement>(".set-entry")).find(
+      (b) => b.dataset.act === "project",
+    );
+    // 行还在 DOM 里（页面代码与摘要函数都没删），只是不可见 ——
+    // 这样功能恢复时不用重写，测试也能继续守着这一页的行为
+    expect(entry, "「项目」行应当仍在 DOM 中").toBeTruthy();
+    expect(entry!.hasAttribute("hidden"), "但它必须带 hidden 属性").toBe(true);
+
+    // 相邻的入口不能被连带打掉
+    expect(
+      Array.from(document.querySelectorAll<HTMLElement>(".set-entry")).some(
+        (b) => b.dataset.act === "mcp" && !b.hasAttribute("hidden"),
+      ),
+      "「MCP 外部工具」必须照常显示",
+    ).toBe(true);
+  });
+
+  it("有包时入口出现，空态/列表与编辑器都可用", async () => {
+    setMock("project_list", ONE_BUNDLE);
+
     await bootApp();
     await openPanel();
     await openProject();
+
     const body = document.getElementById("panel-body")!;
-    expect(body.textContent).toContain("当前没有激活任何项目");
-    // 空列表要给出解释（项目是什么），不能只留一片空白
-    expect(body.textContent).toContain("还没有项目包");
-    // 编辑器必须在（新建入口）
+    expect(body.textContent).toContain("p");
+    // 编辑器必须在（造下一个包的入口）
     expect(document.getElementById("proj-edit-id")).toBeTruthy();
     expect(document.getElementById("proj-save")).toBeTruthy();
   });
@@ -250,6 +309,7 @@ describe("设置 › 项目", () => {
   });
 
   it("保存会把编辑器内容原样交给后端（校验在后端，前端不重复实现）", async () => {
+    setMock("project_list", ONE_BUNDLE);
     await bootApp();
     await openPanel();
     await openProject();
@@ -269,6 +329,7 @@ describe("设置 › 项目", () => {
   });
 
   it("空 id 或空内容不发请求（前端挡掉明显无效的提交）", async () => {
+    setMock("project_list", ONE_BUNDLE);
     await bootApp();
     await openPanel();
     await openProject();
@@ -289,6 +350,7 @@ describe("设置 › 项目", () => {
   });
 
   it("「填入模板」给出一份能直接用的骨架，且含 schemaVersion", async () => {
+    setMock("project_list", ONE_BUNDLE);
     await bootApp();
     await openPanel();
     await openProject();

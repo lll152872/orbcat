@@ -221,18 +221,6 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
-/// 索引里展示的短工具名：`ssh_1mcp_run-command` → `run-command`。
-///
-/// 为什么剥掉 `<组>_1mcp_` 前缀：索引按组分行，组名已经写过一次了，
-/// 56 行里每行再重复一遍前缀纯属浪费 —— 而且模型要调的是
-/// `mcp__<组>__<工具>`，短的反而更好对上。
-fn short_tool_name(name: &str) -> &str {
-    match name.split_once("_1mcp_") {
-        Some((_, tool)) if !tool.is_empty() => tool,
-        _ => name,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // 组名 → 概括
 // ---------------------------------------------------------------------------
@@ -1300,43 +1288,24 @@ impl ToolRegistry {
 
     /// 把一个 server 上的工具切成组。
     ///
-    /// - 工具名带 `_1mcp_`（1MCP 网关）→ 按前缀拆成多组
-    /// - 否则整包一组，组名 = server id
+    /// 一个 MCP server = 一个组，组名 = server id。
+    ///
+    /// 我们**不**解析工具名里的 `<svc>_1mcp_<tool>` 前缀来分子组。网关内部
+    /// 怎么命名工具、怎么按子服务路由，是网关自己的事；orbcat 只维护通用 MCP
+    /// 协议：一个 server 挂进来就是一组，工具名原样透传。
+    ///
+    /// 想给某个子服务单独一个组？在 mcp.json 里把它配成独立 server 就行。
     fn group_tools_for(server_id: &str, tools: Vec<McpTool>) -> Vec<McpGroup> {
-        let gateway_style = tools.iter().any(|t| t.name.contains("_1mcp_"));
-        if !gateway_style {
-            let summary = summarize(server_id, &tools);
-            return vec![McpGroup {
-                name: server_id.to_string(),
-                server_id: server_id.to_string(),
-                summary,
-                tools,
-            }];
+        if tools.is_empty() {
+            return vec![];
         }
-
-        let mut map: Vec<(String, Vec<McpTool>)> = Vec::new();
-        for t in tools {
-            let gname = match t.name.split_once("_1mcp_") {
-                Some((s, _)) => s.to_string(),
-                None => "(standalone)".to_string(),
-            };
-            match map.iter_mut().find(|(k, _)| *k == gname) {
-                Some((_, v)) => v.push(t),
-                None => map.push((gname, vec![t])),
-            }
-        }
-
-        map.into_iter()
-            .map(|(name, tools)| {
-                let summary = summarize(&name, &tools);
-                McpGroup {
-                    name,
-                    server_id: server_id.to_string(),
-                    summary,
-                    tools,
-                }
-            })
-            .collect()
+        let summary = summarize(server_id, &tools);
+        vec![McpGroup {
+            name: server_id.to_string(),
+            server_id: server_id.to_string(),
+            summary,
+            tools,
+        }]
     }
 
     /// 测试用建注册表的统一入口。
@@ -1573,10 +1542,8 @@ impl ToolRegistry {
         let cost = g.total_tokens();
         // 工具名清单（让模型知道现在能调什么，但不重复 schema）。
         //
-        // ⚠️ 必须用 `mcp_tool_callable_name`（剥掉 `_1mcp_` 网关前缀），
-        // 不能直接拼 raw name：那样给出的是 `mcp__ssh__ssh_1mcp_run-command`
-        // 这种**不存在的工具名**，模型照着调只会失败。
-        // 这与 `tools.rs::tool_specs` 构建的可调列表是同一口径。
+        // 口径与 `tools.rs::tool_specs` 一致：`mcp__<server_id>__<raw_tool>`。
+        // 组名 = server id，工具名原样透传。
         let names: Vec<String> = g
             .tools
             .iter()
@@ -1709,7 +1676,7 @@ impl ToolRegistry {
             for t in g.tools.iter() {
                 out.push_str(&format!(
                     "- {} — {}\n",
-                    short_tool_name(&t.name),
+                    t.name,
                     one_line_usage(t)
                 ));
             }
@@ -1824,20 +1791,11 @@ pub fn mcp_tool_full_name(server: &str, tool: &str) -> String {
 
 /// 模型**实际看到并调用**的那个工具名（`tool_specs()` 用的就是这个口径）。
 ///
-/// 为什么要单独一个函数、而不是直接 `mcp_tool_full_name(group, raw_name)`：
-/// 1MCP 网关上的原始名是 `<组>_1mcp_<工具>`，直接拼会得到
-/// `mcp__github__github_1mcp_create_issue` —— 这是个**不存在的工具名**，
-/// 模型照着调只会拿到"未启用"的报错。必须先剥掉 `_1mcp_` 前缀，
-/// 与 `tools.rs::tool_specs`（构建可调工具列表的地方）保持**同一口径**：
-/// 两处口径一旦分叉，`search_tools` 给出的名字就是调不通的。
-///
-/// 非网关（独立 server）的工具没有前缀可剥，按 `standalone` 命名 ——
-/// 与 `tool_specs` 的兜底分支一致。
+/// 组名 = server id，工具名原样透传（不剥 `_1mcp_` 等网关前缀）—— 网关内部
+/// 怎么命名工具是网关自己的事，orbcat 只负责把名字拼成 `mcp__<组名>__<工具名>`
+/// 交给模型。
 pub fn mcp_tool_callable_name(group: &str, raw_name: &str) -> String {
-    match raw_name.split_once("_1mcp_") {
-        Some((_, tool)) if !tool.is_empty() => mcp_tool_full_name(group, tool),
-        _ => mcp_tool_full_name("standalone", raw_name),
-    }
+    mcp_tool_full_name(group, raw_name)
 }
 
 /// 从完整名反解出 (server, tool)
@@ -2476,7 +2434,8 @@ exit 3
     }
 
     #[test]
-    fn groups_by_1mcp_prefix() {
+    fn one_server_one_group_no_prefix_parsing() {
+        // 工具名带 `_1mcp_` 网关前缀？不管 —— 一 server 一组，工具名原样保留。
         let tools = vec![
             tool("ssh_1mcp_run-command"),
             tool("ssh_1mcp_list-connections"),
@@ -2484,18 +2443,18 @@ exit 3
             tool("weird_no_prefix_tool"),
         ];
         let groups = ToolRegistry::group_tools(tools);
-        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
-        assert!(names.contains(&"ssh"));
-        assert!(names.contains(&"playwright-mcp"));
-        assert!(names.contains(&"(standalone)"));
-
-        let ssh = groups.iter().find(|g| g.name == "ssh").unwrap();
-        assert_eq!(ssh.tools.len(), 2);
-        assert!(ssh.summary.contains("远程"));
+        assert_eq!(groups.len(), 1, "一 server 只该有一组");
+        assert_eq!(groups[0].name, "default", "组名 = server id");
+        assert_eq!(groups[0].tools.len(), 4, "所有工具都在同一组里");
+        // 工具名原样透传，不剥前缀
+        let names: Vec<&str> = groups[0].tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"ssh_1mcp_run-command"));
+        assert!(names.contains(&"weird_no_prefix_tool"));
     }
 
     #[test]
-    fn groups_sorted_by_size_desc() {
+    fn group_tools_returns_single_group() {
+        // 一 server 一组，不再有按大小排序的多组。
         let tools = vec![
             tool("a_1mcp_1"),
             tool("b_1mcp_1"),
@@ -2503,8 +2462,9 @@ exit 3
             tool("b_1mcp_3"),
         ];
         let groups = ToolRegistry::group_tools(tools);
-        assert_eq!(groups[0].name, "b");
-        assert_eq!(groups[1].name, "a");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "default");
+        assert_eq!(groups[0].tools.len(), 4);
     }
 
     #[test]
@@ -2742,8 +2702,7 @@ exit 3
         for g in reg.groups() {
             assert!(idx.contains(&format!("**{}**", g.name)), "缺组：{}", g.name);
             for t in &g.tools {
-                let short = short_tool_name(&t.name);
-                assert!(idx.contains(short), "索引缺工具 {short}");
+                assert!(idx.contains(&t.name), "索引缺工具 {}", t.name);
             }
         }
 
@@ -2804,30 +2763,25 @@ exit 3
         assert!(r.contains("read-only-command") || r.contains("list-directory"), "{r}");
 
         // 组名命中 = 整组给出（用户说"用那个 ssh 组"）
+        // 新方案下组名是 server id（"default"），搜 "ssh" 靠工具名命中
         let r = reg.search_tools("ssh");
-        assert!(r.contains("list-connections") && r.contains("run-command"), "{r}");
+        assert!(r.contains("ssh_1mcp_list-connections") && r.contains("ssh_1mcp_run-command"), "{r}");
 
         // 大小写不敏感
         assert!(reg.search_tools("SCREENSHOT").contains("browser_take_screenshot"));
 
-        // 命中结果里给出**可直接调用的全名**，而不是短名（省掉模型自己拼的一步）
-        // 搜索命中结果必须给出**模型真正能调用的**名字：1MCP 网关的原始名是
-        // `<组>_1mcp_<工具>`，直接拼会得到 `mcp__x__x_1mcp_y` 这种不存在的工具名。
-        // （这条口径必须与 `tools.rs::tool_specs` 一致，否则模型照着搜到的名字调必失败。）
+        // 命中结果里给出**可直接调用的全名**：`mcp__<server_id>__<raw_tool>`
+        // 工具名原样透传（不剥网关前缀），与 `tools.rs::tool_specs` 同一口径。
         assert!(
-            reg.search_tools("execute_query").contains("mcp__mcp-server-mysql__execute_query"),
+            reg.search_tools("execute_query").contains("mcp__default__mcp-server-mysql_1mcp_execute_query"),
             "{}",
             reg.search_tools("execute_query")
-        );
-        assert!(
-            !reg.search_tools("execute_query").contains("mcp-server-mysql_1mcp_"),
-            "不得给出带网关前缀的工具名"
         );
 
         // 搜不到时要给可行动的出口（列出可用组），不能只说"没有"
         let miss = reg.search_tools("zzz-nothing-matches");
         assert!(miss.contains("没有匹配"), "{miss}");
-        assert!(miss.contains("playwright-mcp") && miss.contains("ssh"), "{miss}");
+        assert!(miss.contains("default"), "{miss}");
 
         // 空 query = 完整索引（模型在问"我有什么工具"）
         assert_eq!(reg.search_tools("  "), reg.capability_index());
@@ -2891,11 +2845,10 @@ exit 3
         let mut reg = gateway_like_registry();
         reg.active.clear();
         let idx = reg.capability_index();
-        assert!(idx.contains("（24 个，未加载）"), "{idx}");
+        assert!(idx.contains("（56 个，未加载）"), "{idx}");
 
-        reg.active.insert("playwright-mcp".into());
+        reg.active.insert("default".into());
         let idx = reg.capability_index();
-        assert!(idx.contains("（24 个，已加载）"), "{idx}");
-        assert!(idx.contains("（11 个，未加载）"), "{idx}");
+        assert!(idx.contains("（56 个，已加载）"), "{idx}");
     }
 }

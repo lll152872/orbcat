@@ -7,11 +7,168 @@
 
 ---
 
-## [1.0.0] — 2026-10-09 · 前端改版 + 三个实机 bug
+## [1.0.0] — 2026-10-09 · 前端改版 + MCP 命名简化 + 两个实机 bug
 
-面板从 v0.2.0 的样子整体重做了一遍。**只改前端，`src-tauri/` 零改动。**
+面板从 v0.2.0 的样子整体重做了一遍，并把 MCP 的分组/命名层简化成通用协议。
+
+### 变更
+
+**MCP 命名层简化：一 server 一组，不再解析网关前缀**
+
+原先 orbcat 会解析 1MCP 网关的工具名格式 `<子服务>_1mcp_<工具>`，按前缀把一个网关
+拆成多个组（`github` / `ssh` / `mysql`…）。这是把**网关内部的命名约定**当成了协议：
+换一个网关、或网关自己改了命名规则，客户端就得跟着改。
+
+现在只维护通用 MCP 协议：
+
+- **一个 MCP server = 一个组，组名 = server id**
+- **工具名原样透传**，`mcp__<server_id>__<raw_tool_name>`，不改写
+- 想给某个子服务单独一个组？在 `mcp.json` 里把它配成独立 server
+
+配套改动：
+
+- 删 `short_tool_name`（原先会剥 `_1mcp_` 前缀展示短名，导致索引显示的名字与可调用的
+  全名对不上）、删 `tools.rs::tool_with_server`（反向把可调名还原成 `<server>_1mcp_<tool>`）
+- `tool_specs` 改用 `reg.groups()` 遍历取 `server_id`，不再从工具名反解组名
+- `execute` 的"是否已加载"判定从 `t.name.ends_with(&tool)` 改为精确相等 `t.name == tool`
+  —— `ends_with` 会把 `x_run-command` 和 `run-command` 误判成同一个
+
+**接入 dsh/cordis MCP 桥**
+
+`agent-data/mcp.json` 新增 `cordis-bridge`（stdio），把整个 cordis/dsh 插件生态的
+20 个工具（`lsp_*` / `pwc_*` / `bridge_*` / `learn_meme` / `send_meme`）接进 orbcat。
+orbcat 侧零依赖、零体积增长 —— 桥跑在外部 Node 进程里。
+
+**MCP 添加表单的输入框被撑成巨型空盒子**
+
+`.mcp-add-form` 想把「添加 HTTP 网关」「添加 stdio 脚本」的输入框横排，但它与
+`.set-form` 同为 (0,1,0) 特异性且排在后面，只覆盖了 `display/flex-wrap/gap/align-items`，
+**漏了 `flex-direction`** → 沿用 `.set-form` 的 `column`。于是 input 的
+`flex: 1 1 120px` 把 **basis 120px 落到了高度上**，再被父容器 `.mm-body`（`flex: 1`）
+给的确定高度按 `flex-grow` 平分，每个输入框被撑成一两百像素高。补上
+`flex-direction: row` 并给 input 锁死 `height: 30px`。
+
+**设置页减法：一个拼装包都没有时，「项目」入口整行隐藏**
+
+「项目」这一页讲的从头到尾都是**拼装包**（`projects/<名>/project.json`），一行项目
+记忆都没有 —— 项目记忆实际在顶栏 📁 下拉和「记忆」页里管。所以 0 个包时它对用户
+是纯空壳，只在设置入口页占一行、还让人误以为「项目」= 那 8 个记忆目录。
+
+改为：`projectInfo.bundles.length > 0` 才渲染这一行。副作用（有意接受）：造第一个包
+没法从 UI 点，靠手写 `projects/<名>/project.json` —— 这本来就是模块的设计立场
+（「那份 JSON 本来就该能用记事本改」），文件一出现这一行自动回来。
+
+**归档一批无代码引用的残留**
+
+`agent-data/` 下有三笔东西功能已删 / 代码零引用，白占磁盘：`dispatch/workbuddy/`
+（WorkBuddy 分发功能早随 `dispatch-workbuddy` 技能一起删了，3 文件 300KB）、
+`trae-proxy/trae_proxy.py`（代码零引用，13KB）、`tmp/wb-app/`（WorkBuddy 解包的
+115 个 JS chunk，28MB）+ `tmp/trae_cfg/` + `tmp/trae_dump/`（trae 逆向分析遗留，342KB）。
+
+全部按 RULES.md 第二节**归档**到 `.trash/`（rename + 补 `trash.jsonl` 来路），
+可在「设置 › 备份与回收站」一键还原 —— 不是硬删。
+
+**修 `trash.jsonl` 里 19 条记录全部指向已不存在的路径**
+
+项目从 `float-agent` 改名成 `orbcat` 之后，`trash.jsonl` 里的路径没跟着改：
+19 条里 18 条的 `trashed` 路径指着已经不存在的 `float-agent\...`。`list_trash`
+按这个路径探测，于是 85MB 归档物在回收站 UI 上**全部显示「已不在原处」**，
+一个也还原不了 —— 文件明明好好躺在 `.trash/` 里。修正 36 处路径前缀后 19/19 可定位。
+
+**设置入口页补一句「技能 N 个」—— 之前根本找不到 skills 在哪**
+
+技能清单一直在「记忆」页最底下，但设置入口那行摘要写的是「待审批、记忆文件族与
+项目绑定」，**压根没提技能** —— 从入口页完全看不出这页里有技能，等于找不到。
+摘要改成显式列出技能数（`技能 6 个 · 记忆文件 · 项目绑定`，有待审批时前置）。
+
+**设置页减法：两个功能整体暂缓，入口标记 `hidden`**
+
+「项目」（拼装包）和「数据源」（`life.json` 生活清单）这两个功能用户决定**暂缓，
+不随本次发布**。实现一行没删，只是：
+
+- 设置入口页那两行加了 `hidden` 属性（配 `.set-entry[hidden]{display:none!important}`
+  ——`.set-entry` 自己就是 `display:flex`，会盖掉 HTML `hidden` 的 UA 默认值，不加
+  这条等于没隐藏）
+- 两个摘要函数 `projectSummaryText` / `lifeSummaryText` 改成**幽灵函数**：
+  签名保留、调用点保留、返回 `null`（不渲染那行摘要），原实现以注释形式整段
+  留在函数体内
+- `projectInfo` 加一行 `void` 引用钉住 —— 幽灵函数导致它 TS6133，但
+  `renderProjectView` / `project_list` / 整套 vitest 都还活着，不能被当成死代码清掉
+
+恢复功能只需两步：把函数体里的注释实现放回去 + 去掉 `item()` 末尾那个 `true`。
+页面、后端命令、11 个数据源测试和 10 个项目测试全程原地保留，不用重建。
+
+**「文件权限」+「命令策略」合并成一行「安全闸门」**
+
+两个页面都还在、互相可达（文件权限页顶部有「去命令策略 ›」），只是设置入口页不再
+并排摆两行 —— 它们本来就是同一件事的两个面：agent 能碰什么。
 
 ### 修复
+
+**右键球 → 点「记忆」→ 面板缩成一小块，而且回不去**
+
+窗口有胶囊态 / 面板态 / 右键菜单态三套尺寸。点菜单项时 `applyMode("panel")`
+要把窗口从 196×214 拉到 460×600，但 `applyMode` 两个分支给 `mode` 赋值的时间点
+不一致：
+
+```ts
+// orb/menu 分支 —— 先赋值
+mode = next;
+await invoke("set_window_mode", { mode: next });
+
+// panel 分支 —— 先 await（错）
+await invoke("set_window_mode", { mode: next });
+mode = next;
+```
+
+于是整个 IPC 往返里 `mode` 一直是旧的 `"menu"`。`set_bounds` 改窗口大小会触发
+一次激活状态变化 → WebView 抛 `blur` → blur 处理器看到 `mode === "menu"` 就
+`applyMode("orb")` 把窗口收回球大小。外层 await 回来后才写 `mode = "panel"` ——
+**`mode` 说面板、窗口实际是球**。再点球时 `if (next === mode) return` 直接返回，
+从此再也回不去。
+
+两处都修了：
+
+1. panel 分支改成 `mode = next` 在 await **之前**（与另一分支一致），并给
+   `invoke` 加 try/catch —— 万一窗口没改成，`mode` 立刻写回旧值，
+   不让它停在「和实际尺寸不一致」的状态
+2. 新增 `modeSwitching` 标志：切换期间 blur 与 mousedown 一律放行，
+   自己 resize 引来的事件不再被当成「用户点到别处去了」
+
+**MCP「添加」按钮整个看不见（低对比度）**
+
+`.set-btn.add` 的 `background` 与 `color` **是同一个色值 `#a8e6cf`** —— 文字直接
+糊在底色上。改版时底色从深色调成薄荷绿，字色忘了跟着换。改成深字 `#10261E`。
+`.init-go`（初始化引导按钮）同款（近白字压薄荷绿底）一并修。
+
+`#btn-send` 与 `.msg.user .msg-body` 也是同款写法，只是恰好被文件更靠后的规则
+改回深色才没出事 —— 已加注释标注这两处必须成对改。
+
+**模型窗口里改不了 Base URL（保存后静默丢弃）**
+
+模型编辑表单有 Base URL 输入框，但改完保存**什么都不会发生、也不报错**。
+
+根因是接口设计缺陷而非漏传参数：`config::update_model` 的第 3 个参数是「**新**
+Base URL」，本来支持换组；但 `models_edit` 把**同一个** `url` 参数同时当作
+「定位用的旧 URL」和「新 URL」传下去，而前端只发了旧值（`url: f.editUrl`），
+表单里真正填的新值压根没上线。
+
+拆成两个参数：`url`（定位）+ `new_url`（新值）。前端改发 `newUrl`，后端用
+`url_key` 归一后判断是否真的变了，变了才落盘；同时当前选中项的
+`selectedModelUrl` 跟着更新，否则「当前模型」标记会掉没。
+
+**模型窗口几乎没法缩放（只剩一条抓不住的细缝）**
+
+后端建这个窗口时是 `resizable(true)` + `min_inner_size(480,360)`，尺寸还写进
+`settings.modelsWindow` —— 缩放是设计内功能。但代码里**从来没调用过
+`startResizeDragging`**：Windows 的边缘 resize 依赖 mousedown 落到窗口边框，
+而整窗拖动对几乎整个客户区都做了 `preventDefault()` + `startDragging()`，
+客户区里一点 resize 的余地都不剩。
+
+显式画 8 条缩放手柄（四边 + 四角，命中区 7px / 角 12px），mousedown 调
+`startResizeDragging`，并 `stopPropagation` 防止一次操作同时移动+缩放。
+手柄是 `.mw-window` 的**兄弟**节点 —— 它有 `overflow:hidden` + 圆角，
+放里面会被裁掉。
 
 **卡死：思考块越长越卡（最严重）**
 
@@ -25,6 +182,26 @@
   跑完 `.msg.running` 消失，限高自动解除，正文完整展开。
   两个对立需求（要看到全部 / 别卡死）用同一个属性同时满足
 - 新增回归闸门：spy `Element.prototype.scrollHeight`，断言折叠时读取次数为 0
+
+**MCP 添加表单的输入框被撑成巨型空盒子**
+
+`.mcp-add-form` 想把「添加 HTTP 网关」「添加 stdio 脚本」的输入框横排，但它与
+`.set-form` 同为 (0,1,0) 特异性且排在后面，只覆盖了 `display/flex-wrap/gap/align-items`，
+**漏了 `flex-direction`** → 沿用 `.set-form` 的 `column`。于是 input 的
+`flex: 1 1 120px` 把 **basis 120px 落到了高度上**，再被父容器 `.mm-body`（`flex: 1`）
+给的确定高度按 `flex-grow` 平分，每个输入框被撑成一两百像素高。补上
+`flex-direction: row` 并给 input 锁死 `height: 30px`。
+
+**列得出、调不通**
+
+非网关 server 的工具没有 `_1mcp_` 前缀可剥，`mcp_tool_callable_name` 走兜底给出
+`mcp__standalone__lsp_diagnostics`，但 `tools.rs::tool_with_server` 又把它还原成
+`standalone_1mcp_lsp_diagnostics` —— 与 server 上的真实名匹配不上，只能落到任意一个
+client 上，必然报 unknown tool。这正是 `mcp.rs` 里那句「两个方向各有一套猜测规则，
+迟早对不上」注释警告的分叉点，网关场景不触发、非网关场景必触发。
+
+新方案下 `parse_mcp_tool_name` 取第一段为 server、其余即原名，
+`tool_with_server` 整个函数不再需要，分叉点从根上消失。
 
 **原生 `<select>` 下拉项看不见**
 

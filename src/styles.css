@@ -720,6 +720,8 @@ body {
 }
 
 .msg.user .msg-body {
+  /* ⚠️ 这里的 `color: #a8e6cf` 与底色同色（= 看不见），靠文件后面的
+     `.msg.user .msg-body` 规则改回 #141a1b 才生效。两处都别单独改。 */
   background: linear-gradient(135deg, #a8e6cf, #86c9b0);
   color: #a8e6cf;
   max-width: 88%;
@@ -814,7 +816,9 @@ body {
   padding: 7px 20px;
   font-size: 13px;
   font-weight: 600;
-  color: #F2F2F4;
+  /* ⚠️ 薄荷绿底必须配深字。原先这里是 #F2F2F4（近白），压在 #a8e6cf 上
+     基本等于看不见 —— 同款事故还有 .set-btn.add，一并修的。 */
+  color: #10261E;
   background: linear-gradient(135deg, #a8e6cf, #a8e6cf);
   border: none;
   border-radius: 8px;
@@ -893,6 +897,10 @@ body {
   height: 36px;
   border: none;
   border-radius: 9px;
+  /* ⚠️ 字色故意先写错再由文件后面的 `#btn-send` 规则改对（那里是 #141a1b）。
+     历史遗留：这里曾是 `color: #a8e6cf`，与底色同色 = 整个按钮不可见。
+     留着这个值只是因为它是本文件**第一个** `#btn-send` 规则；改任何一处都要
+     同时确认另一处，深底配深字才是对的。 */
   background: linear-gradient(135deg, #a8e6cf, #86c9b0);
   color: #a8e6cf;
   font-size: 15px;
@@ -2569,11 +2577,18 @@ body {
 }
 
 .set-btn.add {
+  /* ⚠️ 底色和字色**不能**都是 #a8e6cf —— 那等于没写字，按钮看上去整个消失
+     （2026-10-10 用户报「MCP 添加按钮看不到了」）。深底必须配深字。 */
   background: linear-gradient(135deg, #a8e6cf, #86c9b0);
   border: none;
-  color: #a8e6cf;
+  color: #10261E;
+  font-weight: 600;
   padding: 6px 14px;
   font-size: 12px;
+}
+
+.set-btn.add:hover {
+  background: linear-gradient(135deg, #bff0dd, #9adcc4);
 }
 
 .set-form {
@@ -3257,8 +3272,15 @@ button.fetch-id {
   border-color: rgba(168, 230, 207, 0.5);
 }
 
+/* MCP「添加 HTTP 网关 / 添加 stdio 脚本」表单：一行内横向排布，放不下才换行。
+   ⚠️ `flex-direction: row` 必须显式写 —— `.set-form` 是 `column`，而这条规则
+   与它同为 (0,1,0)，靠文件顺序取胜；漏掉 direction 就会沿用 column，
+   于是 input 的 `flex: 1 1 120px` 把 **basis 120px 落到高度上**，
+   再叠加 `.mm-body`（flex:1）给的确定高度被 flex-grow 平分 →
+   每个输入框被撑成一两百像素高的空盒子。 */
 .mcp-add-form {
   display: flex;
+  flex-direction: row;
   flex-wrap: wrap;
   gap: 6px;
   align-items: center;
@@ -3266,6 +3288,8 @@ button.fetch-id {
 .mcp-add-form input {
   flex: 1 1 120px;
   min-width: 100px;
+  /* 保险：basis 只该作用于宽度，高度锁回内容尺寸，不让任何父级高度传导进来 */
+  height: 30px;
 }
 
 .set-warn {
@@ -4186,7 +4210,43 @@ body.models-page {
 #models-app {
   width: 100%;
   height: 100%;
+  /* 缩放手柄要贴着窗口边缘，所以这里必须是定位上下文 */
+  position: relative;
 }
+
+/* 八个缩放手柄（.mw-window 的兄弟节点，绕开它的 overflow:hidden + 圆角）。
+   命中区 7px —— Windows 无边框窗口的原生 resize 缝太窄抓不住，自绘就得给足。 */
+.mw-rz {
+  position: absolute;
+  z-index: 40;
+}
+.mw-rz-n, .mw-rz-s {
+  left: 10px;
+  right: 10px;
+  height: 7px;
+  cursor: ns-resize;
+}
+.mw-rz-w, .mw-rz-e {
+  top: 10px;
+  bottom: 10px;
+  width: 7px;
+  cursor: ew-resize;
+}
+.mw-rz-n { top: 0; }
+.mw-rz-s { bottom: 0; }
+.mw-rz-w { left: 0; }
+.mw-rz-e { right: 0; }
+/* 四角：正方形，把边与角的重叠区盖掉，接缝处不会出现两个光标打架 */
+.mw-rz-nw, .mw-rz-ne, .mw-rz-sw, .mw-rz-se {
+  width: 12px;
+  height: 12px;
+}
+.mw-rz-nw { top: 0; left: 0; cursor: nwse-resize; }
+.mw-rz-ne { top: 0; right: 0; cursor: nesw-resize; }
+.mw-rz-sw { bottom: 0; left: 0; cursor: nesw-resize; }
+.mw-rz-se { bottom: 0; right: 0; cursor: nwse-resize; }
+/* 手柄本体不可见，但鼠标事件照常 */
+.mw-rz:hover { background: rgba(168, 230, 207, 0.18); }
 
 /* 窗口骨架：无边框窗口里自己画一层壳 + 自绘标题栏 */
 .mw-window {
@@ -4850,6 +4910,16 @@ body.models-page {
   background: rgba(168, 230, 207, 0.04);
   border: 1px solid rgba(168, 230, 207, 0.07);
   margin-bottom: 8px;
+}
+
+/* 暂时下线的设置行（2026-10-09 用户拍板：拼装包 / 数据源两个功能整体暂缓）。
+   用 `hidden` 属性而不是不渲染 —— 页面代码、单测、摘要函数全部原地保留，
+   功能恢复时把对应行的 `hidden` 去掉即可，不用重写。
+
+   ⚠️ `!important` 不是多余的：`.set-entry` 自己就是 `display: flex`，
+   会盖掉 HTML `hidden` 属性的 UA 默认 `display: none` —— 不加这行就等于没隐藏。 */
+.set-entry[hidden] {
+  display: none !important;
 }
 .set-entry:hover {
   background: var(--accent-wash);

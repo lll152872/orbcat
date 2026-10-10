@@ -988,16 +988,23 @@ fn existing_vendor_or_custom(existing: &Option<config::ModelConfig>) -> String {
 
 /// 编辑已有模型（按 **(Base URL, 接口 id)** 定位）。
 ///
-/// - `url`：定位用的组 Base URL（前端从列表条目带上）；None 回落裸 id
+/// - `url`：**定位用**的旧组 Base URL（前端从被编辑那条带上）；None 回落裸 id
+/// - `new_url`：表单里填的**新** Base URL —— 改了就是换组（跨组移动这条模型）
 /// - `new_id`：改发给提供商的 `model` 字段；**组内查重**（跨组同名合法）
 /// - `apiKey` 空 = 保持原 Key；`clear_key` = 清空
+///
+/// ⚠️ `url` 与 `new_url` 必须分开（2026-10-09 修）。它们以前是**同一个参数**
+/// `url` 既定位又当新值传下去，而前端只发了旧值 → 表单里的 Base URL 压根没上线，
+/// 改完保存**静默丢弃**，用户看不到任何提示。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn models_edit(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     id: String,
     new_id: Option<String>,
     url: Option<String>,
+    new_url: Option<String>,
     api_key: Option<String>,
     clear_key: Option<bool>,
     supports_tool_call: Option<bool>,
@@ -1019,12 +1026,19 @@ fn models_edit(
         .clone()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    // 新 Base URL：空 / 与旧值等价（url_key 归一）都当"没改"
+    let url_changed = match new_url.as_deref().map(str::trim) {
+        Some(nu) if !nu.is_empty() && config::url_key(nu) != config::url_key(&old_url) => {
+            Some(nu.to_string())
+        }
+        _ => None,
+    };
 
     config::update_model(
         &state.data_dir,
         &old_url,
         &old_id,
-        url,
+        url_changed.clone(),
         api_key,
         clear_key.unwrap_or(false),
         supports_tool_call,
@@ -1035,20 +1049,23 @@ fn models_edit(
         nid_trimmed.clone(),
     )?;
 
-    // 改了接口 id 且当前选中项就是这条 → 同步 selected（身份含 id）
-    if let Some(nid) = nid_trimmed {
-        if nid != old_id {
-            let mut s = config::load_settings(&state.data_dir);
-            let sel_matches = s.selected_model.as_deref() == Some(old_id.as_str())
-                && s
-                    .selected_model_url
-                    .as_deref()
-                    .map(|u| config::url_key(u) == config::url_key(&old_url))
-                    .unwrap_or(true);
-            if sel_matches {
+    // 当前选中项就是被编辑的这条 → id / url 任一变了都要同步，否则"当前模型"标记掉没
+    if nid_trimmed.is_some() || url_changed.is_some() {
+        let mut s = config::load_settings(&state.data_dir);
+        let sel_matches = s.selected_model.as_deref() == Some(old_id.as_str())
+            && s
+                .selected_model_url
+                .as_deref()
+                .map(|u| config::url_key(u) == config::url_key(&old_url))
+                .unwrap_or(true);
+        if sel_matches {
+            if let Some(nid) = nid_trimmed {
                 s.selected_model = Some(nid);
-                config::save_settings(&state.data_dir, &s)?;
             }
+            if let Some(nu) = url_changed {
+                s.selected_model_url = Some(nu);
+            }
+            config::save_settings(&state.data_dir, &s)?;
         }
     }
 
