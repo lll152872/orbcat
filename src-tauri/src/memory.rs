@@ -306,9 +306,23 @@ impl MemoryStore {
             return None;
         };
 
+        // ⚠️ 必须让「比较用的路径」两边归一化到同一种形式，否则 `starts_with` 会失效。
+        //
+        // 2026-10-10 抓到的问题（CI windows runner 上暴露，本地中文机器一直通过）：
+        // `source.ref` 里存的是**写入时**的路径原样（测试里是 `temp_dir()`，
+        // CI 上是 `C:\Users\runneradmin\AppData\Local\Temp\...`）；而待匹配的
+        // `paths` 走 `canonicalize()`。在 Windows 上 `canonicalize()` 会调
+        // `GetFinalPathNameByHandle` **把 8.3 短名展开成真实长名**
+        // （`RUNNER~1` → `runneradmin`），两边形态不一致 → 前缀匹配失败。
+        //
+        // 这不只是测试问题：用户项目路径含 8.3 短名（TEMP 目录下尤甚）
+        // 或经符号链接访问时，同样会匹配不上 —— 属于真实缺陷。
+        //
+        // 解法：**两侧都 canonicalize**，归一化到同一种形态。
+        // `strip_verbatim` 顺带剥掉 canonicalize 产物的 `\\?\` 扩展前缀，
+        // 否则两边前缀长度不一致，`starts_with` 又会对不上。
         let norm = |p: &Path| -> PathBuf {
-            let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-            crate::permission::strip_verbatim(c)
+            crate::permission::strip_verbatim(p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
         };
 
         let mut best: Option<(usize, String, String)> = None; // (source_len, name, memory)
@@ -350,7 +364,12 @@ impl MemoryStore {
                     continue;
                 }
                 let pc = norm(p);
-                if pc.starts_with(&src_cmp) {
+                // ⚠️ 用 `path_has_prefix` 而不是 `Path::starts_with`：
+                //   - 前者是**按组件**比较，`D:\myword` 不会误匹配 `D:\mywordx`
+                //   - 前者在 Windows 上**大小写不敏感**（canonicalize 可能产出
+                //     与 source.ref 不同大小写的形式）
+                //   - 后者只比字符串前缀，上述两种情况都会判错
+                if crate::permission::path_has_prefix(&pc, &src_cmp) {
                     let len = src_cmp.as_os_str().len();
                     if best.as_ref().map(|(l, _, _)| len > *l).unwrap_or(true) {
                         best = Some((len, name.clone(), mem.clone()));
@@ -721,6 +740,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&root);
     }
+
 
     #[test]
     fn project_memory_missing_source_or_empty_mem_is_skipped() {
