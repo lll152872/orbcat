@@ -4172,6 +4172,65 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 // 入口
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 平台专属命令占位（非 Windows）
+// ---------------------------------------------------------------------------
+
+/// 隐形桌面相关的三个命令在非 Windows 上的**占位实现**。
+///
+/// ## 为什么需要它们（而不是从注册表里剔除）
+///
+/// `tauri::generate_handler![]` 的参数列表是**字面标识符**，既不允许写
+/// `#[cfg]`，也不会展开嵌套宏（试过 `platform_commands!()`，报
+/// `error: expected ','`）。所以只要注册表里写了 `bg_desk_status`，
+/// 它就必须在这两个平台上有一个可解析的符号。
+///
+/// 而 Windows 版那三个函数挂了 `#[cfg(windows)]` —— 因为它们直接调
+/// `win32desk`，而 `win32desk` 整体只存在于 Windows（`CreateDesktopW` 是
+/// Win32 独有）。于是在 macOS 上就炸了：
+///
+/// ```text
+/// error: cannot find macro `__cmd__bg_desk_status` in this scope
+/// error: cannot find macro `__tauri_command_name_bg_desk_status` in this scope
+/// ```
+///
+/// 这是 2026-10-10 由 GitHub Actions 的 `macos-14` runner 抓出来的 ——
+/// 本机 Windows 上 `cargo check` 永远看不到它。
+///
+/// ## 语义选择：返回「不可用」而不是静默成功
+///
+/// 前端调用这三个命令时拿到明确的错误信息，比拿到一个假的 `false` / `null`
+/// 要好得多 —— 用户打开设置页会看到「隐形桌面仅支持 Windows」，
+/// 而不是困惑于「为什么开关打不开也不报错」。
+#[cfg(not(windows))]
+mod platform_command_stubs {
+    use serde_json::Value;
+
+    const MSG: &str = "隐形桌面仅支持 Windows（macOS 无此机制）";
+
+    #[tauri::command]
+    pub fn bg_desk_status() -> Value {
+        serde_json::json!({
+            "available": false,
+            "enabled": false,
+            "reason": MSG,
+        })
+    }
+
+    #[tauri::command]
+    pub fn bg_desk_set(_enabled: bool) -> Result<bool, String> {
+        Err(MSG.to_string())
+    }
+
+    #[tauri::command]
+    pub fn bg_desk_shot(_title: Option<String>, _out_dir: String) -> Result<String, String> {
+        Err(MSG.to_string())
+    }
+}
+
+#[cfg(not(windows))]
+use platform_command_stubs::{bg_desk_set, bg_desk_shot, bg_desk_status};
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // --- 单实例锁（必须最先做，早于任何窗口创建）---
