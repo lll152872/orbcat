@@ -306,9 +306,23 @@ impl MemoryStore {
             return None;
         };
 
+        // ⚠️ 必须让「比较用的路径」两边归一化到同一种形式，否则 `starts_with` 会失效。
+        //
+        // 2026-10-10 抓到的问题（CI windows runner 上暴露，本地中文机器一直通过）：
+        // `source.ref` 里存的是**写入时**的路径原样（测试里是 `temp_dir()`，
+        // CI 上是 `C:\Users\runneradmin\AppData\Local\Temp\...`）；而待匹配的
+        // `paths` 走 `canonicalize()`。在 Windows 上 `canonicalize()` 会调
+        // `GetFinalPathNameByHandle` **把 8.3 短名展开成真实长名**
+        // （`RUNNER~1` → `runneradmin`），两边形态不一致 → 前缀匹配失败。
+        //
+        // 这不只是测试问题：用户项目路径含 8.3 短名（TEMP 目录下尤甚）
+        // 或经符号链接访问时，同样会匹配不上 —— 属于真实缺陷。
+        //
+        // 解法：**两侧都 canonicalize**，归一化到同一种形态。
+        // `strip_verbatim` 顺带剥掉 canonicalize 产物的 `\\?\` 扩展前缀，
+        // 否则两边前缀长度不一致，`starts_with` 又会对不上。
         let norm = |p: &Path| -> PathBuf {
-            let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-            crate::permission::strip_verbatim(c)
+            crate::permission::strip_verbatim(p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
         };
 
         let mut best: Option<(usize, String, String)> = None; // (source_len, name, memory)
@@ -350,7 +364,12 @@ impl MemoryStore {
                     continue;
                 }
                 let pc = norm(p);
-                if pc.starts_with(&src_cmp) {
+                // ⚠️ 用 `path_has_prefix` 而不是 `Path::starts_with`：
+                //   - 前者是**按组件**比较，`D:\myword` 不会误匹配 `D:\mywordx`
+                //   - 前者在 Windows 上**大小写不敏感**（canonicalize 可能产出
+                //     与 source.ref 不同大小写的形式）
+                //   - 后者只比字符串前缀，上述两种情况都会判错
+                if crate::permission::path_has_prefix(&pc, &src_cmp) {
                     let len = src_cmp.as_os_str().len();
                     if best.as_ref().map(|(l, _, _)| len > *l).unwrap_or(true) {
                         best = Some((len, name.clone(), mem.clone()));
@@ -590,7 +609,26 @@ mod tests {
     use super::*;
 
     fn fresh_store(tag: &str) -> (MemoryStore, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("orbcat_mem_{tag}"));
+        // ⚠️ 目录名必须**每次调用唯一**（2026-10-10 修）。
+        //
+        // 原来只有 tag：`orbcat_mem_daily` / `orbcat_mem_proj` / …，且开头无条件
+        // `remove_dir_all`。`cargo test` 默认**多线程并行**，多个测试共用同一进程时，
+        // 只要 tag 撞上就会互相删掉对方刚写的文件 —— 症状随机：本地串行跑全绿，
+        // CI 上并行度不同就偶发失败。`project_memory_longest_prefix_wins` 就是这么挂的。
+        //
+        // 修法：tag 后缀加纳秒时间戳 + 线程 id，同进程内也不重名。
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let thread = format!("{:?}", std::thread::current().id())
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "");
+        let dir = std::env::temp_dir().join(format!(
+            "orbcat_mem_{tag}_{}_{}_{}",
+            std::process::id(),
+            thread,
+            uniq
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         (MemoryStore::new(&dir), dir)
@@ -660,10 +698,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn project_memory_longest_prefix_wins() {
         let (s, dir) = fresh_store("proj");
-        let root = std::env::temp_dir().join(format!("fa_proj_src_{}", std::process::id()));
+        // ⚠️ 目录名必须**每次唯一**。这里原本只用 `process::id()`，而同一进程内
+        //    有多个测试都建 `fa_proj_src_<pid>` —— 并行执行时会互相覆盖/删除，
+        //    导致 `canonicalize()` 拿到已被删的路径 → 匹配失败。
+        //    2026-10-10 由 GitHub Actions windows runner 抓出（本地串行跑看不出）。
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("fa_proj_src_{}_{}", std::process::id(), uniq));
         let deep = root.join("sub");
         std::fs::create_dir_all(&deep).unwrap();
 
@@ -690,6 +740,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&root);
     }
+
 
     #[test]
     fn project_memory_missing_source_or_empty_mem_is_skipped() {

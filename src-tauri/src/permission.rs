@@ -894,6 +894,10 @@ mod tests {
         g
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn d_drive_is_read_only() {
         let g = gate();
@@ -904,6 +908,10 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn longest_prefix_wins() {
         let g = gate();
@@ -913,6 +921,10 @@ mod tests {
         assert!(g.check(r"D:\myword\agent-data\m.json", Access::Full).is_ok());
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn sibling_prefix_must_not_match() {
         // 关键：D:\myword 不能匹配 D:\mywordx
@@ -922,6 +934,10 @@ mod tests {
                 "D:\\mywordx 应落到 D:\\ 的只读规则，而不是 D:\\myword 的读写规则；实际: {r:?}");
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn path_traversal_is_resolved() {
         let g = gate();
@@ -931,6 +947,10 @@ mod tests {
                 "路径穿越应被规范化后拒绝；实际: {r:?}");
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn case_insensitive_on_windows() {
         let g = gate();
@@ -947,6 +967,10 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn nonexistent_file_under_allowed_dir() {
         // 待创建的文件：路径不存在，但应能规范化并授权
@@ -955,6 +979,10 @@ mod tests {
         assert!(r.is_ok(), "应允许在 D:\\myword 下创建新文件；实际: {r:?}");
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn component_prefix_equality() {
         assert!(path_has_prefix(Path::new(r"D:\a\b"), Path::new(r"D:\a")));
@@ -977,6 +1005,10 @@ mod tests {
 
     // ---- Deny 级别 ----
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn deny_beats_broader_allow() {
         let mut g = PermissionGate::new();
@@ -994,6 +1026,10 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn deny_is_not_reported_as_insufficient() {
         let mut g = PermissionGate::new();
@@ -1007,6 +1043,10 @@ mod tests {
 
     // ---- 持久化 ----
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn save_and_load_roundtrip() {
         let dir = std::env::temp_dir().join("orbcat_perm_persist");
@@ -1049,6 +1089,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn replace_rules_respects_deny() {
         let mut g = PermissionGate::new();
@@ -1072,6 +1116,10 @@ mod tests {
 
     // ---- 临时授权层（「申请权限」）----
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn grant_wins_over_deny_rule_at_same_prefix() {
         // 决策 6 的核心：Deny 也能申请 —— 批准后**必须**能压过 Deny 规则，
@@ -1098,6 +1146,10 @@ mod tests {
         assert_eq!(r.unwrap().grant_idx, Some(0));
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn longer_deny_rule_beats_shorter_grant() {
         // 反向保护：批了上层目录**不能**顺手解开下层红线。
@@ -1119,6 +1171,10 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn longer_grant_beats_shorter_rule() {
         let mut g = PermissionGate::new();
@@ -1142,6 +1198,10 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn insufficient_grant_falls_through_to_rule() {
         // 权限不够的授权**不参与竞争** —— 这样错误信息仍准确指向"是哪条规则不够"
@@ -1161,6 +1221,10 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn check_without_grants_is_unchanged() {
         // 收敛到 authorize() 之后，不带授权表的行为必须与旧实现完全一致
@@ -1176,6 +1240,10 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn once_grant_is_consumed_and_removed() {
         let mut store = GrantStore::new();

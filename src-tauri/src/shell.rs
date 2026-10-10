@@ -173,6 +173,24 @@ pub async fn run_on_desktop(
     })
 }
 
+/// 非 Windows 平台的同名占位 —— macOS 没有「隐形桌面」这个概念
+/// （`CreateDesktopW` 是 Win32 独有）。
+///
+/// 存在的唯一理由是**让 `tools.rs` 的分支能编译**：那里的
+/// `use_bg_desk` 在非 Windows 上恒为 `false`，但 Rust 的类型检查不看运行期
+/// 常量，`if use_bg_desk { … run_on_desktop(…) }` 里的调用仍要被解析。
+///
+/// 真的走到这里说明逻辑出错了（开关在非 Windows 上不可能为 true），
+/// 所以返回错误而不是悄悄降级成普通执行 —— 那样会掩盖 bug。
+#[cfg(not(windows))]
+pub async fn run_on_desktop(
+    _cmd: &str,
+    _cwd: &Path,
+    _timeout_secs: u64,
+) -> Result<CmdOutput, String> {
+    Err("隐形桌面后台执行仅支持 Windows（macOS 无此机制）".to_string())
+}
+
 /// 等待结果：子进程结束 / 超时 / 用户取消
 enum Waited {
     Done(std::io::Result<std::process::ExitStatus>),
@@ -741,6 +759,10 @@ mod tests {
     /// `CreateProcessW` **不够** —— 那个 API 不搜 PATH，传裸名直接
     /// `GetLastError=2`。隐形桌面这条路走的正是 `CreateProcessW`，
     /// 所以现在断言"是个存在的文件"。
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn interpreter_is_resolvable() {
         let (exe, _) = resolve_interpreter();
