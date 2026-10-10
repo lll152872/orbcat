@@ -1147,6 +1147,10 @@ mod tests {
             .contains("不要立刻重试"));
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn denied_memo_blocks_repeat_siblings_and_children() {
         // B2/B3 防骚扰：同路径 / 同父目录兄弟 / 已拒前缀之下，同或更宽 access
@@ -1209,6 +1213,10 @@ mod tests {
         assert_eq!(hit.reason, "第二次", "同一条只留最新理由，不该堆成两条");
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn widen_levels_counts_extra_components() {
         // 同一条路径 → 0 层
@@ -1291,6 +1299,7 @@ mod tests {
         assert_eq!(used2, PathBuf::from(r"D:\report"));
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn ask_returns_timeout_when_nobody_answers() {
         // 不连 app（发不出事件），也没人调 decide → 只能等超时。

@@ -118,8 +118,16 @@ jobs:
       - name: Rust build (bin)
         run: cargo build --manifest-path src-tauri/Cargo.toml --bin orbcat
 
-      # lib 的单元测试。macOS 上多数测试与平台无关，应全部通过；
-      # 平台相关的（context / win32desk）在非 Windows 上走 stub 分支。
+      # lib 的单元测试。macOS 上多数测试与平台无关，应全部通过。
+      #
+      # ⚠️ 有 23 个测试是 **Windows-only**，它们硬编码了 `D:\…` 路径或依赖
+      #    Windows 特有行为（`pwsh.exe` 存在、GBK 文件默认编码、盘符大小写不敏感）。
+      #    在 macOS 上 `D:\foo` 只是一个相对文件名，断言必然失败 —— 那是**测试的
+      #    平台依赖**，不是产品 bug。它们已加 `#[cfg(windows)]` 门，非 Windows 上
+      #    根本不参与编译。
+      #
+      # 这里必须**如实汇报跳过数**，不要用 `--skip` 掩盖 —— 如果哪天新增的测试
+      # 又因平台问题挂了，应该看到红色而不是静悄悄变绿。
       - name: Rust tests
         run: cargo test --lib --manifest-path src-tauri/Cargo.toml
 
@@ -171,5 +179,6 @@ jobs:
       - name: Rust check (lib)
         run: cargo check --manifest-path src-tauri/Cargo.toml --lib
 
+      # 与 arm64 job 同理：23 个 Windows-only 测试已加 cfg 门，此处应全绿。
       - name: Rust tests
         run: cargo test --lib --manifest-path src-tauri/Cargo.toml

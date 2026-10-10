@@ -759,6 +759,10 @@ mod tests {
     /// `CreateProcessW` **不够** —— 那个 API 不搜 PATH，传裸名直接
     /// `GetLastError=2`。隐形桌面这条路走的正是 `CreateProcessW`，
     /// 所以现在断言"是个存在的文件"。
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn interpreter_is_resolvable() {
         let (exe, _) = resolve_interpreter();

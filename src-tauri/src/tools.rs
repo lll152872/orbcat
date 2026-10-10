@@ -4889,6 +4889,10 @@ Write-Output "ARG=[$msg]"
     }
 
     /// GBK 文件不再被静默跳过（中文 Windows 的 .md/.txt 常见）。
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn grep_files_reads_gbk_files() {
         let dir = fresh_tmp("grep_gbk_e2e");
