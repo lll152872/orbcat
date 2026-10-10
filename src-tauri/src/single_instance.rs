@@ -186,7 +186,10 @@ mod imp {
     pub fn acquire() -> Acquired {
         let path = lock_path();
 
-        let file = match OpenOptions::new()
+        // ⚠️ 必须 `mut`：拿到锁后要 `set_len(0)` 清掉上次残留内容。
+        //    这个 `mut` 是 macOS/Linux 专属路径才会被编译器检查到的 ——
+        //    Windows 上整个 imp 模块不存在。
+        let mut file = match OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
