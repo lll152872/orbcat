@@ -63,9 +63,12 @@ agent。它和通用 AI 助手的区别在于两件事：**它记得你是谁**�
 
 | 技能 | 干什么 |
 |---|---|
-| `dual-token-dashboard` | 把 token 用量日志渲染成可交互面板 |
-| `token-usage-report` | 生成 token 用量报告 |
-| `self-rebuild` | 教 agent 怎么重新构建 orbcat 自己（含火绒信任区等本机坑） |
+| `dual-token-dashboard` | 生成并打开「双数据源 Token 消耗看板」（单文件离线 HTML：KPI / 日历热力图 / 模型分布，顶部 tab 切 WorkBuddy 与本机 agent） |
+| `token-usage-report` | 直接读上面那份 `summary.json` 回答「某天用了多少 token、各多少、花了多少钱」，**不生成 HTML** |
+| `self-rebuild` | 改完代码后重建 orbcat 自己。核心是**不杀宿主进程**：用「exe 改名腾锁 + detached 重启脚本」自举（杀 orbcat = 杀自己 = build 永远完不成）。**前提是有源码** |
+
+> ⚠️ `self-rebuild` 只对**持有源码**的用户有意义 —— 它要操作
+> `src-tauri/target/`。没源码的普通用户别触发它。
 
 > 改骨架后新增文件，**必须**同时在 `manifest.json` 的 `assets` 里声明，
 > 否则不会被打包。校验：CI 里的 `npm run check:no-user-data`（含骨架白名单检查）。
@@ -87,15 +90,17 @@ agent。它和通用 AI 助手的区别在于两件事：**它记得你是谁**�
 
 - 建出 8 个目录：`daily` / `images` / `memory` / `pending` / `projects` /
   `screenshots` / `sessions` / `skills`
-- 写空的 `models.json` + 默认 `settings.json`
+- 写 4 个 json：`models.json`（空）+ `settings.json` / `modes.json` /
+  `life.json`（各带完整 schema 说明的默认模板）
 - 顺带**装好内置技能**（`dual-token-dashboard` / `self-rebuild` /
   `token-usage-report`）与 `memory/MEMORY.md` 等模板
 
-> 目录与文件清单**不在 Rust 里硬编码** —— 它来自 `skeleton/manifest.json`，
+> 目录与静态文件清单**不在 Rust 里硬编码** —— 它来自 `skeleton/manifest.json`，
 > 由 `build.rs` 在构建期生成 `SKELETON_DIRS` / `SKELETON_ASSETS`。
-> 已存在的文件**一律不覆盖**（用户可能改过）。
+> 那 3 个 json 则是**故意**不进骨架区：它们由 Rust struct 生成，搬成静态文件后
+> struct 加了字段而文件没跟上，就是一份用户永远看不到、也补不上的死配置。
 >
-> 建完会自动弹出模型管理窗口，直接接着下一步。
+> 已存在的文件**一律不覆盖**（铁律：用户改过的东西不能被升级冲掉）。
 
 **第二段（需要模型，由 agent 完成）**
 
@@ -276,7 +281,7 @@ orbcat 能读写你的文件、跑命令，所以权限是分层的，**默认�
 | **数据源的 `command` 会自动执行** | `kind: command` 的数据源在**构建 prompt 时**跑（不是模型调才跑），信任面比 MCP 大。因此默认 `enabled: false`，必须显式打开；有 15 秒超时，失败只显示一行错误、不打断对话 |
 | **数据源不做 `kind: mcp`** | MCP 工具模型本来就能直接调，再包一层只会多一条会过期的副本。数据源只解决"系统主动呈现"，不重复能力面 |
 | **macOS 无障碍权限需手动授权** | Mac 版前台上下文靠 Accessibility 授权，CI / 无 GUI 会话下 `osascript` 调用会失败并降级为"拿不到前台信息"（**预期行为**）。授权弹窗与系统设置跳转需在有人的 Mac 上手动走查 |
-| **macOS 部分原生能力是 no-op** | `set_no_activate` / `keep_topmost_without_activating` / `force_foreground` 在 macOS 上是空实现，`.lnk` 解析、HKCU 注册表读写同理 |
+| **macOS 部分原生能力是降级实现** | 置顶不抢焦点相关的 `set_no_activate` / `keep_topmost_without_activating` / `force_foreground` 是空实现；`.lnk` 解析返回 `None`（Mac 无 `.lnk`，对应物是 alias / `.app`）；`decode_acp` 退化为 UTF-8 解码（Mac 文本本就是 UTF-8）。**但自启是真实现了** —— `read_hkcu_sz` / `write_hkcu_sz` 在 Mac 上读写 `~/Library/LaunchAgents/*.plist`（刻意不用 `launchctl load`：那要求已登录用户的 launchd 会话，plist 同样能实现「下次登录生效」） |
 | **Linux 等其余平台只能编译，不能用** | `platform/stub.rs` 让任何 target 都过得了 `cargo check`，但**全部 no-op**：orbcat 能跑，没有"知道你在用哪个 app"的能力 |
 
 ---
