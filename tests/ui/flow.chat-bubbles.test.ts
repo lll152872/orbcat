@@ -2,13 +2,13 @@ import { describe, expect, it } from "vitest";
 import { assistantBubbles, bootApp, openPanel, sendText, state, waitFor } from "./helpers";
 
 /**
- * 闲聊模式 = 聊天式呈现（2026-10-08）。
+ * 闲聊模式 = 聊天式呈现。
  *
- * 用户原话：「像 QQ 聊天那样，可以多次发消息」。做法**抄业界**：模型照常输出一条
+ * 目标形态（定稿）：「像 QQ 聊天那样，可以多次发消息」。做法**抄业界**：模型照常输出一条
  * 正文，前端按**分段**切成气泡逐条显示（切分规则在 `src/bubble.ts`，纯函数测试
  * 在 `bubble.test.ts`）。
  *
- * 2026-10-08 追加：模式**跟会话走**了，所以这里判定的不再是"全局切到了哪个模式"，
+ * 模式**跟会话走**，所以这里判定的不再是"全局切到了哪个模式"，
  * 而是**当前会话**是什么模式 —— 用 `state.sessionMode`（= mock 里那条会话的模式）。
  *
  * 这里锁的是**渲染契约**：

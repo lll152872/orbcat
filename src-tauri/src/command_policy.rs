@@ -15,7 +15,7 @@
 //!
 //! 取最严：任一段命中硬阻断 → 整条命令硬阻断（most-restrictive-wins）。
 //!
-//! ## shell 壳内联命令递归（2026-09-22 调整）
+//! ## shell 壳内联命令递归（已调整）
 //!
 //! agent 习惯把命令包一层 shell（`pwsh -Command "rg foo"`）。旧逻辑对 shell spawner
 //! **一律拒绝**，导致"只读命令套个壳也弹卡"。现在改为：能抽出内联命令就**递归评估**，
@@ -44,7 +44,7 @@
 //! - [`CmdScope::Prefix`]：记住「可执行名 + 首个子命令」，如 `git status`（覆盖 `git status -s`）
 //! - [`CmdScope::Full`]：记住**完整命令**（最窄）
 //!
-//! **永久授权落盘**（2026-09-22 用户拍板；这是与文件权限刻意拉开的一处差异）：
+//! **永久授权落盘**（这是与文件权限刻意拉开的一处差异）：
 //!
 //! - 「仅这一次」（`Once`）**不落盘** —— 落盘就跨重启存活，"一次"语义当场破功
 //!   （同 `permission.rs` 里 Once/Turn 不落盘的硬约束）；
@@ -188,7 +188,7 @@ const PARAM_ALIASES: &[(&str, &str)] = &[
 
 /// 会派生子进程/重新解析命令串的可执行名。
 ///
-/// **不再一律拒绝**（2026-09-22 调整）：若内联命令（`pwsh -Command "..."` / `cmd /c ...`）
+/// **不再一律拒绝**（已调整）：若内联命令（`pwsh -Command "..."` / `cmd /c ...`）
 /// 能被抽出，就**递归评估内层命令**，按内层结论放行 / 确认 / 阻断。这样 agent 习惯性把
 /// 只读命令包一层 shell 时不再必弹卡，而 `pwsh -c "shutdown"` 依旧被拦（内层命中硬阻断）。
 /// 只有抽不出内联命令（`-File script.ps1`、纯交互、无参数）时才降级为确认。
@@ -202,7 +202,7 @@ const MAX_SHELL_DEPTH: usize = 4;
 
 /// 一段（复合命令拆出来的一个子命令）。
 ///
-/// ⚠️ 2026-09-30 删掉了 `raw: String` 字段（原始片段"展示用"）：
+/// ⚠️ 删掉了 `raw: String` 字段（原始片段"展示用"）：
 /// 它每次归一化都要多分配一次字符串，却**从没有任何读取点**。
 /// 判定与审计用的都是归一化结果（`exe` / `args`）与 `Normalized.raw` 之外的信息。
 #[derive(Debug, Clone)]
@@ -254,7 +254,7 @@ fn looks_like_path(s: &str) -> bool {
 
 /// 归一化结果。
 ///
-/// ⚠️ 2026-09-30 删掉了 `raw: String`：它保存整条原始命令，每次归一化都
+/// ⚠️ 删掉了 `raw: String`：它保存整条原始命令，每次归一化都
 /// 复制一遍，却**没有任何读取点**（判定只看 `segments` / `obfuscated` /
 /// `encoded`）。原始命令在调用方本来就还在手上，要展示直接用它，
 /// 不必在这里留第二份。
@@ -1083,7 +1083,7 @@ impl CmdGrantStore {
 
     // 注意：这里**没有** `clear_tier`。
     // 命令授权只有两种寿命：一次性（用完即销毁）与永久（落盘，靠撤销回收），
-    // 不存在"某一档整体失效"的语义（2026-09-22 用户拍板）。
+    // 不存在"某一档整体失效"的语义。
 
     pub fn clear_all(&mut self) -> usize {
         let n = self.grants.len();
@@ -1411,7 +1411,7 @@ mod tests {
         assert!(matches!(v, CmdVerdict::Allow { .. }), "实际 {v:?}");
     }
 
-    // ---- shell 内联命令递归（2026-09-22）----
+    // ---- shell 内联命令递归 ----
 
     #[test]
     fn shell_spawner_readonly_inner_is_allowed() {
@@ -1466,7 +1466,7 @@ mod tests {
         assert!(matches!(v, CmdVerdict::Ask { .. }), "实际 {v:?}");
     }
 
-    // ---- 白名单扩容（2026-09-22）----
+    // ---- 白名单扩容 ----
 
     #[test]
     fn expanded_readonly_allowlist() {
@@ -1549,7 +1549,7 @@ mod tests {
         assert!(store.is_empty(), "一次性授权用掉即移除");
     }
 
-    // ---- 永久授权落盘（2026-09-22 用户拍板）----
+    // ---- 永久授权落盘 ----
 
     fn grants_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(name);

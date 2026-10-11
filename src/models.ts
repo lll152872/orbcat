@@ -2,9 +2,9 @@
  * 「模型管理」独立窗口（models.html 入口）。
  *
  * 为什么拆成独立窗口：420px 面板塞不下「三列表格 + 表单 + 组菜单」，
- * 塞进去就是把选择和管理搅在一起 —— 用户明确拍板：**编辑弹到面板外面**。
+ * 塞进去就是把选择和管理搅在一起 —— 定稿结论：**编辑弹到面板外面**。
  *
- * 分工（2026-09-29 定稿）：
+ * 分工：
  * - 面板（main.ts）     ：模型卡片展示 + ▾ 纯名称下拉切换，**不含任何管理功能**
  * - 本窗口（models.ts） ：表格 / 分组 / 添加 / 编辑 / 删除 / 测试连通，全部管理动作
  *
@@ -149,7 +149,7 @@ function emptyModelForm(): ModelFormState {
  * 当前选中判定：**只认唯一那一条**。
  *
  * 原来是 `id 相同 &&（有 url 才比 url）` —— 设置里只有 id 没记 url 时，
- * 所有同 id 的行都会命中（用户 2026-10-02 报的「两个 glm-5.3-flash 都画线」：
+ * 所有同 id 的行都会命中（典型症状：「两个 glm-5.3-flash 都画线」——
  * `models.json` 里确实有两条 id 相同、Base URL 不同的 glm-5.3-flash）。
  * 现在先解析出当前模型，再按 (id, url) 全等比对，最多标一个。
  */
@@ -344,7 +344,7 @@ async function reloadModels(): Promise<void> {
 /**
  * 八个缩放手柄。
  *
- * ⚠️ 为什么必须自己画（2026-10-09 用户报「可以拖拽的范围奇小」）：
+ * ⚠️ 为什么必须自己画（症状：可以拖拽的范围奇小）：
  * 后端这个窗口是 `resizable(true)` + `min_inner_size` + 尺寸写进 settings，
  * 缩放显然是设计内功能。但 Windows 的边缘 resize 命中测试要求 mousedown
  * 能落到窗口**边框那一圈**；而 `bindWindowDrag()` 几乎对整个客户区都做了
@@ -1178,7 +1178,7 @@ function bindApp(): void {
       if (editing) {
         // 身份 = (Base URL, 接口 id)：编辑前条目按 editId + editUrl 精确定位
         //
-        // ⚠️ `url` 与 `newUrl` 是**两个不同的东西**，别合并（2026-10-09 修）：
+        // ⚠️ `url` 与 `newUrl` 是**两个不同的东西**，别合并：
         //   url    = 定位用的**旧** Base URL（哪一条要改）
         //   newUrl = 表单里填的**新** Base URL（= 换组）
         // 以前只发 url=f.editUrl（新值根本没上线），于是输入框里能改 Base URL、

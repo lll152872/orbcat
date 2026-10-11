@@ -73,7 +73,7 @@ pub fn build_history(data_dir: &std::path::Path, session_id: &str) -> Vec<ChatMe
         }
     }
     out.extend(picked.into_iter().filter_map(|m| {
-        // ⚠️ 空的助手消息不回灌（2026-09-26）。来源：「退出不丢轮」机制在开跑时
+        // ⚠️ 空的助手消息不回灌。来源：「退出不丢轮」机制在开跑时
         // 落下的 `partial` 占位 —— 进程若在产出任何内容前被关掉，磁盘上就留着
         // 一条 `text=""`、`steps=[]` 的助手消息。把它喂给模型，部分厂商 API 会
         // 直接因"空 content"报 400。有 steps 的占位照常回灌（那是真实轨迹）。
@@ -121,7 +121,7 @@ fn to_chat_message(m: StoredMessage) -> ChatMessage {
         ));
     }
 
-    // 工具步骤回灌（2026-09-23 修正）：
+    // 工具步骤回灌：
     //
     // 落盘已走 `sessions::cap_steps`（**保序多条**，含 tool_result），不再是
     // 一行摘要。这里直接交给 [`fold_steps_to_line`]：
@@ -129,7 +129,7 @@ fn to_chat_message(m: StoredMessage) -> ChatMessage {
     // - 结构化多条 steps → **近 K 条原文/截断**（含 tool_result），更旧折一行
     //
     // ⚠️ 不要再 `sessions::fold_steps` 预折叠：那会把 tool_result 全部丢掉，
-    // 模型下一轮「失忆」重跑 Get-Content（STATUS 2026-09-22 根因）。
+    // 模型下一轮「失忆」重跑 Get-Content（根因）。
     //
     // 每轮读到的历史对**同一会话前缀**保持稳定（fold 规则只依赖 steps 本身），
     // 有利于 prompt cache；不要在读取路径引入时间戳/随机量。
@@ -164,7 +164,7 @@ fn is_already_folded_line(steps: &[sessions::StoredStep]) -> bool {
 
 /// 已折叠的 steps → 拼进历史文本的那一行（保留近期原文/截断，更旧折一行）
 ///
-/// **为什么必须保留近期 tool_result**（2026-09-23 用户点名）：
+/// **为什么必须保留近期 tool_result**：
 /// 早先实现只 `find` 首条 `tool_call` detail，`tool_result` 全部丢弃 ——
 /// 跨轮/插话后模型「失忆」，只能重跑 `Get-Content`/`Select-String` 打转。
 /// 现在与 `sessions::cap_steps` 对齐：**落盘给模型看的也不是一行摘要**。
@@ -234,8 +234,8 @@ fn fold_steps_to_line(steps: &[sessions::StoredStep]) -> String {
             }
             "reasoning" => {
                 // 思考已单独有 reasoning 字段；这里只留极短摘要，避免与 reason_total 重复
-                // ⚠️ 前缀刻意不用「[思考]」这种会被模型当成正文续写的格式（2026-09-24
-                //    用户截图：商汤把 fold 尾巴回显进 answer.text）。改用轨迹块标记。
+                // ⚠️ 前缀刻意不用「[思考]」这种会被模型当成正文续写的格式：
+                //    有 API 厂商把 fold 尾巴回显进 answer.text。改用轨迹块标记。
                 let head: String = s.detail.trim().chars().take(80).collect();
                 if !head.is_empty() {
                     parts.push(format!("·think {head}"));
@@ -555,7 +555,7 @@ fn short_id(id: &str) -> String {
 /// 且 `libc::localtime_r` 在 Windows 上不可用。这里走 `std::time` 的
 /// 「UTC 秒 + 固定偏移」近似 —— 精确到分钟对"回忆昨天聊了什么"足够。
 ///
-/// ⚠️ **2026-09-30 修跨日 bug**：旧实现是 `let h = (h + 8) % 24;` ——
+/// ⚠️ **跨日 bug 的修法**：旧实现是 `let h = (h + 8) % 24;` ——
 /// 小时回绕了但**日期没跟着进位**，于是 UTC 16:00 之后（本地 00:00 起）
 /// 会算出"昨天 00:xx"。它对历史回灌（昨天/今天的消息）和当前时间注入
 /// 都是错的日期，必须按**总小时数**整体加偏移后再拆日与时。
@@ -574,8 +574,8 @@ pub fn fmt_local(ms: u64) -> String {
 
 /// epoch 毫秒 → 本地星期几（中文单字，`周一`…`周日`）。
 ///
-/// ⚠️ **必须先按本地时区平移再取天数**（2026-09-30 被测试抓到）：
-/// 本地 2026-09-22 00:00 对应 UTC 2026-09-21 16:00 —— 直接拿 UTC 天算
+/// ⚠️ **必须先按本地时区平移再取天数**（被测试抓到）：
+/// 本地某日 00:00 对应前一日 UTC 16:00 —— 直接拿 UTC 天算
 /// 会得到"周一"，而用户眼里的那天是周二。星期错一天，比没有星期更糟。
 ///
 /// 平移后 1970-01-01（本地 08:00，周四）为第 0 天，故 day 0 → 周四。
@@ -1084,7 +1084,7 @@ mod tests {
         assert_eq!(fmt_local(0), "1970-01-01 08:00");
     }
 
-    /// 🔴 跨日进位（2026-09-30 修的 bug）
+    /// 🔴 跨日进位（修过的 bug）
     ///
     /// 旧实现 `(h + 8) % 24` 只回绕小时、不推进日期，于是 UTC 16:00 之后
     /// （本地已过零点）会算出"**昨天** 00:xx"。日期错会让模型把日记写到前一天，

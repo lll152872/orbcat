@@ -3,7 +3,7 @@ import { bootApp, openPanel, sendText, waitFor } from "./helpers";
 import { state, emitEvent } from "./mocks/tauri";
 
 /**
- * 工具行合并（2026-10-02 用户："直接变成执行命令一条就行了"）。
+ * 工具行合并（定稿："直接变成执行命令一条就行了"）。
  *
  * 以前每次工具调用占**两行** —— `🔧 列目录`（tool_call）+ `✅ 列目录`（tool_result）。
  * 现在前端在**数据层**把同名相邻的两条并成一条（`pairToolSteps`，见 main.ts），

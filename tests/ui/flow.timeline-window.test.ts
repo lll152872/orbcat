@@ -3,7 +3,7 @@ import { bootApp, openPanel, sendText, waitFor, sleep } from "./helpers";
 import { emitEvent, state } from "./mocks/tauri";
 
 /**
- * 超长时间线只渲染尾部（2026-10-09）。
+ * 超长时间线只渲染尾部。
  *
  * 背景：renderTimeline 会把每一轮的全部 step 拼成 HTML 字符串，而
  * paintMessages 在流式过程中会反复重绘 —— 221 步的长轮次等于每帧把
@@ -80,9 +80,9 @@ describe("超长时间线只渲染尾部", () => {
 });
 
 /**
- * 卡死回归闸门（2026-10-09）。
+ * 卡死回归闸门。
  *
- * 用户实机报：让模型在**思考**里输出 100 个 "100"，面板直接卡死。
+ * 实机复现：让模型在**思考**里输出 100 个 "100"，面板直接卡死。
  *
  * 根因：`patchTimeline` 为了判断"思考块是否贴底"，**每帧**读一次
  * `pre.scrollHeight`。读 scrollHeight / clientHeight 会**强制浏览器排版**

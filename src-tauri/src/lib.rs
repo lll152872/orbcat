@@ -3,7 +3,7 @@
 mod agent;
 /// 测试钩子 / 集成用例（**整个模块只在测试构建里编译**）
 ///
-/// ⚠️ `#[cfg(test)]` 不能省（2026-09-30）：这个文件里每个 fn 都带 `#[test]`，
+/// ⚠️ `#[cfg(test)]` 不能省：这个文件里每个 fn 都带 `#[test]`，
 /// 而它对 `crate::llm` 的 import 只被那些测试函数用。非测试构建下整个文件
 /// 只剩一行没用的 `use` → 报 `unused imports: ChatMessage and MessageContent`。
 /// 加在 `mod` 上比在文件里逐条 `#[allow]` 干净：它本来就"不进产品路径"。
@@ -236,7 +236,7 @@ const ORB_Y_RATIO: f64 = 0.40;
 /// `WebviewWindowBuilder` 新建的窗口（models）如果漏了这串参数，
 /// `build()` 会返回 `Ok`，但底层 webview 根本没起来 —— 之后任何 getter
 /// 都报 `failed to receive message from webview`，页面也永远不加载
-/// （2026-09-29 实测：日志里 build Ok 但没有任何 page_load 记录）。
+/// （实测：日志里 build Ok 但没有任何 page_load 记录）。
 const ORB_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force-renderer-accessibility --disable-gpu-compositing --disable-gpu-rasterization --disable-gpu-vsync --disable-frame-rate-limit";
 
 /// 「模型管理」窗口的预热延迟（毫秒）。
@@ -255,7 +255,7 @@ const MODELS_PREHEAT_DELAY_MS: u64 = 3_000;
 ///   `.orb:hover` 的 4px 高亮环
 ///   呼吸动画 `transform: scale(1.035)`（球本体会放大）
 /// 窗口若紧贴球（= 球径 56），这些效果**全部伸出窗口矩形被 DWM 硬裁**，
-/// 表现为球四周出现一圈直角方框 —— 用户报的「外面的黑框」就是这么来的。
+/// 表现为球四周出现一圈直角方框 —— 「外面的黑框」就是这么来的。
 /// 给窗口每边留 10px，三个效果（最多 ~6.7px）都落在窗内，硬裁消失。
 const ORB_PAD_LOGICAL: f64 = 10.0;
 
@@ -279,8 +279,7 @@ struct AppState {
     /// 用 Arc 是因为工具层要以 `&PermHub` 借它（见 `tools::ToolCtx`），
     /// 而 Tauri 的 `State` 只能给出借用，不能把所有权传进去。
     perm: std::sync::Arc<perm_request::PermHub>,
-    /// 执行中「插话」的收件箱 + 取消标志，**按会话分槽**（2026-09-26 用户拍板：
-    /// 多会话并行 run）。`chat` 开跑前 `begin(session_id)` 拿槽、收尾 `end()` 归还；
+    /// 执行中「插话」的收件箱 + 取消标志，**按会话分槽**（多会话并行 run）。`chat` 开跑前 `begin(session_id)` 拿槽、收尾 `end()` 归还；
     /// `chat_steer` / `chat_cancel` 都带 `session_id` 路由到对应槽。
     runs: agent::RunRegistry,
 }
@@ -291,7 +290,7 @@ struct AppState {
 /// 而"换会话"本身就意味着上下文全变了 —— 它们跨过去毫无意义。
 /// （`Once` 是"下一次工具调用"，换个会话还算数就很荒唐。）
 ///
-/// ⚠️ **命令授权不走这里**（2026-09-22 用户拍板）：它是**永久**的，
+/// ⚠️ **命令授权不走这里**：它是**永久**的，
 /// 落 `command_grants.json`，跨会话、跨重启都保留 —— 换会话顺手清掉就白永久了。
 fn reload_grants_for_session(state: &AppState, id: &str) {
     let loaded = sessions::load_grants(&state.data_dir, id);
@@ -339,7 +338,7 @@ impl AppState {
         self.refresh_project_dir_rules();
     }
 
-    /// 重建「激活项目目录」动态授权（用户 2026-10-07 定案）：
+    /// 重建「激活项目目录」动态授权：
     /// **新建项目时绑定的目录，项目激活期间默认读写；没绑目录就没有。**
     ///
     /// 规则形态：label = `项目目录「名」`，权限 ReadWrite，**只活内存**
@@ -797,7 +796,7 @@ fn perm_cmd_audit_tail(
 /// 列出可用模型（**不含 apiKey**）。
 ///
 /// 顺带做一次性迁移：`settings.selected_model` 存的若已不是任何接口 id
-/// （2026-10-02 起身份 = (Base URL, 接口 id)，旧显示名全部失效）→ 清空，
+/// （身份 = (Base URL, 接口 id)，旧显示名全部失效）→ 清空，
 /// 让前端兜底自动选第一个。
 #[tauri::command]
 fn list_models(state: State<'_, AppState>) -> Result<Vec<config::ModelView>, String> {
@@ -993,7 +992,7 @@ fn existing_vendor_or_custom(existing: &Option<config::ModelConfig>) -> String {
 /// - `new_id`：改发给提供商的 `model` 字段；**组内查重**（跨组同名合法）
 /// - `apiKey` 空 = 保持原 Key；`clear_key` = 清空
 ///
-/// ⚠️ `url` 与 `new_url` 必须分开（2026-10-09 修）。它们以前是**同一个参数**
+/// ⚠️ `url` 与 `new_url` 必须分开（修过一个 bug）。它们以前是**同一个参数**
 /// `url` 既定位又当新值传下去，而前端只发了旧值 → 表单里的 Base URL 压根没上线，
 /// 改完保存**静默丢弃**，用户看不到任何提示。
 #[tauri::command]
@@ -1518,7 +1517,7 @@ fn foreground_history() -> Vec<context::ForegroundContext> {
 /// 当前前台窗口是不是已知的截图 / 录屏工具（微信、系统截图、Snipaste…）。
 ///
 /// 用途只有一个：面板 `blur` 时**先问一句**再决定收不收起 —— 用户正在截图就
-/// 不许把面板缩成球（2026-10-11 用户报的 bug：拿微信截面板，面板失焦缩球）。
+/// 不许把面板缩成球（拿微信截面板时，面板失焦会缩球）。
 ///
 /// ⚠️ 必须是**现场采集**，不能用 `foreground_context` 那份缓存（watch 轮询有滞后，
 /// blur 瞬间它还停在切换前的窗口）。理由见 `context::foreground_is_capture_tool` 的注释。
@@ -1970,7 +1969,7 @@ fn allowed_for_dir(state: &AppState) -> std::collections::HashSet<String> {
 
 /// 同 [`allowed_for_dir`]，但接收裸参数（启动期还没有 `State` 时用）
 ///
-/// ⚠️ 2026-10-08：模式**跟会话走**了，所以这里不能再读 `settings.activeMode`
+/// ⚠️ 模式**跟会话走**了，所以这里不能再读 `settings.activeMode`
 /// —— 那现在是"新建会话的默认模式"，跟正在用的这个会话没关系。
 /// 改成问 `sessions::effective_mode`（当前会话 → 它自带的模式）。
 /// 漏改的表现：切到「闲聊」后重新拉一次 MCP 快照，工具组又满血复活。
@@ -1998,7 +1997,7 @@ fn allowed_for_dir_of(
     modes::allowed_groups_for(data_dir, Some(&mode.id), &available).as_registry_set()
 }
 
-/// 换了会话 → 它自带模式 → **MCP 活跃组必须跟着重算**（2026-10-08）。
+/// 换了会话 → 它自带模式 → **MCP 活跃组必须跟着重算**。
 ///
 /// 为什么非得显式做一次：`allowed_for_dir` 只在"新快照 / 改设置 / 手动刷新"三条
 /// 路径上跑，切会话一条都不触发。少了这一步，从「标准」切到「闲聊」后工具组
@@ -2351,7 +2350,7 @@ struct ModeView {
     image_replies: String,
     /// 这个模式注入的场景上下文（可能为空，空则前端不显示这一行）
     prompt_extra: String,
-    /// 聊天式呈现（2026-10-08）：一条回复拆成多个气泡 + **不显示「过程」**。
+    /// 聊天式呈现：一条回复拆成多个气泡 + **不显示「过程」**。
     /// 前端据此决定走 `bubble.ts` 的切分。只有闲聊模式为 true。
     chatty: bool,
 }
@@ -2370,7 +2369,7 @@ async fn registry_group_names(state: &AppState) -> Vec<String> {
 /// 每个模式的说明与"允许的组"、以及每组在当前模式下的状态
 /// （`allowed` 给模型 / `denied` 被本模式收起 / `unknown` 模式里写了但不存在）。
 ///
-/// ## `session_id`（2026-10-08，模式改跟会话走）
+/// ## `session_id`（模式改跟会话走）
 ///
 /// 传了就按**那条会话**的模式回 `activeMode`；没传（启动早期 / 老前端）给内置默认。
 /// 另外单给一个 `defaultMode` —— 那**不是**"当前模式"，而是**新建会话时的默认值**，
@@ -2432,11 +2431,11 @@ async fn modes_get(
     }))
 }
 
-// 历史（2026-10-08 删）：这里原来有 `modes_set(id)` —— 改"当前 agent 模式"。
+// 历史（已删）：这里原来有 `modes_set(id)` —— 改"当前 agent 模式"。
 // 它的三级演变值得留着，免得有人又想加回来：
 //   ① 全局"当前模式" → ② 模式跟会话走后降级成"新建会话的默认模式"
 //   → ③ **彻底删掉**。
-// 删它的触发点：用户看到「＋」菜单里**「闲聊」被标成「默认」**，而他要的是
+// 删它的触发点：「＋」菜单里**「闲聊」被标成「默认」**，而期望是
 // "标准是默认"。那个标读的就是 `modes_set` 写进 `settings.json` 的 `activeMode`
 // （用户早先在设置页切过闲聊，值就留在文件里成了"默认"）。
 // 教训：**界面上没有了改它的入口之后，任何"用户可配的默认值"都会变成一个
@@ -2598,7 +2597,7 @@ fn diag_log(state: State<'_, AppState>, msg: String) -> Result<(), String> {
 /// - 位置：贴面板右侧弹；右侧放不下翻左侧；垂直与面板顶对齐再夹进屏幕。
 /// - 已开着时只把它带到前台。
 ///
-/// ⚠️ 为什么不在 tauri.conf.json 里声明这个窗口（2026-09-29 实测）：
+/// ⚠️ 为什么不在 tauri.conf.json 里声明这个窗口（实测）：
 /// 启动时同时创建两个 webview，第二个会与 orb 的 webview 争抢 WebView2 环境，
 /// 留下一个**底层无效**的窗口对象 —— 之后任何 getter（scale_factor /
 /// outer_position / current_monitor）都收不到事件循环的回复，前端拿到
@@ -2730,7 +2729,7 @@ async fn models_window_inner(
 
 /// 启动后在后台**预热**「模型管理」窗口。
 ///
-/// ## 为什么需要（2026-09-30）
+/// ## 为什么需要
 ///
 /// 这个窗口是懒创建的，代价落在**用户第一次点击**上：实测冷启 8.4s
 /// （WebView2 首次为该进程建渲染器 + 加载 models.html）。用户点了卡片之后
@@ -2738,7 +2737,7 @@ async fn models_window_inner(
 ///
 /// ## 为什么要延迟，而不是启动时立刻建
 ///
-/// 2026-09-29 实测过：启动时**同时**创建两个 webview，第二个会与 orb 的
+/// 实测过：启动时**同时**创建两个 webview，第二个会与 orb 的
 /// webview 争抢 WebView2 环境，留下一个"底层无效"的窗口对象 ——
 /// 之后任何 getter 都报 `failed to receive message from webview`。
 /// 所以必须等 orb 那一套彻底起来之后再建。
@@ -2928,7 +2927,7 @@ async fn chat(
         })
     };
 
-    // 轮内增量落盘（2026-09-26 治「退出后整轮清空」）：
+    // 轮内增量落盘（治「退出后整轮清空」）：
     // 开跑先把 [提问 + partial 占位] 写进会话，然后 agent loop 每到一个轮边界 /
     // 工具跑完就回调这里，把"目前已产出"覆盖进那条占位。
     // 进程中途被关掉时，磁盘上留下的是"问了什么 + 已经跑到哪一步"，而不是空文件。
@@ -2994,7 +2993,7 @@ async fn chat(
     }
     // ⚠️ 命令授权**不参与**这里：永久档跨会话存活，靠设置页「撤销」才失效。
 
-    // ⚠️ **成功与失败都要走落盘**（2026-09-22 修 bug）。
+    // ⚠️ **成功与失败都要走落盘**（修过一个 bug）。
     //
     // 这行以前是 `let mut run = result?;` —— 于是撞 429（或任何 API 错误）时
     // 整轮一个字都不写：提问、思考、工具步骤、半截正文全部蒸发，屏幕上只剩
@@ -3039,7 +3038,7 @@ async fn chat(
 
     persist_run(&state, &session_id, &cfg.id, &input, &imgs_for_store, &run);
 
-    // ---- 轮末自动蒸馏（2026-10-07 用户定案：不靠模型自觉调 remember）----
+    // ---- 轮末自动蒸馏（不靠模型自觉调 remember）----
     //
     // 后台发一个小请求，从本轮问答里提取 0~3 条记忆条目：
     // 激活项目 → 直写项目 MEMORY.md；主对话 → 进全局待审批候选。
@@ -3070,11 +3069,11 @@ async fn chat(
 
 /// 一轮结束后的持久化：日记（append-only）+ 会话（JSON）。
 ///
-/// ## 为什么抽成独立函数（2026-09-22）
+/// ## 为什么抽成独立函数
 ///
 /// 成功、被「停止」、轮数用尽、**API 错误**四条路径都要落盘，差别只在
 /// `TurnRecord::interrupted`。以前这段内联在 `chat` 里、且位于 `result?` 之后，
-/// 错误路径根本走不到 —— 这是"整轮消失"的根因（用户 2026-09-22 报的 bug）。
+/// 错误路径根本走不到 —— 这是"整轮消失"的根因（修过一个 bug）。
 ///
 /// ## 日记为什么不写半截轮
 ///
@@ -3115,7 +3114,7 @@ fn persist_run(
             interrupted: run.interrupted,
             model: model_id,
             usage: run.usage,
-            // 上下文预算的真锚点（2026-09-30）：只有本轮真拿到服务端 usage 才有值，
+            // 上下文预算的真锚点：只有本轮真拿到服务端 usage 才有值，
             // 没有时是 None，`append_run_in` 会保留会话里上一轮的值。
             last_prompt_tokens: run.last_prompt_tokens,
             token_scale: run.token_scale,
@@ -3176,7 +3175,7 @@ fn recovery_prune(
 
 /// 生成诊断包并返回落盘路径。
 ///
-/// 为什么值得有（2026-09-30）：出问题时用户唯一的通道一直是**截图一条红条**，
+/// 为什么值得有：出问题时用户唯一的通道一直是**截图一条红条**，
 /// 而现场散在四处（`diag.log` 的前端异常、`audit-commands.jsonl` 跑了什么命令、
 /// 会话里的 `kind = "error"` 条目、各目录体积）。让用户手工凑这四样等于劝退，
 /// 所以做成一个按钮：生成 → 落盘 → 用户把文件拖进对话即可。
@@ -3328,8 +3327,8 @@ fn bootstrap_data(state: State<'_, AppState>) -> Result<bootstrap::BootstrapRepo
 /// 多会话并行 run 下**放行**：新建不碰别的会话，落盘各自带着自己的 `session_id`。
 /// 仍然**禁止**的只剩"改动某个会话本身"的动作（删除/截断/分叉**该会话**），见各自命令。
 ///
-/// `mode` = 用户在「新建会话」菜单里选的模式 id（2026-10-08）。
-/// 会话**建的时候**就把模式钉死，之后不再改 —— 用户定案："一个会话模式不能变"。
+/// `mode` = 用户在「新建会话」菜单里选的模式 id。
+/// 会话**建的时候**就把模式钉死，之后不再改 —— 不变量："一个会话模式不能变"。
 /// 不传 → 内置默认 `modes::DEFAULT_MODE_ID`（`standard`）；传了无效 id →
 /// 由 `modes::resolve` 兜到同一处。**没有"用户可配的默认模式"这回事**
 /// （`settings.activeMode` 已删，理由见 `sessions::effective_mode` 的说明）。
@@ -3365,7 +3364,7 @@ async fn session_new(
 /// ⚠️ 但**有任意 run 在跑时不重载授权**：`reload_grants_for_session` 会把内存里那份
 /// 换成"目标会话"的，正在跑的任务会因此**当场丢权限**（它的工具调用全被拒）。
 ///
-/// ⚠️ 2026-10-08：模式跟会话走 → 切会话 = **换模式** → MCP 活跃组必须跟着重算
+/// ⚠️ 模式跟会话走 → 切会话 = **换模式** → MCP 活跃组必须跟着重算
 /// （见 [`resync_mode_groups`]）。这一步**刻意不加"有 run 在跑就跳过"的闸**：
 /// 加了的话，你切到「闲聊」时它在后台跑着任务，闲聊会话就会**一直**带着满组的
 /// MCP 工具（没有任何后续事件会补算这次），比"在跑的那条会话下一轮少几个工具"
@@ -3600,14 +3599,14 @@ fn mem_propose(state: State<'_, AppState>, content: String) -> Result<memory::Ca
 }
 
 // ---------------------------------------------------------------------------
-// Tauri 命令 —— 记忆蒸馏（2026-10-03）
+// Tauri 命令 —— 记忆蒸馏
 // ---------------------------------------------------------------------------
 
 /// 开一条「记忆蒸馏」会话：新建会话 + 打 `sessions/<id>.distill` 标记 + 命名。
 ///
 /// 之后就是**一条普通聊天**：`agent::run` 见到标记会追加蒸馏角色说明并注入
 /// `distill_move` 工具，模型在标准循环里读中转站、问用户、搬条目，
-/// 思考与工具调用全走主对话那套时间线（用户 2026-10-03 明确要求）。
+/// 思考与工具调用全走主对话那套时间线（按常规聊天的口径走）。
 #[tauri::command]
 fn distill_session_open(state: State<'_, AppState>) -> Result<sessions::Session, String> {
     // 蒸馏会话**固定用标准模式**：它要的是完整工具集（`tool_specs_for_distill`
@@ -3809,9 +3808,9 @@ fn raise_orb(window: tauri::WebviewWindow) -> Result<(), String> {
 
 /// 球的界面状态。
 ///
-/// ## 睡眠 = **球从屏幕上完全消失**，但任务照跑（2026-09-30 用户重新定义）
+/// ## 睡眠 = **球从屏幕上完全消失**，但任务照跑
 ///
-/// 早先实现成"球留在屏幕上、变暗缩小"，同时**停掉前台采样**。用户明确纠正：
+/// 早先实现成"球留在屏幕上、变暗缩小"，同时**停掉前台采样**。这个语义是错的：
 /// *"睡眠是球从页面上消失但是任务不停止啊"* —— 即睡眠是**纯视觉层面的隐身**：
 ///
 /// 1. 球**真的隐藏**（窗口 `hide()`），不是变暗缩小 —— 用户要的是"别占地方"；
@@ -3865,7 +3864,7 @@ fn orb_ui_apply(app: &tauri::AppHandle, action: &str) -> Result<(), String> {
         *g = next;
     }
 
-    // ⚠️ 这里**刻意没有任何"停采样"动作**（2026-09-30 删掉了旧的
+    // ⚠️ 这里**刻意没有任何"停采样"动作**（旧的
     //    `context::set_paused(sleeping)`）。
     //
     // 旧实现把"界面隐身"错当成"省电模式"：睡着就跳过前台采样。但采样产出的
@@ -3912,7 +3911,7 @@ fn orb_ui_apply(app: &tauri::AppHandle, action: &str) -> Result<(), String> {
 
 /// 睡眠时把托盘图标换成**睡猫**，并更新提示文案；唤醒时换回来。
 ///
-/// ## 为什么值得做（2026-09-30）
+/// ## 为什么值得做
 ///
 /// 睡眠把球从屏幕上隐藏了 —— 也就是把**唯一的常驻可见入口**藏掉了。
 /// 托盘图标虽然还在，但它原本和醒着时长得一模一样，用户没有任何视觉线索
@@ -3990,7 +3989,7 @@ fn orb_ui_state() -> OrbUi {
 
 /// 「用户又启动了一次」的**待消费**标记。
 ///
-/// ## 为什么需要它（2026-09-30 修 bug）
+/// ## 为什么需要它（修过一个 bug）
 ///
 /// 第二实例启动的正确语义是"**我要用它**"，所以应该把面板打开。但这里有个
 /// 时序缺口：唤醒事件可能在**前端还没就绪**时到达（WebView 尚在加载、或
@@ -4038,7 +4037,7 @@ fn confirm_panel_opened() {
 
 /// 「用户又启动了一次 exe」→ 唤醒 + **展开面板**。
 ///
-/// ## 为什么不是只唤醒（这是用户报的 bug 的根因）
+/// ## 为什么不是只唤醒（这是该 bug 的根因）
 ///
 /// 旧实现只调 `orb_ui_apply("wake")`。如果球当时**没在睡**，这就是个纯 no-op；
 /// 就算在睡，也只是"变回普通球"。用户点桌面/开始菜单图标的意图是"我要用它"，
@@ -4076,7 +4075,7 @@ fn wake_and_open_panel(app: &tauri::AppHandle) {
         eprintln!("[orbcat] ⚠️ 广播 orb-open-panel 失败: {e}");
     }
 
-    // ⚠️ **自愈兜底**（2026-09-30）：上面已经把窗口改成面板尺寸，而**换 DOM 是
+    // ⚠️ **自愈兜底**：上面已经把窗口改成面板尺寸，而**换 DOM 是
     //    前端的事**。如果前端此刻还没加载出来（WebView 冷启、页面被 CSP 拦、
     //    或它自己崩了），`emit` 就没人接 —— 屏幕上会留一个面板大小的窗口，
     //    里面画着 84px 的球，看起来像"界面坏了"。
@@ -4206,7 +4205,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 /// error: cannot find macro `__tauri_command_name_bg_desk_status` in this scope
 /// ```
 ///
-/// 这是 2026-10-10 由 GitHub Actions 的 `macos-14` runner 抓出来的 ——
+/// 这是由 GitHub Actions 的 macOS runner 抓出来的 ——
 /// 本机 Windows 上 `cargo check` 永远看不到它。
 ///
 /// ## 语义选择：返回「不可用」而不是静默成功
@@ -4315,7 +4314,7 @@ pub fn run() {
                 );
                 gate.add_rule(&path, access, label);
             }
-            // 激活项目绑定目录的动态授权（用户 2026-10-07 定案：项目激活期间
+            // 激活项目绑定目录的动态授权（项目激活期间
             // 默认读写其绑定目录；没绑目录就没有）。只活内存，切项目时重建。
             if let Some((path, name)) = active_project_dir(&data_dir) {
                 gate.add_rule(
@@ -4397,7 +4396,7 @@ pub fn run() {
                 }));
             }
 
-            // 命令授权是**永久**的（2026-09-22 用户拍板）：注入数据目录 + 把上次
+            // 命令授权是**永久**的：注入数据目录 + 把上次
             // 落盘的永久档读回来。文件授权不在这里 —— 它按会话走
             // `reload_grants_for_session`。
             perm.attach_data_dir(data_dir.clone());
@@ -4461,7 +4460,7 @@ pub fn run() {
             // --- 模型管理窗口：启动后预热（治首次点开 8.4s 冷启）---
             //
             // 放在这里（setup 尾部）而不是更早：必须等 orb 的 webview 起稳，
-            // 否则两个 webview 抢 WebView2 环境（2026-09-29 实测的坑）。
+            // 否则两个 webview 抢 WebView2 环境（实测的坑）。
             // 具体延迟与"为什么不能立刻建"见 `spawn_models_preheat` 的文档。
             {
                 let handle = app.handle().clone();

@@ -5,7 +5,7 @@ import { state, emitEvent, callsOf } from "./mocks/tauri";
 /**
  * 流式时间线：思考与工具必须**交错**，出错**不丢**本轮流。
  *
- * 这两条对应 2026-09-22 用户报的两个问题：
+ * 这两条对应两个典型的结构性问题：
  * ① 「他做的都消失了」—— 撞 429 后屏幕上只剩一条红字
  * ② 「思考都堆在一块」—— 所有思考挤成一个块、工具另起一处
  *
@@ -16,7 +16,7 @@ import { state, emitEvent, callsOf } from "./mocks/tauri";
  * 时间线里每个条目的「种类」（供顺序断言）。
  *
  * ⚠️ 选择器是 `[data-i]`（`renderItem` 给每个条目都打），**不是** `.run-timeline > *`。
- * 2026-10-11 起跑完的轮次改为**按类型段切分**：连续 ≥2 条过程条目会收进
+ * 跑完的轮次改为**按类型段切分**：连续 ≥2 条过程条目会收进
  * `details.run-process`，于是它们不再是 `.run-timeline` 的直接子元素。
  * 用 `[data-i]` 两者都覆盖，顺序 = 文档顺序 = 渲染顺序。
  */
@@ -53,7 +53,7 @@ describe("流式时间线", () => {
   /**
    * 推一条 agent 进度事件。
    *
-   * ⚠️ **必须走 `{sessionId, p}` 信封**（2026-09-30 修）：
+   * ⚠️ **必须走 `{sessionId, p}` 信封**（修过一次）：
    * 后端早已把进度事件改成带会话 id 的信封（`lib.rs::chat` 的
    * `json!({ "sessionId": sid, "p": p })`），目的是多会话并行 run 时前端能分清
    * 这条进度属于谁。而本文件原先直接发 `{kind: ...}` —— 前端里 `p` 就是
@@ -105,13 +105,13 @@ describe("流式时间线", () => {
       `timeline items: ${timelineKinds().join(",")}`,
     );
 
-    // 2026-10-02：`read_file` 的调用与返回并成**一行**（原来是 "tool","tool" 两行）
+    // `read_file` 的调用与返回并成**一行**（原来是 "tool","tool" 两行）
     expect(timelineKinds()).toEqual(["reasoning", "tool", "reasoning", "tool"]);
     // 两段思考是**两个**折叠块（这就是"不堆在一块"）
     expect(document.querySelectorAll(".run-timeline > .tl-reason").length).toBe(2);
     const text = timelineText();
     expect(text).toContain("先看 sessions 结构");
-    // 折叠行上给的是中文标签，不是原始工具名（2026-10-02）
+    // 折叠行上给的是中文标签，不是原始工具名
     expect(text).toContain("读取文件");
     expect(text).toContain("摘要必须持久化");
     expect(text.indexOf("先看 sessions 结构")).toBeLessThan(text.indexOf("读取文件"));
@@ -330,7 +330,7 @@ describe("流式时间线", () => {
         at: Date.now() + 1,
         steps: [
           { kind: "reasoning", name: null, detail: "先列目录" },
-          // ⚠️ 2026-10-11 后端改名：中途正文 = `midturn`，不是 `text`。
+          // ⚠️ 后端改名：中途正文 = `midturn`，不是 `text`。
           { kind: "midturn", name: "第 1 轮", detail: "先看一眼目录再说，别急着改代码。" },
           { kind: "tool_call", name: "list_dir", detail: '{"path":"."}' },
           { kind: "tool_result", name: "list_dir", detail: "src\nREADME.md" },
@@ -342,7 +342,7 @@ describe("流式时间线", () => {
     await bootApp();
     await openPanel();
 
-    // 定稿（2026-10-11，逆向 WorkBuddy `vDn`/`rkn` 之后）：
+    // 定稿（逆向对标实现之后）：
     // **items 里没有任何答案本体** —— `midturn` 全是过程，答案走 `e.text`。
     // 所以壳外只剩最终答复，其余统统进「过程 · N 步」。
     // 原先那条 `tkn`（最长 ∪ 最后）启发式已删除，职责移交后端 `promote_thin_answer`。
@@ -381,7 +381,7 @@ describe("流式时间线", () => {
   });
 
   it("跑完：所有过程播报（midturn）全收进壳，壳外只有最终答复", async () => {
-    // 2026-10-11 定稿后的核心断言 —— 这一天里这条消息的渲染改了三轮：
+    // 定稿后的核心断言 —— 这条消息的渲染改过三轮：
     //   ① 整轮塞一个壳（核心内容被藏）→ ② 正文全平铺（步骤播报刷屏）
     //   → ③ tkn 挑两条常显（步骤 3/4 漏出 + 两套表格）→ ④ 现在：全收进壳
     //

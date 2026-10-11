@@ -3,7 +3,7 @@ import { mdToHtml } from "../../src/markdown";
 import { splitBubbles } from "../../src/bubble";
 
 /**
- * 表情包 markdown **必须活着穿过切气泡**（2026-10-08 真机回归）。
+ * 表情包 markdown **必须活着穿过切气泡**（真机回归）。
  *
  * 真机现场：闲聊模式下模型发了
  *   `![双手比心卖萌，星星眼超开心](D:\…bixin.jpg)`

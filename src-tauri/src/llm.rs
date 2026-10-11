@@ -313,7 +313,7 @@ struct ChatRequest {
     stream_options: Option<Value>,
     /// 生成上限（模型配置 `maxOutputTokens`）。
     ///
-    /// 为什么必须上行（2026-09-25 用户报「mimo 老是提前停止」后补）：
+    /// 为什么必须上行（解决「回答被掐在半截」）：
     /// 这个字段以前只是配置里的摆设 —— 从没进过请求体，服务端就用它自己的
     /// 默认值（很多网关只有 4k）。一旦回答长一点，就被 `finish_reason=length`
     /// 掐断在半截，agent 却把半截当成答完 → 表现就是"提前停止"。
@@ -339,7 +339,7 @@ struct Choice {
 
 /// 一次调用的结果
 ///
-/// ⚠️ 2026-09-30 删掉了 `reasoning: Option<String>` 字段。
+/// ⚠️ 删掉了 `reasoning: Option<String>` 字段。
 /// 原因不是"没人用"，而是**它有第二份来源且那份才是真的**：
 /// 思维链在流式路径上由 `on_delta` 回调**逐块累加**，agent loop 拿它拼
 /// `round_reason`（再经 `absorb_reason` 进步骤时间线）。这里再存一份，
@@ -432,7 +432,7 @@ enum ChatError {
     /// (原因标签, 原始信息) —— 标签进状态文案，如 "HTTP 429" / "流中断"
     ///
     /// 流式读到一半 `error decoding response body` 这类**传输层**故障也走这里：
-    /// 它既不是 429，也不是请求写错，整轮直接判死太粗暴（2026-09-24 用户实撞）。
+    /// 它既不是 429，也不是请求写错，整轮直接判死太粗暴。
     Retryable(String, String),
     Fatal(String),
 }
@@ -463,9 +463,9 @@ struct StreamChoice {
 struct Delta {
     #[serde(default)]
     content: Option<String>,
-    /// 思维链。**各家字段名不统一**（2026-09-20 实测）：
-    /// - `reasoning_content` —— spark-x2.5-4b、DeepSeek 系
-    /// - `reasoning`         —— sensenova-6.8-flash-lite
+    /// 思维链。**各家字段名不统一**（实测）：
+    /// - `reasoning_content` —— 部分国产模型与 DeepSeek 系
+    /// - `reasoning`         —— 部分轻量/国产兼容实现
     /// - `thinking`          —— 部分 Claude 兼容网关
     ///
     /// 只认一个的后果很具体：换个模型就"看不到思考过程"，而且**不报错**，
@@ -510,7 +510,7 @@ struct DeltaFunction {
     /// 工具名（流式分片里逐段给全名；归并逻辑以 index 分组、首片取名）
     #[serde(default)]
     name: Option<String>,
-    /// 工具参数分片。**形态不统一**（2026-09-25）：
+    /// 工具参数分片。**形态不统一**：
     /// 绝大多数网关按 OpenAI 规范给**字符串**分片（多片拼接成 JSON 串）；
     /// 个别实现直接给**整个 JSON 对象**（一次给完）。
     /// 只收 String 的后果：`serde_json::from_str::<StreamChunk>` 反序列化失败，
@@ -542,7 +542,7 @@ pub type StatusFn = dyn Fn(String, bool) + Send + Sync;
 /// 典型：火山方舟 5 小时用量配额耗尽（body 里 `"code":"AccountQuotaExceeded"`，
 /// 原文还带恢复时间）；OpenAI 的 `insufficient_quota` 同理。
 ///
-/// 为什么要单独识别（2026-09-22 用户实际撞上）：`is_retryable` 把所有 429 一律
+/// 为什么要单独识别（配额耗尽与临时限流必须分开）：`is_retryable` 把所有 429 一律
 /// 当"临时限流"退避重试，用户于是白等四轮退避，还以为只是被限流了。
 fn is_quota_exhausted(status: u16, body: &str) -> bool {
     if status != 429 && status != 402 && status != 403 {
@@ -626,8 +626,8 @@ async fn chat_stream_once(
 
     // connect 超时单独收紧：连不上应在十几秒内报错，而不是干等总超时。
     //
-    // ⚠️ 总超时从 180s 放宽到 600s（2026-09-25）：reqwest 的 `timeout` 覆盖
-    // **整个请求含流式读取**。mimo 这类"长思考 + 长输出"的模型，一次调用
+    // ⚠️ 总超时从 180s 放宽到 600s：reqwest 的 `timeout` 覆盖
+    // **整个请求含流式读取**。"长思考 + 长输出"这类模型，一次调用
     // 跑三四分钟很常见 —— 180s 会把流拦腰掐断，看起来就像"提前停止/反复重试"。
     // 打断长流靠用户点「停止」（cancel 每个 chunk 都检查），不靠总超时。
     let client = reqwest::Client::builder()
@@ -821,7 +821,7 @@ async fn chat_stream_once(
 
     // ---- 流"干净地"结束了 ≠ 模型答完了 ----
     //
-    // 2026-09-25 用户报「mimo 老是提前停止」后的核心修复：
+    // 解决「模型老是提前停止」的核心修复：
     // 网络/代理/网关掐流时，SSE 连接会**提前正常关闭** —— 既没有 [DONE]，
     // 也没有 finish_reason，但 `while let Some(chunk)` 照样"正常"退出。
     // 旧代码把这种情况当成完整回答返回，agent 拿到半截正文就收工 → 提前停止。
@@ -1255,9 +1255,9 @@ pub fn tools_to_openai(specs: &[crate::tools::ToolSpec]) -> Vec<Value> {
 mod tests {
     use super::*;
 
-    /// 思维链字段名兼容（2026-09-20 实测）：
-    /// spark-x2.5-4b 用 `reasoning_content`，sensenova-6.8-flash-lite 用 `reasoning`。
-    /// 只认前者时，换成 sensenova 就"看不到思考过程"且**不报错** —— 锁一条测试防回归。
+    /// 思维链字段名兼容（实测）：
+    /// 一类实现用 `reasoning_content`，另一类用 `reasoning`。
+    /// 只认前者时，换到后一类就"看不到思考过程"且**不报错** —— 锁一条测试防回归。
     #[test]
     fn delta_accepts_three_reasoning_field_names() {
         let real_sensenova = r#"{"reasoning":"这是一个","content":""}"#;
@@ -1389,7 +1389,7 @@ mod tests {
 
     #[test]
     fn stream_decode_error_is_retryable_not_fatal() {
-        // 用户实撞：火山 glm 流式读到一半 `error decoding response body`
+        // 实撞场景：某网关流式读到一半 `error decoding response body`
         // 以前包成 Fatal → 整轮直接红、从不重试
         let e = stream_read_fail("error decoding response body".into());
         match e {
@@ -1519,7 +1519,7 @@ mod tests {
 
     /// 解析 OpenAI 标准 `/v1/models` 响应，并按 id 排序。
     ///
-    /// ⚠️ 2026-09-30：这个函数**一直漏写 `#[test]`**，于是它躺在测试模块里
+    /// ⚠️ 这个函数**一直漏写 `#[test]`**，于是它躺在测试模块里
     /// 从来没被执行过（rustc 的 `dead_code` 警告把它暴露出来了）。
     /// 补上属性后它才真正开始守住"标准响应能被解析"这条不变量。
     #[test]

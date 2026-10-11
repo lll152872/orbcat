@@ -32,7 +32,7 @@ pub fn redact_key_str(k: &str) -> String {
 
 /// 一个模型配置（对应 models.json 里的一项）
 ///
-/// **身份 = (Base URL, 接口 id)**（2026-10-02 定稿）：同一组（同 Base URL）下
+/// **身份 = (Base URL, 接口 id)**（已定稿）：同一组（同 Base URL）下
 /// 接口 id 唯一，**跨组允许同名**——glm-5.3-flash 可以同时存在于火山两个套餐组。
 /// 旧设计里的「显示名 name」已废弃：models.json 里残留的 `"name"` 键会被
 /// serde 静默忽略（无 `deny_unknown_fields`），不需要迁移脚本。
@@ -711,7 +711,7 @@ pub struct AgentSettings {
     pub selected_model_url: Option<String>,
 }
 
-/// ⚠️ 「当前 agent 模式」**不在 settings.json 里**（2026-10-08 起）。
+/// ⚠️ 「当前 agent 模式」**不在 settings.json 里**。
 ///
 /// 模式跟**会话**走：`Session.mode`（建会话时钉死），读法唯一入口 =
 /// `sessions::effective_mode(data_dir, session_id)`，兜底是
@@ -1127,7 +1127,7 @@ mod tests {
     /// 那会把用户配好的模型/项目/权限全丢掉（`load_settings` 用的是
     /// `.unwrap_or_default()`，解析失败是**静默**的，最容易出事的写法）。
     ///
-    /// 2026-10-08：`activeMode` 字段已从 `AgentSettings` 删掉（模式跟会话走），
+    /// `activeMode` 字段已从 `AgentSettings` 删掉（模式跟会话走），
     /// 所以这条的断言从"默认落到标准"改成"**残留的键被忽略、别的字段照旧生效**"。
     /// serde 默认忽略未知键 —— 这正是我们要的：老文件不用迁移、不报错、
     /// 也不产生任何"看起来能配、其实不生效"的假象。
@@ -1510,7 +1510,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 🔴 回归闸门（2026-10-09 用户报"baseurl 改不了"）。
+    /// 🔴 回归闸门（"baseurl 改不了"这个缺陷）。
     ///
     /// 改 Base URL = 把这条模型**移到另一个组**。以前 `models_edit` 把
     /// 「定位用的旧 url」和「新 url」塞进同一个参数，前端又只发旧值 ——
@@ -1723,7 +1723,7 @@ mod tests {
 
     #[test]
     fn old_json_with_name_key_still_parses() {
-        // 2026-10-02 废弃显示名：旧 models.json 里的 "name" 键必须被静默忽略，
+        // 已废弃显示名：旧 models.json 里的 "name" 键必须被静默忽略，
         // 旧 settings.json 没有 selectedModelUrl 也必须能读。
         let dir = std::env::temp_dir().join(format!("fa-oldjson-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);

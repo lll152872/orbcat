@@ -5,11 +5,11 @@ import { callsOf, resetMock } from "./mocks/tauri";
 /**
  * 「行为」设置页（执行位置 / 执行权限）
  *
- * 背景（2026-10 用户拍板）：这些是**设置**，不该占输入行。
+ * 背景（定稿）：这些是**设置**，不该占输入行。
  * 它们曾以 chip 形式挤在输入行，占掉约 110~165px，把输入框压到
- * 连一行 placeholder 都放不下。用户原话："不要设置我这个页面有设置的啊"。
+ * 连一行 placeholder 都放不下（定稿口径："对话页不该有设置项"）。
  *
- * 2026-10-08 二次搬迁：**Agent 模式从这里搬进了「＋」菜单**（用户定案：
+ * 二次搬迁：**Agent 模式从这里搬进了「＋」菜单**（定论：
  * "b 从设置页挪到一个'新建会话时选模式'的入口 默认是标准"）。理由：模式跟会话走、
  * 建完不能改 —— 它是"建会话的参数"而不是"设置"。模式选择的契约测试见
  * `flow.new-session-menu.test.ts`。
@@ -176,7 +176,7 @@ describe("设置 › 行为页", () => {
     await bootApp();
     await openPanel();
     await openBehavior();
-    // 返回按钮 2026-10-08 起在**滚动区之外**的 `#sub-bar` 里（不随内容滚），
+    // 返回按钮在**滚动区之外**的 `#sub-bar` 里（不随内容滚），
     // 所以要从 document 查、不能在 panel-body 里找 —— 这正是那次修复的目的：
     // 滚到页面底部也点得到返回。
     const back = document.querySelector<HTMLElement>("#sub-bar #sub-back");

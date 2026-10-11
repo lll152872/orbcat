@@ -17,7 +17,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { mdToHtml, splitStable } from "./markdown";
 import { MAX_BUBBLES, splitBubbles } from "./bubble";
-// 纯格式化/工具函数已抽到 format.ts（2026-09-30 拆模块，见该文件头部说明）。
+// 纯格式化/工具函数已抽到 format.ts（拆模块，见该文件头部说明）。
 // 这里集中 re-import，避免散落各处 import 语句。
 import {
   aggregateUsage,
@@ -107,7 +107,7 @@ interface AgentStep {
    * 工具返回预览 —— **只有已配对的 `tool_call` 条目**才有这个字段。
    *
    * 为什么存在：后端落盘是 `tool_call` + `tool_result` 两条（`agent.rs` 工具循环），
-   * 时间线上就是两行（`🔧 列目录` / `✅ 列目录`）。用户 2026-10-02 要求
+   * 时间线上就是两行（`🔧 列目录` / `✅ 列目录`）。设计要求是
    * **一条工具只占一行**，所以前端读盘 / 收流时用 `pairToolSteps()` 把返回并进
    * 调用条目里（`detail` 仍是参数），渲染成一行、点开才看参数与返回。
    *
@@ -182,8 +182,8 @@ interface ChatEntry {
    * - 历史消息：直接来自磁盘（后端 `cap_steps` 保序落盘）
    *
    * 以前这里是两个聚合字段（`progress` 行数组 + `streamReasoning` 单串），
-   * 思考与工具天然被分到两处、不可能交错 —— 用户 2026-09-22 报的
-   * 「思考都堆在一块」就是这个结构造成的。现在条目自带顺序。
+   * 思考与工具天然被分到两处、不可能交错 —— 「思考都堆在一块」
+   * 这个症状就是这个结构造成的。现在条目自带顺序。
    */
   items?: AgentStep[];
   images?: string[];
@@ -254,7 +254,7 @@ interface StoredMsg {
   /** 本轮被中断（text 是半截） */
   interrupted?: boolean;
   /**
-   * **未定稿**的助手消息（2026-09-26 加的"退出不丢轮"机制）。
+   * **未定稿**的助手消息（"退出不丢轮"机制）。
    *
    * 进程在轮内被关掉时，磁盘上留下的是"跑到一半"的占位消息：它带着已产出的
    * 思考与工具步骤，但没有最终正文。UI 要明确告诉用户"这轮没跑完"，
@@ -283,9 +283,9 @@ interface Session {
   /** 分叉点：源会话里的第几条消息 */
   forkAt?: number;
   /**
-   * 这条会话**自己的** Agent 模式 id（2026-10-08）。
+   * 这条会话**自己的** Agent 模式 id。
    *
-   * 用户定案："模式跟会话走，一个会话模式不能变"。建会话时定死，之后只读。
+   * 约定："模式跟会话走，一个会话模式不能变"。建会话时定死，之后只读。
    * 老会话（升级前建的）磁盘上没这个字段 → Rust 侧兜到内置默认
    * （`modes::DEFAULT_MODE_ID` = standard），所以这里在切到老会话后可能短暂是
    * undefined —— 真正判定模式一律走 `currentModeId()`（它自己带兜底）。
@@ -343,9 +343,9 @@ let hasModels = true;
  * 重建的。设它是为了让"模型疯狂重复输出"的时候界面还能动 —— 有个模型会把
  * 整篇正文重复吐进 reasoning 里。
  *
- * ⚠️ 思考过程**不设上限**（2026-09-26 用户拍板"完全不截"）：
- * 以前这里是 20_000 字，配合落盘的 8KB 预算，导致用户看到的思考
- * 比模型真实产出的少一大截（截图报的"思考过程明显不止这么少"）。
+ * ⚠️ 思考过程**不设上限**：
+ * 以前这里是 20_000 字，配合落盘的 8KB 预算，导致思考显示得
+ * 比模型真实产出的少一大截（症状："思考过程明显不止这么少"）。
  * 现在思考一行不截。正文仍保留上限 —— 它的完整版会由后端 `run.answer` 重建，
  * 显示层截断不影响最终结果。
  */
@@ -358,8 +358,8 @@ function sessionToEntries(s: Session): ChatEntry[] {
   const out: ChatEntry[] = [];
 
   // 插话附带的图：插话消息本身**不铺独立气泡**（见下），但它的图必须画在
-  // 时间线的 `kind=steer` 条目上 —— 否则用户在插话里塞的图永远看不到
-  // （2026-09-26 用户报的 bug1）。这里先按 steerId 收集，落到后面回填。
+  // 时间线的 `kind=steer` 条目上 —— 否则插话里塞的图永远看不到
+  // 。这里先按 steerId 收集，落到后面回填。
   const steerImages = new Map<string, string[]>();
   for (const m of s.messages) {
     if (m.steerId && m.images && m.images.length) {
@@ -386,7 +386,7 @@ function sessionToEntries(s: Session): ChatEntry[] {
       return;
     }
     // 时间线条目：给 steer 条目补上插话的图（按 steerId = 条目 name 对齐）；
-    // 再把 `tool_call` + 同名 `tool_result` 并成一条（2026-10-02：一个工具只占一行）。
+    // 再把 `tool_call` + 同名 `tool_result` 并成一条（一个工具只占一行）。
     const items = pairToolSteps(
       m.steps?.map((st) =>
         st.kind === "steer" && st.name && !(st.images && st.images.length)
@@ -456,12 +456,12 @@ function ensureSessionLoaded(): Promise<void> {
 /**
  * 开新会话 → 挂到**当前激活项目**（主对话则不绑）。
  *
- * `mode` = 这条会话的模式 id（2026-10-08，模式跟会话走）。不传就用
+ * `mode` = 这条会话的模式 id（模式跟会话走）。不传就用
  * `defaultModeId` —— 它是**编译期常量级别的"标准模式"**，不是用户可配项
  * （`settings.activeMode` 已删：界面上没有改它的入口，留着就是个会撒谎的死字段）。
  * 「新建项目…」这类非显式选模式的路径自然也落在标准模式上。
  *
- * ⚠️ 模式**只在建的时候**给，建完就钉死（用户定案"一个会话模式不能变"）——
+ * ⚠️ 模式**只在建的时候**给，建完就钉死（"一个会话模式不能变"）——
  * 所以这个参数**没有**对应的"改"接口，别在这里加"切模式"的分支。
  */
 async function newSession(mode?: string): Promise<void> {
@@ -494,7 +494,7 @@ async function newSession(mode?: string): Promise<void> {
 
 /** 进入会话：顶栏项目跟着会话走（主聊天 → 主对话） */
 async function switchSession(id: string): Promise<void> {
-  // ⚠️ 不再用 `busy` 拦住切换（2026-09-26 用户拍板：切走、后台继续跑）。
+  // ⚠️ 不再用 `busy` 拦住切换（切走、后台继续跑）。
   //    落盘路径自带开跑时的 session_id，回答不会写错会话；前端进度监听也按
   //    `runningSessionId !== currentSessionId` 丢掉旧会话的事件（不会污染当前视图）。
   if (id === currentSessionId) return; // 点自己：别白重载一次（会冲掉正在流式的气泡）
@@ -534,7 +534,7 @@ async function switchSession(id: string): Promise<void> {
 /**
  * 「别的会话正在后台跑」提示条。
  *
- * 多会话并行 run（2026-09-26）：切走后**别的**会话还在跑，它们的结果落各自的会话。
+ * 多会话并行 run：切走后**别的**会话还在跑，它们的结果落各自的会话。
  * 不给提示的话，用户在 B 里看不到 A 的动静会以为任务停了。点这条切过去看。
  */
 function updateBgRunBanner(): void {
@@ -1040,7 +1040,7 @@ function renderSessionsView(): string {
     name ? `<span class="sess-proj" title="项目：${esc(name)}">📁 ${esc(name)}</span>` : "";
 
   /**
-   * 这条会话的 Agent 模式标记（2026-10-08 加）。
+   * 这条会话的 Agent 模式标记。
    *
    * 为什么摆在一行 meta 的最后而不是标题行：标题行已经有 分支/项目/当前 三个标，
    * 再塞一个会把标题挤没（`.sess-title` 是省略号截断的）。
@@ -1143,20 +1143,19 @@ function bindSessionsView(root: HTMLElement): void {
  *
  * ⚠️ 必须延后一拍（setTimeout 0）再挂：立刻挂会被**打开菜单的那次 click** 自己触发
  *（事件从按钮冒泡到 window），菜单在渲染同帧就被移除 = "点了没用"。
- * 2026-09-25 Playwright 实证：同帧日志 `menu opened → once-close FIRED`。
+ * Playwright 实证：同帧日志 `menu opened → once-close FIRED`。
  */
 function closeOnOutsideClick(close: () => void): void {
   setTimeout(() => window.addEventListener("click", close, { once: true }), 0);
 }
 
 /**
- * 「＋」菜单 —— **新建会话时选模式**（2026-10-08 从「设置 › 行为」挪过来）。
+ * 「＋」菜单 —— **新建会话时选模式**（从「设置 › 行为」挪过来）。
  *
- * 为什么模式住在这里而不是设置页（用户定案：“b 从设置页挪到一个‘新建会话时选模式’
- * 的入口 默认是标准”）：
+ * 为什么模式住在这里而不是设置页：
  * - 模式**跟会话走**、建完就钉死（“一个会话模式不能变”）—— 它不是一个能随时
  *   回来改的“设置”，而是**建会话时的一个参数**。摆在设置页里既放错位置，
- *   又暗示“随时能改”，用户改完发现当前会话没变才是真疑惑。
+ *   又暗示“随时能改”，改完发现当前会话没变才是真疑惑。
  * - 菜单里显式列出每个模式（而不是“新建会话 + 事后切”），因为**没有事后切**。
  *
  * 「新建项目…」建完项目后**原地再弹一次这个菜单**：项目建好了、会话还没建，
@@ -1164,8 +1163,9 @@ function closeOnOutsideClick(close: () => void): void {
  * 就得把刚建的会话删掉重来。
  *
  * ⚠️ 菜单里**不能**放“修改默认模式”。默认值 = **标准模式**（`modes::DEFAULT_MODE_ID`，
- * 编译期常量）：`settings.activeMode` 已删 —— 用户 2026-10-08 看到「闲聊」被标成
- * 「默认」就是因为那个字段（他早先在设置页切过闲聊），而他要的是"标准是默认"。
+ * 编译期常量）：`settings.activeMode` 已删 —— 「闲聊」被标成
+ * 「默认」就是因为那个字段（它可能残留着早先在设置页切过闲聊的值），
+ * 而默认就该是标准模式。
  * 界面上没有了改默认值的入口，就别再把默认值做成可配项。
  */
 async function showNewMenu(x: number, y: number): Promise<void> {
@@ -1185,7 +1185,7 @@ async function showNewMenu(x: number, y: number): Promise<void> {
     ? ordered
         .map((m) => {
           // 模式里写了 MCP 里不存在的组名 → 这行**必须**看得见。
-          // （2026-10-08 之前这个提示长在「设置 › 行为」的模式卡片上，
+          //   之前这个提示长在「设置 › 行为」的模式卡片上，
           //   模式选择器搬进菜单后一并跟过来；丢了它就是"手编 modes.json 打错组名
           //   却毫无反馈"，那种静默失效最难查。）
           const bad = m.unknownGroups.length
@@ -1264,14 +1264,14 @@ async function showNewMenu(x: number, y: number): Promise<void> {
 }
 
 // 历史：执行位置 / Agent 模式 / 执行权限三组控制曾以 chip 形式住在输入行
-// （先三颗、后合并成一颗）。2026-10 用户拍板「不要设置我这个页面有设置的啊」，
+// （先三颗、后合并成一颗）。曾定论「对话页不该有设置项」，
 // 于是**整个搬进「设置 › 行为」页**，输入行只留一颗行为 logo（🎛）。
 // 那三颗 chip 的刷新函数已随之删除 —— 状态由 `renderBehaviorView` 现算，
 // 不再需要"状态变了刷新 chip"的钩子。
 // ⚠️ **不要**重新往输入行塞设置类控件 —— 那正是被否掉的做法。
 //
-// 2026-10-08 二次搬迁：**Agent 模式离开设置页**，挪进「＋」菜单的「新建会话」里
-// （用户定案："b 从设置页挪到一个'新建会话时选模式'的入口 默认是标准"）。
+// 二次搬迁：**Agent 模式离开设置页**，挪进「＋」菜单的「新建会话」里
+// （定论："b 从设置页挪到一个'新建会话时选模式'的入口 默认是标准"）。
 // 理由：模式跟会话走、建完就钉死 —— 它根本不是一个"设置"，而是**建会话时的一个参数**，
 // 摆在设置页里既放错了地方，又暗示"随时能改"。
 
@@ -1292,7 +1292,7 @@ async function setBgDesk(on: boolean): Promise<void> {
  * 拉一次模式表（启动、切会话后、打开「＋」菜单前都调）。
  *
  * `sessionId` 决定 `activeModeId` 是**哪条会话**的模式：
- * 传了就按它算，没传就用全局默认。模式跟会话走之后（2026-10-08），
+ * 传了就按它算，没传就用全局默认。模式跟会话走之后，
  * 所有"当前是什么模式"的判断都得带上会话，否则会把默认模式当成当前模式。
  *
  * ⚠️ `modesStamp` 是**乱序保护**：启动时先发了一条不带会话的（拿默认模式），
@@ -1707,7 +1707,7 @@ let skillsCache: SkillInfo[] = [];
 /**
  * 🔶 幽灵函数 —— 「项目」（拼装包）功能整体暂缓。
  *
- * 2026-10-09 用户拍板：这个功能未来再说，本轮不发布。签名保留、调用点保留、
+ * 定论：这个功能未来再说，本轮不发布。签名保留、调用点保留、
  * 返回 `null`（= 没有摘要文本）。设置入口页那一行同时带 `hidden`，用户看不见。
  *
  * 为什么留个空壳而不是整段删掉：这一页（`renderProjectView`）和它的整套 vitest
@@ -1717,7 +1717,7 @@ let skillsCache: SkillInfo[] = [];
  */
 function projectSummaryText(): null {
   return null;
-  /* ↓↓↓ 恢复功能时把这段实现放回来（2026-10-10 暂缓前的原样） ----------
+  /* ↓↓↓ 恢复功能时把这段实现放回来（暂缓前的原样） ----------
   if (!projectInfo) return "读取中…";
   const act = projectInfo.active;
   if (!act) return `未激活 · 共 ${projectInfo.bundles.length} 个包`;
@@ -1753,13 +1753,13 @@ let modeSwitching = false;
 let busy = false;
 let thinking = false;
 /**
- * 进行中气泡属于哪个会话 —— 进度事件到达时用来判断"用户是不是已经切走了"。
+ * 进行中气泡属于哪个会话 —— 进度事件到达时用来判断"是不是已经切走了会话"。
  * 切走后到达的事件直接丢（那是旧会话的收尾），没切走则重建气泡接着画。
  */
 let runningSessionId = "";
 
 /**
- * **正在跑的会话集合**（2026-09-26 用户拍板：多会话并行 run）。
+ * **正在跑的会话集合**（多会话并行 run）。
  *
  * 每个会话各自跑各自的 agent loop（后端 `RunRegistry` 按 session_id 分槽），
  * 互不干扰 —— 切到没在跑的会话可以立刻开新任务，切到在跑的会话可以插话。
@@ -1837,7 +1837,7 @@ const ORB_TITLE: Record<OrbState, string> = {
 /**
  * 睡眠中的球标题。
  *
- * ⚠️ 2026-09-30 语义变更后这句**基本看不到**了 —— 睡眠时窗口被隐藏，
+ * ⚠️ 语义变更后这句**基本看不到**了 —— 睡眠时窗口被隐藏，
  * 没有可悬停的元素。保留它是因为 `orbSleeping` 仍会同步过来（例如
  * 后端在另一条路径上改了状态、而窗口还没来得及隐藏的那一瞬），
  * 措辞也改成描述**事实**（睡着的唤醒入口在托盘），不再说"点一下唤醒"
@@ -1887,9 +1887,9 @@ function sameUrl(a: string | null | undefined, b: string | null | undefined): bo
 /**
  * 「哪一条才是当前」——**唯一**一条。
  *
- * 为什么要它（2026-10-02）：`isCurrent` 那种 `id 相同 && (url 为空 || url 相同)`
+ * 为什么要它：`isCurrent` 那种 `id 相同 && (url 为空 || url 相同)`
  * 的写法，在"设置里只有 id、没记 url"时会命中**所有**同 id 的行 ——
- * 用户看到的就是「两个 glm-5.3-flash 都画线（都带当前标记）」。
+ * 症状就是「两个 glm-5.3-flash 都画线（都带当前标记）」。
  * 统一改成"等于 `curModel()` 解析出来的那一条"，最多只标一个。
  */
 function currentModelRef(): { id: string; url: string } | null {
@@ -1900,12 +1900,12 @@ function currentModelRef(): { id: string; url: string } | null {
 /**
  * 模型**分组显示名**（键 = Base URL）—— `settings.modelGroupNames`。
  *
- * 面板的模型卡片要显示「组别 + 模型名」（2026-10 用户明确要求：
- * "这个是让你放模型的部分啊，组别+模型名"）。取不到时回退到 host。
+ * 面板的模型卡片要显示「组别 + 模型名」（定稿：这一块就是放模型的，
+ * 组别 + 模型名）。取不到时回退到 host。
  */
 let modelGroupNames: Record<string, string> = {};
 
-/** 当前模型所属分组的显示名（用户改过用改过的，否则用 host） */
+/** 当前模型所属分组的显示名（配过用配过的，否则用 host） */
 function modelGroupLabel(url: string | undefined): string {
   if (!url) return "";
   return modelGroupNames[url]?.trim() || shortHost(url);
@@ -2001,8 +2001,8 @@ let activeModeId = "standard";
 /**
  * **新建会话的默认模式** —— 就是内置的「标准模式」（`modes_get.defaultMode`）。
  *
- * 它是**常量**，不是用户可配项：`settings.activeMode` 已于 2026-10-08 删除
- * （用户看到「闲聊」被标「默认」就是它干的，而他要的是"标准是默认"）。
+ * 它是**常量**，不是可配项：`settings.activeMode` 已删除
+ * （「闲聊」被标「默认」就是它干的，而默认就该是标准模式）。
  * 界面上早已没有改默认值的入口 —— 一个改不了的字段还留着，只会变成
  * "手编也不生效"的困惑源。
  */
@@ -2022,7 +2022,7 @@ interface ModeView {
   /** 工具呈现方式：`native` / `ptc`（老后端不返回时按 native 处理） */
   toolPresentation?: "native" | "ptc";
   /**
-   * 正文能不能发图（2026-10-08）。老后端不返回时按 `work` 处理。
+   * 正文能不能发图。老后端不返回时按 `work` 处理。
    *
    * ⚠️ 只用于**显示**，前端不做拦截：工作模式也要渲染产物图（截图/图表），
    * 按这个值降级会把它一起挡掉。真正的约束在系统提示的措辞里。
@@ -2031,7 +2031,7 @@ interface ModeView {
   /** 模式注入的场景上下文（可能为空） */
   promptExtra?: string;
   /**
-   * 聊天式呈现（2026-10-08）：一条回复拆成多个气泡、且**不显示过程**。
+   * 聊天式呈现：一条回复拆成多个气泡、且**不显示过程**。
    * 只有闲聊模式开 —— 工作模式的结构化长答案切成 5 个泡会非常难读。
    */
   chatty?: boolean;
@@ -2041,7 +2041,7 @@ interface ModeView {
 const MODE_ICON: Record<string, string> = {
   standard: "🎯",
   ptc: "🚀",
-  // 2026-10-08：「极简」被「闲聊」取代（机制相同 = 不给外部工具组，
+  // 「极简」被「闲聊」取代（机制相同 = 不给外部工具组，
   // 闲聊多了发图能力与场景上下文）。旧 id 的图标留着无害，但新 id 要在这儿。
   chat: "💬",
   minimal: "🪶",
@@ -2049,7 +2049,7 @@ const MODE_ICON: Record<string, string> = {
 };
 
 /**
- * 当前会话的模式 id（2026-10-08 起模式跟会话走）。
+ * 当前会话的模式 id（模式跟会话走）。
  *
  * ⚠️ 前端**唯一**该用来判断"现在是什么模式"的函数。直接读 `activeModeId`
  * 只在"它就是当前会话的模式"时才对 —— 而 `activeModeId` 是 `modes_get` 的
@@ -2077,10 +2077,10 @@ function currentModeName(): string {
  * 开 = 命令跑在**隐形桌面**上：应用自己弹的窗口不会闪到你屏幕上、不抢焦点。
  *
  * ⚠️ 它**不是**一个 agent 模式：模式管"哪些 MCP 工具组可见"，
- * 这个管"在哪儿执行" —— 两个正交维度（用户拍板）。
+ * 这个管"在哪儿执行" —— 两个正交维度（定稿结论）。
  *
  * 历史：紧挨着这里原来还有一个 `PRESENTATION_LABEL`（native / ptc 的一句话说明）。
- * 2026-10-08 模式选择器搬进「＋」菜单时删掉了 —— 那句说明只服务"设置页的模式列表"，
+ * 模式选择器搬进「＋」菜单时删掉了 —— 那句说明只服务"设置页的模式列表"，
  * 现在那份说明在模式菜单项的 `title`（取模式自己的 `description`）与
  * 「设置 › 行为」的提示文字里，留着它就是一段没人读的死代码。
  */
@@ -2315,7 +2315,7 @@ function renderOrb(): void {
   if (!orb) return; // 同上：DOM 已经不在了（被清空/换页），别再往上挂监听
   attachDrag(orb, () => {
     // 左键点球 → 展开面板。
-    // ⚠️ 这里**不再有"睡着的球点一下唤醒"的分支**（2026-09-30 语义变更）：
+    // ⚠️ 这里**不再有"睡着的球点一下唤醒"的分支**（语义变更后）：
     // 睡眠时窗口是隐藏的，隐藏的窗口收不到点击 —— 那段代码永远走不到，
     // 留着只会让人以为睡眠仍是"留在屏幕上"。唤醒入口改到托盘菜单与
     // 「再启动一次 exe」（后者会直接展开面板）。
@@ -2344,9 +2344,9 @@ function applyOrbState(): void {
 /**
  * 睡眠：**把球从屏幕上藏起来**（后端 `win.hide()`），任务照跑。
  *
- * ## 语义（2026-09-30 用户重新定义）
+* ## 语义
  *
- * *"睡眠是球从页面上消失但是任务不停止"* —— 所以这里：
+* *"睡眠是球从页面上消失但是任务不停止"* —— 所以这里：
  * 1. 先切回球态（窗口还是"球"这个形状，只是马上要被隐藏）；
  * 2. 调后端 `sleep` → 窗口隐藏；
  * 3. **完全不碰任务**：不取消、不清空、不重置任何在跑的一轮。
@@ -2404,13 +2404,13 @@ function installOrbUiListener(): void {
 }
 
 /**
- * 「用户又启动了一次 exe」→ 展开面板。
+ * 「又启动了一次 exe」→ 展开面板。
  *
- * ## 为什么需要两条通道（2026-09-30 修「睡眠态点击应用图标无效」）
+ * ## 为什么需要两条通道（修「睡眠态点击应用图标无效」）
  *
  * 后端收到第二实例信号时会 `emit("orb-open-panel")`，但**事件可能赶在前端
  * 就绪之前**（WebView 还在加载），那一次 emit 就丢了 —— 而第二实例已经退出，
- * 用户看到的就是完全没反应。所以后端同时留了一个 `take_open_panel_request`
+ * 表现就是完全没反应。所以后端同时留了一个 `take_open_panel_request`
  * 标记：前端 `boot` 时拉一次，迟到的信号照样生效。
  *
  * ⚠️ `take` 语义（后端 `swap(false)`）：标记只生效一次，不会每次刷新都弹面板。
@@ -2431,7 +2431,7 @@ function installOpenPanelListener(): void {
  * 把面板打开到可用状态（供「又启动了一次」与「程序已睡着」使用）。
  *
  * 与球上点击展开的区别：
- * 1. **先退出睡眠** —— 睡着时窗口是**隐藏**的（2026-09-30 语义变更），
+ * 1. **先退出睡眠** —— 睡着时窗口是**隐藏**的（语义变更后），
  *    后端 `wake` 会把它重新显示出来；前端这份 `orbSleeping` 也要跟上，
  *    否则球回来了、状态还写着"睡着"。
  * 2. **要等一轮事件循环** —— 后端刚 `apply_mode("panel")` 改完窗口 bounds，
@@ -2512,7 +2512,7 @@ function patchThumb(path: string): void {
   });
 }
 
-// ---------------- 正文图（模型在回复里发的图，2026-10-08）----------------
+// ---------------- 正文图（模型在回复里发的图）----------------
 //
 // 与上面的「用户附图缩略图」是**两套**，刻意不合并：
 //   - 缩略图：62×62 的小方块，320px 足够，缓存复用率高（同一条消息反复重绘）；
@@ -2618,13 +2618,13 @@ function hydrateBodyImages(root: ParentNode): void {
 /**
  * 时间线：把一轮里「想了什么 / 做了什么」**按发生顺序**渲染出来。
  *
- * ## 为什么要按顺序（2026-09-22 用户拍板）
+ * ## 为什么要按顺序（定稿结论）
  *
  * 以前是「一个思考折叠块 + 一个工具折叠行」，思考必然挤成一坨、工具另起一处，
  * 看不出"这一步的思考是为了调哪个工具"。现在条目自带顺序，渲染出来就是
  * `💭 思考 → 🔧 调工具 → ✅ 返回 → 💭 思考 → …` 的交错节奏。
  *
- * ## 折叠策略（2026-10-02 用户三轮定稿）
+ * ## 折叠策略（三轮定稿）
  *
  * | kind | 来源 | 运行中（live） | 跑完（历史） |
  * |---|---|---|---|
@@ -2641,15 +2641,15 @@ function hydrateBodyImages(root: ParentNode): void {
  * ## 两级结构：跑完**整轮收成一行**
  *
  * 跑完（历史）时整轮包进 `details.run-process`，摘要就是 `过程 · N 步` ——
- * 用户 10-02 的最后一句话："这个应该全部压缩掉啊"（此前摊平后回看一条消息
+ * 定稿结论是"这个应该全部压缩掉"（此前摊平后回看一条消息
  * 要占十几行折叠行，正文反被顶下去）。
  *
  * - 运行中**不包外壳**：平铺，中途正文摊开（要盯着进度）。
  * - 跑完包外壳，**默认闭合**：一行搞定；点开才看得到里面的思考 / 工具 / 正文。
  * - 里面每一条**再各自折叠**（思考、工具行）—— 展开外壳不会一下子哗啦出一屏原文。
  *
- * ❌ 别再走回头路：① 外壳**不许默认展开**（10-02 第一轮报的就是它摊开着一堆
- * 工具参数）；② `reasoning` **不许**在 live 时自动展开（"思考应该让用户选择展开"）。
+ * ❌ 别再走回头路：① 外壳**不许默认展开**（第一轮报的就是它摊开着一堆
+ * 工具参数）；② `reasoning` **不许**在 live 时自动展开（"思考应该让人选择展开"）。
  *
  * ## 兼容老数据
  *
@@ -2695,7 +2695,7 @@ function renderTimeline(items: AgentStep[] | undefined, live: boolean, key = "")
     const head = items.length - TIMELINE_TAIL;
     timelineStore.set(key, items);
     // 超长轮次走「只渲染尾部 + 按需取更早」的省流路径。
-    // ⚠️ 2026-10-11：原先这里会把"必须常显的正文"提到壳外，那套 `tkn`
+    // ⚠️ 原先这里会把"必须常显的正文"提到壳外，那套 `tkn`
     //    启发式已随 `midturn` 改名 + 后端提升一起删除（见 renderHistTimeline）。
     return `<details class="run-process" data-open-key="proc-${esc(key)}">
       <summary>过程 · ${items.length} 步</summary>
@@ -2717,7 +2717,7 @@ function renderTimeline(items: AgentStep[] | undefined, live: boolean, key = "")
  * 「过程」条目 —— 与 WorkBuddy 的 `foldable` 对齐：折起来不损失信息的东西。
  *
  * `error` / `tool_error` / `steer` **刻意不算** —— 出错的行和用户插话
- * 折进去就等于没人看得见（既有约定，2026-10-02）。
+ * 折进去就等于没人看得见（既有约定）。
  */
 function isFoldableStep(s: AgentStep): boolean {
   return (
@@ -2745,16 +2745,16 @@ function isMidturn(s: AgentStep): boolean {
 /**
  * 跑完的整轮时间线 → HTML：**保序段切分 + 正文筛选**，不再把整轮塞进一个外壳。
  *
- * ## 定稿规则（2026-10-11 与用户逐条对齐）
+* ## 定稿规则
  *
- * | 条目 | 去向 |
+* | 条目 | 去向 |
  * |---|---|
- * | 正文（`text`/`stream` 非空）中**最长 ∪ 最后一条** | 平铺常显（WorkBuddy `tkn` 同款） |
+ * | 正文（`text`/`stream` 非空）中**最长 ∪ 最后一条** | 平铺常显（对标 WorkBuddy `tkn`） |
  * | 其余一切：中间播报、`reasoning`、工具（**含失败行**）、`status` | **一个**「过程 · N 步」外壳 |
  * | 轮级 `error`、`steer`（插话） | 平铺常显 |
  *
  * 渲染顺序：**过程折叠在最前，壳外条目按原序跟在壳后** —— 不做穿插
- * （用户："wb 没有像你这样渲染的"）。上一版的"段切分 + 落单平铺"产生
+ * （对标实现里没有这种渲染法）。上一版的"段切分 + 落单平铺"产生
  * 「壳 / 正文 / 壳 / 正文」交替的多段结构，中间播报还会漏出来，已废弃。
  *
  * ## ⭐ 为什么这里不再有任何"正文常显"启发式
@@ -2762,7 +2762,7 @@ function isMidturn(s: AgentStep): boolean {
  * 上午为了抢救"被折叠吞掉的核心内容"，这里加过 `tkn`（最长 ∪ 最后）——
  * 一度反复（正文全平铺 → 步骤播报刷屏 → 步骤 3/4 漏出来 → 表格两套渲染）。
  *
- * 根因（2026-10-11 逆向 WorkBuddy `codebuddy-lite-wb.mjs` 确认）：**items 里
+ * 根因（逆向对标实现后确认）：**items 里
  * 本来就没有答案本体**。WorkBuddy 一条消息 = 一个 `output` 数组，
  * 「最后一条 text」天然就是答案，所以它那边不需要猜；orbcat 的中途正文被
  * 拆成了独立 step（`kind:"midturn"`），答案另走 `e.text`，两者无结构对应。
@@ -2771,7 +2771,7 @@ function isMidturn(s: AgentStep): boolean {
  * （`promote_thin_answer`），前端就不必再猜。壳外只留 `e.text` 一个来源。
  */
 function renderHistTimeline(items: AgentStep[], key: string): string {
-  // 定稿（2026-10-11，逆向 WorkBuddy `vDn`/`rkn` 后的结果）：
+  // 定稿（逆向对标实现后的结果）：
   // **items 里没有任何"答案本体"** —— `midturn` 全是过程，`assistant` 走 `e.text`
   // 单独常显。所以壳外只剩轮级 error / 插话行，其余**统统进过程折叠**。
   // （原先的 `tkn`「最长 ∪ 最后」已删：那份职责移交给了后端的
@@ -2900,8 +2900,8 @@ function isToolFailure(detail?: string | null): boolean {
 }
 
 /**
- * 把 `tool_call` + 紧跟的同名 `tool_result` **并成一条**（用户 2026-10-02：
- * "直接变成执行命令一条就行了"）—— 以前一个工具占两行（`🔧 列目录` / `✅ 列目录`）。
+ * 把 `tool_call` + 紧跟的同名 `tool_result` **并成一条**（定稿：直接变成执行命令
+ * 一条就行了）—— 以前一个工具占两行（`🔧 列目录` / `✅ 列目录`）。
  *
  * ## 为什么必须在**数据层**合并，不能只改渲染
  *
@@ -3013,14 +3013,14 @@ function renderItem(s: AgentStep, idx = -1, kp = ""): string {
   switch (s.kind) {
     case "reasoning":
       if (!s.detail.trim()) return "";
-      // ⚠️ **永远不自动展开**（2026-10-02 用户要求）：思维链是"想看才点开"的东西，
-      //    不管 live 还是历史。字数进 summary，用户看长度决定要不要点。
-      //    增量 patch 只换 <pre> 文本、**不碰 open**，所以用户展开着不会被顶回去。
+      // ⚠️ **永远不自动展开**：思维链是"想看才点开"的东西，
+      //    不管 live 还是历史。字数进 summary，看长度决定要不要点。
+      //    增量 patch 只换 <pre> 文本、**不碰 open**，所以展开着不会被顶回去。
       //
-      // 2026-10-03：正文改走 **markdown 懒渲染** —— 折叠时是纯 <pre>，
-      // 用户点开（`toggle` → `data-md="1"`）才转成 HTML 并打标记。
+      // 正文改走 **markdown 懒渲染** —— 折叠时是纯 <pre>，
+      // 点开（`toggle` → `data-md="1"`）才转成 HTML 并打标记。
       // 为什么不在这里直接 `mdToHtml`：
-      //   ① 思考默认折叠，转不转用户都看不见，转换纯属白做；
+      //   ① 思考默认折叠，转不转都看不见，转换纯属白做；
       //   ② 流式期间每 chunk 都要重跑一次转换（正文可到几万字），
       //      而折叠状态下没人看 —— 白烧 CPU 还会让 patch 变慢。
       // 详见 `mdToHtml` 上方 `splitStable` 的注释。
@@ -3030,12 +3030,12 @@ function renderItem(s: AgentStep, idx = -1, kp = ""): string {
       </details>`;
 
     case "tool_call": {
-      // 工具调用**默认折叠成一行**（2026-10-02 用户要求）：
+      // 工具调用**默认折叠成一行**：
       // 以前把参数 JSON 直接铺在时间线上（`🔧 调用 write_file {"content":"# -*- coding…`），
-      // 那是给机器看的东西，不是给用户看的。现在只留「🔧 运行命令」，
+      // 那是给机器看的东西，不是给人看的。现在只留「🔧 运行命令」，
       // 参数进 `title` 与详情块，想看再点。
       //
-      // 2026-10-02 第二轮：**调用与返回并成一行**（`pairToolSteps` 已把返回塞进 `s.result`），
+      // 第二轮：**调用与返回并成一行**（`pairToolSteps` 已把返回塞进 `s.result`），
       // 所以一个工具只占一行 —— 前缀按有没有返回在 🔧 / ✅ 之间切，
       // 详情块里先参数后返回，点开一次两样都能看到。
       const args = s.detail ? summarizeArgs(s.detail) : "";
@@ -3096,11 +3096,11 @@ function renderItem(s: AgentStep, idx = -1, kp = ""): string {
     case "midturn":
     case "text":
     case "stream":
-      // **中途正文**：本身不折叠 —— 运行中它就该摊着（用户要盯进度），
+      // **中途正文**：本身不折叠 —— 运行中它就该摊着（要盯进度），
       // 跑完之后整轮已经被「过程」外壳收掉了（见 `renderTimeline`），
       // 所以这里再套一层折叠只会变成"点两次才读到一句话"。
       //
-      // 2026-10-03 用户要求：中途正文**按 markdown 渲染**（它跟最终答复同源，
+      // 中途正文**按 markdown 渲染**（它跟最终答复同源，
       // 模型在里面写 `## 分流总览` / 表格 / 代码块很常见，纯文本没法看）。
       // 走 `splitStable` 切一刀：已收尾的块转 HTML，活动尾巴保持纯文本 ——
       // 否则表格会在分隔行到达的瞬间整块突变，逐 chunk 看就是闪。
@@ -3156,7 +3156,7 @@ function renderMessages(): string {
 /**
  * 重绘消息区并**重新绑定**卡片按钮。
  *
- * ⚠️ 这里**不用** document 级事件委托：实测委托对卡片按钮不生效
+ * ⚠️ 这里**不用** document 级事件委托：委托对卡片按钮不生效
  *    （点了完全没反应，只有键盘 Enter/Esc 有效）。项目里其余按钮
  *    也全是"渲染后直接绑"的写法，保持一致。
  *
@@ -3203,7 +3203,7 @@ function paintMessages(el: HTMLElement): void {
     btn.addEventListener("click", () => {
       // ⚠️ 输入框的真实 id 是 `input`（renderPanel 里写死的）。
       //    曾写成 `#prompt-input`（不存在）→ 填字落空 → send() 读到空值
-      //    撞 `if (!text) return` 静默退出 → 按钮"点了没反应"（2026-09-27 用户截图报过）。
+      //    撞 `if (!text) return` 静默退出 → 按钮"点了没反应"（曾因此报过 bug）。
       const ta = document.getElementById("input") as HTMLTextAreaElement | null;
       if (ta) {
         ta.value = "继续";
@@ -3333,7 +3333,7 @@ function patchTimeline(tl: HTMLElement, items: AgentStep[]): void {
     const last = items[n - 1];
     const node = tl.querySelector<HTMLElement>(`[data-i="${n - 1}"]`);
     if (last.kind === "reasoning" && node) {
-      // 2026-10-03：思考块正文可能已转成 markdown（用户展开过）。
+      // 思考块正文可能已转成 markdown（展开过）。
       // 这种情况下 `textContent` 存的是"渲染后的文字"，不再等于 `last.detail`，
       // 拿它比较会永远不等 → 每帧都重写一遍。这里按 `data-md` 分流：
       //   未转换 → 只换 <pre> 文本（保持懒渲染的省流式开销）
@@ -3342,14 +3342,14 @@ function patchTimeline(tl: HTMLElement, items: AgentStep[]): void {
       const len = node.querySelector<HTMLElement>(".run-reason-len");
       if (pre) {
         const rendered = pre.dataset.md === "1";
-        // ⚠️⚠️ 2026-10-09 **卡死修复**。
+        // ⚠️⚠️ **卡死修复**。
         //
         // 原来这里无条件读 `pre.scrollHeight` 来判断"是否贴底"，
         // 而读 scrollHeight / clientHeight 会**强制浏览器排版这个 <pre>** ——
         // 哪怕它此刻折叠着、内容根本看不见。
         // 模型在思考里连续吐字时，这个 <pre> 越长，
         // 每帧被强制排版的代价就越大 → 平方级增长 → 整个面板卡死。
-        // （用户实测：让模型在思考里输出 100 个 "100" 就卡住了。）
+        // （复现方式：让模型在思考里输出 100 个 "100" 就会卡住。）
         //
         // 现在：折叠时**不读**任何布局属性（`details.open` 是纯属性查询，不触发布局），
         // 只在真看得见的时候才判断贴底。
@@ -3432,7 +3432,7 @@ function nodeFromHtml(html: string): HTMLElement | null {
  * 流式 chunk 来得比帧还快（尤其 fast 模型），每个 chunk 都 patch 一次纯属浪费；
  * 用 rAF 合并后，视觉上仍是「逐字增长」，GPU 那边少干很多活。
  *
- * ⚠️ rAF **不是可靠的心跳**（2026-09-25 用户报「界面卡住不动，其实在跑」）：
+ * ⚠️ rAF **不是可靠的心跳**（症状：界面卡住不动，其实在跑）：
  * 窗口被最小化/完全遮挡时 WebView2 会暂停 requestAnimationFrame —— 回调
  * 可能迟迟不来甚至被丢弃。一旦被丢弃，`runPaintScheduled` 就永远卡在 true，
  * 后续所有 scheduleRunPaint() 直接 return —— 界面**彻底冻结**在某一帧，
@@ -3578,9 +3578,9 @@ function bindPermButtons(root: ParentNode): void {
 const bubblePlayed = new Set<string>();
 
 /**
- * 当前会话是不是"聊天式呈现"（2026-10-08）。
+ * 当前会话是不是"聊天式呈现"。
  *
- * ⚠️ 用的是**当前会话**的模式（`currentModeId()`，2026-10-08 起模式跟会话走），
+ * ⚠️ 用的是**当前会话**的模式（`currentModeId()`，模式跟会话走），
  *    不是"生成那条消息时的模式"—— 所以换到另一个模式的会话后回看历史消息，
  *    观感会跟着变（闲聊的一串气泡变回一大段）。这是刻意的取舍：要做到"按生成时的
  *    模式渲染"，得在落盘的每条消息上记一个 `chatty` 标记（改 `StoredMsg` 格式 +
@@ -3629,7 +3629,7 @@ function renderMessagesInner(): string {
       · 直接把图片拖进来
     </div>`;
   }
-  // 「编辑」只挂在**最后一条已落盘的用户消息**上（2026-10-03 需求）。
+  // 「编辑」只挂在**最后一条已落盘的用户消息**上。
   // 进行中的气泡 / 排队插话没有 storedIdx，自然落选；有比它更新的用户消息也不给。
   const lastUserStored = entries.reduce(
     (m, e) =>
@@ -3700,7 +3700,7 @@ function renderMessagesInner(): string {
           ? `<div class="thumbs">${e.images.map((s, i) => renderThumb(s, i, false)).join("")}</div>`
           : "";
       // 历史里的思考过程与步骤：整轮收进 `details.run-process`「过程 · N 步」，
-      // **默认闭合**（用户 10-02："这个应该全部压缩掉啊" —— 不留外壳的话，
+      // **默认闭合**（定稿："这个应该全部压缩掉" —— 不留外壳的话，
       // 一条消息回看时要占十几行折叠行，最终答案被顶到屏幕外）。
       // 点开外壳之后，里面每条仍各自折叠（思考 / 工具行），不会一次哗啦出一屏。
       //
@@ -3717,7 +3717,7 @@ function renderMessagesInner(): string {
               e.reasoning.length
             } 字）</span></summary>${renderReasonBody(e.reasoning)}</details>`
           : "";
-      // 闲聊模式**不带过程**（用户 2026-10-08）：思考块与工具时间线一并收掉，
+      // 闲聊模式**不带过程**：思考块与工具时间线一并收掉，
       // 只留气泡 —— 否则还是"文档感"，不是聊天。
       const reason = chatty ? "" : `${legacyReason}${tl}`;
       /** 本轮是否以「失败」收尾（决定要不要显示"已中断"角标） */
@@ -3856,10 +3856,10 @@ function renderPermCards(): string {
 }
 
 /**
- * ask_user 问题卡（2026-09-25 用户要求）：模型向用户提问并等回答。
+ * ask_user 问题卡：模型向用户提问并等回答。
  *
  * 与权限卡的区别：没有批/拒，只有**回答**。快捷选项点一下即回；
- * 也可以打字自由回答（Enter 发送）。跳过 = 明确告诉模型"用户不答"。
+ * 也可以打字自由回答（Enter 发送）。跳过 = 明确告诉模型"不答"。
  */
 function renderAskCard(p: PendingPerm): string {
   const deadline = p.createdAt + p.timeoutMs;
@@ -4248,7 +4248,7 @@ function renderPanelRefreshChip(): void {
 /**
  * 打开「模型管理」独立窗口。
  *
- * 入口（2026-10-02 改定）：**设置菜单「🧩 模型」**、空态按钮、会话没模型时的兜底。
+ * 入口（改定）：**设置菜单「🧩 模型」**、空态按钮、会话没模型时的兜底。
  * ❌ 不再是"点模型卡片本体" —— 那一下现在开的是下面这个**模型列表**。
  *
  * 失败时既弹 toast 给用户看，也落盘到 `agent-data/diag.log`：
@@ -4275,10 +4275,10 @@ function openModelsAdd(): void {
 /**
  * 模型列表（点 chip 本体或 ▾ 都出这个）：**只选不管** —— 谁被点谁成为当前模型。
  *
- * ## 条目长相（2026-10-02 用户定稿）
+ * ## 条目长相（定稿）
  *
- * 每条 = 「组别 + 模型名」两行，与工具栏那颗 chip **同构** —— 用户原话
- * "就是 [chip] 这个的罗列"。所以组别再按"撞名时才显示"处理，一律显示。
+ * 每条 = 「组别 + 模型名」两行，与工具栏那颗 chip **同构**（就是这个 chip 的
+ * 罗列）。所以组别再按"撞名时才显示"处理，一律显示。
  * 纯模型名一行（旧形态）看起来像一堆裸 id，认不出是哪个通道的。
  *
  * ## 管理入口不在这儿
@@ -4349,12 +4349,12 @@ function renderPanel(): void {
   const cur = curModel();
   const curName = cur ? cur.id : selectedModel || "（未选模型）";
   const curCtx = cur?.maxInputTokens ? `${Math.round(cur.maxInputTokens / 1000)}K` : "";
-  // 分组显示名（用户可在模型管理里给每个 Base URL 起名；取不到回退 host）
+  // 分组显示名（可在模型管理里给每个 Base URL 起名；取不到回退 host）
   const curGroup = modelGroupLabel(cur?.url);
   const curTags = `${cur?.supportsToolCall ? "工具" : ""}${
     cur?.supportsImages ? (cur?.supportsToolCall ? " / 视觉" : "视觉") : ""
   }`;
-  // chip 显示「组别 + 模型名」（2026-10 用户要求）：
+  // chip 显示「组别 + 模型名」（定稿）：
   //   组别在上、模型名在下（两行紧凑排），或者空间不够时省略组别。
   //   上下文 / host / 功能标签仍全在 title tooltip 里。
   const modelTip = `模型：${curName}${curGroup ? ` · 组别 ${curGroup}` : ""}${
@@ -4384,7 +4384,7 @@ function renderPanel(): void {
 
   app.innerHTML = `
     <div class="panel">
-      <!-- 标题条 = 面板里**唯一**一条 chrome（2026-10-09 合并）。
+      <!-- 标题条 = 面板里**唯一**一条 chrome（合并后）。
            原来 header / toolbar / fg-ctx / sub-bar / bg-run 是五条各自独立的带，
            最多同时出现四条 —— 在 600px 高的窗口里正文还没开始就被吃掉 ~130px。
            现在：项目 select + 三个入口 + 模型 chip 全收进这一行；
@@ -4410,10 +4410,10 @@ function renderPanel(): void {
       <!-- 第二行：有内容才占高度。前台应用 / 子页标题 / 后台任务。 -->
       <div class="panel-sub">
         <div class="fg-ctx" id="fg-ctx" title="用户当前前台应用（点击复制路径）" style="display:none"></div>
-        <!-- 非对话视图的**固定**标题条（2026-10-08）。
+        <!-- 非对话视图的**固定**标题条。
              与 #fg-ctx 同位置、互斥显示：对话视图显示前台应用，其余视图显示
              当前页标题 + 返回。关键差别是**它在 #panel-body 之外** —— 返回按钮
-             不再跟着内容滚，滚到页面底部也够得着（用户截图报的 bug）。 -->
+             不再跟着内容滚，滚到页面底部也够得着（曾因此报过 bug）。 -->
         <div class="sub-bar" id="sub-bar" style="display:none"></div>
         <!-- 「另一个会话在后台跑」提示条（切走后自动出现，点击切回） -->
         <div class="bg-run" id="bg-run" style="display:none"></div>
@@ -4426,7 +4426,7 @@ function renderPanel(): void {
 
       <div class="panel-input">
         <!-- 「行为」入口：**一颗**小 logo，不是三颗 chip。
-             2026-10 用户拍板：执行位置/模式/权限是设置，不该占输入行；
+             定稿：执行位置/模式/权限是设置，不该占输入行；
              但行为本身是高频入口，所以留一颗图标当门，点开进设置 › 行为页。
              与之前"三颗 chip 挤掉输入框宽度"是两回事：一颗图标约 30px。 -->
         <button id="btn-behavior" class="mini-btn behavior-btn" title="行为：执行位置 / Agent 模式 / 执行权限">${setIcon("behavior")}</button>
@@ -4467,7 +4467,7 @@ function renderPanel(): void {
   }
   document.getElementById("btn-gear")!.addEventListener("click", () => void switchView("settings"));
 
-  // 模型 chip（2026-10-02 用户改定）：
+  // 模型 chip（改定）：
   //   整颗 chip（本体 + ▾）→ 出**模型列表**（组别+模型名的罗列，底部带「添加自定义模型」）
   //   管理窗口不在这儿了 —— 走 设置 › 🧩 模型
   const chip = document.getElementById("model-chip");
@@ -4765,7 +4765,7 @@ function scheduleFgCtx(): void {
     // ⚠️ 定时器活过页面卸载是常态（面板一关它照样在队列里）。
     //   测试环境 teardown 之后 `document` 整个不存在，直接 `getElementById`
     //   会抛 ReferenceError，被 vitest 记成 unhandled error → **整个文件退出码 1**，
-    //   哪怕断言全绿（2026-10-03 撞过：新增两个用例多花 1.5s，
+    //   哪怕断言全绿（曾撞过：新增两个用例多花 1.5s，
     //   就把这个 3s 定时器拖过了 teardown）。
     //   `typeof` 守卫：无 DOM 时安静退出，不留噪声。
     if (typeof document === "undefined") return;
@@ -5218,7 +5218,7 @@ function renderMemView(
       ? `<div class="mem-empty">还没有项目记忆。在 <code>agent-data/projects/&lt;名&gt;/</code> 放 <code>source.ref</code>（项目绝对路径）和 <code>MEMORY.md</code> 即可；对话时前台路径命中会自动注入。</div>`
       : projects
           .map((p) => {
-            // 三态徽标（2026-10-03 修正）：空 source ≠ 路径失效 ——
+            // 三态徽标（修正）：空 source ≠ 路径失效 ——
             // 从没绑过路径的项目是「未绑定」，不该跟死路径一样标红吓人
             const badge = !p.source
               ? `<span style="color:#f0c674">未绑定路径</span>`
@@ -5295,12 +5295,12 @@ function bindMemButtons(root: HTMLElement): void {
     }),
   );
 
-  // ---- 记忆蒸馏（2026-10-03）：开一条专用会话，剩下的就是常规聊天 ----
+  // ---- 记忆蒸馏：开一条专用会话，剩下的就是常规聊天 ----
   root.querySelector<HTMLButtonElement>(".mem-distill")?.addEventListener("click", () => {
     void distillStart();
   });
 
-  // ---- 项目记忆维护：改路径 / 归档（2026-10-03） ----
+  // ---- 项目记忆维护：改路径 / 归档 ----
   root.querySelectorAll<HTMLButtonElement>(".proj-set-src").forEach((btn) =>
     btn.addEventListener("click", () => startProjEdit(btn.dataset.proj ?? "")),
   );
@@ -5332,9 +5332,9 @@ function bindMemButtons(root: HTMLElement): void {
  * 搬进 models 窗口），就地替换最省事，Enter 保存 / Esc 取消也好按。
  */
 /**
- * 「蒸馏」入口（2026-10-03 定稿）：开一条**普通聊天**会话，让 agent 自己蒸馏。
+ * 「蒸馏」入口（定稿）：开一条**普通聊天**会话，让 agent 自己蒸馏。
  *
- * 用户原话：「我说的是思考啊，就常规聊天啊」—— 所以这里**不做任何自定义页面**：
+ * 定稿口径是"思考就在常规聊天里发生" —— 所以这里**不做任何自定义页面**：
  * 新会话带 `distill` 标记（`sessions/<id>.distill`），后端 `agent::run` 见到它
  * 就换蒸馏角色说明 + 注入 `distill_move` 工具，模型在标准循环里读中转站、
  * 问你、搬条目 —— 思考过程与工具调用全走主对话那套时间线 UI。
@@ -5411,8 +5411,8 @@ async function switchView(v: View): Promise<void> {
   // 再点同一个非 chat 视图 → 退回对话（toggle 手感）
   const next = v === view && v !== "chat" ? "chat" : v;
   // 进子页从顶部看起：面板体是**同一个**滚动容器，不重置的话从聊天流
-  // 中间点进「行为」会直接落在页面中段 —— 用户看到的是半截卡片，
-  // 还以为页面坏了（2026-10 截图复现）。回 chat 不动，那边有自己的保滚动。
+  // 中间点进「行为」会直接落在页面中段 —— 看到的是半截卡片，
+  // 还以为页面坏了（曾截图复现）。回 chat 不动，那边有自己的保滚动。
   const b = document.getElementById("panel-body");
   if (next !== view && next !== "chat" && b) b.scrollTop = 0;
   view = next;
@@ -5468,7 +5468,7 @@ function setIcon(name: string): string {
 /**
  * 「记忆」入口摘要。
  *
- * ⚠️ 必须**显式提到技能**（2026-10-09 用户反馈"skills 没找到在哪能打开"）：
+ * ⚠️ 必须**显式提到技能**（曾因"skills 没找到在哪能打开"返工）：
  * 技能列表在记忆页最底下，而旧文案只写了「待审批、记忆文件族与项目绑定」——
  * 设置入口页上根本看不出这页里有技能，于是等于找不到。
  * 技能数进摘要后才看得出"哦有 N 个技能"。
@@ -5522,7 +5522,7 @@ function renderSettingsMenu(
   // 页内不再重复「设置」标题 —— 固定标题条（#sub-bar）已经写了"⚙ 设置 + 返回"。
   // 之前两处都写，屏上就出现两个"设置"。
   //
-  // ⚠️ 减法（2026-10-09 用户拍板）——**下面 return 的是模板字符串，模板里的
+  // ⚠️ 减法——**下面 return 的是模板字符串，模板里的
   // `//` 不是注释，是会被原样渲染到页面上的字面文本**（踩过一次：把「减法说明」
   // 写在 `${item(...)}` 之间，结果整段注释直接显示在设置页上）。
   // 所以这个函数的注释一律写在 `return` **外面**。
@@ -5614,9 +5614,9 @@ function bindSettingsMenu(root: HTMLElement): void {
 /**
  * 子页内容流里的**节标题**（不含返回按钮）。
  *
- * ⚠️ 2026-10-08 变更：返回按钮**从这里拿掉了**，改由滚动区外的
+ * ⚠️ 变更后：返回按钮**从这里拿掉了**，改由滚动区外的
  * `#sub-bar` 承担（见 `renderSubBar`）。原来按钮写在这儿，跟着
- * `#panel-body` 一起滚 —— 用户滚到页面下半部分就够不着，必须一路
+ * `#panel-body` 一起滚 —— 滚到页面下半部分就够不着，必须一路
  * 滚回顶部才能退出。现在这里只留标题，标题不动也无所谓（顶部条常驻）。
  */
 function subHeader(title: string): string {
@@ -5624,7 +5624,7 @@ function subHeader(title: string): string {
 }
 
 /**
- * 非对话视图的固定顶部条配置（2026-10-08）。
+ * 非对话视图的固定顶部条配置。
  *
  * `back` = 点返回去哪；`backLabel` = 按钮文案。
  * 两档返回目标：子页回设置入口页、设置与会话历史回对话。
@@ -5686,11 +5686,11 @@ function renderSubBar(): void {
 //
 // 为什么这些住在这里、而不是输入行：
 //   它们是**设置**（改一次管很久），不是每次发消息都要碰的东西。
-//   2026-10 用户原话："不要设置我这个页面有设置的啊" ——
+//   定稿口径："对话页不该有设置项" ——
 //   它们曾以三颗 chip 的形式挤在输入行，占掉约 110~165px，
 //   把输入框压到连一行 placeholder 都放不下。
 //
-// ⚠️ 2026-10-08：**Agent 模式已从这里搬走**（用户定案："b 从设置页挪到一个
+// ⚠️ **Agent 模式已从这里搬走**（定论："b 从设置页挪到一个
 //    '新建会话时选模式'的入口 默认是标准"）。理由见 `showNewMenu` 的注释 ——
 //    一句话：模式跟会话走、**建完不能改**，所以它不是"设置"而是"建会话的参数"。
 //    这里只剩执行位置与执行权限两维。别再往这儿加模式选择器。
@@ -5778,10 +5778,10 @@ function bindBehaviorView(root: HTMLElement): void {
     renderBody(); // 重绘：要刷新摘要行与"正在跑什么"列表
   });
 
-  // ⚠️ 2026-10-08：原来这里还有一坨 'input[name="bh-mode"]' 的 change 监听
+  // ⚠️ 原来这里还有一坨 'input[name="bh-mode"]' 的 change 监听
   //    （勾模式 → `applyModeChange`）。模式搬进「＋」菜单后**整块删掉**：
   //    留着它俩的下场是"改了个不存在的 radio、或者把当前会话的模式偷改了"——
-  //    而用户定案是**一个会话模式不能变**。要改默认模式只能手编 settings.json。
+  //    而定论是**一个会话模式不能变**。要改默认模式只能手编 settings.json。
   root.querySelectorAll<HTMLInputElement>('input[name="bh-trust"]').forEach((el) =>
     el.addEventListener("change", async () => {
       if (!el.checked) return;
@@ -5803,10 +5803,10 @@ function bindBehaviorView(root: HTMLElement): void {
 // 数据源 = 给 agent 的**认知面**注入（与 MCP 的能力面正交）。
 //
 // 为什么单独一页而不是塞进 MCP：MCP 是"模型决定去调"，数据源是
-// "系统决定呈现"。用户问「帮我安排下今天」时模型**没有理由**先去调一个工具，
+// "系统决定呈现"。问「帮我安排下今天」时模型**没有理由**先去调一个工具，
 // 而「更懂你」的前提恰恰是不用说就知道 —— 这是触发权不同，不是工具多少。
 //
-// 注入策略（用户 2026-10 拍板）：system prompt 里只常驻每个源**一行**
+// 注入策略（定稿）：system prompt 里只常驻每个源**一行**
 // （条数 + 新鲜度），细节要模型调 `life_items`。
 
 interface LifeSourceView {
@@ -5838,13 +5838,13 @@ let lifeInfo: LifeStatus | null = null;
 /**
  * 🔶 幽灵函数 —— 「数据源」（`life.json` 生活清单）功能整体暂缓。
  *
- * 2026-10-09 用户拍板：这个功能未来再说，本轮不发布。理由与
+ * 定论：这个功能未来再说，本轮不发布。理由与
  * [`projectSummaryText`] 完全一样 —— 页面与它那 11 个 vitest 用例都还是活的，
  * 留个返回 `null` 的空壳，恢复时把实现放回去即可，不用重建。
  */
 function lifeSummaryText(): null {
   return null;
-  /* ↓↓↓ 恢复功能时把这段实现放回来（2026-10-10 暂缓前的原样） ----------
+  /* ↓↓↓ 恢复功能时把这段实现放回来（暂缓前的原样） ----------
   if (!lifeInfo) return "读取中…";
   const on = lifeInfo.sources.filter((s) => s.enabled);
   if (lifeInfo.sources.length === 0) return "未配置（可接爬虫快照 / 命令）";
@@ -7112,7 +7112,7 @@ function renderUsageView(records: UsageRecord[]): string {
   const tTotal = todayTokenTotal(records);
   const maxDay = Math.max(...days.map((d) => d.total), 1);
 
-  // 全局缓存命中率（2026-09-30）：prompt token 的大头是命中价，
+  // 全局缓存命中率：prompt token 的大头是命中价，
   // 全价部分 = 输入 − 命中。命中率掉下来时成本会成倍上涨而总量看不出变化，
   // 所以这里必须**单独成一张卡**，而不是塞进「全部」的 tooltip。
   const allPrompt = records.reduce((a, r) => a + r.usage.prompt, 0);
@@ -7209,7 +7209,7 @@ function bindUsageView(_root: HTMLElement): void {
  * `pushEntry`，而 `pushEntry` 会 `paintMessages(panel-body)` 整块重绘。
  * 结果是：在设置页点「测」→ 模型列表被顶掉、聊天记录凭空出现在设置页里，
  * 而输入框因为 `renderBody()` 早在切到设置页时就 `display:none` 了 ——
- * 用户看到的就是"测试结果跑进聊天界面 + 输入框消失"（2026-09-20 用户反馈）。
+ * 表现就是"测试结果跑进聊天界面 + 输入框消失"（曾因此报过 bug）。
  *
  * toast 只往里塞内容、自己超时消失，`pointer-events:none` 保证不挡点击。
  */
@@ -7387,7 +7387,7 @@ function installProgressListener(): void {
       case "thinking":
         if (p.iteration) last.text = `正在思考…（第 ${p.iteration} 轮）`;
         // 上一轮流式正文收进时间线（保留可看），再开新轮。
-        // ⚠️ 不能只「不清空」——那会把多轮正文 capAppend 成一坨（用户 2026-09-23 截图）。
+        // ⚠️ 不能只「不清空」——那会把多轮正文 capAppend 成一坨（曾因此报过 bug）。
         archiveStreamToItems(last);
         last.streamDiscarded = false;
         last.reasonOpen = false;
@@ -7414,7 +7414,7 @@ function installProgressListener(): void {
             last.items.push(cur);
             last.reasonOpen = true;
           }
-          // 思考过程**不截**（用户拍板"完全不截"）：直接拼接，不设上限。
+          // 思考过程**不截**（定稿："完全不截"）：直接拼接，不设上限。
           // 见 MAX_STREAM_TEXT_CHARS 的说明。
           cur.detail = (cur.detail ?? "") + p.reasoning;
         }
@@ -7438,7 +7438,7 @@ function installProgressListener(): void {
         //
         // ⚠️ 秒数由**前端本地每秒推**，后端这个 2s 心跳只负责对齐起点 + 带输出尾巴。
         //    理由：后端心跳一旦中断（读任务被掐 / 事件被吞 / 单 run 被卡住），
-        //    显示就冻在某个秒数上 —— 用户 2026-09-26 实报「一直 4s」「心跳也没有了」，
+        //    显示就冻在某个秒数上 —— 曾实报「一直 4s」「心跳也没有了」，
         //    看起来像死掉了。本地推的话，哪怕后端一个心跳都不来，秒数照样往前走。
         startToolTick(p.name ?? "工具", p.elapsedSecs ?? 0, p.tail);
         break;
@@ -7449,7 +7449,7 @@ function installProgressListener(): void {
         if (p.kind === "toolCall" || p.kind === "toolResult") stopToolTick();
         const item = progressItem(p);
         if (item) {
-          // 工具返回**并进上一条调用**，不新占一行（2026-10-02）。
+          // 工具返回**并进上一条调用**，不新占一行。
           // ⚠️ 必须是"原地合并"而不是 push 完再重排：条目数一旦先增后减，
           //    `patchTimeline` 的 `data-n` 就对不上实际节点数，会退回全量重画
           //    （表现是折叠块被重建、展开状态被冲掉）。
@@ -7527,7 +7527,7 @@ function paintToolTick(): void {
 /**
  * 「分叉」入口 —— 只画在**主聊天里、AI 完整回复**上。
  *
- * 语义（用户 2026-09-20 → 后续修正）：以这条**完整的一问一答**为界，把下一轮
+ * 语义（后续修正）：以这条**完整的一问一答**为界，把下一轮
  * 会喂给模型的上下文窗口（最近 6 小时 ∪ 最近 10 条）截出来开一条新线。
  * 挂在 assistant 上而不是 user 上：挂在 user 上时新会话末条是未回答的提问，
  * 接着再发一句就会拼成 user→user，模型侧轮次结构是坏的。完整轮次边界在
@@ -7550,7 +7550,7 @@ function currentSessionKind(): "main" | "task" | "fork" {
 /**
  * 「重新生成」按钮 —— 挂在**已落盘的 AI 回复**上。
  *
- * 语义（用户 2026-09-22 要求）：对这条回答不满意，**丢掉它并重跑这一轮**。
+ * 语义：对这条回答不满意，**丢掉它并重跑这一轮**。
  * 实现方式：把这条 assistant 及其后的所有消息截掉（回到"用户刚问完"的状态），
  * 然后把上一条用户消息重新发一遍。
  *
@@ -7570,7 +7570,7 @@ function renderRegenBtn(e: ChatEntry): string {
 /**
  * 「删除」按钮 —— 挂在每条**已落盘**的消息上（用户消息和回答都给）。
  *
- * 语义（用户 2026-09-20 要求）：**删掉这条，以及它后面的全部消息**。
+ * 语义：**删掉这条，以及它后面的全部消息**。
  * 点在用户自己的发言上，就是"把我这句话和它引出的回答一起丢掉"；
  * 点在一条回答上，则是"这次交互不要了"。
  *
@@ -7587,7 +7587,7 @@ function renderDelBtn(e: ChatEntry): string {
 }
 
 /**
- * 「编辑」按钮 —— 只挂在**最后一条已落盘的用户消息**上（2026-10-03 需求）。
+ * 「编辑」按钮 —— 只挂在**最后一条已落盘的用户消息**上。
  *
  * 语义（ChatGPT 式「编辑并重发」）：把它和它后面的全部回复截掉，
  * 原文放回输入框，改完重新发送。实现完全复用删除链路
@@ -7749,9 +7749,9 @@ async function loadModels(): Promise<void> {
     const sel = await invoke<{ id: string; url: string | null } | null>("get_selected_model");
     selectedModel = sel?.id ?? null;
     selectedModelUrl = sel?.url ?? null;
-    // ⚠️ 消歧回填（2026-10-02）：旧设置里**只有 id、没有 url**（身份键重构之前写的），
+    // ⚠️ 消歧回填：旧设置里**只有 id、没有 url**（身份键重构之前写的），
     // 而同 id 可能有多条（不同 Base URL）。不补的话「当前项」判定会命中所有同 id 的行 ——
-    // 用户看到的现象是「两个 glm-5.3-flash 都带当前标记」。这里定死成解析出来的那条并回写。
+    // 现象是「两个 glm-5.3-flash 都带当前标记」。这里定死成解析出来的那条并回写。
     if (selectedModel && !selectedModelUrl) {
       const resolved = curModel();
       if (resolved) {
@@ -7770,7 +7770,7 @@ async function loadModels(): Promise<void> {
       );
     }
     // 分组显示名：面板的模型卡片要显示「组别 + 模型名」
-    // （2026-10 用户："这个是让你放模型的部分啊，组别+模型名"）。
+    // （定稿：这一块就是放模型的，组别+模型名）。
     // 以前只在独立窗口（models.ts）读，所以面板上永远只看到裸模型名。
     modelGroupNames = await invoke<Record<string, string>>("model_group_names").catch(
       () => ({}),
@@ -7802,13 +7802,13 @@ async function loadProjects(): Promise<void> {
 }
 
 /**
- * 发一条消息：**立刻开跑**（2026-10-09 用户拍板删掉「合并窗口」）。
+ * 发一条消息：**立刻开跑**（定稿删掉「合并窗口」）。
  *
- * 曾经有个 3s 的合并窗口（连发的几条攒起来一次发）。实测两个问题：
+ * 曾经有个 3s 的合并窗口（连发的几条攒起来一次发）。两个问题：
  *   ① 观感上"点了没反应"，还得靠提示条解释；
  *   ② **致命**：消息进了待发批次时若把面板收起（切悬浮球态、不退出），
- *      批次没有 DOM 可落，被当成"没地方去"直接丢掉 —— 用户的消息**凭空消失**。
- * 用户结论："直接删掉这个逻辑，就相当于只多一个发图算了"。
+ *      批次没有 DOM 可落，被当成"没地方去"直接丢掉 —— 消息**凭空消失**。
+ * 定稿结论："直接删掉这个逻辑，就相当于只多一个发图算了"。
  * 于是这里回到最朴素的语义：**按下发送 = 立刻发出**，出去就是出去了。
  * （仍然保留"先同步清空输入框"那一步 —— 它修的是双击回车连发两次的老 bug。）
  *
@@ -7914,10 +7914,10 @@ async function send(): Promise<void> {
         pushEntry("system", "⏹ 已停止");
       }
     } else {
-      // ⚠️ 出错时**不能只删掉进行中气泡**（2026-09-22 用户报的 bug）。
+      // ⚠️ 出错时**不能只删掉进行中气泡**（曾因此报过 bug）。
       //
       // 那个气泡里装着这一轮全部的思考与工具步骤，删了之后屏幕上只剩一条红字
-      // —— 用户看到的就是"他做的也都消失了"。后端现在在错误路径也会把部分
+      // —— 表现就是"他做的也都消失了"。后端现在在错误路径也会把部分
       // 结果落盘（见 `lib.rs::persist_run`），所以这里改成「以磁盘为准重载」：
       // 留下来的就是它真正做过的事，顺带拿到 `storedIdx`
       // （重新生成 / 删除 / 分叉 这些按钮要用它）。
@@ -8063,7 +8063,7 @@ function setBusyUi(on: boolean): void {
   if (input) {
     // ⚠️ 这两句是 placeholder 的**真正来源**（运行时覆盖 HTML 里那份）。
     //    刻意保持极短：老文案 38~44 字（约 470px @13px）在输入框里会折成两行、
-    //    把输入框撑高 —— 那正是 2026-10 用户截图报"太挤"的直接症状。
+    //    把输入框撑高 —— 那正是曾截图报"太挤"的直接症状。
     //    快捷键说明在 `title` 里（悬停可看），不占输入框宽度。
     input.placeholder = on ? "插话…（会排队）" : "问点什么…";
     input.title = on
@@ -8130,7 +8130,7 @@ async function applyMode(next: Mode): Promise<void> {
 
   // ⚠️🔴 切换期间必须**先写 `mode` 再 await**（下面两个分支都这么做）。
   //
-  //    踩过的坑（2026-10-10 用户报「右键球 → 点记忆 → 面板缩成一小块且回不去」）：
+  //    踩过的坑（症状：右键球 → 点记忆 → 面板缩成一小块且回不去）：
   //    panel 分支原先是 `await invoke(...)` 之后才 `mode = next`，
   //    而 orb/menu 分支是先赋值。于是点「记忆」时 `mode` 在整个 IPC 往返里
   //    **一直是旧的 "menu"**；`set_bounds` 把窗口从 196×214 拉到 460×600
@@ -8148,8 +8148,8 @@ async function applyMode(next: Mode): Promise<void> {
   //    `set_window_mode` 是一次 IPC 往返 —— 窗口在 Rust 侧当场就缩好了，
   //    而 renderOrb 要等 promise 回来才执行。复杂任务刚跑完时主线程正忙
   //    （paintMessages 重绘大消息列表），这个空档能拉长到几十毫秒，
-  //    合成器就会画出"小窗口里残留着面板"的帧：用户看到一个深色圆角块，
-  //    里面是被裁掉的面板标题/图表（2026-09-27 用户截图报过，且只在
+  //    合成器就会画出"小窗口里残留着面板"的帧：屏幕上是一个深色圆角块，
+  //    里面是被裁掉的面板标题/图表（曾截图报过，且只在
   //    复杂任务后出现 —— 就是这个竞态被主线程繁忙放大了）。
   //    球/菜单的 DOM 都是同步就绪的：先换 DOM 再缩窗，窗口缩的时候
   //    球已经在了，没有空档。过渡期 visibility:hidden 兜底 ——
@@ -8214,14 +8214,13 @@ async function expand(): Promise<void> {
 }
 
 /**
- * 失焦收起 —— 但「用户正在截图」时**不许收**。
+ * 失焦收起 —— 但「正在截图」时**不许收**。
  *
- * ## 为什么（2026-10-11 用户报的 bug）
+ * ## 为什么
  *
  * 拿微信 `Alt+A`（或系统截图工具）截面板内容时，**blur 一定先于截图发生**：
- * 面板一失焦，原来的 `collapse()` 就把它缩成球 —— 用户截到的是个球，
- * 想截的长内容根本够不着。用户原话：
- * 「微信长截图 orbcat，orbcat 会缩成球导致无法截屏」。
+ * 面板一失焦，原来的 `collapse()` 就把它缩成球 —— 截到的是个球，
+ * 想截的长内容根本够不着。典型现象："微信长截图 orbcat，orbcat 会缩成球导致无法截屏"。
  *
  * ## 判定方式（硬判断，不靠提示词）
  *
@@ -8239,7 +8238,7 @@ async function collapseUnlessCapturing(): Promise<void> {
   if (await foregroundIsCaptureTool()) return;
   await new Promise((r) => setTimeout(r, 150));
   if (await foregroundIsCaptureTool()) return;
-  // 等待期间用户可能已自己收起 / 切了形态 —— 别重复动手
+  // 等待期间可能已自己收起 / 切了形态 —— 别重复动手
   if (mode !== "panel" || !blurCollapse) return;
   void collapse();
 }
@@ -8355,14 +8354,14 @@ function installContextMenu(): void {
   window.addEventListener("blur", () => {
     // ⚠️🔴 自己触发的形态切换会引来一次 blur（见 applyMode 的注释）。
     //    切换期间**必须放行**，否则面板在半路被收回球大小，且 mode 与窗口
-    //    实际尺寸就此不一致 → 之后点球也回不去（2026-10-10 用户报的 bug）。
+    //    实际尺寸就此不一致 → 之后点球也回不去（曾因此报过 bug）。
     if (modeSwitching) return;
     if (mode === "menu") void applyMode("orb");
     // 面板失焦自动收起 —— 悬浮球的本分是用完让路，不该一直挡着屏幕。
     // 展开后 500ms 内的 blur 忽略（展开动画/set_focus 时序抖动）。
     //
-    // 2026-10-11：不再直接 `collapse()`，改成**先问一句新前台是不是截图工具**。
-    // 用户拿微信/系统截图工具截面板时 blur 会先发生，原来那一下直接把面板
+    // 不再直接 `collapse()`，改成**先问一句新前台是不是截图工具**。
+    // 拿微信/系统截图工具截面板时 blur 会先发生，原来那一下直接把面板
     // 缩成球 → 截图里只剩一个球（"微信长截图 orbcat，会缩成球导致无法截屏"）。
     if (mode === "panel" && blurCollapse && Date.now() - panelOpenedAt > 500) {
       void collapseUnlessCapturing();

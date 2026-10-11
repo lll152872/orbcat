@@ -3,9 +3,9 @@ import { bootApp, openPanel, panelExists, waitFor, callsOf, state } from "./help
 import { setMock, resetMock } from "./mocks/tauri";
 
 /**
- * 本轮（2026-09-30）新增的两块前端行为：
+ * 新增的两块前端行为：
  *  1. 设置 › 备份与回收站：有还原入口、能清理、能导诊断包
- *  2. 「又启动了一次 exe」应**打开面板**（用户报的 bug：点了图标没反应）
+ *  2. 「又启动了一次 exe」应**打开面板**（曾报的 bug：点了图标没反应）
  *
  * 为什么这两块值得有测试：它们各自对应一个**用户可感知的失败**
  *  —— 归档还原不回去（只进不出）、点击图标无反应。

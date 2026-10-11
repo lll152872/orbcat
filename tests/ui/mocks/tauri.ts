@@ -29,7 +29,7 @@ type MockState = {
    * 设置里记的 Base URL（身份键 = (Base URL, 接口 id) 的另一半）。
    *
    * `undefined` = 没这个字段（默认，按 `models[0].url` 返回，模拟"选过但没记 url"以外的情况）；
-   * **`null` = 显式"设置里只有 id、没有 url"** —— 这正是 2026-10-02 用户报「两个 glm-5.3-flash
+   * **`null` = 显式"设置里只有 id、没有 url"** —— 这正是「两个 glm-5.3-flash
    * 都画线」的现场：旧版只存 id，身份键重构后没回填，前端判定式就把同 id 的所有行都标成当前。
    */
   selectedModelUrl?: string | null;
@@ -47,7 +47,7 @@ type MockState = {
     title: string;
     kind: string;
     updatedAt: number;
-    /** 这条会话的模式 id（2026-10-08 起模式跟会话走，列表每行都要带） */
+    /** 这条会话的模式 id（模式跟会话走，列表每行都要带） */
     mode?: string;
   }[];
   currentSessionId: string;
@@ -56,7 +56,7 @@ type MockState = {
   /**
    * **当前会话**的 agent 模式（`modes_get({sessionId})` 读它）。
    *
-   * 2026-10-08 前叫 `activeMode`（那时模式是全局设置）。改名的原因就是这次重构：
+   * 早先叫 `activeMode`（那时模式是全局设置）。改名的原因就是这次重构：
    * 模式跟会话走了，`modes_get` 的 `activeMode` 现在必须按**会话**算 ——
    * 测试里要"把当前会话切成闲聊"就改这个字段。
    */
@@ -78,7 +78,7 @@ type MockState = {
   bootHasModels: boolean;
   windowModes: string[];
   /**
-   * 逐命令覆盖返回值（2026-09-30 加）。
+   * 逐命令覆盖返回值。
    *
    * ## 为什么必须走 `MockState` 而不是直接改 `emptyOk`
    *
@@ -132,7 +132,7 @@ function defaultState(): MockState {
     chatReply: "这是 mock 回复 MOCK_OK。",
     chatError: null,
     chatDelayMs: 0,
-    // 身份 = (Base URL, 接口 id)（2026-10-02）：selectedModel 存**接口 id**，
+    // 身份 = (Base URL, 接口 id)：selectedModel 存**接口 id**，
     // get_selected_model 返回 {id, url} 双字段；显示名已废弃
     selectedModel: "mock-1",
     models: [
@@ -259,7 +259,7 @@ const emptyOk: Record<string, unknown> = {  set_window_mode: null,
   model_group_rename: null,
   models_set_group_key: 1,
   models_remove_group: 1,
-  // 独立「模型管理」窗口（2026-09-29 定稿）：编辑弹窗外、选择留面板
+  // 独立「模型管理」窗口（定稿）：编辑弹窗外、选择留面板
   models_window_open: null,
   models_window_close: null,
   perm_add_rule: null,
@@ -304,7 +304,7 @@ const emptyOk: Record<string, unknown> = {  set_window_mode: null,
   perm_cmd_grants_list: [],
   perm_cmd_audit_tail: [],
   usage_report: [],
-  // 备份与回收站（2026-09-30）：默认给空态，专门测这个视图的用例自己覆盖
+  // 备份与回收站：默认给空态，专门测这个视图的用例自己覆盖
   recovery_state: {
     stats: { backupsCount: 0, backupsBytes: 0, trashCount: 0, trashBytes: 0, staleRecords: 0 },
     backups: [],
@@ -406,7 +406,7 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
     case "session_state":
       return sessionStatePayload() as T;
     case "session_new": {
-      // 模式**建的时候**定（2026-10-08）：传了就用传的，没传落默认模式。
+      // 模式**建的时候**定：传了就用传的，没传落默认模式。
       // 与真实后端同一套兜底（`session_new` → `settings.activeMode`）。
       const m = typeof args?.mode === "string" && args.mode ? args.mode : state.defaultMode;
       state.sessionMode = m;
@@ -429,7 +429,7 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
     // 为什么不塞进 emptyOk：模式菜单要按 id 找当前项、要标灰 unknownGroups，
     // 一份静态假数据测不出"切换后 chip 变了 / 未知组标灰"这两件事。
     case "modes_get": {
-      // `activeMode` 按**会话**算（2026-10-08）：传了 sessionId 就查那条会话的模式，
+      // `activeMode` 按**会话**算：传了 sessionId 就查那条会话的模式，
       // 没传（启动早期）退回 `defaultMode`。真实后端走 `sessions::effective_mode`，
       // 同一套优先级 —— mock 跟它不同步的话，"切会话后 UI 还显示旧模式"这种
       // 真 bug 会被 mock 悄悄抹平。
@@ -466,7 +466,7 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
             toolPresentation: "ptc",
           },
           {
-            // 2026-10-08：「极简」被「闲聊」取代（真实后端同步改名）。
+            // 「极简」被「闲聊」取代（真实后端同步改名）。
             // `chatty` 是闲聊的核心 —— 前端据此走 `bubble.ts` 的多气泡切分、
             // 并且**不显示「过程」**。
             id: "chat",
@@ -502,8 +502,8 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
       if (state.modeSetError) {
         throw state.modeSetError;
       }
-      // 2026-10-08：这条命令现在只改**新建会话的默认模式**，不动当前会话
-      // （用户定案"一个会话模式不能变"）。界面上已经没有入口调它了。
+      // 这条命令现在只改**新建会话的默认模式**，不动当前会话
+      // （定论"一个会话模式不能变"）。界面上已经没有入口调它了。
       state.defaultMode = String(args?.id ?? "standard");
       return state.defaultMode as T;
     }

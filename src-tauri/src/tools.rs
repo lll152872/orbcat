@@ -671,7 +671,7 @@ pub fn tool_specs(
 
 /// 「记忆蒸馏」会话专用工具集：标准工具 + `distill_move`。
 ///
-/// 为什么要单独一份（2026-10-03）：`distill_move` 只在蒸馏会话里有意义
+/// 为什么要单独一份：`distill_move` 只在蒸馏会话里有意义
 /// （把条目从中转站迁进 USER/SOUL/IDENTITY）。普通聊天里摆着它只会让模型
 /// 误用 —— 所以按会话注入，而不是全局注册。
 pub fn tool_specs_for_distill(
@@ -699,7 +699,7 @@ pub fn all_tool_specs(
 ) -> Vec<ToolSpec> {
     let mut specs = builtin_specs();
 
-    // ── 发图：只有"发表情包"那一半按模式闸住（2026-10-08）──────────────
+    // ── 发图：只有"发表情包"那一半按模式闸住 ────────────────────────────
     //
     // `send_image` 是常驻内置工具，已经在 `builtin_specs()` 里了（工作模式
     // 也要贴截图 / 图表）。这里单独注入 `send_meme` —— **只在能随便发图的
@@ -1657,7 +1657,7 @@ fn recall_in_session(
 /// | `project` | 直写 `projects/<名>/MEMORY.md` | **报错** + 回传项目清单（不静默改投） |
 /// | `auto`（缺省） | 直写项目记忆（旧行为） | 提交全局候选 |
 ///
-/// ## 为什么让模型自己选（2026-10-10）
+/// ## 为什么让模型自己选
 ///
 /// 早先的规则是「有激活项目就永远写项目」，于是只要顶栏挂着任何一个项目，
 /// 主对话里记的东西就**全部沉进那个项目**，全局待批队列长期为空 ——
@@ -2311,7 +2311,7 @@ const GREP_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// grep 的跳过统计 —— 每一条都要出现在返回文本里。
 ///
-/// ## 为什么这是本工具最重要的设计（2026-10-01 定论）
+/// ## 为什么这是本工具最重要的设计（已定论）
 /// 旧版每一条跳过路径都是裸 `return`，返回的永远是 `(无匹配)`。
 /// 模型**无法区分**「真的没有」和「工具压根没读」—— 实测 543 次调用里
 /// 58% 报零命中，其中 145 次是 `path` 传了文件（`read_dir` 对文件必失败）、
@@ -2510,7 +2510,7 @@ fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     };
 
     if roots.is_file() {
-        // ★ 2026-10-01 修：`path` 传文件时**直接搜这个文件**。
+        // ★ 修过一处：`path` 传文件时**直接搜这个文件**。
         //
         // 旧版把 roots 丢给 `walk()`，而 walk 第一件事是 `read_dir` ——
         // 对文件必然失败，然后裸 `return`，于是返回「命中 0 行」。
@@ -2653,7 +2653,7 @@ fn now_ms() -> u128 {
 
 /// 写/改前备份到 `agent-data/backups/`。原文件不存在则不备份，返回空说明。
 ///
-/// ⚠️ 2026-09-30 起实现搬到 [`crate::recovery`]：原来的版本只把副本命名为
+/// ⚠️ 实现已搬到 [`crate::recovery`]：原来的版本只把副本命名为
 /// `{时间戳}__{文件名}`，**不记原路径** —— 于是 210 个备份都还原不回去
 /// （谁知道那个 `README.md` 原来在哪个目录）。现在每次都写
 /// `backups.jsonl`（原路径 / 时间 / 大小），设置页也能列出并一键还原。
@@ -3213,7 +3213,7 @@ async fn request_access(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, S
 
     // ---- 校验 3：这条申请**刚被拒过**（含同 parent/更宽 access）→ 打回 ----
     //
-    // 2026-09-23：同目录连续写曾连环弹卡。现在同 parent + 同/更宽 access 也拦，
+    // 同目录连续写曾连环弹卡。现在同 parent + 同/更宽 access 也拦，
     // 并提示模型**申请父目录 + task**（而不是单文件 once）。
     if let Some(m) = ctx.perm.find_denied(ctx.session_id, &canon, access) {
         let why = if m.reason.is_empty() {
@@ -3337,7 +3337,7 @@ async fn web_search(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Strin
 /// ⚠️ 命令的副作用**无法静态穷举**（`python -c` / 嵌套 shell 都是逃生口），
 ///    所以本工具只承诺 **default-deny + 逐条用户批准**，不承诺"批了就绝对安全"。
 ///    这与各家 agent 的官方共识一致（静态规则不是安全边界）。
-/// `ask_user`：向用户提一个问题并阻塞等回答（2026-09-25 用户要求加的工具）。
+/// `ask_user`：向用户提一个问题并阻塞等回答。
 ///
 /// 通道复用权限申请的「弹卡等回答」机制（[`PermHub::ask_user`]）：
 /// 张问题卡 → agent loop 阻塞在这里 → 用户打字/点选项 → 唤醒 → 回答进 tool 结果。
@@ -3593,7 +3593,7 @@ async fn run_command(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Stri
     //   · 后台：隐形桌面上跑 —— 应用自己弹的窗口不会闪到用户屏幕上、不抢焦点
     //
     // 为什么用进程级开关而不是 agent 模式：后台执行管的是"在哪儿跑"，
-    // 与模式管的"哪些工具可见"是正交的两个维度（用户拍板）。
+    // 与模式管的"哪些工具可见"是正交的两个维度。
     #[cfg(windows)]
     let use_bg_desk = crate::win32desk::is_enabled();
     #[cfg(not(windows))]
@@ -3865,7 +3865,7 @@ mod tests {
                 "web_search".to_string(),
                 "fetch_url".to_string(),
                 "distill_move".to_string(),
-                // 2026-10-08：只在 `imageReplies = "free"` 的模式里注入
+                // 只在 `imageReplies = "free"` 的模式里注入
                 // （见 `all_tool_specs`），但**名字必须保留** —— 否则项目
                 // 脚本工具能起个同名的，把这道闸门顶掉。
                 "send_meme".to_string(),
@@ -3886,7 +3886,7 @@ mod tests {
         );
     }
 
-    /// `send_meme` 必须被模式**硬**闸住（用户 2026-10-08 要求）。
+    /// `send_meme` 必须被模式**硬**闸住。
     ///
     /// 这条别退化成提示词：闸门的意义就是"模型想调也调不到"。
     /// 同时钉住另一半 —— `send_image` 常驻（工作模式也要贴截图 / 图表）。
@@ -3913,7 +3913,7 @@ mod tests {
         .unwrap();
 
         let names = |dir: &Path, mode: &str| -> Vec<String> {
-            // 模式跟会话走（2026-10-08）：给这个模式**建一条会话**，按它的 id 取工具表。
+            // 模式跟会话走：给这个模式**建一条会话**，按它的 id 取工具表。
             // ⚠️ 不能再写 `settings.json` 的 `activeMode` —— 那个字段已删，
             //    而且就算留着也不影响任何一条会话的模式（曾经靠它切模式的写法已全废）。
             let sid = crate::sessions::new_session(dir, mode).id;
@@ -4776,7 +4776,7 @@ Write-Output "ARG=[$msg]"
     }
 
     // -----------------------------------------------------------------------
-    // grep_files 的「静默失败」回归（2026-10-01）
+    // grep_files 的「静默失败」回归
     //
     // 背景：543 次真实调用里 58% 报零命中，其中 145 次是 `path` 传了文件 ——
     // walk() 对文件 read_dir 必失败后裸 return，工具报「命中 0 行」，
@@ -4870,10 +4870,10 @@ Write-Output "ARG=[$msg]"
     }
 
     // -----------------------------------------------------------------------
-    // grep_files 端到端：重放真实失败现场（2026-10-01）
+    // grep_files 端到端：重放真实失败现场
     // -----------------------------------------------------------------------
 
-    /// 复刻 `s1790833919027-2` 那次事故：模型对**单个文件**调 grep_files，
+    /// 复刻那次事故：模型对**单个文件**调 grep_files，
     /// 文件里明明有这个词，工具却报「命中 0 行」→ 模型放弃工具改跑 PowerShell。
     #[test]
     fn grep_files_accepts_a_file_as_path() {
@@ -5031,7 +5031,7 @@ Write-Output "ARG=[$msg]"
     /// ⚠️ **这个用例依赖运行机器的系统 ACP**：只有 ACP=936（简体中文 Windows）
     /// 才能把 GBK 字节解成「数据」。GitHub 的 `windows-latest` runner 是英文
     /// en-US（ACP=1252），GBK 字节会解成乱码 → 搜不到 → 失败。
-    /// 2026-10-10 由 CI 抓出：本地中文系统一直通过，单机测试看不出问题。
+    /// 由 CI 抓出：本地中文系统一直通过，单机测试看不出问题。
     #[cfg(windows)]
     #[test]
     fn grep_files_reads_gbk_files() {
@@ -5256,7 +5256,7 @@ Write-Output "ARG=[$msg]"
             assert!(ok.text.contains("OK_CONTENT"));
         }
 
-        // 换成一条 **PTC 会话**（模式跟会话走，2026-10-08）。
+        // 换成一条 **PTC 会话**（模式跟会话走）。
         // ⚠️ 不能再写 `settings.json` 的 `activeMode` —— 那字段已删。
         let sid = crate::sessions::new_session(&tmp, "ptc").id;
 
@@ -5288,7 +5288,7 @@ Write-Output "ARG=[$msg]"
         let target = tmp.join("y.txt");
         std::fs::write(&target, "SUB_CALL_OK").unwrap();
 
-        // 整场都在 PTC 会话里跑（模式跟会话走，2026-10-08）
+        // 整场都在 PTC 会话里跑（模式跟会话走）
         let sid = crate::sessions::new_session(&tmp, "ptc").id;
 
         let gate = gate_for(&tmp);
@@ -5619,7 +5619,7 @@ Write-Output "ARG=[$msg]"
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // ---------------- remember 的 scope 落点（2026-10-10） ----------------
+    // ---------------- remember 的 scope 落点 ----------------
 
     fn mem_tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("orb-mem-{tag}-{}", std::process::id()));
