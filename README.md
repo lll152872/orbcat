@@ -131,17 +131,12 @@ bash tools/build-release.sh --fast   # 快速档（约 55s），给人真机测�
 ```
 
 > ⚠️⚠️ **必须在 Git Bash 里跑，不能在 WSL 里跑。**
-> 本机 PATH 上的 `bash` 是 WSL 的 `C:\Windows\system32\bash.exe`，而
 > `node_modules` 是 Windows 装的 —— 进 Ubuntu 后 `npm run build` 会报
 > `Cannot find module '../rolldown-binding.linux-x64-gnu.node'`，
 > 这句错看起来像依赖坏了，**实际是操作系统不对**。
 >
-> 判断方法：脚本里 `pwd` 输出 `/mnt/d/...` 就是 WSL（错），`/d/...` 才是 Git Bash（对）。
->
-> 或者直接用 PowerShell：
-> ```
-> "C:\Program Files\Git\bin\bash.exe" -lc 'cd "/d/<你的仓库路径>/orbcat" && bash tools/build-release.sh'
-> ```
+> 怎么确认自己在 Git Bash 里：脚本里 `pwd` 输出 `/d/...` 是 Git Bash（对），
+> `/mnt/d/...` 就是 WSL（错）。
 
 ---
 
