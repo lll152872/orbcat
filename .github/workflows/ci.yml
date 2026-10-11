@@ -13,7 +13,6 @@
 # |---|---|---|
 # | `build-windows` | windows-latest | Windows 版没有回归（505 个测试 + tsc + vitest） |
 # | `build-macos` | macos-14 (arm64) | **Mac 版能编译**（本次的核心目的） |
-# | `build-macos-x64` | macos-13 (x86_64) | Intel Mac 也能编译（可能有 target 差异） |
 #
 # ## 注意：这里只编译，不跑测试
 #
@@ -147,38 +146,3 @@ jobs:
           name: orbcat-macos-arm64-debug
           path: out/
           retention-days: 14
-
-  # ---------------------------------------------------------------------------
-  # macOS x86_64 —— Intel Mac
-  # ---------------------------------------------------------------------------
-  build-macos-x64:
-    name: macOS (x86_64, Intel)
-    runs-on: macos-13
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: package-lock.json
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri -> target
-
-      - name: npm ci
-        run: npm ci
-
-      # 只 check 不 build：这个 job 的目的是确认「Intel Mac 也能过类型检查」，
-      #   完整构建交给 arm64 job，避免浪费 runner 时间。
-      - name: Rust check (lib)
-        run: cargo check --manifest-path src-tauri/Cargo.toml --lib
-
-      # 与 arm64 job 同理：23 个 Windows-only 测试已加 cfg 门，此处应全绿。
-      - name: Rust tests
-        run: cargo test --lib --manifest-path src-tauri/Cargo.toml
