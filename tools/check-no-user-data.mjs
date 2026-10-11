@@ -1,0 +1,267 @@
+#!/usr/bin/env node
+// ===========================================================================
+// 防夹带闸门 · 仓库级
+// ===========================================================================
+//
+// ## 它查什么
+//
+// build.rs 里那道闸门管的是「骨架区里有没有混进用户数据」—— 那是**编进二进制**
+// 之前最后一道关。这道脚本查的是 build.rs **看不到**的东西：
+//
+//   a) git 有没有跟踪 agent-data/、密钥、调试符号
+//   b) 全仓 include_str! / include_bytes! 的实参是不是都落在骨架区内
+//   c) tauri.conf.json 的 bundle.resources 有没有把数据目录写进去
+//   d) tools/build-release.sh 的拷贝目标里有没有数据目录
+//
+// ## 为什么用 Node 而不是 bash
+//
+// CI 有 windows-latest / macos-14 / macos-13 三个 runner（.github/workflows/ci.yml），
+// bash 在 Windows runner 上不可用；写 bash + PowerShell 双份必然漂移。
+// Node 22 在三个 runner 上都现成，且不新增任何依赖。
+//
+// ## 为什么还要这道 —— build.rs 不是已经拦了吗
+//
+// 因为 build.rs 只管「进二进制的那一份」。这个仓库里 `agent-data/` **物理躺在
+// 仓库里**（开发期数据目录 = `env!("CARGO_MANIFEST_DIR")/../agent-data`），
+// 它进包有三条路：git、打包配置、构建脚本里的 include_*。后两条 build.rs 能管，
+// 第一条不能。
+//
+// 用法：
+//   node tools/check-no-user-data.mjs
+// 退出码非 0 = 有问题。
+
+import { execFileSync } from 'node:child_process';
+import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { dirname, join, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const SKELETON = 'src-tauri' + sep + 'skeleton';
+const DATA = 'agent-data';
+
+const problems = [];
+const notes = [];
+const fail = (where, what, why) => problems.push({ where, what, why });
+
+const ok = (s) => `\x1b[32m${s}\x1b[0m`;
+const bad = (s) => `\x1b[31m${s}\x1b[0m`;
+const dim = (s) => `\x1b[2m${s}\x1b[0m`;
+
+function git(...args) {
+  try {
+    return execFileSync('git', args, { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch {
+    return ''; // 不是 git 仓库 / 没装 git —— 跳过 git 类检查，不假装通过
+  }
+}
+
+function walk(dir, out = []) {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    if (e.name === 'node_modules' || e.name === 'target' || e.name === '.git' || e.name === 'dist') continue;
+    const p = join(dir, e.name);
+    if (e.isDirectory()) walk(p, out);
+    else out.push(p);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// a) git 有没有跟踪不该跟踪的东西
+// ---------------------------------------------------------------------------
+function checkGitTracking() {
+  const raw = git('ls-files', '-z');
+  if (!raw) {
+    notes.push('跳过 a)：拿不到 git ls-files（不在 git 仓库里，或没装 git）');
+    return;
+  }
+  const tracked = raw.split('\0').filter(Boolean).map((p) => p.split('/').join(sep));
+
+  const DATA_RULES = [
+    { re: /(^|\\)agent-data(\\|$)/, why: '运行时用户数据：记忆、画像、会话、API key、日记、截图' },
+    { re: /\.(bak|old)(\.|$)/i, why: '备份残留 —— 里面往往是改了半截的配置或旧记忆' },
+    { re: /\.pdb$/i, why: '调试符号，曾误入过工作树' },
+    { re: /\.key$/i, why: '密钥' },
+    { re: /(^|\\)\.trash(\\|$)/, why: '回收站残留' },
+  ];
+
+  for (const p of tracked) {
+    for (const rule of DATA_RULES) {
+      if (rule.re.test(p)) fail('a) git 跟踪', p, rule.why);
+    }
+  }
+  console.log(`${ok('a) git 跟踪')}  ${dim(`${tracked.length} 个文件，${problems.length} 项可疑`)}`);
+}
+
+// ---------------------------------------------------------------------------
+// b) include_str! / include_bytes! 的实参是否都落在骨架区内
+// ---------------------------------------------------------------------------
+const INCLUDE_RE = /include_(?:str|bytes)!\s*\(\s*"([^"]+)"\s*\)/g;
+
+function checkIncludes() {
+  const files = walk(ROOT).filter((f) => f.endsWith('.rs'));
+  let found = 0;
+
+  for (const f of files) {
+    // build.rs 本身用 include! 拼 OUT_DIR 生成的清单，那是结构性的，跳过
+    if (f.endsWith(join('src-tauri', 'build.rs'))) continue;
+    const text = readFileSync(f, 'utf8');
+    for (const m of text.matchAll(INCLUDE_RE)) {
+      found++;
+      const target = resolve(dirname(f), m[1].split('/').join(sep));
+      const rel = relative(ROOT, target).split(sep).join('/');
+      if (!rel.startsWith(SKELETON.split(sep).join('/') + '/')) {
+        fail(
+          'b) include_*',
+          `${relative(ROOT, f).split(sep).join('/')} → ${m[1]}`,
+          `编译期嵌入的文件不在骨架区 ${SKELETON}/ 内（实际解析到 ${rel}）。\n` +
+            `        include_* 会把文件内容焊进二进制 —— 只有骨架区里的干净模板可以这么做。\n` +
+            `        活数据要从磁盘读（用 data_dir 拼路径），绝不能编译进去。`
+        );
+      }
+    }
+  }
+  console.log(`${ok('b) include_*')}  ${dim(`${files.length} 个 .rs，${found} 处嵌入，全部在骨架区内`)}`);
+}
+
+// ---------------------------------------------------------------------------
+// c) tauri.conf.json 的 bundle 有没有把数据目录写进去
+// ---------------------------------------------------------------------------
+function checkTauriBundle() {
+  const p = join(ROOT, 'src-tauri', 'tauri.conf.json');
+  if (!existsSync(p)) {
+    notes.push('跳过 c)：找不到 src-tauri/tauri.conf.json');
+    return;
+  }
+  const conf = JSON.parse(readFileSync(p, 'utf8'));
+  const bundle = conf.bundle ?? {};
+  const blob = JSON.stringify(bundle.resources ?? bundle);
+  if (blob.includes(DATA)) {
+    fail('c) tauri.conf.json', 'bundle.resources / bundle', `提到了 ${DATA} —— 打包配置会把用户数据卷进安装包`);
+  }
+  if (conf.build?.frontendDist?.includes(DATA)) {
+    fail('c) tauri.conf.json', 'build.frontendDist', `提到了 ${DATA} —— 前端资源目录指到了用户数据区`);
+  }
+  console.log(`${ok('c) tauri 打包')}  ${dim(`bundle.targets=${bundle.targets ?? '(无)'}，未提及 ${DATA}`)}`);
+}
+
+// ---------------------------------------------------------------------------
+// d) build-release.sh 的拷贝目标
+// ---------------------------------------------------------------------------
+function checkReleaseScript() {
+  const p = join(ROOT, 'tools', 'build-release.sh');
+  if (!existsSync(p)) {
+    notes.push('跳过 d)：找不到 tools/build-release.sh');
+    return;
+  }
+  const text = readFileSync(p, 'utf8');
+  text.split('\n').forEach((line, i) => {
+    // 只看拷贝/移动类命令，注释里的提及不算
+    if (!/\b(cp|mv|rsync|tar|zip|7z|install)\b/.test(line)) return;
+    if (line.trimStart().startsWith('#')) return;
+    if (line.includes(DATA)) {
+      fail('d) build-release.sh', `第 ${i + 1} 行`, `${line.trim()}\n        发布脚本拷贝了 ${DATA} —— 这正是「打包夹带用户数据」那条路`);
+    }
+  });
+  console.log(`${ok('d) 发布脚本')}  ${dim(`拷贝目标未提及 ${DATA}`)}`);
+}
+
+// ---------------------------------------------------------------------------
+// e) 骨架区白名单（与 build.rs 的闸门①互为镜像，抓「绕开 cargo 构建」的情况）
+// ---------------------------------------------------------------------------
+function checkSkeletonWhitelist() {
+  const skel = join(ROOT, SKELETON);
+  if (!existsSync(skel)) {
+    fail('e) 骨架区', SKELETON, '目录不存在 —— 声明式骨架区是内置区的唯一来源');
+    return;
+  }
+  const manifestPath = join(skel, 'manifest.json');
+  if (!existsSync(manifestPath)) {
+    fail('e) 骨架区', 'skeleton/manifest.json', '缺声明文件 —— manifest 是内置区唯一真相');
+    return;
+  }
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  const declared = new Set(manifest.assets.map((a) => a.src.split('/').join(sep)));
+
+  const onDisk = [];
+  (function rec(d) {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const p = join(d, e.name);
+      if (e.isDirectory()) rec(p);
+      else onDisk.push(relative(skel, p));
+    }
+  })(skel);
+
+  let undeclared = 0;
+  for (const rel of onDisk) {
+    if (rel === 'manifest.json') continue;
+    if (!declared.has(rel)) {
+      undeclared++;
+      fail('e) 骨架区', `skeleton/${rel.split(sep).join('/')}`, '没在 manifest.json 里声明 —— 白名单制，多出来的文件一律视为「忘了审」');
+    }
+  }
+  // 反向也要查：声明了但文件不在。否则「删了文件忘了改 manifest」会一路绿灯放过去
+  // —— 构建时才会炸，而 build.rs 可能压根没跑（只跑了 npm run test）。
+  let missing = 0;
+  for (const rel of declared) {
+    if (!onDisk.includes(rel)) {
+      missing++;
+      fail('e) 骨架区', `manifest 声明了 skeleton/${rel.split(sep).join('/')}`, '但文件不存在 —— 声明与实际不一致，产物会和源码对不上');
+    }
+  }
+  console.log(`${ok('e) 骨架白名单')}  ${dim(`${onDisk.length} 个文件，${undeclared} 个未声明，${missing} 个声明了但缺失`)}`);
+}
+
+// ---------------------------------------------------------------------------
+// f) 骨架区文件不得含本机绝对路径（与 build.rs 闸门⑤⑥⑦ 同规则，跨进程复验）
+// ---------------------------------------------------------------------------
+function checkSkeletonClean() {
+  const skel = join(ROOT, SKELETON);
+  if (!existsSync(skel)) return;
+  const BAD = [
+    { re: /[A-Za-z]:\\/g, why: '本机绝对路径（盘符）—— 会把构建者的用户名与磁盘布局分发给所有用户' },
+    { re: /__pycache__|\.pyc$|node_modules|\.venv/gi, why: '编译缓存 / 依赖目录 —— 本机运行状态的残留' },
+    { re: /Bearer /g, why: 'Bearer 令牌' },
+    { re: /api_key=|apiKey:/g, why: '凭证赋值' },
+  ];
+  for (const f of walk(skel)) {
+    if (f.endsWith('manifest.json')) continue;
+    const rel = relative(skel, f).split(sep).join('/');
+    const text = readFileSync(f, 'utf8');
+    for (const rule of BAD) {
+      const m = text.match(rule.re);
+      if (m) {
+        fail('f) 骨架正文', `skeleton/${rel}`, `${rule.why}（命中 ${JSON.stringify(m[0])}）`);
+      }
+    }
+  }
+  console.log(`${ok('f) 骨架正文')}  ${dim('无本机路径 / 无缓存 / 无凭证')}`);
+}
+
+// ---------------------------------------------------------------------------
+console.log('防夹带闸门 · 仓库级\n');
+checkGitTracking();
+checkIncludes();
+checkTauriBundle();
+checkReleaseScript();
+checkSkeletonWhitelist();
+checkSkeletonClean();
+console.log('');
+
+for (const n of notes) console.log(dim(`  note: ${n}`));
+if (notes.length) console.log('');
+
+if (problems.length) {
+  console.log(bad(`✗ ${problems.length} 项不合规\n`));
+  for (const p of problems) {
+    console.log(bad(`  [${p.where}] ${p.what}`));
+    console.log(dim(`      ${p.why}\n`));
+  }
+  process.exit(1);
+}
+console.log(ok('✓ 全部通过 —— 仓库里没有任何用户数据会被带进产物'));

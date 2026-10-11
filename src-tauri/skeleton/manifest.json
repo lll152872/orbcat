@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "kind": "orbcat-skeleton",
+  "version": 1,
+
+  "_comment_dirs": "这些目录是空的，文件树表达不了，必须显式列出。顺序 = 提示里的展示顺序。",
+  "dirs": [
+    "daily",
+    "images",
+    "memory",
+    "pending",
+    "projects",
+    "screenshots",
+    "sessions",
+    "skills"
+  ],
+
+  "_comment_assets": "src = 骨架区内的相对路径；rel = 落到 agent-data 下的相对路径（恒用 /）。src 指向的文件若没在这里声明，构建期直接失败 —— 白名单，不是黑名单。",
+  "assets": [
+    {
+      "src": "memory/MEMORY.md",
+      "rel": "memory/MEMORY.md",
+      "template": true
+    },
+    {
+      "src": "skills/README.md",
+      "rel": "skills/README.md",
+      "template": true
+    },
+    {
+      "src": "pending/README.md",
+      "rel": "pending/README.md",
+      "template": true
+    },
+    {
+      "src": "projects/README.md",
+      "rel": "projects/README.md",
+      "template": true
+    },
+
+    {
+      "src": "skills/dual-token-dashboard/SKILL.md",
+      "rel": "skills/dual-token-dashboard/SKILL.md",
+      "render": ["DATA_DIR", "SKILL_DIR"]
+    },
+    {
+      "src": "skills/dual-token-dashboard/scripts/gen_dual_dashboard.py",
+      "rel": "skills/dual-token-dashboard/scripts/gen_dual_dashboard.py"
+    },
+    {
+      "src": "skills/dual-token-dashboard/panel/index.html",
+      "rel": "skills/dual-token-dashboard/panel/index.html"
+    },
+    {
+      "src": "skills/dual-token-dashboard/panel/panel.css",
+      "rel": "skills/dual-token-dashboard/panel/panel.css"
+    },
+    {
+      "src": "skills/dual-token-dashboard/panel/panel.js",
+      "rel": "skills/dual-token-dashboard/panel/panel.js"
+    },
+    {
+      "src": "skills/dual-token-dashboard/references/adapter-schema.md",
+      "rel": "skills/dual-token-dashboard/references/adapter-schema.md"
+    },
+    {
+      "src": "skills/dual-token-dashboard/README.md",
+      "rel": "skills/dual-token-dashboard/README.md",
+      "distribute": false
+    },
+
+    {
+      "src": "skills/self-rebuild/SKILL.md",
+      "rel": "skills/self-rebuild/SKILL.md",
+      "render": ["DATA_DIR"]
+    },
+    {
+      "src": "skills/token-usage-report/SKILL.md",
+      "rel": "skills/token-usage-report/SKILL.md",
+      "render": ["DATA_DIR"]
+    }
+  ]
+}

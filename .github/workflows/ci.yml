@@ -69,6 +69,12 @@ jobs:
       - name: TypeScript check
         run: npx tsc --noEmit
 
+      # 防夹带闸门 · 仓库级。
+      # build.rs 里那道只管「编进二进制的骨架」，管不到 git 跟踪、
+      # tauri 打包配置、发布脚本拷贝目标这三条进包路径 —— 它们要这道。
+      - name: No-user-data gate
+        run: npm run check:no-user-data
+
       - name: Unit tests (frontend)
         run: npx vitest run
 
@@ -77,6 +83,35 @@ jobs:
 
       - name: Rust tests
         run: cargo test --lib --manifest-path src-tauri/Cargo.toml
+
+      # ── 出包 ──────────────────────────────────────────────
+      # 放在测试之后：测试红了就没必要编，编了也是白编。
+      #
+      # ⚠️ exe 必须与 dist/ 同目录分发 —— 见 tools/build-release.sh 的说明。
+      #   tauri.conf.json 的 frontendDist 指向 ./stub-dist，那是编译期嵌进二进制的；
+      #   而 build-release.sh 约定运行时再放一份真 dist/ 在 exe 旁边。**两份都要**。
+      - name: Frontend build
+        run: npm run build
+
+      - name: Rust build (bin)
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin orbcat
+
+      - name: Package (unsigned)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out/dist | Out-Null
+          Copy-Item src-tauri/target/debug/orbcat.exe out/orbcat-windows-x64.exe
+          Copy-Item -Recurse -Force dist/* out/dist/
+          Write-Output "=== artifact tree ==="
+          Get-ChildItem -Recurse out | ForEach-Object {
+            "{0,10}  {1}" -f $_.Length, $_.FullName.Substring((Resolve-Path out).Path.Length + 1)
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbcat-windows-x64-debug
+          path: out/
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # macOS arm64 —— 本次改动的核心验证目标
@@ -106,6 +141,9 @@ jobs:
 
       - name: TypeScript check
         run: npx tsc --noEmit
+
+      - name: No-user-data gate
+        run: npm run check:no-user-data
 
       # ★ 这一步是本次 CI 的核心：证明 `platform/` 抽象层在真实 macOS 上成立。
       #   在此之前，crate 因为 win32.rs / capture.rs / context.rs 里的裸 FFI
@@ -184,6 +222,9 @@ jobs:
 
       - name: npm ci
         run: npm ci
+
+      - name: No-user-data gate
+        run: npm run check:no-user-data
 
       # lib 一层过不了就别谈产物了：crate 里绝大多数 win32 绑定都在 lib。
       - name: Rust check (lib)
