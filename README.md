@@ -45,7 +45,7 @@ agent。它和通用 AI 助手的区别在于两件事：**它记得你是谁**�
 > 它填 `command` / `args`，由 orbcat 拉子进程走 stdin/stdout 的 JSON-RPC，
 > **不新增信任面**，只是换了个"怎么把 JSON-RPC 送过去"的通道。
 >
-> 命名口径（2026-10-10 定）：**一个 server 一个组，组名 = server id，工具名原样透传**。
+> 命名口径：**一个 server 一个组，组名 = server id，工具名原样透传**。
 > 网关内部怎么命名工具是网关自己的事，orbcat 不反解、不剥前缀 —— 模型看到什么名字
 > 就调什么名字，展示名与实际可调用的全名**永远一致**。
 
@@ -117,7 +117,7 @@ agent。它和通用 AI 助手的区别在于两件事：**它记得你是谁**�
 ### 从源码构建
 
 ```bash
-# 前端（10~20s，不重编 Rust）
+# 前端
 npm install
 npm run build
 
@@ -126,8 +126,8 @@ npm run dev          # 仅前端
 npm run tauri dev    # 完整应用
 
 # 正式发布构建
-bash tools/build-release.sh          # fat LTO，最慢最小（约 4~5 分钟）
-bash tools/build-release.sh --fast   # 快速档（约 55s），给人真机测试用
+bash tools/build-release.sh          # fat LTO，最慢最小
+bash tools/build-release.sh --fast   # 快速档，给人真机测试用
 ```
 
 > ⚠️⚠️ **必须在 Git Bash 里跑，不能在 WSL 里跑。**
@@ -147,7 +147,7 @@ bash tools/build-release.sh --fast   # 快速档（约 55s），给人真机测�
 **exe 同目录的 `dist/`** 读取（见 `src-tauri/src/disk_assets.rs`）。
 
 这样做的收益：改前端只跑 `npm run build`，**Rust 完全不用重编**
-（否则每次改一行 CSS 都要重链一次，实测约 57s）。
+（否则每次改一行 CSS 都要重链一次）。
 
 代价：**`orbcat.exe` 必须和 `dist/` 同目录分发**，不能只拷一个 exe 走。
 `tools/build-release.sh` 已经把拷贝 `dist/` 这一步焊进流程。
@@ -164,10 +164,10 @@ bash tools/build-release.sh --fast   # 快速档（约 55s），给人真机测�
 > 找不到 `dist/` 时会回退到编译期嵌入的 `stub-dist` 占位页，
 > 启动日志里会写 `前端资源: 未找到外部 dist/，回退内置占位页`。
 
-### 桌面快捷方式是「常驻」的（2026-10-01 起）
+### 从源码构建时的桌面快捷方式
 
-**快捷方式不指向任何 exe。** 它指向一条**路径永不改变**的调用链，
-由启动器在**每次双击时**挑出当前"能用的那份"构建：
+**快捷方式不指向任何 exe**，而是指向一条路径固定的调用链，由启动器在
+**每次双击时**挑出当前"能用的那份"构建：
 
 ```
 桌面 orbcat.lnk
@@ -178,8 +178,8 @@ bash tools/build-release.sh --fast   # 快速档（约 55s），给人真机测�
   → 选中的 orbcat.exe
 ```
 
-这样**重新构建不需要再管桌面图标**：产物改名、换档位（`release` /
-`release-fast`）、构建失败留下残骸，都不会把图标带偏。
+这样**重新构建不需要再管桌面图标**：产物改名、换构建档位、构建失败留下残骸，
+都不会把图标带偏。
 
 「能用」的判定有三条，缺一不可：
 
@@ -188,10 +188,7 @@ bash tools/build-release.sh --fast   # 快速档（约 55s），给人真机测�
 3. 候选按 **`min(exe 时间, dist 时间)`** 排序取最新
 
 > 第 3 条的 `min` 不是随手写的：exe 和 dist 是**两半**，只有一半是新的就等于旧的。
-> 实测撞上过 `release-fast` 的 exe 是 10-01、dist 还停在 09-29，而 `release`
-> 两边都是新的 —— 只看 exe 时间会选中「新内核 + 旧界面」。
-
-`_old_builds/` 里的归档天然不合格（那里没有 `dist/`），所以不需要额外排除规则。
+> 只看 exe 时间会选中「新内核 + 旧界面」。
 
 ```bash
 # 装 / 修（仓库挪位置后重跑一次即可）
@@ -269,7 +266,7 @@ orbcat 能读写你的文件、跑命令，所以权限是分层的，**默认�
 |---|---|
 | **隐形桌面没有合成键鼠** | 「后台模式」能建一张你看不见的桌面并真跑 GUI 程序（实测 WPS 打开 docx 导出 PDF），但**跨桌面注入键鼠被内核拒绝**。因此后台模式的输入通道必须是应用自身的自动化接口（COM / CLI / UIA Pattern / HTTP） |
 | **UIA 选区对 Electron 不可靠** | VSCode 需 `--force-renderer-accessibility` 启动且不稳定；Typora 本机为改造版。Win32/WinUI 完全可用 |
-| **命令策略编辑器未接 UI** | ~~后端命令已就绪，界面待接~~ **已接**：设置页可编辑白名单与硬阻断表，保存写 `command_policy.json` 并立即生效 |
+| **命令策略编辑器** | 设置页可编辑白名单与硬阻断表，保存写 `command_policy.json` 并立即生效 |
 | **deny 时不隐藏工具** | 策略为 deny 的工具仍会出现在工具列表里（尚未做可见性过滤） |
 | **PTC 需要本机 Node** | PTC 模式把工具调用写成 TypeScript 程序执行，需要**支持原生类型擦除**的 Node（即 `.ts` 能被直接 `import`）。探测顺序：`ORBCAT_NODE` 环境变量 → PATH → 常见安装位置。找不到或版本过旧时 `run_code` 会给出明确提示，而不是静默失败 |
 | **PTC 子调用有硬上限** | 一次 `run_code` 最多 500 次子调用、同时最多 10 个在飞、程序输出 64 KB 上限。前两条是防模型写错循环条件（否则会无限调用且不会自己停） |
@@ -330,7 +327,7 @@ orbcat/
 | 文件 | 适用 | 说明 |
 |---|---|---|
 | `platform/windows.rs` | Windows | 完整实现（前台窗口、HKCU、编码、`.lnk` 解析、置顶不抢焦点…） |
-| `platform/macos.rs` | macOS | 前台窗口（AppleScript）、Accessibility 授权与设置跳转；部分能力 no-op |
+| `platform/macos.rs` | macOS | 前台窗口（AppleScript）、Accessibility 授权与设置跳转、自启（LaunchAgents plist）；部分能力是降级实现，见「已知限制」 |
 | `platform/stub.rs` | 其余（Linux/BSD） | 全部 no-op，只为让任何 target 过得了 `cargo check` |
 
 > macOS 上真正要接无障碍是 AT-SPI 之外的路子（AppleScript / AX API），
@@ -360,27 +357,18 @@ npm run test:e2e:live   # 真实链路
 ## 八、技术栈
 
 - **前端**：TypeScript + 原生 DOM（无框架）、Vite、vitest
-- **后端**：Rust、Tauri 2、tokio、reqwest（**native-tls / SChannel**）
+- **后端**：Rust、Tauri 2、tokio、reqwest（native-tls）
 - **存储**：SQLite（`rusqlite`，仅索引）+ Markdown（长期记忆）
-
-> ⚠️ TLS 必须用 native-tls（Windows SChannel），**不能用 rustls**。
-> 2026-09-21 实测：`ark.cn-beijing.volces.com` 在 rustls 下 body ≥16KB 会超时，
-> 同请求在 SChannel 下正常。
-
----
 
 ## 九、CI（跨平台编译验证）
 
-`.github/workflows/ci.yml`。**目的是回答「macOS 能不能编译」** —— 本机是 Windows，
-`cargo check --target aarch64-apple-darwin` 会卡在 Tauri 自己的
-`objc2-exception-helper`（需要 Xcode 的 Objective-C 编译器），唯一可靠的验证
-方式是**在真实 macOS runner 上跑**。
+`.github/workflows/ci.yml`，三个 job：
 
 | job | 平台 | 验证什么 |
 |---|---|---|
 | `build-windows` | windows-latest (x64) | 防回归：532 个 Rust 测试 + 112 个前端测试 + tsc + 防夹带闸门，然后出包 |
 | `build-windows-arm` | windows-11-arm (arm64) | 能编出**真的是 ARM64** 的可执行文件（读 PE 头 `machine == 0xAA64` 断言，不是"编过了"就算） |
-| `build-macos` | macos-14 (arm64) | **Mac 版能编译**（本次抽象的核心目的）+ 跑 lib 测试 |
+| `build-macos` | macos-14 (arm64) | **Mac 版能编译** + 跑 lib 测试 |
 
 三个 job 各自产出可下载的 artifact（保留 14 天）：
 
@@ -390,21 +378,7 @@ npm run test:e2e:live   # 真实链路
 
 > ⚠️ **macOS 上跑不了前台上下文相关测试** —— 那些需要真实 Accessibility 授权与
 > 前台窗口，CI 没有 GUI 会话。`platform/macos.rs` 的 `osascript` 调用失败后降级，
-> 这是**预期行为**。23 个 Windows-only 测试已加 `#[cfg(windows)]` 门。
+> 这是**预期行为**。相关测试已加 `#[cfg(windows)]` 门。
 
 > ⚠️ **macOS 产物未签名未公证**，Gatekeeper 会拦（需 右键 → 打开，
-> 或 `xattr -d com.apple.quarantine`）。这与 Windows 侧"改前端不用重编 Rust"
-> 是两回事：macOS 还没有 `build-release.sh` 那样的外置前端流程，
-> CI 里走的是标准 `npm run build` + `cargo build`。
-
-### 手动触发 CI
-
-**`ci.yml` 只配了 `master` 分支触发。** 推 feature 分支**不会自动跑 CI**：
-
-```bash
-# feature 分支上推完想验证，手动触发：
-gh workflow run ci.yml --ref <你的分支>
-```
-
-> 如果希望 feature 分支推送即触发，往 `on.push.branches` 里加 `feat/**`
-> （当前只有 `[master]`）。
+> 或 `xattr -d com.apple.quarantine`）。
