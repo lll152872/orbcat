@@ -330,6 +330,50 @@ pub fn apply_entry(root: &Path, p: &DistillProposal) -> Result<DistillReport, St
     })
 }
 
+/// 删除**一条**（`memory_delete` 工具的实现体，2026-10-10 加）。
+///
+/// 与 [`apply_entry`] 的区别只有一个：**不写任何目标文件**，只把这条从中转站摘掉。
+/// 用于「这条已经过时」或「当初就记错了」—— 记忆是滚动累积的，一条错的条目会一直
+/// 影响以后的每一次回答，光加不减迟早把长期记忆污染成一堆假约束。
+///
+/// 备份与匹配规则**完全复用** [`apply_entry`]：按天备份（`MEMORY.md.bak-<日期>`）、
+/// 正文逐字匹配；传错字直接报错、**一个字都不动文件**。
+///
+/// 为什么不给主对话也开这个工具（2026-10-10 定）：删除是破坏性的，而主对话里
+/// 没有「逐条摆给用户过目」这个环节 —— 那正是蒸馏会话存在的意义。
+/// 蒸馏会话每次动手前都会先把建议和原文摆出来，拿不准就问。
+pub fn delete_entry(root: &Path, text: &str) -> Result<DistillReport, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("条目内容不能为空".into());
+    }
+    let mem_path = long_term_path(root);
+    let md = std::fs::read_to_string(&mem_path).map_err(|e| format!("读 MEMORY.md 失败: {e}"))?;
+
+    // 必须真的在中转站里 —— 传错字时不能静默改文件
+    let entries = split_entries(&md);
+    let key = norm_key(text);
+    let Some(hit) = entries.iter().find(|e| norm_key(&e.text) == key) else {
+        return Err("中转站里没有这条（正文与 MEMORY.md 不一致，可能已经处理过了）".into());
+    };
+    let hit = hit.clone();
+
+    // 备份（按天覆盖，与 apply_entry 同策略）
+    let backup_name = format!("MEMORY.md.bak-{}", today_compact());
+    std::fs::create_dir_all(root.join("memory")).map_err(|e| e.to_string())?;
+    std::fs::write(root.join("memory").join(&backup_name), &md)
+        .map_err(|e| format!("写备份失败: {e}"))?;
+
+    let next_md = rewrite_memory(&md, &[hit]);
+    std::fs::write(&mem_path, next_md).map_err(|e| format!("重写 MEMORY.md 失败: {e}"))?;
+
+    Ok(DistillReport {
+        moved: 0,
+        removed: 1,
+        backup: backup_name,
+        skipped: Vec::new(),
+    })
+}
 /// 批量迁移（测试与将来「一键应用」用；agent 走 [`apply_entry`] 逐条）
 #[cfg(test)]
 fn apply_batch(root: &Path, approved: &[DistillProposal]) -> Result<DistillReport, String> {
@@ -531,6 +575,46 @@ mod tests {
         let mem = std::fs::read_to_string(dir.join("memory").join("MEMORY.md")).unwrap();
         assert!(!mem.contains("称呼约定") && !mem.contains("交付风格") && !mem.contains("洛谷"));
         assert!(mem.contains("多行条目第一行"), "未点名的条目保留");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------- 删除（memory_delete，2026-10-10） ----------------
+
+    #[test]
+    fn delete_entry_removes_it_and_keeps_a_backup() {
+        let dir = seed("del");
+        let r = delete_entry(&dir, "交付风格：先结论后细节。（ts2）").unwrap();
+        assert_eq!((r.moved, r.removed), (0, 1), "删除不写任何目标文件");
+        assert!(r.backup.starts_with("MEMORY.md.bak-"), "备份按天命名: {}", r.backup);
+
+        let mem = std::fs::read_to_string(dir.join("memory").join("MEMORY.md")).unwrap();
+        assert!(!mem.contains("交付风格"), "该删的要从文件里消失: {mem}");
+        // 标题、说明行、别的条目一个都不能少
+        assert!(mem.contains("## 用户确认过的约定"), "标题保留");
+        assert!(mem.contains("称呼约定"), "别的条目不动");
+        assert!(mem.contains("多行条目第一行"), "多行条目不动");
+
+        // 备份里是原文 —— 删错了能从这儿捞回来
+        let bak = std::fs::read_to_string(dir.join("memory").join(&r.backup)).unwrap();
+        assert!(bak.contains("交付风格"), "备份必须是删除前的内容");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_entry_rejects_unknown_text_without_touching_files() {
+        let dir = seed("del-err");
+        let before = std::fs::read_to_string(dir.join("memory").join("MEMORY.md")).unwrap();
+        let r = delete_entry(&dir, "这条根本不在中转站里");
+        assert!(r.is_err(), "传错字必须报错");
+        let after = std::fs::read_to_string(dir.join("memory").join("MEMORY.md")).unwrap();
+        assert_eq!(before, after, "报错时不能动文件");
+        // 也不该凭空造出备份
+        let baks: Vec<_> = std::fs::read_dir(dir.join("memory"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
+            .collect();
+        assert!(baks.is_empty(), "报错时不该写备份");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

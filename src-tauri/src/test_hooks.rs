@@ -35,7 +35,7 @@ fn system_prompt_includes_approved_memory_marker() {
     assert!(p.contains("RULES_MARK_E2E"), "RULES 应注入");
     assert!(p.contains("MEM_MARK_E2E"), "已批准长期记忆应注入 system prompt");
     assert!(
-        p.contains("记忆怎么用") && p.contains("remember"),
+        p.contains("<memory_system>") && p.contains("remember"),
         "system prompt 应含记忆使用规则（含 remember 指引）"
     );
     // 2026-10-07：全局候选「宁多勿漏」的取向必须写明（有审批兜底，别让模型憋着不提）
