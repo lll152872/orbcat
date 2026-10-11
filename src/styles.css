@@ -671,6 +671,69 @@ body {
   color: #5C5C62;
 }
 
+/* --- macOS 前台上下文：渐进式授权引导 -------------------------------------
+ *
+ * 只在 macOS 且用户尚未授权辅助功能时出现（见 main.ts 的 fgPermissionPromptHtml）。
+ * 设计取向：**低干扰**。它常驻在指示条里，所以配色刻意压得比普通 fg-row 更淡，
+ * 按钮也做得小 —— 用户没主动要求这个功能，它就不该抢注意力。
+ */
+
+/* 引导条本身不响应「点击复制路径」 */
+.fg-perm {
+  cursor: default;
+  color: #6E6E76;
+  padding-right: 0;
+}
+
+.fg-perm:hover {
+  background: transparent;
+  color: #8A8A92;
+}
+
+/* 等待用户去系统设置勾选的状态：留一点呼吸感，别像坏了 */
+.fg-perm-wait {
+  font-style: italic;
+  color: #5C5C62;
+}
+
+/* 「授权」主按钮。用项目主色薄荷绿，和 orb 状态色一致 */
+.fg-perm-btn {
+  flex-shrink: 0;
+  margin-left: auto;
+  border: 1px solid rgba(168, 230, 207, 0.28);
+  background: rgba(168, 230, 207, 0.10);
+  color: #a8e6cf;
+  font-size: 10px;
+  line-height: 15px;
+  padding: 0 7px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.fg-perm-btn:hover {
+  background: rgba(168, 230, 207, 0.20);
+  border-color: rgba(168, 230, 207, 0.45);
+}
+
+/* 「不用了」关闭按钮。刻意做得很淡 —— 它是「以后再说」的出口，
+ * 不是主要动作，所以不该和「授权」抢视觉权重 */
+.fg-perm-x {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: #4E4E56;
+  font-size: 11px;
+  line-height: 15px;
+  padding: 0 2px;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.fg-perm-x:hover {
+  color: #8A8A92;
+}
+
 .mini-btn {
   flex-shrink: 0;
   width: 30px;

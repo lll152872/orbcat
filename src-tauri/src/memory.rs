@@ -114,6 +114,30 @@ pub struct MemoryStore {
     root: PathBuf,
 }
 
+/// 纯词法规整：消解 `..` 与 `.`（不碰文件系统）。
+///
+/// 只在 [`MemoryStore::canonicalize_with_missing_tail`] 找不到任何存在祖先时兜底使用。
+fn lexical_clean(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // 只有前一个也是普通组件时才回退，避免把 `..` 弹成根
+                match out.last() {
+                    Some(Component::Normal(_)) => {
+                        out.pop();
+                    }
+                    _ => out.push(c),
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out.iter().collect()
+}
+
 impl MemoryStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -292,6 +316,64 @@ impl MemoryStore {
 
     // -- 项目记忆（决策 5 / 16：projects/<name>/）----------------------------
 
+    /// 把路径归一化成**唯一形态**，供跨路径比较（项目记忆前缀匹配）使用。
+    ///
+    /// ## 为什么不能直接用 `canonicalize()`
+    ///
+    /// `canonicalize()` 要求整条路径**都存在**。而项目记忆匹配的两侧天然不对称：
+    /// - `source.ref` 指向的**目录**总是存在的 → canonicalize 成功
+    /// - 待匹配的**文件**经常还不存在（用户说「这个项目」时文件可能没建）
+    ///   → canonicalize 失败，原样返回
+    ///
+    /// 两侧走了不同分支，形态就可能不一致。在 Windows 上 `canonicalize()` 还会
+    /// 调 `GetFinalPathNameByHandle` 把 **8.3 短名展开成真实长名**
+    /// （`RUNNER~1` → `runneradmin`）并加 `\\?\` 前缀，于是「存在侧」被改写、
+    /// 「不存在侧」保持原样 → 前缀匹配失败。
+    ///
+    /// 本地中文机器上两边用户名恰好一致，形态碰巧对上所以永远看不出来；
+    /// CI 的英文 runner（`runneradmin` 走短名展开）立刻暴露。
+    ///
+    /// 真实影响：用户把项目放在 TEMP 等含 8.3 短名的目录下，或匹配一个尚未创建
+    /// 的文件时，**项目记忆会静默失效** —— 不是测试问题。
+    ///
+    /// ## 做法
+    ///
+    /// 从末端往前找**第一个存在的祖先**，对它 canonicalize，再把剩余部分接回去。
+    /// 这样无论整条路径存不存在，得到的都是同一种形态。
+    fn canonicalize_with_missing_tail(p: &Path) -> PathBuf {
+        // 常见情况：整条路径存在，直接 canonicalize
+        if let Ok(c) = p.canonicalize() {
+            return crate::permission::strip_verbatim(c);
+        }
+
+        // 剥掉尾部的不存在部分，找最长存在前缀
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut cur = p.to_path_buf();
+        loop {
+            let Some(parent) = cur.parent().map(|x| x.to_path_buf()) else {
+                break;
+            };
+            let Some(name) = cur.file_name().map(|x| x.to_os_string()) else {
+                break;
+            };
+            tail.push(name);
+            match parent.canonicalize() {
+                Ok(c) => {
+                    let mut out = crate::permission::strip_verbatim(c);
+                    // 尾部按逆序接回（收集时是从后往前）
+                    for seg in tail.iter().rev() {
+                        out.push(seg);
+                    }
+                    return out;
+                }
+                Err(_) => cur = parent,
+            }
+        }
+
+        // 连根都不存在（罕见）：原样返回，至少做了 `..` 消解
+        crate::permission::strip_verbatim(lexical_clean(p))
+    }
+
     fn projects_dir(&self) -> PathBuf {
         self.root.join("projects")
     }
@@ -306,10 +388,26 @@ impl MemoryStore {
             return None;
         };
 
-        let norm = |p: &Path| -> PathBuf {
-            let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-            crate::permission::strip_verbatim(c)
-        };
+        // ⚠️ 两侧必须归一化到**同一种形态**，否则前缀比较会失效。
+        //
+        // 2026-10-10 的诊断（见同文件 `diag_path_forms_in_ci`）在 CI 上给出了确切答案：
+        //   query canon = Err(NotFound)   ← 待匹配的文件**不存在**，canonicalize 失败
+        //   root canon  = Ok("\\\\?\\C:\\...\\runneradmin\\...\\fa_diag_76652")
+        //
+        // 也就是说**两侧的行为本来就不对称**：
+        //   - `source.ref` 指向的目录**存在** → canonicalize 成功 → 拿到 8.3 短名展开后的
+        //     真实长名（`RUNNER~1` → `runneradmin`）+ `\\?\` 前缀
+        //   - 待匹配的**文件不存在**（项目记忆匹配的是「本该在这个目录下的文件」）
+        //     → canonicalize 失败 → 原样返回
+        // 本地中文机器上两边用户目录名恰好一致，形态碰巧对上所以永远通过；
+        // CI 的 `runneradmin` 走短名展开，形态必然不同 → 前缀匹配失败。
+        //
+        // 这不只是测试问题：真实场景里用户匹配的项目文件常常还没创建，
+        // 一样会掉进这个不对称分支，导致项目记忆静默失效。
+        //
+        // 解法：**统一走「解析存在的祖先 + 拼接剩余部分」**，
+        // 不再依赖 canonicalize 整体成功。这样两侧无论存不存在都得到同一形态。
+        let norm = |p: &Path| -> PathBuf { Self::canonicalize_with_missing_tail(p) };
 
         let mut best: Option<(usize, String, String)> = None; // (source_len, name, memory)
 
@@ -350,7 +448,12 @@ impl MemoryStore {
                     continue;
                 }
                 let pc = norm(p);
-                if pc.starts_with(&src_cmp) {
+                // ⚠️ 用 `path_has_prefix` 而不是 `Path::starts_with`：
+                //   - 前者是**按组件**比较，`D:\myword` 不会误匹配 `D:\mywordx`
+                //   - 前者在 Windows 上**大小写不敏感**（canonicalize 可能产出
+                //     与 source.ref 不同大小写的形式）
+                //   - 后者只比字符串前缀，上述两种情况都会判错
+                if crate::permission::path_has_prefix(&pc, &src_cmp) {
                     let len = src_cmp.as_os_str().len();
                     if best.as_ref().map(|(l, _, _)| len > *l).unwrap_or(true) {
                         best = Some((len, name.clone(), mem.clone()));
@@ -590,7 +693,26 @@ mod tests {
     use super::*;
 
     fn fresh_store(tag: &str) -> (MemoryStore, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("orbcat_mem_{tag}"));
+        // ⚠️ 目录名必须**每次调用唯一**（2026-10-10 修）。
+        //
+        // 原来只有 tag：`orbcat_mem_daily` / `orbcat_mem_proj` / …，且开头无条件
+        // `remove_dir_all`。`cargo test` 默认**多线程并行**，多个测试共用同一进程时，
+        // 只要 tag 撞上就会互相删掉对方刚写的文件 —— 症状随机：本地串行跑全绿，
+        // CI 上并行度不同就偶发失败。`project_memory_longest_prefix_wins` 就是这么挂的。
+        //
+        // 修法：tag 后缀加纳秒时间戳 + 线程 id，同进程内也不重名。
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let thread = format!("{:?}", std::thread::current().id())
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "");
+        let dir = std::env::temp_dir().join(format!(
+            "orbcat_mem_{tag}_{}_{}_{}",
+            std::process::id(),
+            thread,
+            uniq
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         (MemoryStore::new(&dir), dir)
@@ -660,10 +782,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
+    // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
+    // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
+    // 2026-10-10 由 macos-14 runner 抓出。
     #[test]
     fn project_memory_longest_prefix_wins() {
         let (s, dir) = fresh_store("proj");
-        let root = std::env::temp_dir().join(format!("fa_proj_src_{}", std::process::id()));
+        // ⚠️ 目录名必须**每次唯一**。这里原本只用 `process::id()`，而同一进程内
+        //    有多个测试都建 `fa_proj_src_<pid>` —— 并行执行时会互相覆盖/删除，
+        //    导致 `canonicalize()` 拿到已被删的路径 → 匹配失败。
+        //    2026-10-10 由 GitHub Actions windows runner 抓出（本地串行跑看不出）。
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("fa_proj_src_{}_{}", std::process::id(), uniq));
         let deep = root.join("sub");
         std::fs::create_dir_all(&deep).unwrap();
 
@@ -690,6 +824,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// 路径形态不对称时，项目记忆必须照样命中（2026-10-10 真实缺陷回归测试）
+    ///
+    /// ## 缺陷本身
+    ///
+    /// 旧实现对比较的两侧用同一条规则：
+    ///
+    /// ```text
+    /// strip_verbatim(p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+    /// ```
+    ///
+    /// 但**两侧能不能 canonicalize 成功是不对称的**：
+    ///
+    /// - `source.ref` 指向的目录**总是存在** → 成功。Windows 上 `canonicalize`
+    ///   走 `GetFinalPathNameByHandle`，会**展开重解析点与 8.3 短名**：
+    ///   `C:\Users\RUNNER~1\...` → `C:\Users\runneradmin\...`
+    /// - 待匹配的**文件常常还不存在**（用户说「这个项目」时文件可能还没建）
+    ///   → 失败 → 原样返回，**形态没被归一**
+    ///
+    /// 于是只要两侧指向同一个真实位置、但写法不同，前缀比较必然失败，
+    /// 用户看到的现象是「项目记忆突然不生效」，而且**没有任何报错**。
+    ///
+    /// ## 为什么本机能复现
+    ///
+    /// GitHub `windows-latest` 的 TEMP 是 `C:\Users\RUNNER~1\...`（8.3 短名），
+    /// canonicalize 必然把它展开。而本机 C: 盘 `NtfsDisable8dot3NameCreation=1`，
+    /// 8.3 短名压根没生成，所以本地永远碰巧通过 —— 这也是前两轮盲修
+    /// （先猜「目录竞态」、后猜「短名」）都改不对的原因。
+    ///
+    /// 这里改用**目录联接（junction）** 复现**同一类**不对称：
+    /// `source.ref` 存联接路径（存在 → 被解析成 `real`），
+    /// 而查询文件不存在（保持联接形态）。普通 Windows 本地就能稳定复现。
+    #[cfg(windows)]
+    #[test]
+    fn project_memory_matches_across_path_forms() {
+        let (s, dir) = fresh_store("proj_form");
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let base = std::env::temp_dir().join(format!("fa_form_{}_{}", std::process::id(), uniq));
+        let real = base.join("real");
+        let deep = real.join("sub");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        // 建不出联接（策略/权限）就跳过并如实打印，不假装通过。
+        let link = base.join("link");
+        if let Err(e) = std::os::windows::fs::symlink_dir(&real, &link) {
+            eprintln!(
+                "跳过：当前环境不允许创建目录联接（{e}）—— 本用例覆盖的正是同一类路径形态不对称"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let mk = |name: &str, src: &Path, mem: &str| {
+            let p = dir.join("projects").join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("source.ref"), src.display().to_string()).unwrap();
+            std::fs::write(p.join("MEMORY.md"), mem).unwrap();
+        };
+        // 关键：`outer` 的 source.ref 存的是**联接路径**形态
+        mk("outer", &link, "外层项目记忆");
+        mk("inner", &deep, "内层项目记忆");
+
+        // 查询文件**不存在** → 旧实现在这里保持联接形态，永远匹配不上
+        let hit = s
+            .match_project_memory(&[&link.join("sub").join("file.txt")])
+            .expect("联接形态 + 未创建的文件，也应命中项目记忆");
+        assert_eq!(hit.0, "inner", "最长前缀应选中 inner");
+        assert!(hit.1.contains("内层项目记忆"));
+
+        let hit2 = s
+            .match_project_memory(&[&link.join("other.txt")])
+            .expect("联接形态也应命中外层");
+        assert_eq!(hit2.0, "outer");
+
+        // ⚠️ 清理顺序：必须先 `remove_dir` 掉联接**本身**（不递归），
+        //    否则 `remove_dir_all` 会顺着联接把 `real` 里的内容一起删掉。
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
 
     #[test]
     fn project_memory_missing_source_or_empty_mem_is_skipped() {

@@ -4463,6 +4463,120 @@ interface FgCtx {
   file: string | null;
 }
 
+/**
+ * 前台上下文的能力级别（对应 Rust 侧 `platform::ContextCapability`）。
+ *
+ * macOS 上「知道你在哪个 app」和「知道你在编辑哪个文件」是两个权限级别，
+ * 所以这里要区分 `appOnly` 与 `full`，据此决定要不要引导用户授权。
+ * Windows 恒为 `full`（不需要任何系统权限），这段逻辑在 Windows 上不会触发。
+ */
+interface ContextCapability {
+  level: "unavailable" | "appOnly" | "full";
+  detail: string;
+  canRequest: boolean;
+  needsSystemSettings: boolean;
+}
+
+/** 能力级别缓存。Windows 上第一次问完就固定了；macOS 上会随用户授权而变。 */
+let fgCapability: ContextCapability | null = null;
+/** 用户已明确点过「不再提示」—— 不管是授权成功还是主动拒绝 */
+let fgCapabilityDismissed = false;
+/** 正在等用户在系统设置里勾选，轮询期间不重复弹引导 */
+let fgAwaitingSystemSettings = false;
+
+/**
+ * 拉一次能力级别（带缓存）。
+ *
+ * 只有 `appOnly` 且用户还能授权时才会真的问 Rust；拿到 `full` 之后缓存起来，
+ * 不再产生任何 IPC —— 这是这条路径在 Windows 上零开销的原因。
+ */
+async function fetchCapability(force = false): Promise<ContextCapability | null> {
+  if (!force && fgCapability && fgCapability.level !== "appOnly") return fgCapability;
+  try {
+    const c = await withTimeout(
+      invoke<ContextCapability>("context_capability"),
+      1500,
+      null as ContextCapability | null,
+    );
+    if (c) fgCapability = c;
+    return c;
+  } catch {
+    return fgCapability;
+  }
+}
+
+/**
+ * 请求辅助功能授权。
+ *
+ * ⚠️ macOS 的辅助功能授权是**两步**：先弹框点「允许」，**再去
+ * 「系统设置 → 隐私与安全性 → 辅助功能」手动勾选 orbcat**。
+ * 所以点完「允许」只是开始 —— 这里转成「等待中」状态并开始轮询，
+ * 用户勾完回来引导条会自动变成完整版。
+ */
+async function requestFgPermission(): Promise<void> {
+  try {
+    await invoke("request_context_permission");
+  } catch {
+    // 非 macOS 或用户拒绝：走降级，不打扰
+    fgCapabilityDismissed = true;
+    return;
+  }
+  fgAwaitingSystemSettings = true;
+  // 轮询：用户去系统设置勾选可能要几十秒，10 秒一次足够，别太频繁
+  const poll = setInterval(() => {
+    void (async () => {
+      const c = await fetchCapability(true);
+      if (!c) return;
+      if (c.level === "full") {
+        clearInterval(poll);
+        fgAwaitingSystemSettings = false;
+        void refreshFgCtx(false);
+      }
+    })();
+  }, 10_000);
+  // 5 分钟后放弃等待，恢复普通展示
+  setTimeout(() => clearInterval(poll), 5 * 60_000);
+}
+
+/**
+ * macOS 渐进式授权的引导条。
+ *
+ * ## 为什么是「渐进」而不是启动就弹
+ *
+ * 启动就弹窗的话，用户第一次打开 orbcat 就看到一个
+ * 「orbcat 想要控制这台电脑」—— 他不知道为什么要给，多半直接拒绝，
+ * 然后这个功能就永远没了。
+ *
+ * 渐进的做法是：**只在用户真的需要它的那一刻**才提示 —— 也就是
+ * 「他说『帮我改一下这个』，而我知道他在 VSCode 但不知道具体文件」的时候。
+ * 那时他已经体验到 orbcat 的价值，自然愿意给。
+ *
+ * @returns 引导条的 HTML，null 表示不需要展示
+ */
+async function fgPermissionPromptHtml(): Promise<string | null> {
+  if (fgCapabilityDismissed) return null;
+
+  const cap = await fetchCapability();
+  // Windows / 已授权 / 拿不到能力信息 —— 都不提示
+  if (!cap || cap.level !== "appOnly" || !cap.canRequest) return null;
+
+  // 已经点过授权、正等用户去系统设置勾选 —— 换成「等待中」文案
+  if (fgAwaitingSystemSettings) {
+    return `<div class="fg-row fg-perm fg-perm-wait">
+      <span class="fg-eye">👁</span>
+      <span class="fg-label">请到「系统设置 → 隐私与安全性 → 辅助功能」勾选 orbcat，勾完这里会自动更新</span>
+      <button class="fg-perm-btn" id="fg-perm-open">打开设置</button>
+    </div>`;
+  }
+
+  return `<div class="fg-row fg-perm">
+    <span class="fg-eye">👁</span>
+    <span class="fg-label">${esc(cap.detail)}</span>
+    <button class="fg-perm-btn" id="fg-perm-ask">授权</button>
+    <button class="fg-perm-x" id="fg-perm-no" title="不用了">✕</button>
+  </div>`;
+}
+
 /** 指示条最多显示几条（Rust 侧保留 6 条） */
 const FG_SHOW_MAX = 6;
 /** 列表是否展开：折叠时只显示第一条 + 「+N」角标，点角标翻开/收起 */
@@ -4494,8 +4608,7 @@ async function refreshFgCtx(loop = true): Promise<void> {
       // 空态不隐藏整体 —— 显示提示，避免用户以为功能没了
       el.innerHTML = `<div class="fg-row fg-empty">👁 还没记录到其他应用（切到 VSCode/Typora 再回来看）</div>`;
       el.style.display = "block";
-    } else {
-      const rowHtml = (c: FgCtx, i: number) => {
+    } else {      const rowHtml = (c: FgCtx, i: number) => {
         const where = c.file || c.dir || "";
         const base = where
           ? (where.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? where)
@@ -4530,6 +4643,25 @@ async function refreshFgCtx(loop = true): Promise<void> {
       tg?.addEventListener("click", (e) => {
         e.stopPropagation();
         fgExpanded = !fgExpanded;
+        void refreshFgCtx(false);
+      });
+    }
+
+    // macOS 渐进式授权引导（Windows 上永远返回 null，是死代码）
+    const permHtml = await fgPermissionPromptHtml();
+    if (permHtml) {
+      el.insertAdjacentHTML("beforeend", permHtml);
+      document.getElementById("fg-perm-ask")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void requestFgPermission().then(() => refreshFgCtx(false));
+      });
+      document.getElementById("fg-perm-open")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void invoke("open_accessibility_settings").catch(() => {});
+      });
+      document.getElementById("fg-perm-no")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        fgCapabilityDismissed = true;
         void refreshFgCtx(false);
       });
     }
