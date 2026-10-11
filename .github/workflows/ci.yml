@@ -11,7 +11,8 @@
 #
 # | job | 平台 | 验证什么 |
 # |---|---|---|
-# | `build-windows` | windows-latest | Windows 版没有回归（505 个测试 + tsc + vitest） |
+# | `build-windows` | windows-latest (x64) | Windows 版没有回归（506 个测试 + tsc + vitest） |
+# | `build-windows-arm` | windows-11-arm (arm64) | Windows ARM64 版能编出可执行文件 |
 # | `build-macos` | macos-14 (arm64) | **Mac 版能编译**（本次的核心目的） |
 #
 # ## 注意：这里只编译，不跑测试
@@ -144,5 +145,78 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: orbcat-macos-arm64-debug
+          path: out/
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Windows ARM64 —— 原生 ARM Windows（Snapdragon X / Azure Cobalt 等）
+  #
+  # 与 `build-windows` 的分工：那边跑完整回归（506 个测试），这边只回答**一个**
+  # 问题 ——「这个 crate 在 ARM64 下能不能编出可执行文件」。
+  #
+  # 这**不是**把 x64 job 复制一遍改个 label。Win32 FFI 集中在
+  # `platform/windows.rs`、`capture.rs`（GDI）、`win32desk.rs`，而 Windows API
+  # 并非每个都有 arm64 变体；链接器还要 MSVC 的 ARM64 工具链。所以这是一个
+  # 真会独立失败的验证点，值得单独一个 job。
+  #
+  # runner 是 GitHub 官方的 Windows 11 arm64 镜像（Azure Cobalt 100 / 4 vCPU）。
+  # 公开仓库免费，不消耗付费配额；私有仓库要用更大的付费 arm runner。
+  # ---------------------------------------------------------------------------
+  build-windows-arm:
+    name: Windows (arm64)
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: npm ci
+        run: npm ci
+
+      # lib 一层过不了就别谈产物了：crate 里绝大多数 win32 绑定都在 lib。
+      - name: Rust check (lib)
+        run: cargo check --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Rust build (bin)
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin orbcat
+
+      # ⚠️ 不看这个，job 绿了也可能白绿 —— 得确认产物**真的是 ARM64**，
+      #   而不是「编过了但拿了个别的东西」。直接读 PE 头的 machine 字段：
+      #     0xAA64 = IMAGE_FILE_MACHINE_ARM64   0x8664 = IMAGE_FILE_MACHINE_AMD64
+      #   PE 头的偏移在 e_lfanew（文件偏移 0x3C），machine 在 COFF 头开头，
+      #   即 e_lfanew + 4。
+      - name: Package + verify ARM64
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item src-tauri/target/debug/orbcat.exe out/orbcat-windows-arm64.exe
+          $len = (Get-Item out/orbcat-windows-arm64.exe).Length
+          Write-Output "size = $len bytes"
+          $bytes = [System.IO.File]::ReadAllBytes("out/orbcat-windows-arm64.exe")
+          $pe = [System.BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [System.BitConverter]::ToUInt16($bytes, $pe + 4)
+          Write-Output ("PE machine = 0x{0:X4}" -f $machine)
+          if ($machine -ne 0xAA64) {
+            throw ("产物不是 ARM64！machine=0x{0:X4}，期望 0xAA64" -f $machine)
+          }
+          Write-Output "确认：ARM64 PE"
+
+      # 不跑 506 个测试 —— 它们已在 x64 上跑过，重跑是纯开销。
+      # 这里要回答的是「能不能编」，不是「行为对不对」。
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbcat-windows-arm64-debug
           path: out/
           retention-days: 14
