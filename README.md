@@ -1,8 +1,8 @@
 # orbcat
 
-> 悬浮球形态的私人 agent —— 一个记得住你的 Windows 桌面助手。
+> 悬浮球形态的私人 agent —— 一个记得住你的桌面助手。
 >
-> **v1.0.0**（2026-10-09）
+> **v1.0.0**（2026-10-09）· Windows / macOS 双平台
 
 orbcat 平时是屏幕上的一颗小球，点开是一个能读文件、跑命令、查网页、写日记的
 agent。它和通用 AI 助手的区别在于两件事：**它记得你是谁**，以及**它把你的偏好
@@ -41,13 +41,34 @@ agent。它和通用 AI 助手的区别在于两件事：**它记得你是谁**�
 | **一整套配好的东西**（技能范围 + 模型槽位 + 权限预设 + 脚本工具） | 设置 › 项目，写 `projects/<名>/project.json` | ❌ |
 
 > **stdio 与 http 在权限上完全同权** —— 都走 `mcp__<server>__<tool>` 命名、
-> 同一段执行分支（权限卡 + 执行档位判定）。stdio 只是省掉了"额外起一个 HTTP 网关"。
+> 同一段执行分支（权限卡 + 执行档位判定）。stdio 只是省掉了"额外起一个 HTTP 网关"：
+> 它填 `command` / `args`，由 orbcat 拉子进程走 stdin/stdout 的 JSON-RPC，
+> **不新增信任面**，只是换了个"怎么把 JSON-RPC 送过去"的通道。
+>
+> 命名口径（2026-10-10 定）：**一个 server 一个组，组名 = server id，工具名原样透传**。
+> 网关内部怎么命名工具是网关自己的事，orbcat 不反解、不剥前缀 —— 模型看到什么名字
+> 就调什么名字，展示名与实际可调用的全名**永远一致**。
 
-设计取舍与边界见 [`docs/compose/spec/plugin-feasibility.md`](../docs/compose/spec/plugin-feasibility.md)
-与 [`docs/compose/spec/composable-project-bundle.md`](../docs/compose/spec/composable-project-bundle.md)。
 **代码级插件（原生 dylib / 任意 hook）明确不做** —— Rust 没有稳定 ABI，
 且 dylib 一旦加载就在进程内，会让三层权限闸门全部失效。**MCP 就是我们的"代码级插件"**：
 进程隔离、语言无关、崩溃不带走宿主。
+
+### 内置技能（骨架自带，不用手动装）
+
+`src-tauri/skeleton/` 是**声明式安装器**：一份 `manifest.json` 列出要落到
+`agent-data/` 的哪些目录与文件，构建期编进二进制，`build.rs` 负责拷。
+清单是**白名单**——声明了但文件不存在，构建直接失败。
+
+骨架自带三个技能：
+
+| 技能 | 干什么 |
+|---|---|
+| `dual-token-dashboard` | 把 token 用量日志渲染成可交互面板 |
+| `token-usage-report` | 生成 token 用量报告 |
+| `self-rebuild` | 教 agent 怎么重新构建 orbcat 自己（含火绒信任区等本机坑） |
+
+> 改骨架后新增文件，**必须**同时在 `manifest.json` 的 `assets` 里声明，
+> 否则不会被打包。校验：CI 里的 `npm run check:no-user-data`（含骨架白名单检查）。
 
 ---
 
@@ -58,10 +79,23 @@ agent。它和通用 AI 助手的区别在于两件事：**它记得你是谁**�
 新克隆的仓库里**没有** `agent-data/`，而模型配置又存在 `agent-data/` 里 ——
 要 agent 自己建目录会撞上死锁。所以拆成两段：
 
-**第一段（纯 Rust，不需要模型）**
+**第一段（不需要模型，按钮直接调后端）**
 
-启动 orbcat，点界面上的**「建出目录结构」**按钮。它会建好 8 个目录 +
-空的 `models.json` + 默认 `settings.json`。
+启动 orbcat，空态上点**「建出目录结构」**。这一步**不让模型参与** ——
+要跑模型得有 `models.json`，而 `models.json` 就在还没建出来的 `agent-data/` 里，
+让 agent 自己建就是死锁。所以按钮 `bootstrap_data` 直连 Rust 干活：
+
+- 建出 8 个目录：`daily` / `images` / `memory` / `pending` / `projects` /
+  `screenshots` / `sessions` / `skills`
+- 写空的 `models.json` + 默认 `settings.json`
+- 顺带**装好内置技能**（`dual-token-dashboard` / `self-rebuild` /
+  `token-usage-report`）与 `memory/MEMORY.md` 等模板
+
+> 目录与文件清单**不在 Rust 里硬编码** —— 它来自 `skeleton/manifest.json`，
+> 由 `build.rs` 在构建期生成 `SKELETON_DIRS` / `SKELETON_ASSETS`。
+> 已存在的文件**一律不覆盖**（用户可能改过）。
+>
+> 建完会自动弹出模型管理窗口，直接接着下一步。
 
 **第二段（需要模型，由 agent 完成）**
 
@@ -235,13 +269,15 @@ orbcat 能读写你的文件、跑命令，所以权限是分层的，**默认�
 |---|---|
 | **隐形桌面没有合成键鼠** | 「后台模式」能建一张你看不见的桌面并真跑 GUI 程序（实测 WPS 打开 docx 导出 PDF），但**跨桌面注入键鼠被内核拒绝**。因此后台模式的输入通道必须是应用自身的自动化接口（COM / CLI / UIA Pattern / HTTP） |
 | **UIA 选区对 Electron 不可靠** | VSCode 需 `--force-renderer-accessibility` 启动且不稳定；Typora 本机为改造版。Win32/WinUI 完全可用 |
-| **命令策略编辑器未接 UI** | 后端 `perm_cmd_policy` / `perm_path` / `perm_grants_list` 命令已就绪，设置页界面待接 |
+| **命令策略编辑器未接 UI** | ~~后端命令已就绪，界面待接~~ **已接**：设置页可编辑白名单与硬阻断表，保存写 `command_policy.json` 并立即生效 |
 | **deny 时不隐藏工具** | 策略为 deny 的工具仍会出现在工具列表里（尚未做可见性过滤） |
 | **PTC 需要本机 Node** | PTC 模式把工具调用写成 TypeScript 程序执行，需要**支持原生类型擦除**的 Node（即 `.ts` 能被直接 `import`）。探测顺序：`ORBCAT_NODE` 环境变量 → PATH → 常见安装位置。找不到或版本过旧时 `run_code` 会给出明确提示，而不是静默失败 |
 | **PTC 子调用有硬上限** | 一次 `run_code` 最多 500 次子调用、同时最多 10 个在飞、程序输出 64 KB 上限。前两条是防模型写错循环条件（否则会无限调用且不会自己停） |
 | **数据源的 `command` 会自动执行** | `kind: command` 的数据源在**构建 prompt 时**跑（不是模型调才跑），信任面比 MCP 大。因此默认 `enabled: false`，必须显式打开；有 15 秒超时，失败只显示一行错误、不打断对话 |
 | **数据源不做 `kind: mcp`** | MCP 工具模型本来就能直接调，再包一层只会多一条会过期的副本。数据源只解决"系统主动呈现"，不重复能力面 |
-| **仅 Windows** | 大量 Win32 FFI（`capture.rs` / `win32.rs` / `win32desk.rs`），无跨平台计划 |
+| **macOS 无障碍权限需手动授权** | Mac 版前台上下文靠 Accessibility 授权，CI / 无 GUI 会话下 `osascript` 调用会失败并降级为"拿不到前台信息"（**预期行为**）。授权弹窗与系统设置跳转需在有人的 Mac 上手动走查 |
+| **macOS 部分原生能力是 no-op** | `set_no_activate` / `keep_topmost_without_activating` / `force_foreground` 在 macOS 上是空实现，`.lnk` 解析、HKCU 注册表读写同理 |
+| **Linux 等其余平台只能编译，不能用** | `platform/stub.rs` 让任何 target 都过得了 `cargo check`，但**全部 no-op**：orbcat 能跑，没有"知道你在用哪个 app"的能力 |
 
 ---
 
@@ -265,17 +301,20 @@ orbcat/
 │   │   ├── perm_request.rs  权限申请卡
 │   │   ├── sessions.rs      会话持久化
 │   │   ├── mcp.rs           MCP 网关
-│   │   ├── win32.rs / win32desk.rs / capture.rs   原生能力
+│   │   ├── context.rs       前台上下文采集（跨平台）
 │   │   ├── recovery.rs      备份 / 回收站还原
 │   │   ├── modes.rs         模式（组可见性 + 工具呈现方式）
 │   │   ├── ptc.rs           PTC：把工具调用写成程序（Node 子进程 + SDK）
-│   │   └── life.rs          数据源：认知面注入（读快照 / 跑命令）
+│   │   ├── life.rs          数据源：认知面注入（读快照 / 跑命令）
+│   │   └── platform/        **平台抽象层**（见下）
+│   ├── skeleton/            内置技能骨架（manifest.json 声明式安装）
 │   └── Cargo.toml
 ├── tests/
-│   ├── ui/                  vitest（happy-dom）
+│   ├── ui/                  vitest（happy-dom，16 文件）
 │   └── e2e/                 真实链路（mock / live）
 ├── tools/
 │   ├── build-release.sh         发布构建
+│   ├── check-no-user-data.mjs    防夹带闸门（CI + npm test 都跑）
 │   ├── install-shortcut.ps1     装/修/体检桌面快捷方式
 │   ├── orbcat-launch.vbs        无控制台入口（快捷方式指向它）
 │   └── orbcat-launch.ps1        运行时挑出"能用的那份"构建
@@ -284,15 +323,29 @@ orbcat/
 └── CHANGELOG.md
 ```
 
+### 平台抽象层
+
+`platform/mod.rs` 按 target 做一次 `pub use`，三个实现：
+
+| 文件 | 适用 | 说明 |
+|---|---|---|
+| `platform/windows.rs` | Windows | 完整实现（前台窗口、HKCU、编码、`.lnk` 解析、置顶不抢焦点…） |
+| `platform/macos.rs` | macOS | 前台窗口（AppleScript）、Accessibility 授权与设置跳转；部分能力 no-op |
+| `platform/stub.rs` | 其余（Linux/BSD） | 全部 no-op，只为让任何 target 过得了 `cargo check` |
+
+> macOS 上真正要接无障碍是 AT-SPI 之外的路子（AppleScript / AX API），
+> Linux 若要支持应新建 `platform/linux.rs` 接 AT-SPI2，**不要复用 stub**。
+
 ---
 
 ## 七、测试
 
 ```bash
-npm test              # 前端 + Rust 全跑
-npm run test:ui       # vitest（8 文件 / 51 用例）
-npm run test:rust     # cargo test --lib（310 用例）
+npm test              # 防夹带闸门 + 前端 + Rust 全跑
+npm run test:ui       # vitest（16 文件 / 112 用例）
+npm run test:rust     # cargo test --lib（532 用例）
 npx tsc --noEmit      # 类型检查
+npm run check:no-user-data   # 防夹带闸门：用户数据不进产物
 ```
 
 E2E：
@@ -313,3 +366,45 @@ npm run test:e2e:live   # 真实链路
 > ⚠️ TLS 必须用 native-tls（Windows SChannel），**不能用 rustls**。
 > 2026-09-21 实测：`ark.cn-beijing.volces.com` 在 rustls 下 body ≥16KB 会超时，
 > 同请求在 SChannel 下正常。
+
+---
+
+## 九、CI（跨平台编译验证）
+
+`.github/workflows/ci.yml`。**目的是回答「macOS 能不能编译」** —— 本机是 Windows，
+`cargo check --target aarch64-apple-darwin` 会卡在 Tauri 自己的
+`objc2-exception-helper`（需要 Xcode 的 Objective-C 编译器），唯一可靠的验证
+方式是**在真实 macOS runner 上跑**。
+
+| job | 平台 | 验证什么 |
+|---|---|---|
+| `build-windows` | windows-latest (x64) | 防回归：532 个 Rust 测试 + 112 个前端测试 + tsc + 防夹带闸门，然后出包 |
+| `build-windows-arm` | windows-11-arm (arm64) | 能编出**真的是 ARM64** 的可执行文件（读 PE 头 `machine == 0xAA64` 断言，不是"编过了"就算） |
+| `build-macos` | macos-14 (arm64) | **Mac 版能编译**（本次抽象的核心目的）+ 跑 lib 测试 |
+
+三个 job 各自产出可下载的 artifact（保留 14 天）：
+
+- `orbcat-windows-x64-debug`
+- `orbcat-windows-arm64-debug`
+- `orbcat-macos-arm64-debug`
+
+> ⚠️ **macOS 上跑不了前台上下文相关测试** —— 那些需要真实 Accessibility 授权与
+> 前台窗口，CI 没有 GUI 会话。`platform/macos.rs` 的 `osascript` 调用失败后降级，
+> 这是**预期行为**。23 个 Windows-only 测试已加 `#[cfg(windows)]` 门。
+
+> ⚠️ **macOS 产物未签名未公证**，Gatekeeper 会拦（需 右键 → 打开，
+> 或 `xattr -d com.apple.quarantine`）。这与 Windows 侧"改前端不用重编 Rust"
+> 是两回事：macOS 还没有 `build-release.sh` 那样的外置前端流程，
+> CI 里走的是标准 `npm run build` + `cargo build`。
+
+### 手动触发 CI
+
+**`ci.yml` 只配了 `master` 分支触发。** 推 feature 分支**不会自动跑 CI**：
+
+```bash
+# feature 分支上推完想验证，手动触发：
+gh workflow run ci.yml --ref <你的分支>
+```
+
+> 如果希望 feature 分支推送即触发，往 `on.push.branches` 里加 `feat/**`
+> （当前只有 `[master]`）。
