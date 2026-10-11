@@ -78,6 +78,15 @@ jobs:
       - name: Unit tests (frontend)
         run: npx vitest run
 
+      # ⚠️ 必须在下面任何 cargo 命令**之前**跑（2026-10-11 实测踩坑）。
+      #   tauri-build 在编译期就解析 bundle.resources，而 ResourcePaths::from_map
+      #   走的是 Walk（递归列目录）不是 glob —— 源目录不存在就直接
+      #   `error: resource path '../dist' doesn't exist`，build script exit 101。
+      #   dist/ 又在 .gitignore 里，CI 全新 checkout 时根本没有它。
+      #   所以「前端是构建产物」这件事要求：先 build，再碰 cargo。
+      - name: Frontend build (dist must exist before cargo)
+        run: npm run build
+
       - name: Rust check
         run: cargo check --manifest-path src-tauri/Cargo.toml --lib
 
@@ -90,9 +99,6 @@ jobs:
       # ⚠️ exe 必须与 dist/ 同目录分发 —— 见 tools/build-release.sh 的说明。
       #   tauri.conf.json 的 frontendDist 指向 ./stub-dist，那是编译期嵌进二进制的；
       #   而 build-release.sh 约定运行时再放一份真 dist/ 在 exe 旁边。**两份都要**。
-      - name: Frontend build
-        run: npm run build
-
       - name: Rust build (bin)
         run: cargo build --manifest-path src-tauri/Cargo.toml --bin orbcat
 
@@ -144,6 +150,15 @@ jobs:
 
       - name: No-user-data gate
         run: npm run check:no-user-data
+
+      # ⚠️ 必须在下面任何 cargo 命令**之前**跑（2026-10-11 实测踩坑）。
+      #   tauri-build 在编译期解析 bundle.resources，ResourcePaths::from_map
+      #   走 Walk（递归列目录）不是 glob —— 源目录不存在直接
+      #   `error: resource path '../dist' doesn't exist`，build script exit 101。
+      #   dist/ 在 .gitignore 里，全新 checkout 根本没有它。
+      #   这个 job 之前压根没有 build 前端，所以一 push 就全红。
+      - name: Frontend build (dist must exist before cargo)
+        run: npm run build
 
       # ★ 这一步是本次 CI 的核心：证明 `platform/` 抽象层在真实 macOS 上成立。
       #   在此之前，crate 因为 win32.rs / capture.rs / context.rs 里的裸 FFI
@@ -254,6 +269,11 @@ jobs:
 
       - name: No-user-data gate
         run: npm run check:no-user-data
+
+      # ⚠️ 必须在 cargo 之前跑（2026-10-11 实测踩坑）：tauri-build 编译期解析
+      #   bundle.resources，源目录 ../dist 不存在直接 exit 101；dist 在 .gitignore。
+      - name: Frontend build (dist must exist before cargo)
+        run: npm run build
 
       # lib 一层过不了就别谈产物了：crate 里绝大多数 win32 绑定都在 lib。
       - name: Rust check (lib)
