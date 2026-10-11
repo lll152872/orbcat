@@ -187,40 +187,48 @@ jobs:
       # ── 出包：.app + .dmg ─────────────────────────────────
       # 未签名 + 未公证，Gatekeeper 会拦 —— 这是预期的，
       #   试用时需 右键 → 打开，或用 xattr -d com.apple.quarantine 解隔离。
+      # ⚠️ 必须显式带 `app`：`--bundles dmg` 时 Tauri 会把打完 dmg 的中间
+      #    .app **删掉**（日志里有一行 `Cleaning .../bundle/macos/orbcat.app`），
+      #    只剩 dmg 一个文件。下面的校验步骤要看 .app 内部结构，所以两个都要。
       #
       # tauri build 内部会自己再跑一次 beforeBuildCommand（npm run build），
-      #   所以 dist/ 一定是当次构建的新鲜产物，不要在这里手工 npm run build。
-      - name: Bundle (dmg, unsigned)
+      #   所以 dist/ 一定是当次构建的新鲜产物。
+      - name: Bundle (app + dmg, unsigned)
         run: |
-          npm run tauri -- build --bundles dmg
+          npm run tauri -- build --bundles app,dmg
           echo "=== bundle output ==="
-          ls -lh src-tauri/target/release/bundle/dmg/ || true
-          ls -lh src-tauri/target/release/bundle/macos/ || true
+          ls -lh src-tauri/target/release/bundle/dmg/
+          ls -lh src-tauri/target/release/bundle/macos/
 
       # ⚠️ 别只看 job 绿了就说成功 —— 一个 dist 没进包的 .dmg 也是绿的，
-      #   装上去打开是白窗。这里把 .app 的实际结构打出来核对：
-      #   dist 必须在 Contents/Resources/dist/index.html（见 disk_assets.rs
-      #   的 compute_dist_dir：.app 里 exe 与 Resources 不同目录）。
+      #   装上去打开是白窗（回退到 stub-dist 占位页）。
+      #   这里把 .app 实际结构打出来核对：dist 必须在
+      #   Contents/Resources/dist/index.html —— 见 disk_assets.rs 的
+      #   compute_dist_dir：.app 里 exe（Contents/MacOS/）与 Resources 不同目录。
       - name: Verify .app contains dist
         run: |
           APP="src-tauri/target/release/bundle/macos/orbcat.app"
           if [ ! -d "$APP" ]; then
-            echo "找不到 .app：$APP"; exit 1
+            echo "FAIL: 找不到 .app：$APP"; exit 1
           fi
-          echo "=== .app 顶层 ==="
+          echo "=== .app/Contents ==="
           ls -la "$APP/Contents"
           echo "=== Contents/MacOS ==="
           ls -la "$APP/Contents/MacOS"
+          echo "=== Contents/Resources（dist 应在此） ==="
+          ls -la "$APP/Contents/Resources" || true
           if [ ! -f "$APP/Contents/Resources/dist/index.html" ]; then
             echo "FAIL: .app 里没有 Contents/Resources/dist/index.html —— 装上去会是白窗"
-            echo "   实际 Resources 内容："
-            ls -la "$APP/Contents/Resources" || true
             exit 1
           fi
           echo "OK: dist 已进包 Contents/Resources/dist/index.html"
+          echo "=== dist 文件清单 ==="
+          find "$APP/Contents/Resources/dist" -type f | head -20
           echo "=== 二进制架构核对 ==="
           file "$APP/Contents/MacOS/orbcat"
           lipo -archs "$APP/Contents/MacOS/orbcat"
+          echo "=== dmg ==="
+          ls -lh src-tauri/target/release/bundle/dmg/
 
       - uses: actions/upload-artifact@v4
         with:
