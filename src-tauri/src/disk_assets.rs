@@ -125,8 +125,12 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
 
 /// 解析前端资源目录。
 ///
-/// 1. 发布形态：exe 同目录的 `dist/`
-/// 2. dev 构建：仓库根的 `dist/`（`cargo run` 时 exe 在 target/ 里，旁边没有 dist）
+/// 依次尝试：
+/// 1. **Windows 发布形态**：exe 同目录的 `dist/`
+/// 2. **macOS `.app` 包内**：`Contents/Resources/dist/`
+///    （Tauri 的 `bundle.resources` 把 `dist` 映射到 `Contents/Resources/dist`；
+///    exe 自身在 `Contents/MacOS/`，两者**不同目录**，所以光看 exe 同目录必然落空）
+/// 3. **dev 构建**：仓库根的 `dist/`（`cargo run` 时 exe 在 target/ 里，旁边没有 dist）
 ///
 /// 都找不到就返回 `None` → 走编译期嵌入资源（即 `stub-dist` 占位页）。
 ///
@@ -148,9 +152,21 @@ pub fn dist_dir_status() -> String {
 fn compute_dist_dir() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
+            // 1. Windows 发布形态：exe 同目录的 dist/
             let d = dir.join("dist");
             if d.join("index.html").is_file() {
                 return Some(d);
+            }
+            // 2. macOS .app 包内：dist 被映射到 Contents/Resources/dist，
+            //    exe 在 Contents/MacOS/ —— 必须从 .app 根往上两层拼，
+            //    只按 exe 同目录找会永远落空（表现为启动后白窗/占位页）。
+            if dir.file_name().is_some_and(|n| n == "MacOS") {
+                if let Some(app_root) = dir.parent().and_then(|c| c.parent()) {
+                    let d = app_root.join("Resources").join("dist");
+                    if d.join("index.html").is_file() {
+                        return Some(d);
+                    }
+                }
             }
         }
     }
