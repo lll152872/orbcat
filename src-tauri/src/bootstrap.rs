@@ -457,15 +457,38 @@ fn write_report(data_dir: &Path, r: &RunReport) -> Result<(), String> {
     let (y, m, d) = civil_today();
     let dir = data_dir.join(MIGRATIONS_DIR).join(y).join(m).join(d);
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建 {} 失败: {e}", dir.display()))?;
-    let path = dir.join(format!(
-        "orbcat-skeleton-{}-{}.json",
-        r.finished_at_ms,
-        std::process::id()
-    ));
+    // ⚠️ 文件名必须**保证不撞**。毫秒 + pid 不够：连续两次运行（用户双击
+    // 「建出目录结构」按钮、或失败后立刻重试）完全可能落在同一毫秒里，
+    // 那样第二次会直接覆盖第一次 —— 审计线索凭空少一条，且**完全静默**。
+    // 用户要的是「每次都写」，所以一份都不能丢。
+    // （macOS CI 上就是这么挂的：两次 bootstrap 落在同一毫秒，只剩一份。）
+    let stamp = now_nanos();
+    let mut path = dir.join(format!("orbcat-skeleton-{stamp}-{}.json", std::process::id()));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!(
+            "orbcat-skeleton-{stamp}-{}-{n}.json",
+            std::process::id()
+        ));
+        n += 1;
+        if n > 1000 {
+            return Err(format!(
+                "{} 下同名报告已超过 1000 份，拒绝继续写",
+                dir.display()
+            ));
+        }
+    }
     let txt =
         serde_json::to_string_pretty(r).map_err(|e| format!("序列化运行报告失败: {e}"))?;
     std::fs::write(&path, format!("{txt}\n"))
         .map_err(|e| format!("写入 {} 失败: {e}", path.display()))
+}
+
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 fn now_ms() -> u128 {
@@ -517,6 +540,67 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    /// 递归数 migrations/ 下有几份运行报告（不按日期分层假设）。
+    fn count_reports(d: &Path) -> usize {
+        fn rec(dir: &Path, n: &mut usize) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.filter_map(|e| e.ok()) {
+                if e.path().is_dir() {
+                    rec(&e.path(), n);
+                } else if e.file_name().to_string_lossy().starts_with("orbcat-skeleton-") {
+                    *n += 1;
+                }
+            }
+        }
+        let mut n = 0;
+        rec(&d.join(MIGRATIONS_DIR), &mut n);
+        n
+    }
+
+    fn latest_report(d: &Path) -> PathBuf {
+        fn rec(dir: &Path, best: &mut Option<(std::time::SystemTime, PathBuf)>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.filter_map(|e| e.ok()) {
+                let p = e.path();
+                if p.is_dir() {
+                    rec(&p, best);
+                } else if p.file_name().unwrap().to_string_lossy().starts_with("orbcat-skeleton-")
+                {
+                    let m = e.metadata().unwrap().modified().unwrap();
+                    if best.as_ref().map(|(t, _)| m > *t).unwrap_or(true) {
+                        *best = Some((m, p));
+                    }
+                }
+            }
+        }
+        let mut best = None;
+        rec(&d.join(MIGRATIONS_DIR), &mut best);
+        best.expect("应至少有报告").1
+    }
+
+    /// 回归：报告文件名不许互相覆盖。
+    ///
+    /// 这条是 macOS CI 上真挂过的 —— 连续两次 bootstrap 落在同一毫秒，
+    /// `{毫秒}-{pid}` 的文件名完全相同，第二次把第一次覆盖掉，审计记录
+    /// 凭空少一条且**没有任何提示**。用户要的是「每次都写」。
+    #[test]
+    fn repeated_runs_never_overwrite_a_report() {
+        let d = tmp("noclobber");
+        for i in 0..6 {
+            bootstrap_agent_data(&d).unwrap_or_else(|e| panic!("第 {i} 次应成功: {e}"));
+        }
+        assert_eq!(
+            count_reports(&d),
+            6,
+            "跑 6 次就该有 6 份报告 —— 少一份说明文件名撞了"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     // ── 首装 ────────────────────────────────────────────────────
@@ -849,20 +933,13 @@ mod tests {
         bootstrap_agent_data(&d).expect("首装应成功");
         // 真的跑第二次 —— 否则读到的是首装那份（skipped 为空），断言会假通过
         bootstrap_agent_data(&d).expect("二次应成功");
-        let (y, m, day) = civil_today();
-        let dir = d.join(MIGRATIONS_DIR).join(&y).join(&m).join(&day);
-        assert_eq!(
-            std::fs::read_dir(&dir).unwrap().count(),
-            2,
-            "跑两次就该有两份报告"
-        );
-        let latest = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("orbcat-skeleton-"))
-            .max_by_key(|e| e.metadata().unwrap().modified().unwrap())
-            .expect("应至少有报告")
-            .path();
+
+        // 递归数而不是只看当天目录：两次运行若跨了 UTC 零点，报告会分到两天，
+        // 只看 `civil_today()` 会读到 1 份而误判。
+        let reports = count_reports(&d);
+        assert_eq!(reports, 2, "跑两次就该有两份报告，实际 {reports}");
+
+        let latest = latest_report(&d);
         let rep: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(latest).unwrap()).unwrap();
 
