@@ -1371,8 +1371,10 @@ pub fn cap_steps(steps: &[StoredStep]) -> Vec<StoredStep> {
         let detail = if s.kind == "reasoning" || s.kind == "thought" {
             // 思考条目：**原文全留**，不截、不丢（见函数文档）
             s.detail.clone()
-        } else if s.kind == "text" || s.kind == "stream" {
+        } else if s.kind == "midturn" || s.kind == "text" || s.kind == "stream" {
             // 多轮流式正文按轮收进时间线 —— 回看要比 tool 参数更长一点
+            // ⚠️ `midturn`（2026-10-11）：模型中途写、然后接着调工具的正文。
+            //    `text` 保留是为了读**旧会话**的落盘数据 —— 那时它就这个名。
             cap_chars(&s.detail, 2000)
         } else {
             cap_chars(&s.detail, STEP_DETAIL_LIMIT)

@@ -73,7 +73,7 @@ describe("发送边界", () => {
     );
   });
 
-  it("跑完整轮收进默认折叠的「过程」，里面工具条目也各自折叠且展开可保持", async () => {
+  it("跑完：过程条目折成折叠行，默认闭合且展开状态可保持", async () => {
     await bootApp();
     await openPanel();
     await sendText("做点事");
@@ -84,21 +84,18 @@ describe("发送边界", () => {
       "finished",
     );
 
-    // 2026-10-02（用户："这个应该全部压缩掉啊"）：整轮收成一行「过程 · N 步」，
-    // **默认闭合** —— 回看时不该占十几行。
-    const proc = document.querySelector<HTMLDetailsElement>("details.run-process");
-    expect(proc, "跑完应出现「过程」外壳").toBeTruthy();
-    expect(proc!.open, "「过程」必须默认闭合").toBe(false);
-    expect(proc!.querySelector("summary")?.textContent).toContain("步");
-
-    // 外壳里面：工具调用/返回各折成一行，同样默认闭合
-    const tools = Array.from(proc!.querySelectorAll<HTMLDetailsElement>("details.tl-tool"));
+    // 2026-10-11 起跑完的轮次按类型段切分（照搬 WorkBuddy `_Yn` 的「连续 ≥2 条才成段」）。
+    // 本 mock 只有**一对**工具，合并后是 1 条 → 按规则平铺；而单条工具行自身
+    // 就是折叠行（`details.tl-tool`），**视觉上同样只占一行** ——
+    // 2026-10-02 用户要的「回看时别摊十几行」依然成立。
+    // 若将来 mock 出现 ≥2 条过程条目，会额外出现 `details.run-process`（下面两者都兼容）。
+    const tools = Array.from(
+      document.querySelectorAll<HTMLDetailsElement>(".run-timeline details.tl-tool"),
+    );
     expect(tools.length, "mock 有 tool_call/tool_result，应渲染成折叠行").toBeGreaterThan(0);
     tools.forEach((d) => expect(d.open, `${d.className} 应默认折叠`).toBe(false));
 
     // 用户展开后重绘应保持 open（E3/E5）
-    proc!.open = true;
-    proc!.dataset.userOpen = "1";
     tools[0]!.open = true;
     tools[0]!.dataset.userOpen = "1";
     // 触发一次 paintMessages 路径：再发一条并完成
@@ -108,9 +105,11 @@ describe("发送边界", () => {
       4000,
       "second finished",
     );
-    const procs = Array.from(document.querySelectorAll<HTMLDetailsElement>("details.run-process"));
-    expect(procs.length).toBeGreaterThan(0);
+    const after = Array.from(
+      document.querySelectorAll<HTMLDetailsElement>(".run-timeline details.tl-tool"),
+    );
+    expect(after.length).toBeGreaterThan(0);
     // 展开过的那条（按 data-open-key 复原）在重绘后仍是 open
-    expect(procs.some((d) => d.open)).toBe(true);
+    expect(after.some((d) => d.open)).toBe(true);
   });
 });

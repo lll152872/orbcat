@@ -1515,6 +1515,18 @@ fn foreground_history() -> Vec<context::ForegroundContext> {
     context::current_excluding_self().into_iter().collect()
 }
 
+/// 当前前台窗口是不是已知的截图 / 录屏工具（微信、系统截图、Snipaste…）。
+///
+/// 用途只有一个：面板 `blur` 时**先问一句**再决定收不收起 —— 用户正在截图就
+/// 不许把面板缩成球（2026-10-11 用户报的 bug：拿微信截面板，面板失焦缩球）。
+///
+/// ⚠️ 必须是**现场采集**，不能用 `foreground_context` 那份缓存（watch 轮询有滞后，
+/// blur 瞬间它还停在切换前的窗口）。理由见 `context::foreground_is_capture_tool` 的注释。
+#[tauri::command]
+fn foreground_is_capture_tool() -> bool {
+    context::foreground_is_capture_tool()
+}
+
 // ---------------------------------------------------------------------------
 // macOS 前台上下文：渐进式授权
 // ---------------------------------------------------------------------------
@@ -4571,6 +4583,7 @@ pub fn run() {
             bg_desk_shot,
             foreground_context,
             foreground_history,
+            foreground_is_capture_tool,
             context_capability,
             request_context_permission,
             open_accessibility_settings,

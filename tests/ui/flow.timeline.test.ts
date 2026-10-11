@@ -12,9 +12,16 @@ import { state, emitEvent, callsOf } from "./mocks/tauri";
  * 断言直接打在 DOM 顺序上（`.run-timeline > *`），因为问题本身就是顺序问题。
  */
 
-/** 时间线里每个子节点的「种类」（供顺序断言） */
+/**
+ * 时间线里每个条目的「种类」（供顺序断言）。
+ *
+ * ⚠️ 选择器是 `[data-i]`（`renderItem` 给每个条目都打），**不是** `.run-timeline > *`。
+ * 2026-10-11 起跑完的轮次改为**按类型段切分**：连续 ≥2 条过程条目会收进
+ * `details.run-process`，于是它们不再是 `.run-timeline` 的直接子元素。
+ * 用 `[data-i]` 两者都覆盖，顺序 = 文档顺序 = 渲染顺序。
+ */
 function timelineKinds(scope = document): string[] {
-  return Array.from(scope.querySelectorAll(".run-timeline > *")).map((n) => {
+  return Array.from(scope.querySelectorAll<HTMLElement>(".run-timeline [data-i]")).map((n) => {
     if (n.classList.contains("tl-reason")) return "reasoning";
     if (n.classList.contains("tl-error")) return "error";
     if (n.classList.contains("tl-status")) return "status";
@@ -25,7 +32,7 @@ function timelineKinds(scope = document): string[] {
 }
 
 function timelineText(scope = document): string {
-  return Array.from(scope.querySelectorAll(".run-timeline > *"))
+  return Array.from(scope.querySelectorAll<HTMLElement>(".run-timeline [data-i]"))
     .map((n) => (n.textContent ?? "").trim())
     .join(" | ");
 }
@@ -313,7 +320,7 @@ describe("流式时间线", () => {
     await waitFor(() => !document.querySelector(".msg.running"), 3000, "run finished");
   });
 
-  it("跑完：整轮压成一行「过程 · N 步」，点开才看得到中途正文与工具行", async () => {
+  it("跑完：过程收进单个「过程 · N 步」，中途正文也在壳内", async () => {
     // 直接喂磁盘历史（跑完的形态），比走一遍流式再重载更稳
     state.messages = [
       { role: "user", text: "看看结构", at: Date.now() },
@@ -323,33 +330,115 @@ describe("流式时间线", () => {
         at: Date.now() + 1,
         steps: [
           { kind: "reasoning", name: null, detail: "先列目录" },
-          { kind: "text", name: "第 1 轮", detail: "先看一眼目录再说，别急着改代码。" },
+          // ⚠️ 2026-10-11 后端改名：中途正文 = `midturn`，不是 `text`。
+          { kind: "midturn", name: "第 1 轮", detail: "先看一眼目录再说，别急着改代码。" },
           { kind: "tool_call", name: "list_dir", detail: '{"path":"."}' },
           { kind: "tool_result", name: "list_dir", detail: "src\nREADME.md" },
+          { kind: "tool_call", name: "read_file", detail: '{"path":"src/main.rs"}' },
+          { kind: "tool_result", name: "read_file", detail: "fn main() {}" },
         ],
       },
     ];
     await bootApp();
     await openPanel();
 
-    // 用户 2026-10-02："这个应该全部压缩掉啊" —— 回看时整轮只占一行
+    // 定稿（2026-10-11，逆向 WorkBuddy `vDn`/`rkn` 之后）：
+    // **items 里没有任何答案本体** —— `midturn` 全是过程，答案走 `e.text`。
+    // 所以壳外只剩最终答复，其余统统进「过程 · N 步」。
+    // 原先那条 `tkn`（最长 ∪ 最后）启发式已删除，职责移交后端 `promote_thin_answer`。
     const proc = document.querySelector<HTMLDetailsElement>("details.run-process");
-    expect(proc, "跑完应出现「过程」外壳").toBeTruthy();
+    expect(proc, "过程条目应收进单个「过程」外壳").toBeTruthy();
     expect(proc!.open, "「过程」默认闭合").toBe(false);
-    expect(proc!.querySelector("summary")?.textContent).toContain("3 步");
+    expect(proc!.querySelector("summary")?.textContent).toContain("4 步");
+    // 壳在前：外壳是时间线容器的第一个元素
+    expect(proc!.parentElement?.firstElementChild).toBe(proc);
 
-    // 中途正文在外壳里（不额外折叠 —— 展开外壳就该读到它）
-    const mid = proc!.querySelector<HTMLElement>(".tl-text");
-    expect(mid?.textContent).toContain("别急着改代码");
-    // 工具行各自折叠，且调用+返回已并成**一行**
-    const tools = Array.from(proc!.querySelectorAll<HTMLDetailsElement>("details.tl-tool"));
-    expect(tools.length, "list_dir 的调用与返回应合成一行").toBe(1);
+    // ⭐ 中途正文**必须在壳内** —— 它是过程播报，不是答案。
+    //    （今天上午曾把它常显在壳外，为修"核心内容被藏"；那次的根因是
+    //      前端在猜"哪段是答案"。猜错了就出现"步骤 3/4"漏出、"两套表格"。
+    //      现在答案由后端提升进 `e.text`，前端不必再猜。）
+    expect(proc!.textContent).toContain("别急着改代码");
+    const leaked = Array.from(
+      document.querySelectorAll<HTMLElement>(".msg.assistant > .msg-body.md"),
+    ).filter((n) => n.textContent?.includes("别急着改代码"));
+    expect(leaked.length, "中途正文不该常显在壳外").toBe(0);
+
+    // 工具行各自折叠，且调用+返回已并成**一行**（两个工具 = 两行）
+    const tools = Array.from(
+      document.querySelectorAll<HTMLDetailsElement>(".run-timeline details.tl-tool"),
+    );
+    expect(tools.length, "两个工具各合成一行").toBe(2);
     tools.forEach((d) => expect(d.open).toBe(false));
     // 那一行里参数与返回都能看到
     expect(tools[0]!.querySelector("summary")?.textContent).toContain("列目录");
     expect(tools[0]!.textContent).toContain("README.md");
-    // 最终答案在壳外、始终摊开
-    expect(document.querySelector(".msg.assistant .msg-body")?.textContent).toContain("结构没问题");
+    // 最终答案在壳外、始终摊开 —— 消息里**只有这一个** .msg-body
+    const bodies = Array.from(
+      document.querySelectorAll<HTMLElement>(".msg.assistant > .msg-body"),
+    );
+    expect(bodies.length, "壳外只应有最终答复一个正文块").toBe(1);
+    expect(bodies[0]!.textContent).toContain("结构没问题");
+  });
+
+  it("跑完：所有过程播报（midturn）全收进壳，壳外只有最终答复", async () => {
+    // 2026-10-11 定稿后的核心断言 —— 这一天里这条消息的渲染改了三轮：
+    //   ① 整轮塞一个壳（核心内容被藏）→ ② 正文全平铺（步骤播报刷屏）
+    //   → ③ tkn 挑两条常显（步骤 3/4 漏出 + 两套表格）→ ④ 现在：全收进壳
+    //
+    // ④ 的依据：`midturn` 是过程播报（后端 `agent.rs` 落盘），答案走 `e.text`。
+    // 后端 `promote_thin_answer` 负责把答案写好，前端不必再猜哪段是答案。
+    state.messages = [
+      { role: "user", text: "跑个长任务", at: Date.now() },
+      {
+        role: "assistant",
+        text: "任务完成。",
+        at: Date.now() + 1,
+        steps: [
+          { kind: "midturn", name: null, detail: "步骤 1/4：列目录。" },
+          {
+            kind: "midturn",
+            name: null,
+            detail: "步骤 2/4：读文件，这一步的播报写得比较长一些但并不是最长的那个。",
+          },
+          { kind: "tool_call", name: "list_dir", detail: '{"path":"."}' },
+          { kind: "tool_result", name: "list_dir", detail: "a\nb" },
+          {
+            kind: "midturn",
+            name: null,
+            detail:
+              "步骤 3/4：核心内容。这一段是最长的实质内容，必须常显，不能被折叠吞掉，也不能被后面的步骤刷屏顶没。",
+          },
+          { kind: "midturn", name: null, detail: "步骤 4/4：收尾。" },
+        ],
+      },
+    ];
+    await bootApp();
+    await openPanel();
+
+    const proc = document.querySelector<HTMLDetailsElement>("details.run-process");
+    expect(proc, "过程应收进「过程」外壳").toBeTruthy();
+    // 4 条 midturn + 1 个工具（调用+返回已合并）= 5 步
+    expect(proc!.querySelector("summary")?.textContent).toContain("5 步");
+    // 四条播报**全在壳内** —— 这正是第③版漏出「步骤 3/4」「步骤 4/4」的地方
+    for (const t of ["步骤 1/4", "步骤 2/4", "步骤 3/4", "步骤 4/4"]) {
+      expect(proc!.textContent, `${t} 应在壳内`).toContain(t);
+    }
+    // 壳内播报走 `.tl-text`；壳外不该出现播报块
+    expect(proc!.querySelectorAll(".tl-text").length).toBeGreaterThan(0);
+
+    // 壳外只有最终答复这一个正文块
+    const bodies = Array.from(
+      document.querySelectorAll<HTMLElement>(".msg.assistant > .msg-body"),
+    );
+    expect(bodies.length, "壳外只应有最终答复").toBe(1);
+    expect(bodies[0]!.textContent).toContain("任务完成");
+    // 任何一条播报都不该出现在壳外
+    ["步骤 1/4", "步骤 3/4", "步骤 4/4"].forEach((t) => {
+      expect(
+        bodies[0]!.textContent?.includes(t),
+        `${t} 泄漏到壳外了（这是今天反复出现的那个 bug）`,
+      ).toBe(false);
+    });
   });
 
   it("进时间线增量 patch：流式增长的思考块只有两个节点，不重建整块", async () => {

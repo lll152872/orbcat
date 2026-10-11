@@ -106,10 +106,15 @@ fn is_acknowledgement_only(text: &str) -> bool {
     if t.chars().count() > ACK_ONLY_MAX_CHARS {
         return false;
     }
-    // 去掉标点与空白后再比对，避免「已完成！」「Done.」这类尾巴影响判定
+    // 去掉标点与空白后再比对，避免「已完成！」「Done.」这类尾巴影响判定。
+    // ⚠️ 2026-10-11 补 `：／／／`（全角冒号）等 —— 原集合**漏了全角冒号**，
+    //    于是「未执行：无。」的 core 是 `未执行：无`，不以词表里的「未执行」开头，
+    //    前缀匹配也救不了（用户实测句式，16:18 截图）。
+    //    这里宁可多滤几个字符：漏滤会让判定失灵，多滤顶多影响极端词条。
+    const PUNCT: &str = "，。！？、；：,.!?;:~～-—…「」【】()（）《》“”\"'/／／＼&*#　";
     let core: String = t
         .chars()
-        .filter(|c| !c.is_whitespace() && !"，。！？、；：,.!?;:~～-—…「」“”\"'()（）".contains(*c))
+        .filter(|c| !c.is_whitespace() && !PUNCT.contains(*c))
         .collect::<String>()
         .to_lowercase();
     if core.is_empty() {
@@ -120,6 +125,12 @@ fn is_acknowledgement_only(text: &str) -> bool {
         "已完成", "已回答", "已回复", "已处理", "已归档", "已记录", "已保存", "已更新",
         "已完成任务", "任务完成", "完成了", "好了", "好的", "收到", "明白", "了解",
         "没问题", "可以了", "搞定了", "处理完毕", "操作完成", "如上", "见上", "同上",
+        // ↓ 2026-10-11 用户实测漏网的「自我交代」句式：说自己在做什么/没做什么，
+        //   但**没交付任何内容**。原先词表只收「确认」，这类「汇报」一律放过，
+        //   于是「未执行：无。」成了最终答复（用户 16:18 / 16:23 截图）。
+        "未执行", "未运行", "未测试", "未验证", "未修改", "未提交", "未运行任何操作",
+        "仅供参考", "以上是分析", "以上仅为分析", "需要你确认",
+        "待你确认", "请确认后", "请告诉我", "由你决定", "看你的意思",
     ];
     const EN_ACKS: &[&str] = &[
         "done", "taskcomplete", "completed", "answered", "finished", "alldone",
@@ -238,6 +249,93 @@ fn last_substantive_midturn_text(messages: &[ChatMessage]) -> Option<String> {
         return Some(t.to_string());
     }
     None
+}
+
+/// 收尾正文「单薄」的阈值（字符数）。
+///
+/// 低于它就认为模型只是打了个招呼/做了个自我交代，没交付内容。
+/// 取 200 是因为「结论 + 一张表」的正文轻松过 200，而
+/// 「未执行：无。」「已完成。」「见上表。」这类都在 20 字以内。
+const THIN_ANSWER_MAX_CHARS: usize = 200;
+
+/// 收尾单薄时，把本轮最长的中途正文提升为最终答复。
+///
+/// 返回 `(最终答复正文, 被提升的原文)`；第二个 `None` 表示**没提升**，
+/// 调用方据此决定要不要 push 说明行、要不要删同内容条目。
+///
+/// ## 为什么需要（2026-10-11）
+///
+/// 逆向 WorkBuddy `codebuddy-lite-wb.mjs` 得到的结论：它的回合结束判据只有
+/// `response.output.length <= 0`，`hasFinalAnswer = (stopReason === "end_turn")`，
+/// **从不判断「有字但没答」**。因为它一条消息就是一个 `output` 数组，
+/// 「最后一条 text」就是答案 —— 结构上不需要猜。
+///
+/// orbcat 的中途正文被拆成独立 step（`kind:"midturn"`），答案另走 `e.text`，
+/// 没有结构对应关系。模型于是能「中途写完整推导 → 收尾只写一句自我交代」，
+/// 那句交代就成了用户看到的答案（实测「未执行：无。」）。
+///
+/// 词表（`is_acknowledgement_only` / `is_deferral_only`）是**替结构缺失打补丁**，
+/// 挡得住「已完成」「见上一条」，挡不住词表外的任意句式。本函数改用
+/// **长度 + 内容占比**判定，不依赖词表穷举。
+fn promote_thin_answer(final_text: &str, messages: &[ChatMessage]) -> (String, Option<String>) {
+    let t = final_text.trim();
+    let t_len = t.chars().count();
+
+    // 收尾本身够长 → 它就是答案，不动它。
+    if t_len > THIN_ANSWER_MAX_CHARS {
+        return (final_text.to_string(), None);
+    }
+
+    // 已知的空洞收尾（空 / 应答 / 指路）→ 无条件提升。
+    let known_hole = t.is_empty() || is_acknowledgement_only(t) || is_deferral_only(t);
+
+    // 有内容但很短：只有本轮存在**明显更长**的中途正文才提升。
+    //
+    // 「明显更长」= 2 倍 **且** 绝对下限 `MIDTURN_PROMOTE_MIN_CHARS`。
+    // 那个绝对下限是关键：一条 30 字的短收尾（"确认过了"）不该被 80 字的
+    // 过程播报顶掉 —— 那正是用户在 16:23 截图里遇到的「未执行：无」被常显，
+    // 换成另一种形式复发。字数不够格的中途正文**根本进不了候选**。
+    let src = longest_midturn_text(messages).filter(|s| {
+        let n = s.trim().chars().count();
+        n >= MIDTURN_PROMOTE_MIN_CHARS && n > t_len.saturating_mul(2)
+    });
+
+    let chosen = if known_hole {
+        // 已知空洞：优先用更严格的版本（它会跳过应答/指路类正文）
+        last_substantive_midturn_text(messages).or(src)
+    } else {
+        src
+    };
+
+    match chosen {
+        Some(p) => (p.clone(), Some(p)),
+        None => (final_text.to_string(), None),
+    }
+}
+
+/// 本轮（最后一个 user 之后）所有 assistant 消息里最长的正文。
+fn longest_midturn_text(messages: &[ChatMessage]) -> Option<String> {
+    let mut best: Option<String> = None;
+    for m in messages.iter().rev() {
+        if m.role == "user" {
+            break; // 本轮起点
+        }
+        if m.role != "assistant" {
+            continue;
+        }
+        let Some(content) = m.content.as_ref() else {
+            continue;
+        };
+        let t = content.as_plain().trim().to_string();
+        if t.is_empty() {
+            continue;
+        }
+        if best.as_ref().is_some_and(|b| b.chars().count() >= t.chars().count()) {
+            continue;
+        }
+        best = Some(t);
+    }
+    best
 }
 
 /// 插话队列上限（满了就让用户等当前轮结束）
@@ -1656,7 +1754,7 @@ pub async fn run(
                         //    否则同一段话会既在「过程」里、又当答案显示一遍。
                         if let Some(pos) = steps
                             .iter()
-                            .rposition(|s| s.kind == "text" && s.detail.trim() == promoted.trim())
+                            .rposition(|s| s.kind == "midturn" && s.detail.trim() == promoted.trim())
                         {
                             steps.remove(pos);
                         }
@@ -1759,15 +1857,48 @@ pub async fn run(
 
             // 真的答完了：这就是最终答案（流式内容已经在界面上）
             if calls.is_empty() {
+                // ★ 单薄收尾提升（2026-10-11，逆向 WorkBuddy 后的正解）。
+                //
+                // 判据对应 WorkBuddy 的 `MODEL_RESPONSE_DONE`：它的
+                // `response.output.length <= 0` 为真就 abort，
+                // `resolveTaskOutcome` 里 `hasFinalAnswer = (stopReason === "end_turn")`。
+                // 它**不判"有字但没答"** —— 因为它的 output 是单一数组，
+                // 「最后一条 text」天然就是答案，根本不需要猜。
+                //
+                // orbcat 不行：中途正文被拆成了独立 step（`kind:"midturn"`），
+                // 答案另走 `e.text`，两者**没有结构对应关系**。模型于是可能
+                // 中途写完整推导、收尾只写一句「未执行：无。」—— 那句话就成了
+                // `e.text`（用户 16:18 / 16:23 截图）。
+                //
+                // 这里补上 WorkBuddy 缺的那半：收尾单薄时，把本轮最长的
+                // 中途正文**提升为答案**（`promote_thin_answer`），
+                // 顺带把同内容的 midturn 条目删掉，避免同一段话显示两遍。
+                let (answer_text, promoted) = promote_thin_answer(&text, &messages);
+                if let Some(src) = promoted {
+                    if let Some(pos) = steps
+                        .iter()
+                        .rposition(|s| s.kind == "midturn" && s.detail.trim() == src.trim())
+                    {
+                        steps.remove(pos);
+                    }
+                    steps.push(AgentStep {
+                        kind: "status".into(),
+                        name: None,
+                        detail: "⚠️ 模型收尾只有一句自我交代（没交付内容），\
+                                 已把它本轮中途写好的结论提升为最终答复"
+                            .into(),
+                        images: Vec::new(),
+                    });
+                }
                 on_progress(Progress::Answering);
                 steps.push(AgentStep {
                     kind: "assistant".into(),
                     name: None,
-                    detail: text.clone(),
+                    detail: answer_text.clone(),
                     images: Vec::new(),
                 });
                 return Ok(AgentRun {
-                    answer: text,
+                    answer: answer_text,
                     steps,
                     iterations: iter,
                     reasoning: (!reason_total.is_empty()).then_some(reason_total),
@@ -1803,7 +1934,18 @@ pub async fn run(
             //    错误路径（interrupted_run）同理，正文由它自己带走，这里不补。
             if let Some(detail) = midturn_detail(&peek_text(&round_text)) {
                 steps.push(AgentStep {
-                    kind: "text".into(),
+                    // ⚠️ `midturn` 而不是 `text`（2026-10-11 改）。
+                    //
+                    // 语义边界（照 WorkBuddy 的数据模型理清，之前一直含糊）：
+                    // - `midturn` = 模型**中途**写、然后接着调工具的正文 → **过程**，
+                    //   进「过程 · N 步」折叠，前端不常显
+                    // - `assistant` = 模型**收工**时写的正文 → **答案本体**，
+                    //   走 `e.text` 单独常显（见下面 `calls.is_empty()` 分支）
+                    //
+                    // 以前叫 `text`，于是"内容"和"过程"共用一个名字：前端只能靠
+                    // `tkn`（最长 ∪ 最后）启发式去猜哪段是答案，猜错就把
+                    // 「未执行：无。」这种收尾碎片常显出来（用户 16:18 截图）。
+                    kind: "midturn".into(),
                     name: None,
                     detail,
                     images: Vec::new(),
@@ -2923,7 +3065,7 @@ mod tests {
                 images: Vec::new(),
             },
             AgentStep {
-                kind: "text".into(),
+                kind: "midturn".into(),
                 name: None,
                 detail: format!("  {promoted}\n"), // 落盘时可能带空白
                 images: Vec::new(),
@@ -2938,12 +3080,12 @@ mod tests {
         // 复刻 1571 分支里的去重逻辑
         if let Some(pos) = steps
             .iter()
-            .rposition(|s| s.kind == "text" && s.detail.trim() == promoted.trim())
+            .rposition(|s| s.kind == "midturn" && s.detail.trim() == promoted.trim())
         {
             steps.remove(pos);
         }
         assert!(
-            !steps.iter().any(|s| s.kind == "text"),
+            !steps.iter().any(|s| s.kind == "midturn"),
             "同内容的中途正文条目应被删掉"
         );
         assert_eq!(steps.len(), 2, "只删那一条，别的条目不能动");
@@ -4147,4 +4289,78 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    // ---------- 单薄收尾提升（2026-10-11） ----------
+
+    fn asst(text: &str) -> ChatMessage {
+        ChatMessage::assistant(text.to_string())
+    }
+
+    /// 用户实测场景：中途写了完整推导，收尾只写「未执行：无。」
+    /// → 应提升中途正文当答案，否则用户只看到那句自我交代。
+    ///
+    /// ⚠️ 两个前提（缺一个就不提升，这是防误伤的设计）：
+    ///    ① 中途正文必须在**最后一个 user 之后**（本轮起点，真实时序）；
+    ///    ② 它要过 `MIDTURN_PROMOTE_MIN_CHARS`(200) 的绝对下限 + 2 倍阈值 ——
+    ///       一条 30 字的短收尾不该被 80 字的播报顶掉。
+    #[test]
+    fn thin_self_report_promotes_midturn_answer() {
+        // 实测用户那句推导的体量（129 字是**不够**的，这里给足 200+）
+        let derivation = "子网掩码 /20 表示前 20 位是网络号，后 12 位是主机号。\
+所以 192.168.1.130 的 /20 段落在 192.168.0.0 到 192.168.15.255 这个区间里，\
+而 192.168.1.1 也在同一个 /20 段中，因此两者的前三段完全相同，属于同一网段。\
+如果掩码是 /24，那么网段会细到 192.168.1.0–192.168.1.255，结论就会反过来。\
+所以判断两台机器是否同网段，先看掩码位数，再比对它们在掩码范围内的比特是否一致。";
+        assert!(
+            derivation.chars().count() >= super::MIDTURN_PROMOTE_MIN_CHARS,
+            "测试数据必须过绝对下限，否则测的是另一条分支"
+        );
+        let msgs = vec![
+            ChatMessage::user("A 类网段里 192.168.1.130 和 192.168.1.1 同网段吗？"),
+            asst("先看 /20 的划分规则。"),
+            asst(derivation),
+        ];
+        let (answer, promoted) = promote_thin_answer("未执行：无。", &msgs);
+        assert_eq!(answer, derivation, "应提升最长的中途正文");
+        assert!(promoted.is_some(), "应报告发生了提升");
+    }
+
+    /// 短收尾 + 短播报（都没过 200 字下限）→ **不该提升**。
+    /// 这是"未执行：无"那个 bug 的反向防线：不能为了救一句废话就劫持答案。
+    #[test]
+    fn short_midturn_below_floor_does_not_get_promoted() {
+        let msgs = vec![
+            ChatMessage::user("再确认下"),
+            asst("我核查了 sessions 与 projects 两个目录的结构，一共读了 12 个文件。"),
+        ];
+        let (answer, promoted) = promote_thin_answer("确认过了", &msgs);
+        assert_eq!(answer, "确认过了", "原样保留");
+        assert!(promoted.is_none(), "中途正文只有 ~35 字，不够格提升");
+    }
+
+    /// 只比"长一点"的收尾不该触发提升 —— 否则模型写「综上，答案如上」
+    /// 这种正常短总结，会被换成前面的过程播报。
+    #[test]
+    fn marginally_longer_midturn_does_not_trigger_promotion() {
+        let msgs = vec![
+            ChatMessage::user("继续"),
+            asst("第一步先看清楚目录结构，这是后续判断的前提条件。"),
+        ];
+        let final_text = "综合上面两步的推导，可以确定这个判断成立，结论如下所述，请注意边界条件。";
+        let (answer, promoted) = promote_thin_answer(final_text, &msgs);
+        assert!(promoted.is_none(), "未到 2 倍阈值，不该提升");
+        assert_eq!(answer, final_text);
+    }
+
+    /// 词表兜底：「已完成」「见上一条」这类仍走原回打路径。
+    #[test]
+    fn ack_and_deferral_words_are_recognised() {
+        assert!(is_acknowledgement_only("未执行：无。"));
+        assert!(is_acknowledgement_only("仅供参考"));
+        assert!(is_acknowledgement_only("已完成"));
+        assert!(is_deferral_only("见上一条回复"));
+        // 长正文里提到这些词不该被当成空洞收尾（防误伤）
+        assert!(!is_acknowledgement_only(&format!("未执行：无。{}", "详细推导见下文。".repeat(20))));
+    }
 }
+

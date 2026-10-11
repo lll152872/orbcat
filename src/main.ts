@@ -2694,6 +2694,9 @@ function renderTimeline(items: AgentStep[] | undefined, live: boolean, key = "")
   if (!live && items.length > TIMELINE_TAIL) {
     const head = items.length - TIMELINE_TAIL;
     timelineStore.set(key, items);
+    // 超长轮次走「只渲染尾部 + 按需取更早」的省流路径。
+    // ⚠️ 2026-10-11：原先这里会把"必须常显的正文"提到壳外，那套 `tkn`
+    //    启发式已随 `midturn` 改名 + 后端提升一起删除（见 renderHistTimeline）。
     return `<details class="run-process" data-open-key="proc-${esc(key)}">
       <summary>过程 · ${items.length} 步</summary>
       <div class="run-timeline tl-hist" data-open-key="${esc(key)}" data-head="${head}">
@@ -2703,15 +2706,100 @@ function renderTimeline(items: AgentStep[] | undefined, live: boolean, key = "")
     </details>`;
   }
 
+  if (!live) return renderHistTimeline(items, key);
+
   const body = items.map((s, i) => renderItem(s, i, key)).join("");
   if (!body) return "";
-  if (!live) {
-    return `<details class="run-process" data-open-key="proc-${esc(key)}">
-      <summary>过程 · ${items.length} 步</summary>
-      <div class="run-timeline tl-hist">${body}</div>
-    </details>`;
-  }
   return `<div class="run-timeline">${body}</div>`;
+}
+
+/**
+ * 「过程」条目 —— 与 WorkBuddy 的 `foldable` 对齐：折起来不损失信息的东西。
+ *
+ * `error` / `tool_error` / `steer` **刻意不算** —— 出错的行和用户插话
+ * 折进去就等于没人看得见（既有约定，2026-10-02）。
+ */
+function isFoldableStep(s: AgentStep): boolean {
+  return (
+    s.kind === "reasoning" ||
+    s.kind === "tool_call" ||
+    s.kind === "tool_result" ||
+    s.kind === "status" ||
+    s.kind === "omitted"
+  );
+}
+
+/**
+ * 过程中途正文（**永远进「过程」折叠，不常显**）的判定。
+ *
+ * `midturn` = 模型中途写、然后接着调工具的正文（后端 `agent.rs` 落盘）。
+ * 它**不是**答案本体 —— 答案走 `e.text` 单独常显。
+ *
+ * ⚠️ `text` 只为**读旧会话**保留（改名之前 midturn 就叫 text）。
+ *    新一轮的 run 不该再产生 `kind:"text"`。
+ */
+function isMidturn(s: AgentStep): boolean {
+  return s.kind === "midturn" || s.kind === "text" || s.kind === "stream";
+}
+
+/**
+ * 跑完的整轮时间线 → HTML：**保序段切分 + 正文筛选**，不再把整轮塞进一个外壳。
+ *
+ * ## 定稿规则（2026-10-11 与用户逐条对齐）
+ *
+ * | 条目 | 去向 |
+ * |---|---|
+ * | 正文（`text`/`stream` 非空）中**最长 ∪ 最后一条** | 平铺常显（WorkBuddy `tkn` 同款） |
+ * | 其余一切：中间播报、`reasoning`、工具（**含失败行**）、`status` | **一个**「过程 · N 步」外壳 |
+ * | 轮级 `error`、`steer`（插话） | 平铺常显 |
+ *
+ * 渲染顺序：**过程折叠在最前，壳外条目按原序跟在壳后** —— 不做穿插
+ * （用户："wb 没有像你这样渲染的"）。上一版的"段切分 + 落单平铺"产生
+ * 「壳 / 正文 / 壳 / 正文」交替的多段结构，中间播报还会漏出来，已废弃。
+ *
+ * ## ⭐ 为什么这里不再有任何"正文常显"启发式
+ *
+ * 上午为了抢救"被折叠吞掉的核心内容"，这里加过 `tkn`（最长 ∪ 最后）——
+ * 一度反复（正文全平铺 → 步骤播报刷屏 → 步骤 3/4 漏出来 → 表格两套渲染）。
+ *
+ * 根因（2026-10-11 逆向 WorkBuddy `codebuddy-lite-wb.mjs` 确认）：**items 里
+ * 本来就没有答案本体**。WorkBuddy 一条消息 = 一个 `output` 数组，
+ * 「最后一条 text」天然就是答案，所以它那边不需要猜；orbcat 的中途正文被
+ * 拆成了独立 step（`kind:"midturn"`），答案另走 `e.text`，两者无结构对应。
+ *
+ * 所以正解不在前端：让**后端**把单薄收尾时的实质内容提升进 `e.text`
+ * （`promote_thin_answer`），前端就不必再猜。壳外只留 `e.text` 一个来源。
+ */
+function renderHistTimeline(items: AgentStep[], key: string): string {
+  // 定稿（2026-10-11，逆向 WorkBuddy `vDn`/`rkn` 后的结果）：
+  // **items 里没有任何"答案本体"** —— `midturn` 全是过程，`assistant` 走 `e.text`
+  // 单独常显。所以壳外只剩轮级 error / 插话行，其余**统统进过程折叠**。
+  // （原先的 `tkn`「最长 ∪ 最后」已删：那份职责移交给了后端的
+  //   `promote_thin_answer`，它把答案直接搬进 `e.text`。）
+  const isProcessStep = (s: AgentStep): boolean =>
+    isFoldableStep(s) || s.kind === "tool_error" || isMidturn(s);
+
+  const fold: number[] = [];
+  /** 壳外但仍属"时间线"的条目（轮级 error / 插话行）—— 需要 .run-timeline 父节点 */
+  const timeline: string[] = [];
+  items.forEach((s, i) => {
+    if (isProcessStep(s)) {
+      fold.push(i);
+      return;
+    }
+    timeline.push(renderItem(s, i, key));
+  });
+
+  const tl = timeline.length ? `<div class="run-timeline tl-hist">${timeline.join("")}</div>` : "";
+
+  const shell = fold.length
+    ? `<details class="run-process" data-open-key="proc-${esc(key)}">
+      <summary>过程 · ${fold.length} 步</summary>
+      <div class="run-timeline tl-hist">${fold.map((i) => renderItem(items[i], i, key)).join("")}</div>
+    </details>`
+    : "";
+
+  return shell + tl;
 }
 
 /**
@@ -2733,10 +2821,7 @@ function installTimelineMore(root: ParentNode = document): void {
 
     const take = Math.min(TIMELINE_TAIL, cur);
     const from = cur - take;
-    const html = items
-      .slice(from, cur)
-      .map((s, i) => renderItem(s, from + i, openKey))
-      .join("");
+    const html = items.slice(from, cur).map((s, i) => renderItem(s, from + i, openKey)).join("");
 
     // ⚠️ 顺序要紧：必须**先插入再决定按钮去留**。
     //    反过来写（先 remove 再 insertAdjacentHTML）时，按钮已经脱离文档，
@@ -3008,6 +3093,7 @@ function renderItem(s: AgentStep, idx = -1, kp = ""): string {
       return `<div class="tl-steer"${di}>💬 插话：${esc(s.detail)}${thumbs}</div>`;
     }
 
+    case "midturn":
     case "text":
     case "stream":
       // **中途正文**：本身不折叠 —— 运行中它就该摊着（用户要盯进度），
@@ -8127,6 +8213,51 @@ async function expand(): Promise<void> {
   await applyMode("panel");
 }
 
+/**
+ * 失焦收起 —— 但「用户正在截图」时**不许收**。
+ *
+ * ## 为什么（2026-10-11 用户报的 bug）
+ *
+ * 拿微信 `Alt+A`（或系统截图工具）截面板内容时，**blur 一定先于截图发生**：
+ * 面板一失焦，原来的 `collapse()` 就把它缩成球 —— 用户截到的是个球，
+ * 想截的长内容根本够不着。用户原话：
+ * 「微信长截图 orbcat，orbcat 会缩成球导致无法截屏」。
+ *
+ * ## 判定方式（硬判断，不靠提示词）
+ *
+ * 问后端「当前前台窗口的进程名是不是已知截图/录屏工具」——
+ * 白名单在 `context.rs::CAPTURE_TOOL_STEMS`（微信 / QQ / snippingtool / Snipaste …）。
+ * 命中 → 跳过这次收起。
+ *
+ * ## 为什么要判两次
+ *
+ * blur 触发的瞬间新前台窗口**可能还没切过去**（微信是先激活自己的 overlay
+ * 再取画面），此刻采到的仍是切换前的窗口。所以 150ms 后再问一次，
+ * 两次都不命中才收 —— 代价是收起晚 150ms，肉眼无感。
+ */
+async function collapseUnlessCapturing(): Promise<void> {
+  if (await foregroundIsCaptureTool()) return;
+  await new Promise((r) => setTimeout(r, 150));
+  if (await foregroundIsCaptureTool()) return;
+  // 等待期间用户可能已自己收起 / 切了形态 —— 别重复动手
+  if (mode !== "panel" || !blurCollapse) return;
+  void collapse();
+}
+
+/**
+ * 问后端：当前前台是不是截图/录屏工具。
+ *
+ * 命令不可用（老构建 / 调用异常）时**退回旧行为**（返回 false → 照常收起），
+ * 绝不让一个诊断性判定把"失焦让路"这个本分功能卡死。
+ */
+async function foregroundIsCaptureTool(): Promise<boolean> {
+  try {
+    return await invoke<boolean>("foreground_is_capture_tool");
+  } catch {
+    return false;
+  }
+}
+
 async function collapse(): Promise<void> {
   // 收起会把整个 DOM 换成球（`renderOrb` 覆盖 app.innerHTML），先把手打的字捞出来 ——
   // 否则"打了半句话、出去看一眼、回来"内容就没了。
@@ -8229,8 +8360,12 @@ function installContextMenu(): void {
     if (mode === "menu") void applyMode("orb");
     // 面板失焦自动收起 —— 悬浮球的本分是用完让路，不该一直挡着屏幕。
     // 展开后 500ms 内的 blur 忽略（展开动画/set_focus 时序抖动）。
+    //
+    // 2026-10-11：不再直接 `collapse()`，改成**先问一句新前台是不是截图工具**。
+    // 用户拿微信/系统截图工具截面板时 blur 会先发生，原来那一下直接把面板
+    // 缩成球 → 截图里只剩一个球（"微信长截图 orbcat，会缩成球导致无法截屏"）。
     if (mode === "panel" && blurCollapse && Date.now() - panelOpenedAt > 500) {
-      void collapse();
+      void collapseUnlessCapturing();
     }
   });
 }
