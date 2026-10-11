@@ -71,11 +71,11 @@ const MAX_PSEUDO_NUDGES: usize = 2;
 
 /// 「回合结束时没有可用正文」自动续跑的最大次数（防死循环）。
 ///
-/// 抄 MiMo/WB 的 `INVALID_OUTPUT_CONTINUATION_LIMIT`（默认 2，env 可覆盖）：
+/// 抄同类 agent 的 `INVALID_OUTPUT_CONTINUATION_LIMIT`（默认 2，env 可覆盖）：
 /// 模型只吐了思考、或只回一句「已完成 / 收到」就收工 —— 那不是答案。
 /// 判定为 invalid 后注入一条合成 user 消息让它**接着答**，而不是把空应答当结论交给用户。
 ///
-/// 为什么必须有这一层（2026-10-01 定论）：提示词只能堵"态度问题"，
+/// 为什么必须有这一层（已定论）：提示词只能堵"态度问题"，
 /// 真正确保"最后一定有一句正经回答"的是**运行时判定** —— 提示词是软约束，
 /// 模型可以不理；这里是硬约束，它没有绕过的余地。
 const MAX_INVALID_OUTPUT_CONTINUES: usize = 2;
@@ -106,10 +106,15 @@ fn is_acknowledgement_only(text: &str) -> bool {
     if t.chars().count() > ACK_ONLY_MAX_CHARS {
         return false;
     }
-    // 去掉标点与空白后再比对，避免「已完成！」「Done.」这类尾巴影响判定
+    // 去掉标点与空白后再比对，避免「已完成！」「Done.」这类尾巴影响判定。
+    // ⚠️ 补了 `：／／／`（全角冒号）等 —— 原集合**漏了全角冒号**，
+    //    于是「未执行：无。」的 core 是 `未执行：无`，不以词表里的「未执行」开头，
+    //    前缀匹配也救不了（真实句式，"未执行：无"这类）。
+    //    这里宁可多滤几个字符：漏滤会让判定失灵，多滤顶多影响极端词条。
+    const PUNCT: &str = "，。！？、；：,.!?;:~～-—…「」【】()（）《》“”\"'/／／＼&*#　";
     let core: String = t
         .chars()
-        .filter(|c| !c.is_whitespace() && !"，。！？、；：,.!?;:~～-—…「」“”\"'()（）".contains(*c))
+        .filter(|c| !c.is_whitespace() && !PUNCT.contains(*c))
         .collect::<String>()
         .to_lowercase();
     if core.is_empty() {
@@ -120,6 +125,12 @@ fn is_acknowledgement_only(text: &str) -> bool {
         "已完成", "已回答", "已回复", "已处理", "已归档", "已记录", "已保存", "已更新",
         "已完成任务", "任务完成", "完成了", "好了", "好的", "收到", "明白", "了解",
         "没问题", "可以了", "搞定了", "处理完毕", "操作完成", "如上", "见上", "同上",
+        // ↓ 「自我交代」句式：说自己在做什么/没做什么，
+        //   但**没交付任何内容**。原先词表只收「确认」，这类「汇报」一律放过，
+        //   于是「未执行：无。」曾成为最终答复。
+        "未执行", "未运行", "未测试", "未验证", "未修改", "未提交", "未运行任何操作",
+        "仅供参考", "以上是分析", "以上仅为分析", "需要你确认",
+        "待你确认", "请确认后", "请告诉我", "由你决定", "看你的意思",
     ];
     const EN_ACKS: &[&str] = &[
         "done", "taskcomplete", "completed", "answered", "finished", "alldone",
@@ -137,14 +148,14 @@ fn is_acknowledgement_only(text: &str) -> bool {
 /// 「把答案指向别处」类正文的长度闸门。
 ///
 /// 比 [`ACK_ONLY_MAX_CHARS`] 宽得多：这类收尾往往带一两句总结，不止一句确认语
-/// （2026-10-02 那次实测是 183 字符）。但真正完整的答案通常远超这个长度，
+/// （那次实测是 183 字符）。但真正完整的答案通常远超这个长度，
 /// 所以仍然卡一个上限来防误伤。
 const DEFERRAL_MAX_CHARS: usize = 600;
 
 /// 这句正文是不是「把答案指向别处」——没说答案，只说「答案在别处 / 我已经答过了」。
 ///
-/// 这是用户报的**原始问题**（「最后说已回答」）。2026-10-02 拿到实测复现：
-/// 会话 `s1790916789470-0` 第 6 条，模型跑完 **41 步**分析后，最后只写了 183 字符：
+/// 这就是**原始问题**（「最后说已回答」）。实测复现：
+/// 某会话的第 6 条，模型跑完 **41 步**分析后，最后只写了 183 字符：
 ///
 /// > 结论已给出（缓存命中与未命中分开计价…），完整表格和铁证数据见上一条回复。
 ///
@@ -201,7 +212,7 @@ const MIDTURN_PROMOTE_MIN_CHARS: usize = 200;
 
 /// 本轮里模型中途写过、后来因为「接着调了工具」而被归档的最后一段**实质**正文。
 ///
-/// 为什么需要它（**根因**，2026-10-02 定位）：
+/// 为什么需要它（**根因**，已定位）：
 /// 模型写正文 + 同一轮接着调工具时，`DiscardStream` 只让**前端**把那段正文
 /// 淡化归档（标注「模型中途决定调用工具，以下内容不是最终答复」），
 /// 但它**没有从 `messages` 里删掉** —— 模型自己的历史里那段话完好无损。
@@ -238,6 +249,93 @@ fn last_substantive_midturn_text(messages: &[ChatMessage]) -> Option<String> {
         return Some(t.to_string());
     }
     None
+}
+
+/// 收尾正文「单薄」的阈值（字符数）。
+///
+/// 低于它就认为模型只是打了个招呼/做了个自我交代，没交付内容。
+/// 取 200 是因为「结论 + 一张表」的正文轻松过 200，而
+/// 「未执行：无。」「已完成。」「见上表。」这类都在 20 字以内。
+const THIN_ANSWER_MAX_CHARS: usize = 200;
+
+/// 收尾单薄时，把本轮最长的中途正文提升为最终答复。
+///
+/// 返回 `(最终答复正文, 被提升的原文)`；第二个 `None` 表示**没提升**，
+/// 调用方据此决定要不要 push 说明行、要不要删同内容条目。
+///
+/// ## 为什么需要
+///
+/// 逆向 WorkBuddy `codebuddy-lite-wb.mjs` 得到的结论：它的回合结束判据只有
+/// `response.output.length <= 0`，`hasFinalAnswer = (stopReason === "end_turn")`，
+/// **从不判断「有字但没答」**。因为它一条消息就是一个 `output` 数组，
+/// 「最后一条 text」就是答案 —— 结构上不需要猜。
+///
+/// orbcat 的中途正文被拆成独立 step（`kind:"midturn"`），答案另走 `e.text`，
+/// 没有结构对应关系。模型于是能「中途写完整推导 → 收尾只写一句自我交代」，
+/// 那句交代就成了用户看到的答案（实测「未执行：无。」）。
+///
+/// 词表（`is_acknowledgement_only` / `is_deferral_only`）是**替结构缺失打补丁**，
+/// 挡得住「已完成」「见上一条」，挡不住词表外的任意句式。本函数改用
+/// **长度 + 内容占比**判定，不依赖词表穷举。
+fn promote_thin_answer(final_text: &str, messages: &[ChatMessage]) -> (String, Option<String>) {
+    let t = final_text.trim();
+    let t_len = t.chars().count();
+
+    // 收尾本身够长 → 它就是答案，不动它。
+    if t_len > THIN_ANSWER_MAX_CHARS {
+        return (final_text.to_string(), None);
+    }
+
+    // 已知的空洞收尾（空 / 应答 / 指路）→ 无条件提升。
+    let known_hole = t.is_empty() || is_acknowledgement_only(t) || is_deferral_only(t);
+
+    // 有内容但很短：只有本轮存在**明显更长**的中途正文才提升。
+    //
+    // 「明显更长」= 2 倍 **且** 绝对下限 `MIDTURN_PROMOTE_MIN_CHARS`。
+    // 那个绝对下限是关键：一条 30 字的短收尾（"确认过了"）不该被 80 字的
+    // 过程播报顶掉 —— 那正是用户在 16:23 截图里遇到的「未执行：无」被常显，
+    // 换成另一种形式复发。字数不够格的中途正文**根本进不了候选**。
+    let src = longest_midturn_text(messages).filter(|s| {
+        let n = s.trim().chars().count();
+        n >= MIDTURN_PROMOTE_MIN_CHARS && n > t_len.saturating_mul(2)
+    });
+
+    let chosen = if known_hole {
+        // 已知空洞：优先用更严格的版本（它会跳过应答/指路类正文）
+        last_substantive_midturn_text(messages).or(src)
+    } else {
+        src
+    };
+
+    match chosen {
+        Some(p) => (p.clone(), Some(p)),
+        None => (final_text.to_string(), None),
+    }
+}
+
+/// 本轮（最后一个 user 之后）所有 assistant 消息里最长的正文。
+fn longest_midturn_text(messages: &[ChatMessage]) -> Option<String> {
+    let mut best: Option<String> = None;
+    for m in messages.iter().rev() {
+        if m.role == "user" {
+            break; // 本轮起点
+        }
+        if m.role != "assistant" {
+            continue;
+        }
+        let Some(content) = m.content.as_ref() else {
+            continue;
+        };
+        let t = content.as_plain().trim().to_string();
+        if t.is_empty() {
+            continue;
+        }
+        if best.as_ref().is_some_and(|b| b.chars().count() >= t.chars().count()) {
+            continue;
+        }
+        best = Some(t);
+    }
+    best
 }
 
 /// 插话队列上限（满了就让用户等当前轮结束）
@@ -328,7 +426,7 @@ fn trim_old_tool_results(messages: &mut [ChatMessage], keep_recent: usize) -> us
 /// 为什么要这个：agent loop 一轮可能跑 30-60 秒（多次模型调用 + 工具执行），
 /// 中间是**完全黑盒**的 —— 用户只看到空白，然后答案突然出现。
 /// 把这些节点推给前端，就能实时显示「正在思考 / 调用了什么工具 / 工具返回了什么」。
-/// ## ⚠️ `rename_all_fields` 不能省（2026-09-26 修 bug）
+/// ## ⚠️ `rename_all_fields` 不能省（修过一个 bug）
 ///
 /// serde 对**枚举**的 `rename_all` 只重命名**变体名**（`ToolTick` → `toolTick`），
 /// **不重命名字段**。本枚举里 `elapsed_secs` 是唯一的多词字段，只写 `rename_all`
@@ -362,7 +460,7 @@ pub enum Progress {
     /// 工具返回了
     ToolResult { name: String, preview: String },
     /// 工具执行**还在跑**（长命令每 2s 一次心跳）—— 前端据此刷"已运行 N 秒 + 输出尾巴"，
-    /// 消掉「界面卡在 run_com 步骤不动」的假死感（2026-09-25）。
+    /// 消掉「界面卡在 run_com 步骤不动」的假死感。
     ToolTick {
         name: String,
         elapsed_secs: u64,
@@ -379,8 +477,8 @@ pub enum Progress {
     ///
     /// `images` 是插话附带的图片（文件路径）。为什么一并推给前端：插话的图
     /// 在对话流里不铺独立气泡（见 `steer_id` 的设计），只在**时间线的
-    /// `kind=steer` 条目**上画 —— 少了它，用户在"插话里带图"时只能看到文字
-    /// （2026-09-26 用户报的 bug1）。
+    /// `kind=steer` 条目**上画 —— 少了它，"插话里带图"时只能看到文字
+    /// （修过一个 bug：插话图片不显示）。
     Steer {
         id: String,
         text: String,
@@ -509,7 +607,7 @@ impl RunHub {
 }
 
 // ---------------------------------------------------------------------------
-// 多会话并行 run：按 session_id 分槽的运行时注册表（2026-09-26 用户拍板）
+// 多会话并行 run：按 session_id 分槽的运行时注册表
 // ---------------------------------------------------------------------------
 
 /// 一轮执行的运行时句柄。**每个会话一个**，互不干扰。
@@ -634,7 +732,7 @@ impl RunRegistry {
 /// 进度回调。用 Arc<dyn Fn> 而不是泛型，避免把泛型参数污染到整个 agent loop。
 pub type ProgressFn = std::sync::Arc<dyn Fn(Progress) + Send + Sync>;
 
-/// **轮内增量落盘**的回调（2026-09-26 加，治「退出后整轮蒸发」）。
+/// **轮内增量落盘**的回调（治「退出后整轮蒸发」）。
 ///
 /// 参数：`(目前已产出的步骤, 目前流出的正文, 目前的思考过程)`。
 /// agent loop 在每个轮边界、以及每个工具跑完后调用；`lib.rs` 收到后写进会话里
@@ -659,7 +757,7 @@ fn checkpoint(cb: &Option<CheckpointFn>, steps: &[AgentStep], answer: &str, reas
 
 /// 流式正文的落盘节流间隔（毫秒）。
 ///
-/// ## 为什么需要"流式落盘"（2026-09-30 补的缺口）
+/// ## 为什么需要"流式落盘"（补上的缺口）
 ///
 /// 已有的 [`checkpoint`] 只在**轮边界**与**工具跑完后**触发。但一轮模型调用
 /// 可能流式吐几十秒到几分钟（长思考 + 长输出实测很常见），这段时间里
@@ -715,15 +813,15 @@ fn peek_text(acc: &std::sync::Mutex<String>) -> String {
 
 /// 这段中途正文能不能落成时间线条目 —— 能就给 `Some(原文)`，纯空白给 `None`。
 ///
-/// ## 为什么要落盘（2026-10-02 修）
+/// ## 为什么要落盘（修过一处）
 ///
 /// 模型写了正文又接着调工具时，此前只发一条 `Progress::DiscardStream` 让前端
 /// 把那半截话"淡化归档" —— **后端从没把它写进 `steps`**。于是在前端它只活在
 /// 运行中气泡的内存里（`archiveStreamToItems` 本地 push 的 `text` 条目），
-/// 一轮跑完、前端按磁盘重建消息时**凭空消失**（用户报的"我的中途正文呢"）。
+/// 一轮跑完、前端按磁盘重建消息时**凭空消失**（"我的中途正文呢"）。
 ///
 /// 落成 `kind = "text"` 之后，回看时它还在「过程」折叠外壳里 —— 正好符合
-/// 用户定的「中途正文在中途展开、其余时候收起」。
+/// 「中途正文在中途展开、其余时候收起」这条交互约定。
 ///
 /// 返回**原文**（只做"空不空"的判断，不 trim 内容）：正文里的缩进/换行是模型
 /// 排版的一部分，这里不该动它。
@@ -735,7 +833,7 @@ fn midturn_detail(text: &str) -> Option<String> {
 ///
 /// 空轮直接跳过（多数轮没有 reasoning，不该在界面上留一堆空的思考条目）。
 ///
-/// ## 为什么既要 `steps` 又要 `total`（2026-09-22 用户拍板）
+/// ## 为什么既要 `steps` 又要 `total`
 ///
 /// - `steps`（kind = `reasoning`）是**规范来源**：思考作为独立条目按位置插进去，
 ///   此刻正落在本轮工具调用**之前**，渲染出来就是「思考 → 调工具 → 思考 → 调工具」
@@ -847,7 +945,7 @@ pub struct AgentRun {
 /// 一轮对话的**校准累加器**：把"本地估算 vs 服务端真实值"的偏差记下来，
 /// 供下一轮（乃至下一次进程启动）把预算算准。
 ///
-/// ## 为什么必须有这个（2026-09-30）
+/// ## 为什么必须有这个
 ///
 /// 上下文预算此前只靠 `estimate_messages_tokens`，而实测**低估 5~144 倍**
 /// （工具 schema、MCP 已加载组、reasoning 原文都没进估算）。后果：
@@ -906,7 +1004,7 @@ impl Calibration {
 
 /// 一轮对话**失败**时带出的结果：错误文案 + 已经产出的部分结果。
 ///
-/// ## 为什么错误要携带 `run`（2026-09-22 用户报 bug 后定案）
+/// ## 为什么错误要携带 `run`（定案）
 ///
 /// 以前错误直接 `Err(String)` 抛给 `lib.rs`，而 `lib.rs` 是在**落盘之前**
 /// `result?` 的 —— 于是撞 429（或任何 API 错误）时，这一轮的提问、思考、
@@ -988,12 +1086,12 @@ pub async fn run(
         Some(session_id),
     );
 
-    // ── 「记忆蒸馏」会话角色（2026-10-03）────────────────────────────────
+    // ── 「记忆蒸馏」会话角色 ─────────────────────────────────────────────
     //
     // 蒸馏就是**一条普通聊天**：这个会话由 `distill_session_open` 开出来，
     // 带 `sessions/<id>.distill` 标记；命中时追加这段角色说明 + 注入
     // `distill_move` 工具，模型就在常规循环里读中转站、问用户、搬条目 ——
-    // 思考与工具调用全走标准时间线（用户要求：「就是常规聊天」）。
+    // 思考与工具调用全走标准时间线（口径就是「就是常规聊天」）。
     //
     // 为什么放**动态区**而不是 modes.json：模式是全局的（一改全改），
     // 而蒸馏必须是**独立会话**，不能把用户的主聊天也变成蒸馏助手。
@@ -1009,7 +1107,11 @@ pub async fn run(
              - `SOUL.md`（人格/语气）：你应表现出的人格、语气、表达纪律。\n\
              - `IDENTITY.md`（称呼）：名字、互相怎么称呼、身份定位。\n\
              - 与目标文件现有内容重复 → `duplicate`（不写文件，只从中转站删）。\n\
-             - 项目/环境/工具事实、无处可放 → `stay`（**保持不动**，别硬塞进上面三个）。\n\n\
+             - 项目/环境/工具事实、无处可放 → `stay`（**保持不动**，别硬塞进上面三个）。\n\
+             - **这条已经过时，或当初就记错了** → `memory_delete`（把这条从中转站删掉，\n\
+             不写任何文件；执行前自动按天备份，可反悔）。\n\
+             记忆是**滚动累积**的：光加不减，错的条目会一直影响以后每一次回答。\n\
+             但删比加危险 —— **拿不准该不该删，先问用户**，别自己判。\n\n\
              ## 工作方式（重要）\n\
              1. 先用 `read_file` 读 `agent-data/memory/MEMORY.md`（必要时也读三个目标文件，避免重复搬运）。\n\
              2. **先给结论、再动手**：把逐条建议（每条引用原文）摆出来，让用户过目。\n\
@@ -1021,6 +1123,8 @@ pub async fn run(
              - `distill_move` 的 `text` 必须与 MEMORY.md 里的条目逐字一致（不含行首 `- `）——\
              它靠这个匹配并摘除条目。\n\
              - 未经用户明确同意，不要迁移「拿不准」的条目。\n\
+             - **删除一律先问**：把「要删哪条 + 为什么删」摆给用户，拿到明确同意再动
+               `memory_delete`。\n\
              - 项目记忆（`agent-data/projects/`）**不在这轮范围内**，除非用户要求。",
         );
     }
@@ -1074,7 +1178,7 @@ pub async fn run(
 
     let first_user = build_user_message(cfg, data_dir, user_input, &images);
 
-    // ---- 多轮上下文回灌（2026-10-07 定案：全量注入）----
+    // ---- 多轮上下文回灌（全量注入）----
     // 未压缩区间全量带回，选取规则见 history.rs 文档；预算由自动 compact
     // （0.6 水位）+ 循环内 75% 硬裁剪兜底。
     //
@@ -1088,7 +1192,7 @@ pub async fn run(
 
     // ---- 上下文预算：拿"真值优先"的口径定水位 ----
     //
-    // ⚠️ 2026-09-30 重做（旧实现让 compact 永远触发不了）：
+    // ⚠️ 重做过（旧实现让 compact 永远触发不了）：
     //
     // 旧口径 = `估算(history)` vs `窗口 × 60%`。两个致命问题：
     //   ① 估算只算 history，**不含** system prompt 与工具 schema，
@@ -1194,7 +1298,7 @@ pub async fn run(
     // 跨轮累计的思考过程（多轮时按「【第 N 轮】」分段）。
     //
     // 为什么要累加：模型每轮都会重新推演一遍，只留最后一轮会让用户看不懂
-    // "前面为什么这么绕"。落盘时**原文全存**（2026-09-26 起不截，见 `sessions::cap_steps`）。
+    // "前面为什么这么绕"。落盘时**原文全存**（不截，见 `sessions::cap_steps`）。
     // ⚠️ 这是**旧字段**（兼容用）：新数据以 `steps` 里的 `reasoning` 条目为准。
     let mut reason_total = String::new();
 
@@ -1223,7 +1327,7 @@ pub async fn run(
     // 上下文预算：模型配了就用，没配走保守兜底。乘安全水位。
     // （`context_window` 已在自动 compact 那一段算过，这里直接复用）
     //
-    // ⚠️ 与 compact 水位的关系（2026-09-30 统一口径）：`COMPACT_TRIGGER_RATIO`（0.6）
+    // ⚠️ 与 compact 水位的关系（统一口径）：`COMPACT_TRIGGER_RATIO`（0.6）
     // 低于这里的 `CONTEXT_SAFE_RATIO`（0.75）是**刻意**的 —— compact 在 60% 就把
     // 历史压掉，循环内的硬裁剪（75%）只是压缩失败时的最后一道闸，正常轮不到它。
     let context_budget = ((context_window as f64) * CONTEXT_SAFE_RATIO) as usize;
@@ -1315,7 +1419,7 @@ pub async fn run(
         // assistant + N 条 tool 结果）。轮数上限拉到 100/250 后，不检查就会
         // 一路顶穿模型窗口 → 413 / context_length_exceeded → 整轮报废。
         //
-        // ⚠️ 2026-09-30 三处修正（此前这条闸门形同虚设）：
+        // ⚠️ 三处修正（此前这条闸门形同虚设）：
         //   1. **算上固定开销**：system prompt 与工具 schema 此前完全没进估算，
         //      而它们本来就在每次请求里（56 个 MCP 工具约 14k token）。
         //   2. **乘校准倍率**：本地 `char/4` 估算实测低估 5~144 倍，
@@ -1378,7 +1482,7 @@ pub async fn run(
         let round_reason = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let round_text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
-        // 流式落盘的三件套（2026-09-30）：
+        // 流式落盘的三件套：
         //   - `steps_so_far`：回调里不能碰 `steps`（它在本轮后面还会被可变借用），
         //     所以每轮开头 take 一份只读快照；
         //   - `ckpt_cb`：checkpoint 回调本身（`Option<Arc<dyn Fn>>`，clone 即共享）；
@@ -1523,14 +1627,14 @@ pub async fn run(
         // 本轮的 token 用量并入合计（无论这轮是出答案还是调工具）
         if let Some(u) = out.usage {
             usage_total.add(&u);
-            // ⚠️ 与上面的求和**不同口径**（2026-09-30）：
+            // ⚠️ 与上面的求和**不同口径**：
             //   `usage_total.prompt` 是整个 run 各轮求和（几百万很正常），
             //   而 `u.prompt` 是**这一轮**实际发出去的上下文大小 ——
             //   只有它代表"现在上下文有多大"，是预算与 compact 水位的真锚点。
             //   所以校准吃的是这一个数，不是求和。
             calib.observe(u.prompt, est_overhead, est_msgs_before_round);
 
-            // 每轮 cache 命中率（2026-09-30）：prompt 的大头走命中价，
+            // 每轮 cache 命中率：prompt 的大头走命中价，
             // **全价部分 = prompt − cache_hit**。命中率掉下来时成本成倍上涨
             // 而总量看不出变化，所以必须**逐轮留痕**才追得到回归点。
             // 定位手段：这条日志配合"改了前缀稳定性 / 换了模型 / 动了技能与
@@ -1548,12 +1652,12 @@ pub async fn run(
         }
         let mut calls: Vec<llm::ToolCall> = out.tool_calls().to_vec();
 
-        // --- 没有工具调用：先分辨"真的答完了"还是"假象"（2026-09-25 用户报提前停止）---
+        // --- 没有工具调用：先分辨"真的答完了"还是"假象"（修过提前停止）---
         //
         // 两种假象必须先排掉，否则都会被当成最终答案收工：
         // ① 输出被 max_tokens 掐断（finish_reason=length）——半截正文不是答案；
         // ② 模型把工具调用**写成正文**（模仿历史回灌的 «steps…调用 X…» 格式，
-        //    mimo 实测会这样）—— 没有真 tool_calls，但意图是"继续干活"。
+        //    部分模型会这样）—— 没有真 tool_calls，但意图是"继续干活"。
         if calls.is_empty() {
             let text = out.text();
 
@@ -1626,7 +1730,7 @@ pub async fn run(
                 return Ok(r);
             }
 
-            // ③ 空应答 / 纯确认收尾（2026-10-01 新增，抄 MiMo/WB 的 autoContinueInvalidOutput）——
+            // ③ 空应答 / 纯确认收尾（新增，抄同类 agent 的 autoContinueInvalidOutput）——
             //    模型没调工具、正文是空的、或者只回一句「已完成 / Done」。
             //    这不是答案：用户问的是问题，不是"你做完了没"。
             //    提示词里已经写了「不要只回一句已完成」，但**软约束挡不住**，
@@ -1645,12 +1749,12 @@ pub async fn run(
                              （{} 字符）提升为最终答复",
                             promoted.chars().count()
                         );
-                        // ⚠️ 去重（2026-10-02）：这段正文在它当年那轮已经作为 `text`
+                        // ⚠️ 去重（修过一处）：这段正文在它当年那轮已经作为 `text`
                         //    条目落过盘了（见上面工具调用分支的 push）。删掉它，
                         //    否则同一段话会既在「过程」里、又当答案显示一遍。
                         if let Some(pos) = steps
                             .iter()
-                            .rposition(|s| s.kind == "text" && s.detail.trim() == promoted.trim())
+                            .rposition(|s| s.kind == "midturn" && s.detail.trim() == promoted.trim())
                         {
                             steps.remove(pos);
                         }
@@ -1753,15 +1857,48 @@ pub async fn run(
 
             // 真的答完了：这就是最终答案（流式内容已经在界面上）
             if calls.is_empty() {
+                // ★ 单薄收尾提升（逆向 WorkBuddy 后的正解）。
+                //
+                // 判据对应 WorkBuddy 的 `MODEL_RESPONSE_DONE`：它的
+                // `response.output.length <= 0` 为真就 abort，
+                // `resolveTaskOutcome` 里 `hasFinalAnswer = (stopReason === "end_turn")`。
+                // 它**不判"有字但没答"** —— 因为它的 output 是单一数组，
+                // 「最后一条 text」天然就是答案，根本不需要猜。
+                //
+                // orbcat 不行：中途正文被拆成了独立 step（`kind:"midturn"`），
+                // 答案另走 `e.text`，两者**没有结构对应关系**。模型于是可能
+                // 中途写完整推导、收尾只写一句「未执行：无。」—— 那句话就成了
+                // `e.text`（用户 16:18 / 16:23 截图）。
+                //
+                // 这里补上 WorkBuddy 缺的那半：收尾单薄时，把本轮最长的
+                // 中途正文**提升为答案**（`promote_thin_answer`），
+                // 顺带把同内容的 midturn 条目删掉，避免同一段话显示两遍。
+                let (answer_text, promoted) = promote_thin_answer(&text, &messages);
+                if let Some(src) = promoted {
+                    if let Some(pos) = steps
+                        .iter()
+                        .rposition(|s| s.kind == "midturn" && s.detail.trim() == src.trim())
+                    {
+                        steps.remove(pos);
+                    }
+                    steps.push(AgentStep {
+                        kind: "status".into(),
+                        name: None,
+                        detail: "⚠️ 模型收尾只有一句自我交代（没交付内容），\
+                                 已把它本轮中途写好的结论提升为最终答复"
+                            .into(),
+                        images: Vec::new(),
+                    });
+                }
                 on_progress(Progress::Answering);
                 steps.push(AgentStep {
                     kind: "assistant".into(),
                     name: None,
-                    detail: text.clone(),
+                    detail: answer_text.clone(),
                     images: Vec::new(),
                 });
                 return Ok(AgentRun {
-                    answer: text,
+                    answer: answer_text,
                     steps,
                     iterations: iter,
                     reasoning: (!reason_total.is_empty()).then_some(reason_total),
@@ -1782,9 +1919,9 @@ pub async fn run(
         // ⚠️ 只作废**正文**。reasoning 保留 —— 它是"为什么调这个工具"的推演，
         //    正是用户想看的；作废它等于把最有价值的部分删掉。
         if streamed_this_round.load(std::sync::atomic::Ordering::Relaxed) {
-            // ★ 先把这段中途正文**落进时间线**（2026-10-02 修）。
+            // ★ 先把这段中途正文**落进时间线**（修过一处）。
             //   以前只发 DiscardStream 给前端"淡化"，后端不落盘 → 一轮跑完
-            //   前端按磁盘重建消息，这段正文就没了（用户："我的中途正文呢"）。
+            //   前端按磁盘重建消息，这段正文就没了（"我的中途正文呢"）。
             //   位置必须在下面 `for call in calls` **之前**，时间线里才会
             //   "正文 → 工具行"地排；每轮的 `round_text` 是新的，所以多轮
             //   "正文→调工具"会各自留一条。
@@ -1797,7 +1934,18 @@ pub async fn run(
             //    错误路径（interrupted_run）同理，正文由它自己带走，这里不补。
             if let Some(detail) = midturn_detail(&peek_text(&round_text)) {
                 steps.push(AgentStep {
-                    kind: "text".into(),
+                    // ⚠️ `midturn` 而不是 `text`（已改）。
+                    //
+                    // 语义边界（照 WorkBuddy 的数据模型理清，之前一直含糊）：
+                    // - `midturn` = 模型**中途**写、然后接着调工具的正文 → **过程**，
+                    //   进「过程 · N 步」折叠，前端不常显
+                    // - `assistant` = 模型**收工**时写的正文 → **答案本体**，
+                    //   走 `e.text` 单独常显（见下面 `calls.is_empty()` 分支）
+                    //
+                    // 以前叫 `text`，于是"内容"和"过程"共用一个名字：前端只能靠
+                    // `tkn`（最长 ∪ 最后）启发式去猜哪段是答案，猜错就把
+                    // 「未执行：无。」这种收尾碎片常显出来（用户 16:18 截图）。
+                    kind: "midturn".into(),
                     name: None,
                     detail,
                     images: Vec::new(),
@@ -1845,7 +1993,7 @@ pub async fn run(
                     })
                 };
                 // 取消探针：让 run_command 在**执行期间**也能被「停止」掐断
-                // （2026-09-26 修：以前 cancel 只在轮边界读，命令跑 600s 就得等 600s）。
+                // （修过：以前 cancel 只在轮边界读，命令跑 600s 就得等 600s）。
                 // 现在 `cancel` 是**每 run 一个** `Arc<AtomicBool>`（多会话并行 run），
                 // 闭包直接捕获它的 clone —— 不再依赖 `'static` 全局，停 A 不会误停 B。
                 let cancel_flag = cancel.clone();
@@ -2000,10 +2148,10 @@ fn take_text(acc: &std::sync::Mutex<String>) -> String {
 
 /// 从正文里解析**写成文字的伪工具调用**，还原成真 `tool_calls`。
 ///
-/// ## 为什么需要（2026-09-25 用户报「mimo 老是提前停止」后定案）
+/// ## 为什么需要（解决「模型老是提前停止」）
 ///
 /// 历史回灌把工具轨迹以 `«steps … 调用 X / 参数: {…} …»` 文本形式拼进
-/// assistant 消息（见 `history::fold_steps_to_line`）。部分模型（mimo 实测）
+/// assistant 消息（见 `history::fold_steps_to_line`）。部分模型
 /// 会**模仿这个格式**：它把下一步要调的工具写成正文「调用 run_command
 /// 参数: {...}」，然后就此收工 —— 没有真 `tool_calls`，agent loop 判定
 /// "没有调用 = 答完了"，任务停在半路。
@@ -2199,7 +2347,7 @@ pub fn summarize_args_pub(raw: &str) -> String {
 ///
 /// 组装 prompt（不含本轮用户消息）—— 等价于 `build_system_prompt_full(dir, "", None)`。
 ///
-/// ⚠️ **仅供测试**（2026-09-30 标注，2026-10 更新）：生产路径走
+/// ⚠️ **仅供测试**（后有更新）：生产路径走
 /// [`build_system_prompt_full`]，因为它要把本轮用户消息传进去做**技能自动命中**
 /// （命中的技能正文会拼到动态区最尾），并且要带上 PTC 的程序内工具声明。
 /// 这个不带消息的版本只给"前缀稳定性"那批单测用 —— 它们只关心
@@ -2226,14 +2374,14 @@ pub fn build_system_prompt(data_dir: &Path) -> String {
 /// 所以由调用方（`run()`，它本来就是 async 且能拿到注册表）算好传进来。
 /// 不走"落盘缓存"那条路：SDK 与工具集必须严格同步，多一份缓存就多一个
 /// 能悄悄过期的地方，而这里根本不需要 —— 调用点就在同一个函数里。
-/// 模式 → 「发图」那段系统提示（2026-10-08，同日改为**工具驱动**）。
+/// 模式 → 「发图」那段系统提示（已改为**工具驱动**）。
 ///
-/// ## 为什么改成工具（用户 2026-10-08 提出）
+/// ## 为什么改成工具
 ///
 /// 原先教模型自己写 `![说明](路径)`。问题在**约束力**：那是提示词措辞，
 /// 模型理论上可以不听。而 `send_image` / `send_meme` 是**工具** ——
 /// 工作模式下 `send_meme` 压根不在工具表里（见 `tools::all_tool_specs`），
-/// 模型想发表情包也调不到。**硬闸门比措辞可靠**，这一点用户说得对。
+/// 模型想发表情包也调不到。**硬闸门比措辞可靠**。
 ///
 /// ## 但图仍然显示在**正文**里
 ///
@@ -2349,7 +2497,8 @@ pub fn build_system_prompt_full(
                              **你必须主动维护这份项目记忆**：\n\
                              1. 结论、路径、术语、未决问题 → 本轮用 `remember` 写入（直接落盘）\n\
                              2. 发现过时/错误条目 → `remember` 写「更正：…」并点明作废哪条\n\
-                             3. 不要写全局 MEMORY；主对话闲聊不进项目记忆\n\
+                             3. 项目事实写项目；**跨项目偏好与通用教训仍要用 `remember(scope:\"global\")`**\n\
+                             —— 别因为当前在项目里，就把通用经验全丢进项目层\n\
                              4. 每得出可复用结论就记，不要攒到最后",
                             name = p.name
                         ));
@@ -2368,21 +2517,35 @@ pub fn build_system_prompt_full(
 
     // ── 稳定区：记忆使用规则（纯规则文字，条目本身在动态区）────────────
     stable.push(
-        "# 记忆怎么用\n\n\
-         `memory/MEMORY.md` 是**已批准**的跨项目长期记忆；\
-         `projects/<名>/MEMORY.md` 是项目记忆（顶栏切换项目后整段注入）。\
-         另有轮末自动蒸馏在后台补充：项目记忆由它直写，全局候选由它代提 ——\
-         但你在对话中**当场**判断值得记的，仍然要自己调 `remember`，别全推给后台。\n\n\
-         调 `remember` 的时机（**当场就调，不要攒**）：\n\
-         - 用户说「以后 / 记住 / 下次 / 我的习惯是 / 以后都…」—— 立即 remember\n\
-         - 用户给出项目路径、目录结构、命名约定等稳定事实 —— 当场 remember\n\
-         - 用户确认了一项决策/约定（「就用 X」「以后按 Y 来」）—— 当场 remember\n\
-         - 你踩了坑并找到解法 —— 修完当场 remember（错因 + 规避方式）\n\n\
-         落点规则：**主对话**进全局候选（有审批关，宁多勿漏 —— 提错的\
-         用户会驳掉，漏记的永远丢了）；**已切换项目**直接写项目 MEMORY.md\
-         （无审批，必须准：只写确认过的事实，不写猜测）。\n\n\
-         不该记：临时状态、一次路径的临时拼接、编造的猜测、尚未确认的推断。\n\n\
-         记不清某事时：先查长期记忆与项目记忆，再调 `recall_turns`，仍没有再问用户 —— 不要瞎编。"
+        "<memory_system>\n\n\
+         # 记忆：三个落点，写哪一层由你选\n\n\
+         工具是 `remember(content, scope)`。**scope 决定落点，不要默认全写当前项目**：\n\n\
+         - `scope:\"global\"` → 提交全局候选 → 用户在 设置 › 记忆 批准后进 `memory/MEMORY.md`（跨项目长期记忆）\n\
+         - `scope:\"project\"` → 直写 `projects/<名>/MEMORY.md`（只在本项目成立的事实；当前没有激活项目时工具会报错）\n\
+         - `USER.md` / `SOUL.md` / `IDENTITY.md` **不是** `remember` 的落点 —— 那是记忆蒸馏会话的活，别自己往里写\n\
+         - **过时/记错的条目要删** → 你这里没有删除工具；把「哪条过时、为什么」告诉用户，
+           由记忆蒸馏会话的 `memory_delete` 处理（会先按天备份）\n\n\
+         # When to write（MUST follow —— 不是「等用户开口才记」）\n\n\
+         命中下面任一条，**当场就调 `remember`，不要攒**：\n\
+         - 用户**纠正你**或否定你的做法 → 记「错因 + 正确做法」\n\
+         - 用户表达偏好、雷区、长期约定（「以后都…」「别再…」「我不喜欢…」）\n\
+         - 定下技术决策 / 选型 / 目录与命名约定（「就用 X」「以后按 Y」）\n\
+         - 你踩了坑并定位到根因 → 记「错因 + 规避方式」\n\
+         - 产出了下次还要用的结论（路径、结构、命令、环境事实）\n\n\
+         **收尾闸门**：给出最终答复**之前**自问一遍「这轮有没有产出上面任一类的东西」。\
+         有 → 先 remember，再作答。写记忆是你的本分，不是可选项。\n\n\
+         # 落点怎么选\n\n\
+         - 跨项目通用（用户偏好 / 雷区 / 通用教训 / 关于用户本人的事实）→ `scope:\"global\"`\n\
+         - 只在本项目成立（路径、术语、目录与命名约定、本项目进展与未决项）→ `scope:\"project\"`\n\
+         - 拿不准 → `global`：候选有审批把关，提错会被驳；漏记的永远丢了\n\n\
+         全局侧**有审批关，宁多勿漏**；项目侧**无审批，必须准**：只写确认过的事实，不写猜测。\
+         选了 `project` 而当前没有激活项目时，工具会报错并给你项目清单 —— 改口成 `global`，\
+         或请用户切顶栏，**不要自己偷偷换落点**。另有轮末自动蒸馏在后台兜底，但它**不替代**你当场判断。\n\n\
+         # 不该记\n\n\
+         临时状态、一次路径的临时拼接、编造的猜测、尚未确认的推断、闲聊 —— 这些只会污染明天的上下文。\n\n\
+         记不清某事时：先查上方已注入的长期记忆段与项目记忆，再调 `recall_turns`，\
+         仍没有再问用户 —— 不要瞎编。\n\
+         </memory_system>"
             .to_string(),
     );
 
@@ -2405,7 +2568,7 @@ pub fn build_system_prompt_full(
             .to_string(),
     );
 
-    // ── 场景能力：正文发图 + 场景上下文（2026-10-08）─────────────────────
+    // ── 场景能力：正文发图 + 场景上下文 ──────────────────────────────
     //
     // 这两段是**模式**对 prompt 的唯一影响面。边界见 `modes.rs` 顶部：
     // 模式可以决定"注入什么内容"，但不可以决定"拦不拦"（权限/轮数仍归各自闸门）。
@@ -2413,12 +2576,12 @@ pub fn build_system_prompt_full(
     // 为什么放稳定区：切模式是低频操作（一次切换换一次缓存），而这两段
     // 属于"这个模式下模型能做什么"，跟人格/红线一样跨轮稳定 —— 每轮都变
     // 的东西（前台窗口、数据源摘要）才必须留在动态区最尾。
-    // 模式**跟着会话走**（2026-10-08 用户定案）：同一个进程里两个会话可以跑不同模式，
+    // 模式**跟着会话走**：同一个进程里两个会话可以跑不同模式，
     // 所以这里必须按 `session_id` 取，不能读全局的 `settings.activeMode`。
     let mode = crate::sessions::effective_mode(data_dir, session_id);
     stable.push(image_replies_prompt(&mode));
 
-    // 表情包库摘要 —— **只在能随便发图的模式下注入**（2026-10-08）。
+    // 表情包库摘要 —— **只在能随便发图的模式下注入**。
     // 工作模式不注：那儿本来就不该发表情包，把库摆出来等于诱导。
     // 库为空时 `prompt_section` 返回空串，这里自然跳过，不会塞一段废话进 prompt。
     if mode.freestyle_images() {
@@ -2502,7 +2665,7 @@ pub fn build_system_prompt_full(
         ));
     }
 
-    // ── 稳定区：工具调用格式红线（2026-09-25 mimo 提前停止的根因之一）────
+    // ── 稳定区：工具调用格式红线（部分模型提前停止的根因之一）─────────
     // 历史回灌把工具轨迹拼成 «steps … 调用 X / 参数: …» 文本（history.rs），
     // 部分模型会把它当成"输出格式"模仿 —— 调用写成文字、没有 tool_calls，
     // agent 只能判定"答完了"。必须显式禁止。
@@ -2516,9 +2679,9 @@ pub fn build_system_prompt_full(
             .to_string(),
     );
 
-    // ── 稳定区：收尾纪律（2026-10-01，抄 WB 的正面钉死 + 堵出口）────────
+    // ── 稳定区：收尾纪律（抄 WB 的正面钉死 + 堵出口）──────────────────
     //
-    // 用户的原问题：「怎么保证在最后的时候能稳定回答用户的问题，
+    // 原始问题：「怎么保证在最后的时候能稳定回答用户的问题，
     // 而不是最后说已回答」。
     //
     // 答案分两层，**这一层只是第二道防线**：
@@ -2528,8 +2691,7 @@ pub fn build_system_prompt_full(
     //   ② 就是下面这段提示词 —— 软约束，目的是**少触发**①，
     //      因为每触发一次就多烧一轮 token。
     //
-    // 抄自 WB/MiMo 的 system prompt 原文（`tmp/wb_sysprompt_extract.txt`
-    // 第 75/78/131 行，2026-10-01 从 asar 提取实证）：
+    // 抄自同类 agent 的 system prompt 原文（提取实证）：
     //   - "End-of-turn summary: What changed and what's next. Nothing else."
     //   - "Do not end a turn with only an acknowledgement or a future-tense promise"
     //   - "Assume users can't see most tool calls or thinking — only your text output."
@@ -2632,7 +2794,7 @@ pub fn build_system_prompt_full(
     );
 
     // ── 稳定区：对话历史机制（**纯规则文字**）──────────────────────────
-    // 2026-10-07 起历史是**全量回灌**（未压缩区间一条不丢）；被 compact
+    // 历史是**全量回灌**（未压缩区间一条不丢）；被 compact
     // 摘要覆盖的更早部分不在逐条上下文里（只有摘要）。模型仍要知道"有原文
     // 可查"，否则会：① 对着"上次那个方案"瞎编 ② 反问用户"哪个方案？"
     // 跨会话检索（scope=all）同理：**不说它就不知道能跨会话**，会直接回
@@ -2743,7 +2905,7 @@ pub fn build_system_prompt_full(
     // 注：组状态本身由 `tool_specs()` 每轮实时反映在工具定义里，
     // 这里只是一个文字提示，告诉模型"当前手上有什么"。
     //
-    // ⚠️ **当前时间必须在动态区**（2026-09-30 加）：放稳定前缀会让**整段
+    // ⚠️ **当前时间必须在动态区**（补过一处）：放稳定前缀会让**整段
     //    后续内容每分钟失效一次**（prompt cache 按前缀逐字节比对）——
     //    那是拿"每轮最贵的成本项"去换一条时间。放尾部则只失效尾部这一小段。
     //    这是有意的取舍：模型没有时间就无法给日记/文档打正确日期、无法做
@@ -2792,7 +2954,7 @@ pub fn build_system_prompt_full(
     // 放动态区（不放稳定前缀）：切模式才变，而切模式是低频操作；
     // 放稳定区会让**每次切模式**都把后面所有内容的前缀缓存打掉。
     //
-    // ⚠️ 2026-10-08 修：这里原来读的是全局 `settings.activeMode`（`load_active_mode`），
+    // ⚠️ 修过：这里原来读的是全局 `settings.activeMode`（`load_active_mode`），
     //    模式跟会话走之后那是**另一个会话的模式** —— 表现是"闲聊会话拿到了 PTC 的行为段"
     //    （或反过来）。直接用函数上方按 `session_id` 取好的那个 `mode`。
     if mode.is_ptc() {
@@ -2842,7 +3004,7 @@ pub fn build_system_prompt_full(
 
 /// 当前 epoch 毫秒。会话与历史模块共用同一口径。
 ///
-/// 历史（2026-10-08 删）：这里原来还有一个 `load_active_mode()` ——
+/// 历史（已删）：这里原来还有一个 `load_active_mode()` ——
 /// 读 `settings.json` 的 `activeMode` 当"当前模式"。模式跟会话走之后
 /// 它是**错的**（那是另一个会话的模式），唯一读入口是
 /// `sessions::effective_mode(data_dir, session_id)`。
@@ -2873,7 +3035,7 @@ mod tests {
 
     /// 有内容 → 落一条（返回原文，不 trim）；纯空白 → 不落。
     ///
-    /// 回归测试对象：2026-10-02 用户报「我的中途正文呢」—— 模型中途写正文又接着
+    /// 回归测试对象：「我的中途正文呢」—— 模型中途写正文又接着
     /// 调工具时，那段正文以前只发给前端"淡化"，后端不落盘，一轮跑完就消失。
     #[test]
     fn midturn_detail_keeps_real_text_and_drops_blank() {
@@ -2902,7 +3064,7 @@ mod tests {
                 images: Vec::new(),
             },
             AgentStep {
-                kind: "text".into(),
+                kind: "midturn".into(),
                 name: None,
                 detail: format!("  {promoted}\n"), // 落盘时可能带空白
                 images: Vec::new(),
@@ -2917,12 +3079,12 @@ mod tests {
         // 复刻 1571 分支里的去重逻辑
         if let Some(pos) = steps
             .iter()
-            .rposition(|s| s.kind == "text" && s.detail.trim() == promoted.trim())
+            .rposition(|s| s.kind == "midturn" && s.detail.trim() == promoted.trim())
         {
             steps.remove(pos);
         }
         assert!(
-            !steps.iter().any(|s| s.kind == "text"),
+            !steps.iter().any(|s| s.kind == "midturn"),
             "同内容的中途正文条目应被删掉"
         );
         assert_eq!(steps.len(), 2, "只删那一条，别的条目不能动");
@@ -2934,7 +3096,7 @@ mod tests {
 
     /// `Progress` 的字段**必须是 camelCase** —— 前端按 camelCase 读。
     ///
-    /// 回归测试对象：2026-09-26 用户报「长命令一直显示已运行 0s」。
+    /// 回归测试对象：「长命令一直显示已运行 0s」。
     /// 根因是 serde 对**枚举**的 `rename_all` 只重命名变体、不重命名字段，
     /// `elapsed_secs` 出去还是 snake_case，前端 `p.elapsedSecs ?? 0` 永远取到 0。
     /// 修法是给枚举加 `rename_all_fields = "camelCase"`（见 Progress 定义）。
@@ -2982,7 +3144,7 @@ mod tests {
 
     /// 多会话并行 run：**停 A 绝不能停 B**（每 run 独立的取消标志）。
     ///
-    /// 2026-09-26 用户拍板。以前是全局单个 `CHAT_CANCEL`，`chat_cancel` 一按
+    /// 早先是全局单个 `CHAT_CANCEL`，`chat_cancel` 一按
     /// 所有会话全停。
     #[test]
     fn run_registry_isolates_cancel_per_session() {
@@ -3242,7 +3404,7 @@ mod tests {
 
     /// 稳定前缀必须**逐字节稳定**：同一份输入调两次，**前缀**完全相同。
     ///
-    /// ⚠️ 2026-09-30 改口径：以前断言的是"整个 prompt 两次完全一致"，
+    /// ⚠️ 改口径：以前断言的是"整个 prompt 两次完全一致"，
     /// 但动态区现在含「当前时间」（精确到分钟）。如果两次调用正好跨过一分钟
     /// 边界，这条断言会**偶发失败** —— 那是测试本身不可靠，不是实现错了。
     ///
@@ -3405,7 +3567,7 @@ mod tests {
             "非 PTC 也要有模式说明，否则模型不知道自己处于哪个模式"
         );
 
-        // 「切到 PTC」现在是**换一个 PTC 会话**（模式跟会话走，2026-10-08）。
+        // 「切到 PTC」现在是**换一个 PTC 会话**（模式跟会话走）。
         // ⚠️ 不能再用 `settings.activeMode` —— 那个字段已删，而且它现在
         //    根本不影响任何一条会话的模式。
         let sid = crate::sessions::new_session(&tmp, "ptc").id;
@@ -3474,7 +3636,7 @@ mod tests {
             "标准模式不该有 run_code"
         );
 
-        // 换一条 PTC 会话：只剩 run_code（模式跟会话走，2026-10-08）
+        // 换一条 PTC 会话：只剩 run_code（模式跟会话走）
         let ptc_sid = crate::sessions::new_session(&tmp, "ptc").id;
 
         let collapsed = crate::tools::tool_specs(None, false, &tmp, Some(&ptc_sid));
@@ -3506,7 +3668,7 @@ mod tests {
 
     /// 模式不同只影响**动态区**，不该把稳定前缀打掉（prompt cache 成本）。
     ///
-    /// 2026-10-08：模式跟会话走后测法变成"两条不同模式的会话各取一次 prompt"
+    /// 模式跟会话走后测法变成"两条不同模式的会话各取一次 prompt"
     /// —— 语义没变（稳定前缀必须逐字节一致），但更贴近真实用法。
     #[test]
     fn mode_switch_only_touches_dynamic_tail() {
@@ -3520,7 +3682,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("RULES.md"), "RULES_STABLE_MARKER").unwrap();
 
-        // ⚠️ 2026-10-08：模式跟会话走后，"切模式"= **换一条会话**。
+        // ⚠️ 模式跟会话走后，"切模式"= **换一条会话**。
         //    这里用两条不同模式的会话来验同一件事，而且比原来更严格：
         //    它验的是"两个会话来来回回取 prompt，稳定前缀都不许动"。
         let sid_std = crate::sessions::new_session(&tmp, "standard").id;
@@ -3690,11 +3852,11 @@ mod tests {
         );
     }
 
-    // ---- 伪工具调用解析（mimo 提前停止的兜底）----
+    // ---- 伪工具调用解析（模型提前停止的兜底）----
 
     #[test]
     fn pseudo_calls_parsed_from_folded_text() {
-        // 真实案例形态（2026-09-25 会话 s1790306950716）：mimo 把工具调用
+        // 真实案例形态：模型把工具调用
         // 模仿成历史回灌的 «steps 折叠格式写进正文
         let text = "继续验证反代。跑最终测试。\n«steps\n·think Let me check\n\
                     调用 run_command\n  参数: {\"command\": \"echo hi\"}\n\
@@ -3725,9 +3887,9 @@ mod tests {
         assert!(!super::smells_like_pseudo(text));
     }
 
-    // ---------------- 空应答收尾的运行时判定（2026-10-01） ----------------
+    // ---------------- 空应答收尾的运行时判定 ----------------
     //
-    // 抄 MiMo/WB 的 autoContinueInvalidOutput：回合结束但没有可用正文时，
+    // 抄同类 agent 的 autoContinueInvalidOutput：回合结束但没有可用正文时，
     // 必须注入提醒让它接着答，而不是把「已完成」当成结论交给用户。
     // 提示词是软约束（模型可以不理），这一层是硬约束。
 
@@ -3790,18 +3952,18 @@ mod tests {
         assert!(!super::is_acknowledgement_only(&long));
     }
 
-    // ------------- 「把答案指向别处」的运行时判定（2026-10-02 实测复现） -------------
+    // ------------- 「把答案指向别处」的运行时判定（实测复现） -------------
     //
-    // 用户报的**原始问题**就是这个：AI 最后不说结论，只说「结论已给出 / 见上一条回复」。
+    // **原始问题**就是这个：AI 最后不说结论，只说「结论已给出 / 见上一条回复」。
     // 上一版只防了「太短的空话」（ACK_ONLY_MAX_CHARS = 80），
     // 而真实失败是 183 字符的指路式收尾 —— 正好从闸门缝里漏过去。
 
-    /// 会话 `s1790916789470-0` 第 6 条的**逐字原文**（用户当场追问「结论给到哪里了」）。
+    /// 那条失败输出的**逐字原文**（当场追问「结论给到哪里了」时截获的）。
     const REAL_DEFERRAL_TEXT: &str = "结论已给出（缓存命中与未命中分开计价，1M token 命中 50% vs 90% 积分差 1.8~4.2 倍，模型间差异明显），完整表格和铁证数据见上一条回复。\n\n公式修正已写入项目记忆，作废了之前「0.06x→27.8万 token/积分」的旧条目——那个只是 94% 命中率下的混合价，真实范围是 0% 命中≈9万 token/积分 到 95% 命中≈33万。";
 
     #[test]
     fn deferral_to_an_earlier_message_is_invalid_output() {
-        // ★ 这条断言就是用户报的那个 bug。它 183 字符，比 ACK_ONLY_MAX_CHARS 长，
+        // ★ 这条断言锁的就是那个 bug。它 183 字符，比 ACK_ONLY_MAX_CHARS 长，
         //   所以 is_acknowledgement_only 放过它 —— 必须由 is_deferral_only 拦住。
         assert!(
             !super::is_acknowledgement_only(REAL_DEFERRAL_TEXT),
@@ -3809,7 +3971,7 @@ mod tests {
         );
         assert!(
             super::is_deferral_only(REAL_DEFERRAL_TEXT),
-            "★ 实测原文必须判为「把答案指向别处」——这正是用户报的原始问题"
+            "★ 实测原文必须判为「把答案指向别处」——这正是这条规则的原始问题"
         );
 
         // 同类指路说法
@@ -3916,7 +4078,7 @@ mod tests {
         assert_eq!(super::last_substantive_midturn_text(&deferral_mid), None);
     }
 
-    // ---------------- 流式落盘节流（2026-09-30） ----------------
+    // ---------------- 流式落盘节流 ----------------
 
     /// 数调用次数的 checkpoint 回调工厂
     fn counting_ckpt() -> (
@@ -4096,4 +4258,108 @@ mod tests {
             "真值在手时判定量就是它，与估算无关"
         );
     }
+
+    // ---------------- 记忆规则段 ----------------
+
+    /// 记忆规则必须是**自主触发**，不能退回「等用户开口才记」。
+    ///
+    /// 这条闸门是本次改造的全部意义：早先的触发条件清一色是
+    /// 「用户说以后/记住/…」，于是全局待批队列长期为空，
+    /// `memory/MEMORY.md` 再也不更新。
+    #[test]
+    fn memory_rules_teach_proactive_writing() {
+        let tmp = std::env::temp_dir().join(format!("fa-memrules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("memory")).unwrap();
+
+        let p = build_system_prompt(&tmp);
+
+        assert!(p.contains("When to write"), "要有显式的写入触发清单");
+        assert!(p.contains("收尾闸门"), "要有收尾自检这一步");
+        assert!(
+            p.contains("scope:\"global\"") && p.contains("scope:\"project\""),
+            "要讲清两个落点"
+        );
+        assert!(
+            !p.contains("不要写全局 MEMORY"),
+            "项目态不得再禁写全局 —— 否则与 global 落点自相矛盾"
+        );
+        assert!(p.contains("<memory_system>"), "记忆段要有自己的作用域包裹");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---------- 单薄收尾提升 ----------
+
+    fn asst(text: &str) -> ChatMessage {
+        ChatMessage::assistant(text.to_string())
+    }
+
+    /// 场景：中途写了完整推导，收尾只写「未执行：无。」
+    /// → 应提升中途正文当答案，否则用户只看到那句自我交代。
+    ///
+    /// ⚠️ 两个前提（缺一个就不提升，这是防误伤的设计）：
+    ///    ① 中途正文必须在**最后一个 user 之后**（本轮起点，真实时序）；
+    ///    ② 它要过 `MIDTURN_PROMOTE_MIN_CHARS`(200) 的绝对下限 + 2 倍阈值 ——
+    ///       一条 30 字的短收尾不该被 80 字的播报顶掉。
+    #[test]
+    fn thin_self_report_promotes_midturn_answer() {
+        // 实测用户那句推导的体量（129 字是**不够**的，这里给足 200+）
+        let derivation = "子网掩码 /20 表示前 20 位是网络号，后 12 位是主机号。\
+所以 192.168.1.130 的 /20 段落在 192.168.0.0 到 192.168.15.255 这个区间里，\
+而 192.168.1.1 也在同一个 /20 段中，因此两者的前三段完全相同，属于同一网段。\
+如果掩码是 /24，那么网段会细到 192.168.1.0–192.168.1.255，结论就会反过来。\
+所以判断两台机器是否同网段，先看掩码位数，再比对它们在掩码范围内的比特是否一致。";
+        assert!(
+            derivation.chars().count() >= super::MIDTURN_PROMOTE_MIN_CHARS,
+            "测试数据必须过绝对下限，否则测的是另一条分支"
+        );
+        let msgs = vec![
+            ChatMessage::user("A 类网段里 192.168.1.130 和 192.168.1.1 同网段吗？"),
+            asst("先看 /20 的划分规则。"),
+            asst(derivation),
+        ];
+        let (answer, promoted) = promote_thin_answer("未执行：无。", &msgs);
+        assert_eq!(answer, derivation, "应提升最长的中途正文");
+        assert!(promoted.is_some(), "应报告发生了提升");
+    }
+
+    /// 短收尾 + 短播报（都没过 200 字下限）→ **不该提升**。
+    /// 这是"未执行：无"那个 bug 的反向防线：不能为了救一句废话就劫持答案。
+    #[test]
+    fn short_midturn_below_floor_does_not_get_promoted() {
+        let msgs = vec![
+            ChatMessage::user("再确认下"),
+            asst("我核查了 sessions 与 projects 两个目录的结构，一共读了 12 个文件。"),
+        ];
+        let (answer, promoted) = promote_thin_answer("确认过了", &msgs);
+        assert_eq!(answer, "确认过了", "原样保留");
+        assert!(promoted.is_none(), "中途正文只有 ~35 字，不够格提升");
+    }
+
+    /// 只比"长一点"的收尾不该触发提升 —— 否则模型写「综上，答案如上」
+    /// 这种正常短总结，会被换成前面的过程播报。
+    #[test]
+    fn marginally_longer_midturn_does_not_trigger_promotion() {
+        let msgs = vec![
+            ChatMessage::user("继续"),
+            asst("第一步先看清楚目录结构，这是后续判断的前提条件。"),
+        ];
+        let final_text = "综合上面两步的推导，可以确定这个判断成立，结论如下所述，请注意边界条件。";
+        let (answer, promoted) = promote_thin_answer(final_text, &msgs);
+        assert!(promoted.is_none(), "未到 2 倍阈值，不该提升");
+        assert_eq!(answer, final_text);
+    }
+
+    /// 词表兜底：「已完成」「见上一条」这类仍走原回打路径。
+    #[test]
+    fn ack_and_deferral_words_are_recognised() {
+        assert!(is_acknowledgement_only("未执行：无。"));
+        assert!(is_acknowledgement_only("仅供参考"));
+        assert!(is_acknowledgement_only("已完成"));
+        assert!(is_deferral_only("见上一条回复"));
+        // 长正文里提到这些词不该被当成空洞收尾（防误伤）
+        assert!(!is_acknowledgement_only(&format!("未执行：无。{}", "详细推导见下文。".repeat(20))));
+    }
 }
+

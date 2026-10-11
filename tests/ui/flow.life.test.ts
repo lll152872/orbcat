@@ -5,9 +5,9 @@ import { callsOf, resetMock, state } from "./mocks/tauri";
 /**
  * 设置 › 数据源（认知面注入）
  *
- * 背景（2026-10 用户拍板）：数据源和 MCP 是两件事 ——
+ * 背景（定稿）：数据源和 MCP 是两件事 ——
  * MCP 是能力面（模型决定去调），数据源是认知面（系统决定呈现）。
- * 用户问「帮我安排下今天」时模型**没有理由**先去调一个工具，
+ * 问「帮我安排下今天」时模型**没有理由**先去调一个工具，
  * 所以数据源要主动出现在 system prompt 里（一行摘要）。
  *
  * 这一页锁的是：
@@ -186,7 +186,7 @@ describe("设置 › 数据源", () => {
     await bootApp();
     await openPanel();
     await openLife();
-    // 返回按钮 2026-10-08 起在**滚动区之外**的 `#sub-bar` 里（不随内容滚），
+    // 返回按钮在**滚动区之外**的 `#sub-bar` 里（不随内容滚），
     // 所以要从 document 查、不能在 panel-body 里找 —— 这正是那次修复的目的：
     // 滚到页面底部也点得到返回。
     const bar = document.querySelector("#sub-bar");

@@ -3,7 +3,7 @@ import { waitFor } from "./helpers";
 import { callsOf } from "./mocks/tauri";
 
 /**
- * models 独立窗口内部（src/models.ts）—— 2026-09-29 两个实机 bug 的回归锁。
+ * models 独立窗口内部（src/models.ts）—— 两个实机 bug 的回归锁。
  *
  *   Bug A：只有标题栏能拖，标题栏以下整片拖不动
  *   Bug B：点任何按钮 / 输入都会整块重绘 → 滚动位置归零（页面「自动上翻」）

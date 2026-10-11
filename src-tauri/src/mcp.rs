@@ -125,7 +125,7 @@ pub struct Annotations {
 impl McpTool {
     /// 展示用标题（MCP 的 `annotations.title`，缺省回落工具名）。
     ///
-    /// ⚠️ **仅供测试**（2026-09-30 标注）：生产 UI 直接用 `name`，
+    /// ⚠️ **仅供测试**：生产 UI 直接用 `name`，
     /// 没走 `annotations.title`。留着是为了让"缺省回落工具名"这条规则有断言。
     #[cfg(test)]
     pub fn title(&self) -> String {
@@ -165,7 +165,7 @@ pub struct McpGroup {
     pub summary: String,
     /// 组内工具（`name` = 该 server 上的原始工具名）
     pub tools: Vec<McpTool>,
-    // ⚠️ 2026-09-30 删掉了 `available: bool`（"该 server 是否可用"）：
+    // ⚠️ 删掉了 `available: bool`（"该 server 是否可用"）：
     //    它被写了 4 处、**从没被读过**，而且值恒为 true ——
     //    "连不上"这件事在别处表达（组根本不会进 `groups`，或整体状态不是 connected）。
     //    恒真字段最坏的效果是让人以为某处会把它置 false，从而去找一个不存在的分支。
@@ -1034,7 +1034,7 @@ impl ToolRegistry {
             .collect()
     }
 
-    // ⚠️ 2026-09-30 清 dead-code：这个 impl 块里原本有五个"兼容旧接口"的方法
+    // ⚠️ 清 dead-code：这个 impl 块里原本有五个"兼容旧接口"的方法
     //    （`client_clone` / `server_urls` / `fetch_snapshot_one` /
     //     `apply_snapshot_one` / `refresh`），**全部零调用者**，已删。
     //
@@ -1310,7 +1310,7 @@ impl ToolRegistry {
 
     /// 测试用建注册表的统一入口。
     ///
-    /// ⚠️ 2026-09-30 清 dead-code 时删掉了 `group_tools()`（"兼容旧测试/调用"）：
+    /// ⚠️ 清 dead-code 时删掉了 `group_tools()`（"兼容旧测试/调用"）：
     /// 它只是 `group_tools_for("default", …)` + 一段排序，而生产侧
     /// `fetch_snapshot` 内部已经带同样的排序 —— 两处各写一份，迟早不一致。
     /// 需要造注册表请走下面这个 `from_tools_for_test`。
@@ -1449,7 +1449,7 @@ impl ToolRegistry {
         &self.groups
     }
 
-    // ⚠️ 2026-09-30 清 dead-code 删了三个查询方法（都零调用者）：
+    // ⚠️ 清 dead-code 删了三个查询方法（都零调用者）：
     //    - `server_urls()` —— 设置页的 server 列表读的是 `mcp.json`（`mcp_servers_list`
     //      命令），不走注册表
     //    - `active_groups()` —— 活跃组在别处是从 `groups().filter(is_active)` 现算的；
@@ -1498,7 +1498,7 @@ impl ToolRegistry {
         client.call_tool(raw_name, args).await
     }
 
-    /// ⚠️ 2026-09-30 清 dead-code：这个 impl 块里原本还有五个"兼容旧接口"的
+    /// ⚠️ 清 dead-code：这个 impl 块里原本还有五个"兼容旧接口"的
     /// 方法（`client_clone` / `server_urls` / `call_tool_full` / `raw_name_of` /
     /// `group_of`），**全部零调用者**，已删。
     ///

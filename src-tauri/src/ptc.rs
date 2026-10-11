@@ -63,7 +63,7 @@ pub const RUN_CODE: &str = "run_code";
 /// 而写岔的后果是**工具坍缩了但提示词没换**（模型看到 run_code 却不知道怎么用），
 /// 或反过来（提示词讲了 SDK 但工具还是 native 列表）。那是很难查的半坏状态。
 pub fn mode_active(data_dir: &Path, session_id: Option<&str>) -> bool {
-    // 2026-10-08：模式**跟着会话走**（用户定案），所以一律经
+    // 模式**跟着会话走**，所以一律经
     // `sessions::effective_mode` 读 —— 它自己处理"老会话没 mode 字段 → 回退全局"。
     crate::sessions::effective_mode(data_dir, session_id).is_ptc()
 }

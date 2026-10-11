@@ -40,14 +40,14 @@ fn last_other() -> &'static Mutex<Vec<ForegroundContext>> {
 
 /// 启动轮询线程（setup 里调一次）。每 800ms 采一次前台，非自身则记入历史。
 ///
-/// ⚠️ **睡眠不再暂停它**（2026-09-30 语义变更）。
+/// ⚠️ **睡眠不再暂停它**（语义变更）。
 /// 早先有一套 `PAUSED` 开关：球睡眠时跳过采样，理由是"睡着就别再忙了"。
-/// 用户重新定义睡眠为「球从屏幕上消失，但**任务不停止**」之后，那套开关被删除：
+/// 睡眠语义被重新定义为「球从屏幕上消失，但**任务不停止**」之后，那套开关被删除：
 /// 它把"界面隐身"错当成了"省电模式"。而采样产出的"用户正在看什么"是
 /// **每轮对话的上下文** —— 停掉它，等于睡着期间问 agent 问题，agent 对眼前
 /// 的东西一无所知（球看不见了不代表用户在看的窗口不存在）。
 ///
-/// 开销本来也可忽略：每 800ms 枚举一次窗口，用户明确要的是"不占地方"，
+/// 开销本来也可忽略：每 800ms 枚举一次窗口，这里要的是"不占地方"，
 /// 不是"别感知"。真要省电应该做成独立开关，而不是绑在可见性上。
 ///
 /// ⚠️ 每一轮都套 catch_unwind：单个采样轮 panic 不能让整个线程静默死掉
@@ -106,6 +106,65 @@ pub fn current_excluding_self() -> Option<ForegroundContext> {
         return None;
     }
     Some(ctx)
+}
+
+/// 已知**截图 / 录屏工具**的进程名（小写、不含扩展名）。
+///
+/// ## 为什么需要（截图类工具与面板收起导致的两个问题是同一件事）
+///
+/// 面板「失焦自动收起」在**用户正在截图**时是有害的：拿微信 `Alt+A` 去截面板，
+/// 面板在按键瞬间失焦 → 缩成球 → 截出来是个球，或者干脆截不到长内容。
+///
+/// ## 白名单口径
+///
+/// 只收**以截图/录屏为唯一或主要用途**的进程。刻意**不收**：
+/// - `explorer`：资源管理器 / 桌面，点任务栏或桌面就会被命中 → 面板永远收不起来
+/// - `python` / `node` / `javaw`：宿主太泛，脚本调截图 API 时命中会误伤
+///
+/// 微信 PC 版的截图（`Alt+A`）由**主进程**承担，所以 `wechat` / `weixin` 都要在；
+/// Win11 的「截图工具」会拉起 `screenclippinghost` 做覆盖层，两个都收。
+///
+/// ⚠️ 用 `static` 而不是 `const`：`const` 在每个使用点内联复制，O3 下字符串
+/// 比较还可能被拆成立即数 —— 前者浪费、后者让"产物里有没有这条白名单"
+/// 无法用字符串搜索验证（排查桌面版本是否更新时踩到）。
+static CAPTURE_TOOL_STEMS: &[&str] = &[
+    // 微信 / 企业微信 / 腾讯会议（PC 端截图走主进程）
+    "wechat", "wechatappex", "weixin", "wxwork", "wemeetapp",
+    // QQ / TIM（Alt+A 截图由 QQ.exe 承担）
+    "qq", "tim",
+    // Windows 自带：Win10 截图与草图 / Win11 截图工具 / 覆盖层宿主
+    "screensketch", "snippingtool", "snipandsketch", "screenclippinghost",
+    // 第三方截图
+    "snipaste", "pixpin", "sharex", "greenshot", "picpick", "faststone",
+    // 录屏
+    "obs64", "obs32", "bandicam", "camtasia",
+];
+
+/// 进程名（不含扩展名，大小写不敏感）是否属于已知截图 / 录屏工具。
+///
+/// 单独抽出来是为了**能测** —— `foreground_is_capture_tool()` 依赖真实前台窗口，
+/// 在 CI 上没有稳定的前台，测不了；这条纯函数可以。
+pub fn is_capture_tool_stem(stem: &str) -> bool {
+    CAPTURE_TOOL_STEMS.contains(&stem)
+}
+
+/// 当前前台窗口是不是已知的截图 / 录屏工具？
+///
+/// ⚠️ **必须现场采集**，不能走 [`cached()`] —— 那份缓存是 watcher 每 800ms 轮的
+/// 「用户最近在看的应用」，在 `blur` 这一瞬间它大概率还停在**切换之前**的那个窗口，
+/// 拿它判定等于永远判不出「刚抢到前台的截图工具」。
+///
+/// 非 Windows 平台上 `foreground_window_info()` 返回 `None` → 恒为 `false`
+/// （不拦，行为与改前一致）。
+pub fn foreground_is_capture_tool() -> bool {
+    let Some((exe, _title)) = crate::win32::foreground_window_info() else {
+        return false;
+    };
+    let stem = std::path::Path::new(&exe)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    is_capture_tool_stem(&stem)
 }
 
 /// 一次采集的结果
@@ -456,6 +515,26 @@ mod tests {
     fn current_does_not_panic() {
         // 无前台窗口也不应 panic（CI/服务环境）
         let _ = current();
+    }
+
+    /// 截图工具白名单：认得出该认的，**也认不出不该认的**。
+    ///
+    /// 反向用例比正向重要 —— 白名单误伤（把 `explorer` / `node` 收进来）
+    /// 会让面板在点任务栏时永远收不起来，比"截图时被收起"更难排查。
+    #[test]
+    fn capture_tool_stem_matches_whitelist_only() {
+        for hit in ["wechat", "weixin", "wechatappex", "qq", "snippingtool", "snipaste", "pixpin"] {
+            assert!(is_capture_tool_stem(hit), "{hit} 应在截图工具白名单里");
+        }
+        for miss in ["explorer", "node", "python", "orbcat", "chrome", "code", "typora", ""] {
+            assert!(!is_capture_tool_stem(miss), "{miss} 不该被当成截图工具（会误伤）");
+        }
+    }
+
+    #[test]
+    fn foreground_is_capture_tool_does_not_panic() {
+        // 没有前台窗口（CI / 服务环境）时应安静返回 false，不能 panic
+        let _ = foreground_is_capture_tool();
     }
 
     /// 本机诊断：打印当前前台与缓存。手动跑：

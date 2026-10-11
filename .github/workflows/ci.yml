@@ -27,7 +27,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, "feat/**", "fix/**"]
   pull_request:
     branches: [master]
   workflow_dispatch:
@@ -69,14 +69,55 @@ jobs:
       - name: TypeScript check
         run: npx tsc --noEmit
 
+      # 防夹带闸门 · 仓库级。
+      # build.rs 里那道只管「编进二进制的骨架」，管不到 git 跟踪、
+      # tauri 打包配置、发布脚本拷贝目标这三条进包路径 —— 它们要这道。
+      - name: No-user-data gate
+        run: npm run check:no-user-data
+
       - name: Unit tests (frontend)
         run: npx vitest run
+
+      # ⚠️ 必须在下面任何 cargo 命令**之前**跑（2026-10-11 实测踩坑）。
+      #   tauri-build 在编译期就解析 bundle.resources，而 ResourcePaths::from_map
+      #   走的是 Walk（递归列目录）不是 glob —— 源目录不存在就直接
+      #   `error: resource path '../dist' doesn't exist`，build script exit 101。
+      #   dist/ 又在 .gitignore 里，CI 全新 checkout 时根本没有它。
+      #   所以「前端是构建产物」这件事要求：先 build，再碰 cargo。
+      - name: Frontend build (dist must exist before cargo)
+        run: npm run build
 
       - name: Rust check
         run: cargo check --manifest-path src-tauri/Cargo.toml --lib
 
       - name: Rust tests
         run: cargo test --lib --manifest-path src-tauri/Cargo.toml
+
+      # ── 出包 ──────────────────────────────────────────────
+      # 放在测试之后：测试红了就没必要编，编了也是白编。
+      #
+      # ⚠️ exe 必须与 dist/ 同目录分发 —— 见 tools/build-release.sh 的说明。
+      #   tauri.conf.json 的 frontendDist 指向 ./stub-dist，那是编译期嵌进二进制的；
+      #   而 build-release.sh 约定运行时再放一份真 dist/ 在 exe 旁边。**两份都要**。
+      - name: Rust build (bin)
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin orbcat
+
+      - name: Package (unsigned)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out/dist | Out-Null
+          Copy-Item src-tauri/target/debug/orbcat.exe out/orbcat-windows-x64.exe
+          Copy-Item -Recurse -Force dist/* out/dist/
+          Write-Output "=== artifact tree ==="
+          Get-ChildItem -Recurse out | ForEach-Object {
+            "{0,10}  {1}" -f $_.Length, $_.FullName.Substring((Resolve-Path out).Path.Length + 1)
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbcat-windows-x64-debug
+          path: out/
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # macOS arm64 —— 本次改动的核心验证目标
@@ -107,6 +148,18 @@ jobs:
       - name: TypeScript check
         run: npx tsc --noEmit
 
+      - name: No-user-data gate
+        run: npm run check:no-user-data
+
+      # ⚠️ 必须在下面任何 cargo 命令**之前**跑（2026-10-11 实测踩坑）。
+      #   tauri-build 在编译期解析 bundle.resources，ResourcePaths::from_map
+      #   走 Walk（递归列目录）不是 glob —— 源目录不存在直接
+      #   `error: resource path '../dist' doesn't exist`，build script exit 101。
+      #   dist/ 在 .gitignore 里，全新 checkout 根本没有它。
+      #   这个 job 之前压根没有 build 前端，所以一 push 就全红。
+      - name: Frontend build (dist must exist before cargo)
+        run: npm run build
+
       # ★ 这一步是本次 CI 的核心：证明 `platform/` 抽象层在真实 macOS 上成立。
       #   在此之前，crate 因为 win32.rs / capture.rs / context.rs 里的裸 FFI
       #   **根本编译不过**（只有 win32desk.rs 挂了 #![cfg(windows)]）。
@@ -131,21 +184,58 @@ jobs:
       - name: Rust tests
         run: cargo test --lib --manifest-path src-tauri/Cargo.toml
 
-      # 产出可分发二进制，方便直接下载给朋友试用。
-      # 注意：未签名 + 未公证，Gatekeeper 会拦 —— 这是预期的，
+      # ── 出包：.app + .dmg ─────────────────────────────────
+      # 未签名 + 未公证，Gatekeeper 会拦 —— 这是预期的，
       #   试用时需 右键 → 打开，或用 xattr -d com.apple.quarantine 解隔离。
-      - name: Package (unsigned)
+      # ⚠️ 必须显式带 `app`：`--bundles dmg` 时 Tauri 会把打完 dmg 的中间
+      #    .app **删掉**（日志里有一行 `Cleaning .../bundle/macos/orbcat.app`），
+      #    只剩 dmg 一个文件。下面的校验步骤要看 .app 内部结构，所以两个都要。
+      #
+      # tauri build 内部会自己再跑一次 beforeBuildCommand（npm run build），
+      #   所以 dist/ 一定是当次构建的新鲜产物。
+      - name: Bundle (app + dmg, unsigned)
         run: |
-          mkdir -p out
-          cp src-tauri/target/debug/orbcat out/orbcat-macos-arm64
-          echo "=== binary info ==="
-          file out/orbcat-macos-arm64
-          ls -lh out/orbcat-macos-arm64
+          npm run tauri -- build --bundles app,dmg
+          echo "=== bundle output ==="
+          ls -lh src-tauri/target/release/bundle/dmg/
+          ls -lh src-tauri/target/release/bundle/macos/
+
+      # ⚠️ 别只看 job 绿了就说成功 —— 一个 dist 没进包的 .dmg 也是绿的，
+      #   装上去打开是白窗（回退到 stub-dist 占位页）。
+      #   这里把 .app 实际结构打出来核对：dist 必须在
+      #   Contents/Resources/dist/index.html —— 见 disk_assets.rs 的
+      #   compute_dist_dir：.app 里 exe（Contents/MacOS/）与 Resources 不同目录。
+      - name: Verify .app contains dist
+        run: |
+          APP="src-tauri/target/release/bundle/macos/orbcat.app"
+          if [ ! -d "$APP" ]; then
+            echo "FAIL: 找不到 .app：$APP"; exit 1
+          fi
+          echo "=== .app/Contents ==="
+          ls -la "$APP/Contents"
+          echo "=== Contents/MacOS ==="
+          ls -la "$APP/Contents/MacOS"
+          echo "=== Contents/Resources（dist 应在此） ==="
+          ls -la "$APP/Contents/Resources" || true
+          if [ ! -f "$APP/Contents/Resources/dist/index.html" ]; then
+            echo "FAIL: .app 里没有 Contents/Resources/dist/index.html —— 装上去会是白窗"
+            exit 1
+          fi
+          echo "OK: dist 已进包 Contents/Resources/dist/index.html"
+          echo "=== dist 文件清单 ==="
+          find "$APP/Contents/Resources/dist" -type f | head -20
+          echo "=== 二进制架构核对 ==="
+          file "$APP/Contents/MacOS/orbcat"
+          lipo -archs "$APP/Contents/MacOS/orbcat"
+          echo "=== dmg ==="
+          ls -lh src-tauri/target/release/bundle/dmg/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: orbcat-macos-arm64-debug
-          path: out/
+          name: orbcat-macos-arm64-dmg
+          path: |
+            src-tauri/target/release/bundle/dmg/
+            src-tauri/target/release/bundle/macos/
           retention-days: 14
 
   # ---------------------------------------------------------------------------
@@ -184,6 +274,14 @@ jobs:
 
       - name: npm ci
         run: npm ci
+
+      - name: No-user-data gate
+        run: npm run check:no-user-data
+
+      # ⚠️ 必须在 cargo 之前跑（2026-10-11 实测踩坑）：tauri-build 编译期解析
+      #   bundle.resources，源目录 ../dist 不存在直接 exit 101；dist 在 .gitignore。
+      - name: Frontend build (dist must exist before cargo)
+        run: npm run build
 
       # lib 一层过不了就别谈产物了：crate 里绝大多数 win32 绑定都在 lib。
       - name: Rust check (lib)

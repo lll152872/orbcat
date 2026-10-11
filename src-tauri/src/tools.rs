@@ -397,13 +397,30 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "remember",
-            "把一条值得**长期记住**的信息提交为记忆候选（用户确认后才会真正进入长期记忆）。\
-             适用：用户偏好/雷区/长期约定；**做完一轮后**可复用的「做过什么」；失败时的「错因与规避」。\
-             不要用：临时状态、一次路径、闲聊、未验证猜测。任务完成或失败收尾时优先考虑调用本工具。",
+            "把一条值得**长期记住**的信息提交下来。**落点由你选（scope）**：\n\
+
+             - `global`：跨项目通用的（用户偏好/雷区/通用教训）→ 提交候选，用户在 设置 › 记忆 批准后进长期记忆\n\
+
+             - `project`：只在本项目成立的（路径/术语/约定/进展）→ 直写该项目的记忆文件；当前没有激活项目时会报错\n\
+
+             - `auto`（默认）：有激活项目走项目，否则走全局\n\
+
+             适用：用户偏好/雷区/长期约定；**做完一轮后**可复用的「做过什么」；失败时的「错因与规避」。\n\
+
+             不要用：临时状态、一次路径、闲聊、未验证猜测。\n\
+
+             **每轮收尾、给最终答复之前，先自问有没有该记的**；拿不准就用 `global`\n\
+
+             （候选有审批把关，提错会被驳；漏记的永远丢了）。",
             json!({
                 "type": "object",
                 "properties": {
-                    "content": { "type": "string", "description": "要记住的信息，一句话，自包含（不要写\"他\"\"上面说的\"这类指代）" }
+                    "content": { "type": "string", "description": "要记住的信息，一句话，自包含（不要写\"他\"\"上面说的\"这类指代）" },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "project", "auto"],
+                        "description": "写哪一层：global=跨项目通用的（提交待批候选，用户批准后进长期记忆）；project=只在本项目成立的（直写项目记忆，当前没有激活项目时会报错并回传项目清单）；auto=有激活项目走项目、否则走全局（默认）"
+                    }
                 },
                 "required": ["content"]
             }),
@@ -654,7 +671,7 @@ pub fn tool_specs(
 
 /// 「记忆蒸馏」会话专用工具集：标准工具 + `distill_move`。
 ///
-/// 为什么要单独一份（2026-10-03）：`distill_move` 只在蒸馏会话里有意义
+/// 为什么要单独一份：`distill_move` 只在蒸馏会话里有意义
 /// （把条目从中转站迁进 USER/SOUL/IDENTITY）。普通聊天里摆着它只会让模型
 /// 误用 —— 所以按会话注入，而不是全局注册。
 pub fn tool_specs_for_distill(
@@ -665,6 +682,7 @@ pub fn tool_specs_for_distill(
 ) -> Vec<ToolSpec> {
     let mut specs = tool_specs(mcp, web_search_ready, data_dir, session_id);
     specs.push(distill_move_spec());
+    specs.push(memory_delete_spec());
     specs
 }
 
@@ -681,7 +699,7 @@ pub fn all_tool_specs(
 ) -> Vec<ToolSpec> {
     let mut specs = builtin_specs();
 
-    // ── 发图：只有"发表情包"那一半按模式闸住（2026-10-08）──────────────
+    // ── 发图：只有"发表情包"那一半按模式闸住 ────────────────────────────
     //
     // `send_image` 是常驻内置工具，已经在 `builtin_specs()` 里了（工作模式
     // 也要贴截图 / 图表）。这里单独注入 `send_meme` —— **只在能随便发图的
@@ -1227,6 +1245,7 @@ async fn execute_inner(
         }
         "remember" => remember(args, ctx.data_dir),
         "distill_move" => distill_move(args, ctx.data_dir),
+        "memory_delete" => memory_delete(args, ctx.data_dir),
         "life_items" => life_items(args, ctx).await,
         "ask_user" => ask_user(args, ctx).await,
         "recall_turns" => recall_turns(args, ctx),
@@ -1630,28 +1649,147 @@ fn recall_in_session(
 // remember
 // ---------------------------------------------------------------------------
 
-/// 提交长期记忆候选。不直接写 MEMORY.md —— 要等用户审批。
-/// 提交长期记忆。
-/// - **主对话**（无激活项目）→ 全局 pending 审批
-/// - **已切到项目** → 直接追加 `projects/<名>/MEMORY.md`（跳脱主对话）
+/// 提交长期记忆。**落点由模型显式选（`scope`）**，不再由「有没有激活项目」隐式决定。
+///
+/// | scope | 有激活项目 | 无激活项目 |
+/// |---|---|---|
+/// | `global` | 提交全局候选（**无视**激活项目） | 提交全局候选 |
+/// | `project` | 直写 `projects/<名>/MEMORY.md` | **报错** + 回传项目清单（不静默改投） |
+/// | `auto`（缺省） | 直写项目记忆（旧行为） | 提交全局候选 |
+///
+/// ## 为什么让模型自己选
+///
+/// 早先的规则是「有激活项目就永远写项目」，于是只要顶栏挂着任何一个项目，
+/// 主对话里记的东西就**全部沉进那个项目**，全局待批队列长期为空 ——
+/// `memory/MEMORY.md` 再也不更新。现在「这条是否跨项目通用」由模型按**内容**
+/// 判断，路由不再由会话状态决定。
 fn remember(args: &Value, data_dir: &Path) -> Result<ToolOutput, String> {
     let content = get_str(args, "content")?;
+
+    // 落点：global / project / auto（auto = 旧行为，兼容没带 scope 的老调用）
+    let scope = args
+        .get("scope")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("auto");
+    if !matches!(scope, "global" | "project" | "auto") {
+        return Err(format!(
+            "scope 只能是 \"global\" / \"project\" / \"auto\"，收到 `{scope}`"
+        ));
+    }
+
     let settings = crate::config::load_settings(data_dir);
-    if let Some(pid) = settings.active_project_id {
-        let projects = crate::pmem::list_projects(data_dir)?;
-        if let Some(p) = projects.into_iter().find(|x| x.id == pid) {
+    let active = settings.active_project_id.and_then(|pid| {
+        crate::pmem::list_projects(data_dir)
+            .ok()
+            .and_then(|list| list.into_iter().find(|x| x.id == pid))
+    });
+
+    match scope {
+        // 跨项目通用 —— **无视**激活项目，一律进待批候选
+        "global" => remember_to_candidates(data_dir, &content),
+        // 只在本项目成立 —— 没有激活项目就明说，不静默改投
+        "project" => {
+            let Some(p) = active else {
+                let names: Vec<String> = crate::pmem::list_projects(data_dir)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| p.name)
+                    .collect();
+                return Err(format!(
+                    "你选了 scope=\"project\"，但当前**没有激活项目**，没有地方写项目记忆。\
+                     可选做法二选一：\n\
+                     1. 这条其实跨项目通用 → 改用 scope=\"global\"（提交候选，用户批准后进长期记忆）\n\
+                     2. 它只属于某个项目 → 让用户在顶栏「项目 ▾」里切到那个项目，然后你再调一次\n\
+                     现有项目：{}",
+                    if names.is_empty() {
+                        "（一个都没有）".to_string()
+                    } else {
+                        names.join("、")
+                    }
+                ));
+            };
             crate::pmem::append_project_memory(data_dir, &p.name, &content, "model")?;
-            return Ok(ToolOutput::text(format!(
+            Ok(ToolOutput::text(format!(
                 "已写入项目「{}」的记忆（projects/{}/MEMORY.md），跨会话有效。",
                 p.name, p.name
-            )));
+            )))
+        }
+        // auto：有激活项目走项目，否则走全局（= 旧行为）
+        _ => {
+            if let Some(p) = active {
+                crate::pmem::append_project_memory(data_dir, &p.name, &content, "model")?;
+                return Ok(ToolOutput::text(format!(
+                    "已写入项目「{}」的记忆（projects/{}/MEMORY.md），跨会话有效。",
+                    p.name, p.name
+                )));
+            }
+            remember_to_candidates(data_dir, &content)
         }
     }
+}
+
+/// 全局通道：**只提交待批候选**，用户在 设置 › 记忆 批准后才进 `memory/MEMORY.md`。
+///
+/// 返回文案必须说清落点与下一步 —— 模型会把它原样转述给用户。
+fn remember_to_candidates(data_dir: &Path, content: &str) -> Result<ToolOutput, String> {
     let store = crate::memory::MemoryStore::new(data_dir);
-    let c = store.propose(&content, "model")?;
+    let c = store.propose(content, "model")?;
     Ok(ToolOutput::text(format!(
-        "已提交全局记忆候选（id: {}），等用户在面板里确认后才会进入长期记忆。",
+        "已提交**全局**记忆候选（id: {}）。用户在 设置 › 记忆 批准后，它才会进入 \
+         memory/MEMORY.md 并跨会话生效。",
         c.id
+    )))
+}
+
+/// `memory_delete` 的 schema —— **只在蒸馏会话注入**（见 [`tool_specs_for_distill`]）。
+///
+/// 为什么删除要做成**独立工具**而不是给 `distill_move` 加一个 `target`：
+/// `distill_move` 的语义是"把这条搬到该去的地方"，而删除是"这条不该存在"——
+/// 名字混在一起，模型在搬运时很容易顺手挑错。两者的**匹配与备份规则完全相同**，
+/// 实现也共用 [`crate::distill`] 里的逻辑。
+fn memory_delete_spec() -> ToolSpec {
+    ToolSpec::new(
+        "memory_delete",
+        "从长期记忆（中转站 `memory/MEMORY.md`）里**删掉一条**。\n\
+         只用于两种情况：**这条已经过时**，或**当初就记错了**。\n\
+         执行前会自动按天备份（`memory/MEMORY.md.bak-<日期>`）。\n\
+         `text` 必须与 MEMORY.md 里的条目正文逐字一致（不含行首 \"- \"），否则报错。\n\
+         一次只删一条；多条请多次调用（每条都会单独返回结果）。\n\
+         ⚠️ 这不是\"整理\"动作 —— 只是把条目从文件里摘掉，不会写进 USER/SOUL/IDENTITY。\n\
+         拿不准该不该删，**先问用户**，别自己判。",
+        json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "条目正文（与 MEMORY.md 逐字一致，不含行首 \"- \"）" },
+                "reason": { "type": "string", "description": "删除理由（会在结果里回显，便于你向用户交代为什么删）" }
+            },
+            "required": ["text"]
+        }),
+    )
+}
+
+/// `memory_delete` —— **只在蒸馏会话可用**。
+///
+/// 返回文本要**说清结果**（删了哪条、备份在哪），因为模型会把它原样转述给用户。
+fn memory_delete(args: &Value, data_dir: &Path) -> Result<ToolOutput, String> {
+    let text = get_str(args, "text")?;
+    let reason = args
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let r = crate::distill::delete_entry(data_dir, &text)?;
+    let head = if reason.is_empty() {
+        clip(text.trim(), 60)
+    } else {
+        format!("{}（理由：{}）", clip(text.trim(), 60), reason)
+    };
+    Ok(ToolOutput::text(format!(
+        "已从长期记忆中删除：{head}。\n\
+         备份在 `memory/{}`，同一天内再删会覆盖它 —— 想反悔就从这份备份里捞回来。",
+        r.backup
     )))
 }
 
@@ -2173,7 +2311,7 @@ const GREP_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// grep 的跳过统计 —— 每一条都要出现在返回文本里。
 ///
-/// ## 为什么这是本工具最重要的设计（2026-10-01 定论）
+/// ## 为什么这是本工具最重要的设计（已定论）
 /// 旧版每一条跳过路径都是裸 `return`，返回的永远是 `(无匹配)`。
 /// 模型**无法区分**「真的没有」和「工具压根没读」—— 实测 543 次调用里
 /// 58% 报零命中，其中 145 次是 `path` 传了文件（`read_dir` 对文件必失败）、
@@ -2372,7 +2510,7 @@ fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     };
 
     if roots.is_file() {
-        // ★ 2026-10-01 修：`path` 传文件时**直接搜这个文件**。
+        // ★ 修过一处：`path` 传文件时**直接搜这个文件**。
         //
         // 旧版把 roots 丢给 `walk()`，而 walk 第一件事是 `read_dir` ——
         // 对文件必然失败，然后裸 `return`，于是返回「命中 0 行」。
@@ -2515,7 +2653,7 @@ fn now_ms() -> u128 {
 
 /// 写/改前备份到 `agent-data/backups/`。原文件不存在则不备份，返回空说明。
 ///
-/// ⚠️ 2026-09-30 起实现搬到 [`crate::recovery`]：原来的版本只把副本命名为
+/// ⚠️ 实现已搬到 [`crate::recovery`]：原来的版本只把副本命名为
 /// `{时间戳}__{文件名}`，**不记原路径** —— 于是 210 个备份都还原不回去
 /// （谁知道那个 `README.md` 原来在哪个目录）。现在每次都写
 /// `backups.jsonl`（原路径 / 时间 / 大小），设置页也能列出并一键还原。
@@ -3075,7 +3213,7 @@ async fn request_access(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, S
 
     // ---- 校验 3：这条申请**刚被拒过**（含同 parent/更宽 access）→ 打回 ----
     //
-    // 2026-09-23：同目录连续写曾连环弹卡。现在同 parent + 同/更宽 access 也拦，
+    // 同目录连续写曾连环弹卡。现在同 parent + 同/更宽 access 也拦，
     // 并提示模型**申请父目录 + task**（而不是单文件 once）。
     if let Some(m) = ctx.perm.find_denied(ctx.session_id, &canon, access) {
         let why = if m.reason.is_empty() {
@@ -3199,7 +3337,7 @@ async fn web_search(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Strin
 /// ⚠️ 命令的副作用**无法静态穷举**（`python -c` / 嵌套 shell 都是逃生口），
 ///    所以本工具只承诺 **default-deny + 逐条用户批准**，不承诺"批了就绝对安全"。
 ///    这与各家 agent 的官方共识一致（静态规则不是安全边界）。
-/// `ask_user`：向用户提一个问题并阻塞等回答（2026-09-25 用户要求加的工具）。
+/// `ask_user`：向用户提一个问题并阻塞等回答。
 ///
 /// 通道复用权限申请的「弹卡等回答」机制（[`PermHub::ask_user`]）：
 /// 张问题卡 → agent loop 阻塞在这里 → 用户打字/点选项 → 唤醒 → 回答进 tool 结果。
@@ -3455,7 +3593,7 @@ async fn run_command(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Stri
     //   · 后台：隐形桌面上跑 —— 应用自己弹的窗口不会闪到用户屏幕上、不抢焦点
     //
     // 为什么用进程级开关而不是 agent 模式：后台执行管的是"在哪儿跑"，
-    // 与模式管的"哪些工具可见"是正交的两个维度（用户拍板）。
+    // 与模式管的"哪些工具可见"是正交的两个维度。
     #[cfg(windows)]
     let use_bg_desk = crate::win32desk::is_enabled();
     #[cfg(not(windows))]
@@ -3727,7 +3865,7 @@ mod tests {
                 "web_search".to_string(),
                 "fetch_url".to_string(),
                 "distill_move".to_string(),
-                // 2026-10-08：只在 `imageReplies = "free"` 的模式里注入
+                // 只在 `imageReplies = "free"` 的模式里注入
                 // （见 `all_tool_specs`），但**名字必须保留** —— 否则项目
                 // 脚本工具能起个同名的，把这道闸门顶掉。
                 "send_meme".to_string(),
@@ -3748,7 +3886,7 @@ mod tests {
         );
     }
 
-    /// `send_meme` 必须被模式**硬**闸住（用户 2026-10-08 要求）。
+    /// `send_meme` 必须被模式**硬**闸住。
     ///
     /// 这条别退化成提示词：闸门的意义就是"模型想调也调不到"。
     /// 同时钉住另一半 —— `send_image` 常驻（工作模式也要贴截图 / 图表）。
@@ -3775,7 +3913,7 @@ mod tests {
         .unwrap();
 
         let names = |dir: &Path, mode: &str| -> Vec<String> {
-            // 模式跟会话走（2026-10-08）：给这个模式**建一条会话**，按它的 id 取工具表。
+            // 模式跟会话走：给这个模式**建一条会话**，按它的 id 取工具表。
             // ⚠️ 不能再写 `settings.json` 的 `activeMode` —— 那个字段已删，
             //    而且就算留着也不影响任何一条会话的模式（曾经靠它切模式的写法已全废）。
             let sid = crate::sessions::new_session(dir, mode).id;
@@ -4638,7 +4776,7 @@ Write-Output "ARG=[$msg]"
     }
 
     // -----------------------------------------------------------------------
-    // grep_files 的「静默失败」回归（2026-10-01）
+    // grep_files 的「静默失败」回归
     //
     // 背景：543 次真实调用里 58% 报零命中，其中 145 次是 `path` 传了文件 ——
     // walk() 对文件 read_dir 必失败后裸 return，工具报「命中 0 行」，
@@ -4732,10 +4870,10 @@ Write-Output "ARG=[$msg]"
     }
 
     // -----------------------------------------------------------------------
-    // grep_files 端到端：重放真实失败现场（2026-10-01）
+    // grep_files 端到端：重放真实失败现场
     // -----------------------------------------------------------------------
 
-    /// 复刻 `s1790833919027-2` 那次事故：模型对**单个文件**调 grep_files，
+    /// 复刻那次事故：模型对**单个文件**调 grep_files，
     /// 文件里明明有这个词，工具却报「命中 0 行」→ 模型放弃工具改跑 PowerShell。
     #[test]
     fn grep_files_accepts_a_file_as_path() {
@@ -4893,7 +5031,7 @@ Write-Output "ARG=[$msg]"
     /// ⚠️ **这个用例依赖运行机器的系统 ACP**：只有 ACP=936（简体中文 Windows）
     /// 才能把 GBK 字节解成「数据」。GitHub 的 `windows-latest` runner 是英文
     /// en-US（ACP=1252），GBK 字节会解成乱码 → 搜不到 → 失败。
-    /// 2026-10-10 由 CI 抓出：本地中文系统一直通过，单机测试看不出问题。
+    /// 由 CI 抓出：本地中文系统一直通过，单机测试看不出问题。
     #[cfg(windows)]
     #[test]
     fn grep_files_reads_gbk_files() {
@@ -5118,7 +5256,7 @@ Write-Output "ARG=[$msg]"
             assert!(ok.text.contains("OK_CONTENT"));
         }
 
-        // 换成一条 **PTC 会话**（模式跟会话走，2026-10-08）。
+        // 换成一条 **PTC 会话**（模式跟会话走）。
         // ⚠️ 不能再写 `settings.json` 的 `activeMode` —— 那字段已删。
         let sid = crate::sessions::new_session(&tmp, "ptc").id;
 
@@ -5150,7 +5288,7 @@ Write-Output "ARG=[$msg]"
         let target = tmp.join("y.txt");
         std::fs::write(&target, "SUB_CALL_OK").unwrap();
 
-        // 整场都在 PTC 会话里跑（模式跟会话走，2026-10-08）
+        // 整场都在 PTC 会话里跑（模式跟会话走）
         let sid = crate::sessions::new_session(&tmp, "ptc").id;
 
         let gate = gate_for(&tmp);
@@ -5479,5 +5617,162 @@ Write-Output "ARG=[$msg]"
         assert!(err.contains("只读") || err.contains("run_command"), "{}", err);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---------------- remember 的 scope 落点 ----------------
+
+    fn mem_tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("orb-mem-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// `scope:"global"` **无视**激活项目 —— 本次改造的核心闸门。
+    ///
+    /// 早先的路由是「有激活项目就写项目」，于是主对话只要顶栏挂着任何一个项目，
+    /// 记的东西就永远进不了全局待批队列。
+    #[test]
+    fn remember_global_ignores_active_project() {
+        let d = mem_tmp("g");
+        let p = crate::pmem::create_project(&d, "proj", "").unwrap();
+        let mut s = crate::config::load_settings(&d);
+        s.active_project_id = Some(p.id);
+        crate::config::save_settings(&d, &s).unwrap();
+
+        let out = remember(
+            &json!({"content": "用户偏好：回答用中文", "scope": "global"}),
+            &d,
+        )
+        .unwrap();
+        assert!(out.text.contains("全局"), "回执要说清落点：{}", out.text);
+
+        let pend = crate::memory::MemoryStore::new(&d).list_pending().unwrap();
+        assert_eq!(pend.len(), 1, "global 应提交待批候选");
+        assert!(pend[0].content.contains("回答用中文"));
+        let pm = crate::pmem::project_memory_md(&d, "proj").unwrap_or_default();
+        assert!(!pm.contains("回答用中文"), "global 不得写进项目层");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `scope:"project"` 且**没有**激活项目 → 报错 + 回传项目清单，不静默改投。
+    #[test]
+    fn remember_project_without_active_project_errors() {
+        let d = mem_tmp("p");
+        crate::pmem::create_project(&d, "论文", "").unwrap();
+        let mut s = crate::config::load_settings(&d);
+        s.active_project_id = None;
+        crate::config::save_settings(&d, &s).unwrap();
+
+        let err = remember(
+            &json!({"content": "Fig.2 是任务表", "scope": "project"}),
+            &d,
+        )
+        .expect_err("没有激活项目时必须报错");
+        assert!(err.contains("没有激活项目"), "{err}");
+        assert!(err.contains("论文"), "错误里要回传可用项目清单：{err}");
+
+        assert!(crate::memory::MemoryStore::new(&d)
+            .list_pending()
+            .unwrap()
+            .is_empty());
+        let f = d.join("projects").join("论文").join("MEMORY.md");
+        let written = std::fs::read_to_string(&f).unwrap_or_default();
+        assert!(!written.contains("Fig.2"), "报错时不得写任何文件");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `scope:"project"` + 有激活项目 → 直写项目记忆，不进全局队列。
+    #[test]
+    fn remember_project_writes_project_memory() {
+        let d = mem_tmp("p2");
+        let p = crate::pmem::create_project(&d, "论文", "").unwrap();
+        let mut s = crate::config::load_settings(&d);
+        s.active_project_id = Some(p.id);
+        crate::config::save_settings(&d, &s).unwrap();
+
+        remember(
+            &json!({"content": "Fig.2 是任务表", "scope": "project"}),
+            &d,
+        )
+        .unwrap();
+        assert!(crate::pmem::project_memory_md(&d, "论文")
+            .unwrap()
+            .contains("Fig.2 是任务表"));
+        assert!(crate::memory::MemoryStore::new(&d)
+            .list_pending()
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `auto`（缺省）保持旧行为 —— 老调用不带 scope 不能坏。
+    #[test]
+    fn remember_auto_keeps_legacy_behaviour() {
+        let d = mem_tmp("a");
+        let p = crate::pmem::create_project(&d, "proj", "").unwrap();
+
+        let mut s = crate::config::load_settings(&d);
+        s.active_project_id = Some(p.id);
+        crate::config::save_settings(&d, &s).unwrap();
+        remember(&json!({"content": "老调用不带 scope"}), &d).unwrap();
+        assert!(crate::pmem::project_memory_md(&d, "proj")
+            .unwrap()
+            .contains("老调用不带 scope"));
+
+        let mut s2 = crate::config::load_settings(&d);
+        s2.active_project_id = None;
+        crate::config::save_settings(&d, &s2).unwrap();
+        remember(&json!({"content": "无项目时的记忆"}), &d).unwrap();
+        let pend = crate::memory::MemoryStore::new(&d).list_pending().unwrap();
+        assert_eq!(pend.len(), 1);
+        assert!(pend[0].content.contains("无项目时的记忆"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 非法 scope 直接报错，别默默当 auto 处理（静默改投等于撒谎）。
+    #[test]
+    fn remember_rejects_unknown_scope() {
+        let d = mem_tmp("bad");
+        let err = remember(&json!({"content": "x", "scope": "gobal"}), &d).unwrap_err();
+        assert!(err.contains("scope"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 工具 schema 必须把 scope 暴露给模型，否则它没有理由去选落点。
+    #[test]
+    fn remember_spec_exposes_scope() {
+        let d = mem_tmp("spec");
+        let specs = all_tool_specs(None, false, &d, None);
+        let sp = specs
+            .iter()
+            .find(|s| s.name == "remember")
+            .expect("remember 必须在工具表里");
+        assert!(sp.description.contains("scope"), "描述要教怎么选落点");
+        let schema = serde_json::to_string(&sp.parameters).unwrap();
+        assert!(schema.contains("scope"), "schema 要有 scope 参数");
+        assert!(schema.contains("\"global\"") && schema.contains("\"project\""));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 删除是破坏性的，只在**蒸馏会话**里给 —— 主对话里没有。
+    #[test]
+    fn memory_delete_only_in_distill_sessions() {
+        let d = mem_tmp("del");
+        let plain = all_tool_specs(None, false, &d, None);
+        assert!(
+            !plain.iter().any(|s| s.name == "memory_delete"),
+            "主对话不该有这个工具"
+        );
+
+        let distill = tool_specs_for_distill(None, false, &d, None);
+        let sp = distill
+            .iter()
+            .find(|s| s.name == "memory_delete")
+            .expect("蒸馏会话必须有 memory_delete");
+        assert!(sp.description.contains("过时"), "描述要说明什么时候该删");
+        let schema = serde_json::to_string(&sp.parameters).unwrap();
+        assert!(schema.contains("text"), "要能指定删哪条");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -390,7 +390,7 @@ impl MemoryStore {
 
         // ⚠️ 两侧必须归一化到**同一种形态**，否则前缀比较会失效。
         //
-        // 2026-10-10 的诊断（见同文件 `diag_path_forms_in_ci`）在 CI 上给出了确切答案：
+        // 诊断（见同文件 `diag_path_forms_in_ci`）在 CI 上给出了确切答案：
         //   query canon = Err(NotFound)   ← 待匹配的文件**不存在**，canonicalize 失败
         //   root canon  = Ok("\\\\?\\C:\\...\\runneradmin\\...\\fa_diag_76652")
         //
@@ -560,7 +560,7 @@ impl MemoryStore {
 }
 
 // ---------------------------------------------------------------------------
-// 轮末自动蒸馏（2026-10-07 用户定案：不靠模型自觉调 remember）
+// 轮末自动蒸馏（不靠模型自觉调 remember）
 // ---------------------------------------------------------------------------
 
 /// 自动蒸馏单次写入的条数上限
@@ -693,7 +693,7 @@ mod tests {
     use super::*;
 
     fn fresh_store(tag: &str) -> (MemoryStore, PathBuf) {
-        // ⚠️ 目录名必须**每次调用唯一**（2026-10-10 修）。
+        // ⚠️ 目录名必须**每次调用唯一**。
         //
         // 原来只有 tag：`orbcat_mem_daily` / `orbcat_mem_proj` / …，且开头无条件
         // `remove_dir_all`。`cargo test` 默认**多线程并行**，多个测试共用同一进程时，
@@ -785,14 +785,14 @@ mod tests {
     #[cfg(windows)]
     // 这些用例硬编码了 Windows 路径（`D:\…`）与 Windows 的大小写不敏感语义，
     // 在 macOS/Linux 上 `D:\` 只是一个相对文件名，断言必然失败 —— 不是产品 bug。
-    // 2026-10-10 由 macos-14 runner 抓出。
+    // 由 CI 的 macos runner 抓出。
     #[test]
     fn project_memory_longest_prefix_wins() {
         let (s, dir) = fresh_store("proj");
         // ⚠️ 目录名必须**每次唯一**。这里原本只用 `process::id()`，而同一进程内
         //    有多个测试都建 `fa_proj_src_<pid>` —— 并行执行时会互相覆盖/删除，
         //    导致 `canonicalize()` 拿到已被删的路径 → 匹配失败。
-        //    2026-10-10 由 GitHub Actions windows runner 抓出（本地串行跑看不出）。
+        //    由 GitHub Actions windows runner 抓出（本地串行跑看不出）。
         let uniq = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -825,7 +825,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 路径形态不对称时，项目记忆必须照样命中（2026-10-10 真实缺陷回归测试）
+    /// 路径形态不对称时，项目记忆必须照样命中（真实缺陷回归测试）
     ///
     /// ## 缺陷本身
     ///

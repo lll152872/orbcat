@@ -30,7 +30,7 @@ const MAX_MESSAGES: usize = 400;
 
 /// 折叠后单条工具结果的展示上限（字符）
 ///
-/// ⚠️ **仅供测试**（2026-09-30 标注）：它只被 [`fold_steps`] 用，而那个函数
+/// ⚠️ **仅供测试**：它只被 [`fold_steps`] 用，而那个函数
 /// 现在也只服务单测（折叠已下沉到落盘 `cap_steps`）。生产落盘的上限看
 /// `STEP_DETAIL_LIMIT`。
 #[cfg(test)]
@@ -41,7 +41,7 @@ const FOLDED_DETAIL_LIMIT: usize = 120;
 /// 为什么不像以前那样**整组折叠成一行**（见 [`cap_steps`]）：折叠把"做了几步、
 /// 哪一步的思考对应哪个工具"全部抹平了，用户回看时只剩
 /// `[已执行：read_file、grep（共 12 次工具调用）]` —— 等于"做过的事又消失一次"
-/// （2026-09-22 用户报的第二个问题）。现在保留条目与顺序，只在**单条**上截断。
+/// （属于"过期步骤被砍掉"的第二个症状）。现在保留条目与顺序，只在**单条**上截断。
 ///
 /// ⚠️ 只作用于工具类条目（参数 / 结果）。**思考条目不受任何上限约束** ——
 /// 见 [`cap_steps`] 的说明。
@@ -50,7 +50,7 @@ const STEP_DETAIL_LIMIT: usize = 300;
 /// 单轮落盘的时间线条目数上限（超出只留最近的，前面补一条省略说明）。
 ///
 /// 会话是**全量 JSON 读写**，单文件体积要控制。但上限不能压到会丢掉思考：
-/// 2026-09-26 实测用户一条长任务里单轮就产生 61 步、被砍掉 **199 步**更早的
+/// 实测一条长任务里单轮就产生 61 步、被砍掉 **199 步**更早的
 /// 步骤（`omitted` 标记实锤）—— 症状③「早期轮次思考块消失」就是这么来的。
 ///
 /// 轮数硬顶 250 × 每轮约 3 条 ≈ 750 步，取值要高于它才不会误砍。
@@ -122,7 +122,7 @@ pub struct StoredMessage {
     /// 搜索和历史回灌的字节，且一旦落盘就再也分不清哪部分是模型原话。
     #[serde(default, skip_serializing_if = "is_false")]
     pub interrupted: bool,
-    /// **未定稿的占位消息**（2026-09-26 加的"退出不丢轮"机制）。
+    /// **未定稿的占位消息**（"退出不丢轮"机制）。
     ///
     /// 一轮对话开跑时，先落一条 `partial = true` 的助手占位消息；轮内每完成
     /// 一段就增量更新它；轮结束由 `finish_turn` 定稿（清掉这个标记）。
@@ -181,7 +181,7 @@ pub struct Session {
     pub summary_upto: Option<usize>,
     /// **上一轮最后一个模型调用实际发出的 prompt token 数**（服务端 `usage.prompt`）。
     ///
-    /// ## 为什么必须落盘（2026-09-30 加）
+    /// ## 为什么必须落盘
     ///
     /// 上下文预算此前全靠本地估算，而实测**低估 5~144 倍**（缘由：工具 schema、
     /// MCP 已加载组、reasoning 原文都没进估算），后果是自动 compact
@@ -198,7 +198,7 @@ pub struct Session {
     /// 只在两端都拿到时写入，缺失即 None（表示"未校准"，按 1.0 处理）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_scale: Option<f64>,
-    /// 这个会话绑定的 agent 模式 id（2026-10-08，用户定案）。
+    /// 这个会话绑定的 agent 模式 id。
     ///
     /// ## 为什么模式要跟着会话走
     ///
@@ -225,7 +225,7 @@ impl Session {
 
     /// 能不能被分叉 —— **只有主聊天可以**。
     ///
-    /// 用户定案：主聊天是"关系的主线"，从它上面挑一个上下文窗口开一条新线才有意义；
+    /// 主聊天是"关系的主线"，从它上面挑一个上下文窗口开一条新线才有意义；
     /// 任务会话本来就是一次性的，分叉它只会制造一堆没人认领的碎片。
     pub fn can_fork(&self) -> bool {
         self.is_main()
@@ -312,7 +312,7 @@ fn read_session(path: &Path) -> Option<Session> {
     // 授权文件（`<id>.grants.json`）与会话**平级存放**，形状完全不同。
     // 它会走到这里（`unique_main` 等路径按目录遍历），直接跳过 ——
     // 否则每次启动都刷一屏 `解析失败: missing field 'id'` 的假警告
-    // （2026-09-30 实测：启动一次 6 行），把真问题淹掉。
+    // （实测：启动一次 6 行），把真问题淹掉。
     if is_grants_file(path) {
         return None;
     }
@@ -392,8 +392,7 @@ pub fn new_session(data_dir: &Path, mode: &str) -> Session {
         summary_upto: None,
         last_prompt_tokens: None,
         token_scale: None,
-        // 会话**建的时候**就把模式钉死，之后不再改（用户 2026-10-08：
-        // "一个会话模式不能变"）。空串 / 无效 id 会在 `effective_mode`
+        // 会话**建的时候**就把模式钉死，之后不再改（"一个会话模式不能变"）。空串 / 无效 id 会在 `effective_mode`
         // 的 `resolve` 里兜到标准模式。
         mode: Some(mode.to_string()),
     };
@@ -481,7 +480,7 @@ fn create_main(data_dir: &Path) -> Session {
         summary_upto: None,
         last_prompt_tokens: None,
         token_scale: None,
-        // 主会话是最早那条，建的时候就落**内置默认模式**（用户 2026-10-08：默认 standard）。
+        // 主会话是最早那条，建的时候就落**内置默认模式**（默认 standard）。
         //
         // ⚠️ 显式落盘而不是留 `None`：留 None 会走 `effective_mode` 的兜底 —— 结果一样，
         //    但文件里看不到这个会话是什么模式，排查时要靠推理。
@@ -649,7 +648,7 @@ pub fn switch(data_dir: &Path, id: &str) -> Result<Session, String> {
     Ok(s)
 }
 
-/// 一个会话**实际生效**的模式 —— 全项目读"当前是什么模式"的**唯一入口**（2026-10-08）。
+/// 一个会话**实际生效**的模式 —— 全项目读"当前是什么模式"的**唯一入口**。
 ///
 /// 规则（按优先级）：
 /// 1. 会话自带 `mode` → 用它（**绝大多数情况**）
@@ -658,11 +657,11 @@ pub fn switch(data_dir: &Path, id: &str) -> Result<Session, String> {
 ///
 /// ## `settings.activeMode` 呢？
 ///
-/// **2026-10-08 已删**。它经历了三级演变，值得记一笔免得有人又想加回来：
+/// **已删**。它经历了三级演变，值得记一笔免得有人又想加回来：
 /// 全局"当前模式" → "新建会话的默认模式" → 彻底删掉。
-/// 删它的触发点很具体：用户看到新建菜单里**「闲聊」被标成「默认」**，
-/// 而他要的是「标准是默认」。当时那个标读的正是 `settings.activeMode`
-/// —— 用户早先在设置页切过闲聊，这个值就留在文件里成了"默认"。
+/// 删它的触发点很具体：新建菜单里**「闲聊」被标成「默认」**，
+/// 而期望的是「标准是默认」。当时那个标读的正是 `settings.activeMode`
+/// —— 设置页早先切到过闲聊，这个值就留在文件里成了"默认"。
 /// 教训：**一旦界面上没有改它的入口，任何"用户可配的默认值"都会变成
 /// 一个会撒谎的死字段**（手编也不生效）。所以默认值只能是编译期常量。
 ///
@@ -684,7 +683,7 @@ pub fn switch(data_dir: &Path, id: &str) -> Result<Session, String> {
 /// 这次全改成"按会话读"。各写一遍迟早写岔，而写岔的后果是
 /// **模式只在部分地方生效**（工具坍缩了但提示词没换、或反过来）——
 /// 那种半坏状态最难查。所以留这一个入口，谁问模式都走它。
-/// （2026-10-08 实测抓到过一处漏改：`agent.rs` 的"当前模式：按需 / PTC"
+/// （实测抓到过一处漏改：`agent.rs` 的"当前模式：按需 / PTC"
 ///  动态段还在读全局 `activeMode`，闲聊会话会拿到 PTC 的行为段。）
 pub fn effective_mode(data_dir: &Path, session_id: Option<&str>) -> crate::modes::Mode {
     let id = session_id
@@ -709,7 +708,7 @@ pub fn set_title(data_dir: &Path, id: &str, title: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// 蒸馏会话标记（2026-10-03）
+// 蒸馏会话标记
 // ---------------------------------------------------------------------------
 //
 // 为什么用「同目录一个空标记文件」而不是往会话 JSON 里加字段：
@@ -763,7 +762,7 @@ pub fn delete(data_dir: &Path, id: &str) -> Result<(), String> {
 
 /// 从第 `upto` 条消息起**删到末尾**（含 `upto` 自己），并把结果写回磁盘。
 ///
-/// 语义（用户 2026-09-20 要求）：在对话流里点某条消息上的「删除」，
+/// 语义：在对话流里点某条消息上的「删除」，
 /// 就是「从这条开始，后面全不要了」—— 包括这条。也就是把 `messages` 截成
 /// `messages[..upto]`。这是**不可恢复**的，前端必须二次确认。
 ///
@@ -801,7 +800,7 @@ pub fn truncate(data_dir: &Path, id: &str, upto: usize) -> Result<Session, Strin
 
 /// 从**主聊天**的某条消息处分叉出一条新会话。
 ///
-/// ## 语义（用户 2026-09-20 修正；选取口径 2026-10-07 改全量）
+/// ## 语义（选取口径后改为全量）
 /// **分叉的上下文 = 下一轮实际会喂给模型的那段历史**，不是别的加工版。
 /// 也就是说：把主聊天切成 `messages[..=upto]` 这个前缀，套用
 /// [`crate::history::pick_window`] 的同一套规则（全量注入 —— 原先是
@@ -873,7 +872,7 @@ pub fn fork(data_dir: &Path, src: &Session, upto: usize) -> Result<Session, Stri
         last_prompt_tokens: None,
         token_scale: None,
         // **继承源会话的模式**：分叉是"从这里接着聊"，换个模式等于换了个说话方式，
-        // 那就不叫接着聊了（2026-10-08）。
+        // 那就不叫接着聊了。
         mode: src.mode.clone(),
     };
     write_session(data_dir, &s)?;
@@ -912,19 +911,19 @@ pub struct TurnRecord<'a> {
 
 /// 一轮**开跑时**立刻落盘：用户提问 + 一条 `partial` 助手占位。
 ///
-/// ## 为什么需要（2026-09-26 用户报「退出后整轮清空」）
+/// ## 为什么需要（解决「退出后整轮清空」）
 ///
 /// 以前整轮只在 `agent::run` 返回之后才走 [`append_run`]。用户在长命令
 /// 执行期等不及直接关掉进程时，那个 future 被直接丢弃，`append_run` 根本没
 /// 执行 —— 提问、思考、工具步骤、正文**一个字都没落盘**。
-/// 实证：`s1790400662188-0.json` 13:31 建、`messages: []`，而 grants 里
-/// 13:34 批的 `D:/mimo-proxy` 授权正是卡死那轮留下的。
+/// 实证：一个会话文件 13:31 建、`messages: []`，而 grants 里
+/// 13:34 批的一条目录授权正是卡死那轮留下的。
 ///
 /// 现在改成：开跑先落提问与占位 → 轮内 [`checkpoint_turn`] 增量更新 →
 /// 结束 [`append_run`] 定稿。哪怕进程被杀，磁盘上至少留下"问了什么 +
 /// 已经产出到哪一步"。
 ///
-/// ⚠️ **仅供测试**（2026-09-30 标注）：生产路径一律用 [`begin_turn_in`]，
+/// ⚠️ **仅供测试**：生产路径一律用 [`begin_turn_in`]，
 /// 因为它要**显式带上开跑时的会话 id** —— 用户中途切走会话时 `current.txt`
 /// 已经变了，再按"当前会话"落盘会把这一轮写进**另一个**会话。
 /// 这个不带 id 的版本只给单测省一个参数。
@@ -935,7 +934,7 @@ pub fn begin_turn(data_dir: &Path, user_text: &str, images: &[String]) -> Result
 
 /// 解析"这一轮该写进哪个会话"。
 ///
-/// 显式 `session_id` 优先 —— 支持**切走会话、后台继续跑**（2026-09-26 用户拍板）：
+/// 显式 `session_id` 优先 —— 支持**切走会话、后台继续跑**：
 /// 用户中途切走时 `current.txt` 已经变了，但这一轮的结果必须落回**开跑时的那个**
 /// 会话（`chat` 开跑前就把 id 定死了）。id 为空 / 指向已不存在的会话时退回当前会话。
 fn target_session(data_dir: &Path, session_id: Option<&str>) -> Session {
@@ -1001,7 +1000,7 @@ pub fn begin_turn_in(
 /// 由 agent 循环在轮边界 / 每个工具跑完后回调触发。找不到占位就静默返回 ——
 /// 说明这轮没走 `begin_turn`（老路径 / 分叉会话），不要在这里硬造一条消息。
 ///
-/// ⚠️ **仅供测试**（2026-09-30 标注）：生产路径用 [`checkpoint_turn_in`]，
+/// ⚠️ **仅供测试**：生产路径用 [`checkpoint_turn_in`]，
 /// 理由同 [`begin_turn`] —— 必须显式指定会话 id，否则后台继续跑的轮会写错会话。
 #[cfg(test)]
 pub fn checkpoint_turn(
@@ -1054,7 +1053,7 @@ pub fn checkpoint_turn_in(
 /// - 工具步骤在这里**只限长、不折叠**（见 [`cap_steps`]）：保留
 ///   `reasoning / tool_call / tool_result / status / error` 的顺序，界面才能
 ///   还原成交错时间线。喂给模型的那份仍走 [`fold_steps`]（`history.rs` 读时）。
-/// - `reasoning` **原文全存**（2026-09-26 起不截）。这是**旧字段**，
+/// - `reasoning` **原文全存**（不截）。这是**旧字段**，
 ///   新数据以 `steps` 里的 `reasoning` 条目为准；保留写入是为了老前端 / 回滚安全。
 /// - `interrupted` 的中断轮**照样落盘** —— 用户要看到自己那条消息和已产出的部分。
 pub fn append_run(data_dir: &Path, rec: &TurnRecord<'_>) -> Result<(), String> {
@@ -1075,7 +1074,7 @@ pub fn append_run_in(
 
     // 插话（执行中追加的指令）—— 仍是 user 消息（历史回灌要按角色），
     // 但带 steer_id：UI 不单独铺气泡，改画在 steps 时间线里（与真实进度交错）。
-    // 「退出不丢轮」（2026-09-26）：开跑时 `begin_turn` 已经落了 [用户提问 +
+    // 「退出不丢轮」：开跑时 `begin_turn` 已经落了 [用户提问 +
     // partial 助手占位]。这里若发现队尾是那条占位，就**就地定稿**：
     //   - 用户消息**不再重复 push**（它已经在盘上）
     //   - 把占位替换成真正的助手消息（补全 steps / 正文 / 用量）
@@ -1125,7 +1124,7 @@ pub fn append_run_in(
         text: strip_step_folds(rec.answer),
         images: Vec::new(),
         steps: cap_steps(rec.steps),
-        // 思考过程**原文全存**（2026-09-26 起不截）：回看时要能逐字复现它当时怎么想的
+        // 思考过程**原文全存**（不截）：回看时要能逐字复现它当时怎么想的
         reasoning: rec.reasoning.filter(|r| !r.is_empty()).map(str::to_string),
         interrupted: rec.interrupted,
         // 定稿：清掉 partial 标记
@@ -1157,7 +1156,7 @@ pub fn append_run_in(
         }
         s.messages.drain(..cut);
     }
-    // 上下文预算的**真锚点**（2026-09-30）：只有本轮真拿到了服务端 usage 才更新，
+    // 上下文预算的**真锚点**：只有本轮真拿到了服务端 usage 才更新，
     // 拿不到就保留上一轮的值 —— 抹成 None 等于把已经校准好的会话退回瞎估。
     if let Some(p) = rec.last_prompt_tokens.filter(|p| *p > 0) {
         s.last_prompt_tokens = Some(p);
@@ -1189,7 +1188,7 @@ pub fn context_calibration(data_dir: &Path, session_id: &str) -> (Option<u32>, O
 
 /// 往当前会话追加一轮对话（用户消息 + 助手回答）。
 ///
-/// ## 工具结果在这里就折叠掉（用户 2026-09-19 定案）
+/// ## 工具结果在这里就折叠掉
 ///
 /// assistant 消息的 `steps` 体积最大（一轮 grep 可能几 KB），落盘前就压成
 /// 一行摘要。为什么放在**落盘**而不是每轮组装时折：
@@ -1239,8 +1238,8 @@ pub fn append_turn(
 /// 把 Rust 侧 AgentStep 转成可存储的步骤
 /// 剥掉正文里混入的「工具轨迹 / 思考摘要」尾巴。
 ///
-/// 根因（2026-09-24）：`history::fold_steps_to_line` 把 steps 拼进发给模型的
-/// assistant 文本后，部分模型（商汤等）会把 `«steps…»` / `调用 …` / `·think …`
+/// 根因：`history::fold_steps_to_line` 把 steps 拼进发给模型的
+/// assistant 文本后，部分模型厂商会把 `«steps…»` / `调用 …` / `·think …`
 /// / 旧版 `[思考] …` 回显进 `answer`。落盘前剥掉，界面才不会把思考画成正文。
 pub fn strip_step_folds(text: &str) -> String {
     let t = text;
@@ -1325,7 +1324,7 @@ pub fn steps_from_agent(steps: &[crate::agent::AgentStep]) -> Vec<StoredStep> {
 
 /// 落盘前给时间线条目"限长"，**但保留条目与顺序**。
 ///
-/// ## 与 `history::fold_steps_to_line` 的分工（2026-09-23 更新）
+/// ## 与 `history::fold_steps_to_line` 的分工（已更新）
 ///
 /// - 喂给**模型**的历史 → `history::fold_steps_to_line`：近 K 条 steps **原文/截断**
 ///   （含 tool_result），更旧折一行摘要。**不要**再把 tool_result 压成一行。
@@ -1343,15 +1342,15 @@ pub fn steps_from_agent(steps: &[crate::agent::AgentStep]) -> Vec<StoredStep> {
 /// - 思考条目：**原文全留**（见下）
 /// - 其余条目的 `detail`：截到 [`STEP_DETAIL_LIMIT`]，末尾加"（已截断）"
 ///
-/// ## 思考过程为什么完全不截（2026-09-26 用户拍板）
+/// ## 思考过程为什么完全不截
 ///
 /// 以前有 `REASONING_LIMIT = 8KB` 的**总预算**，且预算是按**字节**算的 ——
 /// 中文一个字 3 字节，实际只装得下约 2700 字；更糟的是预算一旦耗尽，
-/// **后续思考条目整条不落盘**（`continue`）。用户报的三个症状都由它引起：
+/// **后续思考条目整条不落盘**（`continue`）。三个症状都由它引起：
 /// 展开后内容比标注字数少、早期轮次的思考块整个消失。
 ///
 /// 现在的取舍：思维链是"它当时怎么想的"，正是回看时最想看的东西，
-/// 不设任何上限。会话文件会变大（用户已确认接受）。
+/// 不设任何上限。会话文件会变大（已确认可接受）。
 ///
 /// ## 砍掉了什么
 /// - status 条目只留最后 [`STATUS_STEPS_LIMIT`] 条（限流退避通知会刷屏）
@@ -1371,8 +1370,10 @@ pub fn cap_steps(steps: &[StoredStep]) -> Vec<StoredStep> {
         let detail = if s.kind == "reasoning" || s.kind == "thought" {
             // 思考条目：**原文全留**，不截、不丢（见函数文档）
             s.detail.clone()
-        } else if s.kind == "text" || s.kind == "stream" {
+        } else if s.kind == "midturn" || s.kind == "text" || s.kind == "stream" {
             // 多轮流式正文按轮收进时间线 —— 回看要比 tool 参数更长一点
+            // ⚠️ `midturn`：模型中途写、然后接着调工具的正文。
+            //    `text` 保留是为了读**旧会话**的落盘数据 —— 那时它就这个名。
             cap_chars(&s.detail, 2000)
         } else {
             cap_chars(&s.detail, STEP_DETAIL_LIMIT)
@@ -1430,13 +1431,13 @@ fn is_keep_always(kind: &str) -> bool {
 /// **保留原始 `kind` 字段**（`tool_call`），`detail` 换成摘要 ——
 /// 这样下游看到的是"一条 steps 记录"，不必区分折叠前后。
 ///
-/// ⚠️ 用途已收窄（2026-09-22）：**只服务于"喂给模型的历史"**（`history.rs`），
+/// ⚠️ 用途已收窄：**只服务于"喂给模型的历史"**（`history.rs`），
 ///    不再用于落盘。落盘改走 [`cap_steps`]（保留条目与顺序）。
 ///
 /// 全部非 `tool_call`（例如只有 `thought`）→ 返回空 vec：这些步骤
 /// 在历史上没有回灌价值，模型正文里已经说了它想了什么。
 ///
-/// ⚠️ **仅供测试**（2026-09-30 标注）：`history.rs` 读历史时走的是
+/// ⚠️ **仅供测试**：`history.rs` 读历史时走的是
 /// `fold_steps_to_line`（把 steps 折成一行文本），**不是**这个函数 ——
 /// 折叠已下沉到落盘（`cap_steps`）。这里留着是给"折叠规则本身"留单测入口。
 #[cfg(test)]
@@ -1556,8 +1557,8 @@ mod tests {
 
     /// 「退出不丢轮」：开跑即落盘 —— 提问与 partial 占位必须在 agent 跑之前就存在。
     ///
-    /// 这是 2026-09-26 用户报「退出后整轮清空」的回归测试（实证：卡死那轮的
-    /// `s1790400662188-0.json` 是空的 `messages: []`）。
+    /// 这是「退出后整轮清空」的回归测试（实证：卡死那轮的
+    /// 会话文件是空的 `messages: []`）。
     #[test]
     fn begin_turn_persists_question_and_placeholder() {
         let d = tmp("begin_turn");
@@ -1688,7 +1689,7 @@ mod tests {
 
     /// 切走会话、后台继续跑：落盘必须回**开跑的那个**会话，而不是"当前会话"。
     ///
-    /// 2026-09-26 用户拍板「切走 = 后台继续跑」。回归点：`begin_turn` /
+    /// 回归点：`begin_turn` /
     /// `checkpoint_turn` / `append_run` 的老版本走 `ensure_current`，中途切走会把
     /// 这一轮的回答写进**另一个**会话。
     #[test]
@@ -1996,7 +1997,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// **分叉带的是"下一轮会喂给模型的那段历史"**（2026-10-07 起为全量前缀）。
+    /// **分叉带的是"下一轮会喂给模型的那段历史"**（全量前缀）。
     ///
     /// 造 30 条（新旧时间戳混排），分叉点取第 29 条（assistant 回复）→
     /// 分叉会话应带上 `[0..=29]` **全部 30 条**：窗口筛选已废弃，
@@ -2305,7 +2306,7 @@ mod tests {
         assert!(few.iter().all(|s| s.kind == "tool_call"));
     }
 
-    /// 思考条目**原文全留**：不截、不丢（2026-09-26 用户拍板"完全不截"）。
+    /// 思考条目**原文全留**：不截、不丢。
     ///
     /// 这是三个症状的回归测试：① 标注字数比真实少 ② 展开内容比标注少
     /// ③ 早期轮次思考块消失 —— 根因都是旧的 8KB 字节预算。
@@ -2510,9 +2511,9 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 模式跟会话走（2026-10-08）
+    // 模式跟会话走
     //
-    // 用户定案："我判断为模式跟会话走，一个会话模式不能变"。
+    // 不变量："模式跟会话走，一个会话模式不能变"。
     // 下面这一组锁的就是这条不变量 —— 它的反面（模式是全局设置）曾经是事实，
     // 所以每条断言都在防"某个调用点又回去读全局模式"。
     //
@@ -2559,8 +2560,8 @@ mod tests {
     /// **主会话只能是它建时的模式**（内置默认 standard），
     /// 而且没有任何"全局开关"能把它改掉。
     ///
-    /// 回归背景（2026-10-08）：`create_main` 原来读 `settings.activeMode`。
-    /// 用户 `settings.json` 里留着早先在设置页切过的 `"chat"`，
+    /// 回归背景：`create_main` 原来读 `settings.activeMode`。
+    /// `settings.json` 里若留着早先在设置页切过的 `"chat"`，
     /// 于是主聊天莫名其妙跟着那个值跑。现在它是常量。
     #[test]
     fn main_session_mode_is_the_builtin_default() {

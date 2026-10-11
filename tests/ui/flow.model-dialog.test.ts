@@ -3,12 +3,12 @@ import { bootApp, openPanel, waitFor } from "./helpers";
 import { callsOf, state } from "./mocks/tauri";
 
 /**
- * 模型交互（2026-10-02 改定）：
+ * 模型交互（改定）：
  *   选择模型  → 留在面板：点**整颗 chip**（本体或 ▾）出「模型列表」，
  *               条目 = 组别 + 模型名两行，底部单独一颗「＋ 添加自定义模型」
  *   编辑/管理 → 弹出独立第二窗口，入口 = 设置菜单「🧩 模型」
  *
- * 旧定稿「点卡片本体 = 管理入口」已被用户推翻（他说点开该是列表不是管理窗口）。
+ * 旧定稿「点卡片本体 = 管理入口」已被推翻（点开该是列表，不是管理窗口）。
  * jsdom 里无法渲染第二个 Tauri 窗口 —— 所以这里锁的是**入口与选择**，
  * 独立窗口内部（表格/表单/分组）靠 MCP 截图验收。
  */
@@ -65,7 +65,7 @@ describe("模型列表（只选不管 + 底部添加）", () => {
     await openPanel();
     const dd = await openDropdown();
 
-    // 身份 = (Base URL, 接口 id)（2026-10-02）：第二行显示接口 id
+    // 身份 = (Base URL, 接口 id)：第二行显示接口 id
     expect(dd.querySelector(".mc-mi-name")!.textContent).toContain("mock-1");
     // 第一行是组别（chip 上那行小字，同一个概念）
     const group = dd.querySelector(".mc-mi-group");
@@ -107,7 +107,7 @@ describe("模型列表（只选不管 + 底部添加）", () => {
   });
 
   it("同 id 两条 + 设置里没记 url → 只标一条当前，并把 url 回填进设置", async () => {
-    // 复刻 2026-10-02 用户报的现场：models.json 里两条 id 同为 glm-5.3-flash（Base URL 不同），
+    // 复刻现场：models.json 里两条 id 同为 glm-5.3-flash（Base URL 不同），
     // 而 settings 里只有 id、没有 url → 旧判定式 `id 相同 && (url 为空 || …)` 会把
     // **所有**同 id 的行都标成当前（更要命的是把 ✓ 画到了每一行上）。
     state.models = [

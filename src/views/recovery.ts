@@ -1,7 +1,7 @@
 /**
  * 设置 › 备份与回收站 —— 视图渲染与交互。
  *
- * ## 为什么单独成模块（2026-09-30 拆 main.ts）
+ * ## 为什么单独成模块（拆 main.ts）
  *
  * 这一整块（类型 + 渲染 + 事件绑定，约 240 行）是**自洽的**：只依赖
  * `invoke` 与三个格式化函数，不碰 main.ts 的任何模块状态。而它偏偏有
@@ -27,7 +27,7 @@ import { esc, fmtBytes, fmtWhen, tailPath } from "../format";
 /**
  * 后端 `recovery::RecoveryState` 的镜像。
  *
- * 为什么要有这个视图（2026-09-30）：`backups/` 与 `.trash/` 在此之前**只进不出**
+ * 为什么要有这个视图：`backups/` 与 `.trash/` 在此之前**只进不出**
  * —— 实测 17.4 MB 备份 + 85.3 MB 归档，而还原只能靠用户手工搬文件。
  * 「可逆」是项目的底线承诺（决策 8 写的"30 天内可一键还原"），
  * 没有还原入口的归档等于半个硬删除。
@@ -258,7 +258,7 @@ export function bindRecoveryView(
     }
   });
 
-  // 导出诊断包（2026-09-30）：出问题时用户此前只能截图红条，
+  // 导出诊断包：出问题时此前只能截红条图，
   // 而现场散在 diag.log / 审计链 / 会话 error 条目 / 目录体积四处。
   document.getElementById("rec-diag")?.addEventListener("click", async () => {
     const btn = document.getElementById("rec-diag") as HTMLButtonElement | null;
