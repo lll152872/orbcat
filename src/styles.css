@@ -701,7 +701,7 @@ body {
 /* 引导条本身不响应「点击复制路径」 */
 .fg-perm {
   cursor: default;
-  color: #6E6E76;
+  color: #7E7E87;
   padding-right: 0;
 }
 
@@ -859,7 +859,7 @@ body {
 .steps-folded {
   margin-top: 6px;
   font-size: 11px;
-  color: #61695f;
+  color: #778174;
   line-height: 1.5;
   word-break: break-all;
 }
@@ -1214,7 +1214,7 @@ body {
   max-width: 100%;
   padding: 2px 8px;
   font-size: 11px;
-  color: #8B7070;
+  color: #A28383;
   border: 1px solid rgba(247, 202, 190, 0.25);
   border-radius: 8px;
   background: rgba(247, 202, 190, 0.08);
@@ -1438,7 +1438,7 @@ body {
 }
 
 .thumb-bad {
-  color: #8B7070;
+  color: #A28383;
   background: rgba(247, 202, 190, 0.08);
 }
 
@@ -3281,7 +3281,10 @@ button.fetch-id {
 }
 
 .mcp-url-input::placeholder {
-  color: #45454B;
+  /* #45454B 只有 1.75:1 —— 而输入框真实底是 rgba(168,230,207,0.06) 盖在
+     #14120f 上（合成 #1D1F1B），比面板底更暗，占位符基本等于没有。
+     抬到 #8E8E94（5.1:1），仍明显淡于输入框正文 #DEDEE2。 */
+  color: #8E8E94;
 }
 
 /* 多 server 列表 */
@@ -3881,7 +3884,9 @@ details.tl-tool.tl-res > summary {
 .run-reason-len {
   margin-left: 4px;
   font-size: 10.5px;
-  color: #4E4E54;
+  /* #4E4E54 在过程块卡片底上只有 1.97:1。抬到 #9C9CA2 并让它跟随
+     summary 的色（#7C7C82），字数为辅助信息，不该比标题还难读。 */
+  color: #9C9CA2;
 }
 
 /* 思考块正文容器。
