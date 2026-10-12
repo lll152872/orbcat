@@ -399,8 +399,14 @@ jobs:
         shell: pwsh
         run: |
           cargo build --release --manifest-path src-tauri/Cargo.toml --bin orbcat
-          $machine = [System.BitConverter]::ToUInt16(
-            [System.IO.File]::ReadAllBytes("src-tauri/target/release/orbcat.exe"), 4)
+          # ⚠️ machine 字段在 **e_lfanew + 4**，不是固定的文件偏移 4。
+          #    e_lfanew 存在 0x3C，指向 "PE\0\0" 签名。直接读偏移 4 读到的是
+          #    DOS 头残留（实测 0x0003），会把好的产物误判成坏的。
+          $bytes = [System.IO.File]::ReadAllBytes("src-tauri/target/release/orbcat.exe")
+          $pe = [System.BitConverter]::ToInt32($bytes, 0x3C)
+          $sig = [System.Text.Encoding]::ASCII.GetString($bytes, $pe, 4)
+          if ($sig -ne "PE`0`0") { throw ("不是有效的 PE 文件：签名 '$sig'") }
+          $machine = [System.BitConverter]::ToUInt16($bytes, $pe + 4)
           Write-Output ("PE machine = 0x{0:X4}" -f $machine)
           $want = if ("${{ matrix.artifact }}" -eq "windows-arm64") { 0xAA64 } else { 0x8664 }
           if ($machine -ne $want) {
@@ -445,9 +451,13 @@ jobs:
           name: orbcat ${{ github.ref_name }}
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
-          # 发布说明直接引用仓库里的 CHANGELOG，避免在 workflow 里再抄一份
-          # （抄两份必然对不上，这是 BUGS.md 里 BUG-014 同类的问题）。
-          body_path: CHANGELOG.md
+          # 发布说明用仓库里的 RELEASE_NOTES.md。
+          # ⚠️ 不要改成 `body_path: CHANGELOG.md` —— CHANGELOG 里有 5 个
+          #    都叫 [1.0.0] 的段（历史累积，只有第一段有日期），整个贴上去
+          #    会把所有旧版本的内容混进 Release 页面。
+          #    RELEASE_NOTES.md 由 tools/gen-release-notes.mjs 生成：
+          #    只取 CHANGELOG 的第一个 [1.0.0] 段 + 手工维护的发布头。
+          body_path: RELEASE_NOTES.md
           files: |
             orbcat-${{ matrix.artifact }}.zip
             src-tauri/target/release/bundle/dmg/*.dmg
