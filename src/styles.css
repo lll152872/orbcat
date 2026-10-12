@@ -3101,6 +3101,25 @@ button.fetch-id {
   line-height: 1.5;
 }
 
+/* 安全闸门页里的「去命令策略 ›」页内跳转。
+   ⚠️ 这个类名曾经**根本没有对应规则** —— `<a>` 于是吃了浏览器默认值
+   （rgb(0,0,238) 纯蓝 + 下划线，10.5px 时对比度只有 1.99:1），在暖黑 + 薄荷绿的
+   深色主题里像贴进来的一块异物色。而它是安全闸门页**唯一**通往命令策略
+   （白名单 / 硬阻断 / 审计）的路径，样式缺失等于入口也等于隐形。
+   以后新加页内跳转时记得在这里登记，别让它裸奔。 */
+.goto-cmdpolicy {
+  color: var(--accent-1);
+  text-decoration: none;
+  border-bottom: 1px solid rgba(168, 230, 207, 0.4);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.goto-cmdpolicy:hover {
+  color: #c6f0dd;
+  border-bottom-color: rgba(168, 230, 207, 0.75);
+}
+
 /* 长期记忆全文 */
 .mem-long pre {
   white-space: pre-wrap;
