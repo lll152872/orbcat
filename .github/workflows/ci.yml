@@ -349,8 +349,14 @@ jobs:
   # ---------------------------------------------------------------------------
   release:
     name: Release artifacts (${{ matrix.artifact }})
-    # tag push 才跑；日常分支 push / PR 直接跳过整个 matrix
-    if: startsWith(github.ref, 'refs/tags/v')
+    # tag push 才跑；日常分支 push / PR 直接跳过整个 matrix。
+    #
+    # ⚠️ workflow_dispatch 手动跑 = **只出产物、不发布**。
+    #    「先让用户下载实测、通过再上线」这条流程需要一个不发版就能拿到
+    #    release 产物的入口（debug job 的 exe 是 debug profile，测不出
+    #    打包问题）。真正挂 Release 的是最后那个 Upload 步骤，它自己
+    #    再闸一次 tag，手动跑绝不会创建 Release。
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       # 一个平台挂了不要拖掉另外两个的产物
@@ -474,6 +480,10 @@ jobs:
       #    默认只读时这里稳定 403，三个平台一起挂 —— 但产物已由上面那步
       #    留住了，修权限后重跑本步骤即可，不必重新编译。
       - name: Upload to GitHub Release
+        # ⚠️ 必须再闸一次 tag：workflow_dispatch 手动跑时这一整步要跳过，
+        #    否则 softprops 会在没有 tag 的情况下**创建一个 Release**，
+        #    正好把「先实测再上线」变成「直接上线」。
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}

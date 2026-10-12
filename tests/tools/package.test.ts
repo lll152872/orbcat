@@ -240,3 +240,26 @@ describe("JS 侧的布局契约与 Rust 侧不漂移", () => {
     expect(ci).not.toMatch(/Copy-Item -Recurse -Force dist\/\* pkg\/?\s*$/m);
   });
 });
+
+describe("「手动跑只出产物、不发布」这个约定不能被悄悄拆掉", () => {
+  const ci = readFileSync(
+    path.join(REPO_ROOT, ".github", "workflows", "ci.yml"),
+    "utf8"
+  );
+  const TAG_GATE = /startsWith\(github\.ref, 'refs\/tags\/v'\)/g;
+
+  it("workflow_dispatch 能拉起 release job（否则没法不发版就拿到 release 产物）", () => {
+    expect(ci).toMatch(/workflow_dispatch:/);
+    expect(ci).toMatch(
+      /if: startsWith\(github\.ref, 'refs\/tags\/v'\) \|\| github\.event_name == 'workflow_dispatch'/
+    );
+  });
+
+  // 一旦只剩一处 tag 闸门，就说明 Upload 那步的 if: 被删了 ——
+  // softprops 会在没有 tag 的情况下**创建 Release**，
+  // 「先实测再上线」会悄悄变成「直接上线」。
+  it("tag 闸门至少两处：job 一处 + Upload 步骤一处", () => {
+    const n = (ci.match(TAG_GATE) ?? []).length;
+    expect(n).toBeGreaterThanOrEqual(2);
+  });
+});
