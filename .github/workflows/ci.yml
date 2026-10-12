@@ -412,17 +412,24 @@ jobs:
           if ($machine -ne $want) {
             throw ("产物架构不对！machine=0x{0:X4}，期望 0x{1:X4}" -f $machine, $want)
           }
-          New-Item -ItemType Directory -Force -Path pkg | Out-Null
-          Copy-Item src-tauri/target/release/orbcat.exe "pkg/orbcat.exe"
-          Copy-Item -Recurse -Force dist/* pkg/
-          # README + 使用说明：下载的人得知道 exe 不能单独拷走
-          Copy-Item README.md pkg/
+          # ⚠️ 装配与布局校验都走 tools/package.mjs，**不在这里自带一份复制逻辑**。
+          #    2026-10-12 事故：这段曾经 `Copy-Item -Recurse -Force dist/* pkg/`
+          #    把 dist 内容平铺进 pkg/ 根。dist 并没丢，只是摊平了，于是
+          #    compute_dist_dir() 找不到 <exe 同目录>/dist/index.html，
+          #    静默回退到编译期嵌的 stub 占位页 —— CI 全绿、Release 照发，
+          #    只有真跑 exe 的用户看得见。
+          #    现在布局被 tests/tools/package.test.ts 锁住（npm test 会跑），
+          #    装配/自检只有这一份实现，改错会直接红在那个测试上。
+          node tools/package.mjs --exe src-tauri/target/release/orbcat.exe --dist dist --out pkg --file README.md
           Compress-Archive -Path pkg/* -DestinationPath "orbcat-${{ matrix.artifact }}.zip" -Force
-          Write-Output "=== zip 内容 ==="
+          # 解压后再验一次：真正发出去的是 zip，验的必须是 zip 的内容
+          Remove-Item -Recurse -Force verify -ErrorAction SilentlyContinue
           Expand-Archive -Path "orbcat-${{ matrix.artifact }}.zip" -DestinationPath verify -Force
+          Write-Output "=== zip 内容 ==="
           Get-ChildItem -Recurse verify | ForEach-Object {
             "{0,10}  {1}" -f $_.Length, $_.FullName.Substring((Resolve-Path verify).Path.Length + 1)
           }
+          node tools/package.mjs --verify verify --exe-name orbcat.exe
 
       # ---- macOS（arm64）---------------------------------------------------
       # ⚠️ 必须显式带 `app`：`--bundles dmg` 时 Tauri 会把打完 dmg 的中间
