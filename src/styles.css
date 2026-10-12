@@ -1380,7 +1380,12 @@ body {
    1. 悬停才显现 + opacity 过渡时，任何整块重绘都会让过渡重放 → 肉眼看到闪一下；
    2. 更要命的是布局位移：流式输出时面板贴着底走，下方内容一长，
       停在按钮上的光标就被"推离"按钮 → hover 反复丢失/命中 → 按钮忽隐忽现。
-   常显（低对比）就没有这两种闪烁的物理基础了。 */
+   常显（低对比）就没有这两种闪烁的物理基础了。
+
+   ⚠️ 「低对比」有个下限：0.45 太低了。叠加 .msg-foot 规则给的 var(--cream-3)
+   (#7C8479) 之后，合成出来只有 **1.92:1** —— 这就是「消息底部那排按钮几乎
+   不存在」的实测原因。降到 0.85 仍保留「比正文淡」的意图（正文 #F2F2F4 是
+   16.7:1），但不再依赖 hover 才能看见。 */
 .msg-foot {
   display: flex;
   justify-content: flex-end;
@@ -1404,7 +1409,8 @@ body {
 
 .msg-copy,
 .msg-fork {
-  opacity: 0.45;
+  /* 0.45 → 0.85：见上方 .msg-foot 注释（1.92:1 → 5.25:1） */
+  opacity: 0.85;
 }
 
 .msg-fork {
@@ -4005,7 +4011,7 @@ details.tl-tool.tl-res > summary {
   margin-right: 6px;
   cursor: pointer;
   user-select: none;
-  opacity: 0.45;
+  opacity: 0.85; /* 0.45 → 0.85，见 .msg-foot 处的说明 */
   transition: background 0.12s, color 0.12s;
 }
 
@@ -4035,7 +4041,7 @@ details.tl-tool.tl-res > summary {
   margin-right: 6px;
   cursor: pointer;
   user-select: none;
-  opacity: 0.45;
+  opacity: 0.85; /* 0.45 → 0.85，见 .msg-foot 处的说明 */
   transition: background 0.12s, color 0.12s;
 }
 
@@ -4690,7 +4696,7 @@ body.models-page {
   margin-right: 6px;
   cursor: pointer;
   user-select: none;
-  opacity: 0.45;
+  opacity: 0.85; /* 0.45 → 0.85，见 .msg-foot 处的说明 */
   transition: background 0.12s, color 0.12s;
 }
 
@@ -5106,7 +5112,10 @@ body.models-page {
 .msg-foot .msg-regen,
 .msg-foot .msg-fork {
   font-size: var(--fs-1);
-  color: var(--cream-3);
+  /* var(--cream-3) → #9C9CA2：cream-3 本身 4.84:1 勉强够，但它还要再乘
+     本组按钮的 opacity（0.85），合成后掉到 3.82:1 就又不合格了。
+     抬到 #9C9CA2 后合成是 5.25:1，仍然明显淡于正文 #F2F2F4。 */
+  color: #9C9CA2;
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--r-xs);
