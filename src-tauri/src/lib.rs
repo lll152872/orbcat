@@ -389,16 +389,24 @@ fn active_project_dir(data_dir: &Path) -> Option<(PathBuf, String)> {
 // 数据目录解析
 // ---------------------------------------------------------------------------
 
-/// 解析 agent-data 目录。
+/// 解析 `agent-data/` 数据目录。
 ///
-/// 优先级：
-///   1. 环境变量 `ORBCAT_DATA_DIR`
-///   2. 源码树里的 `<项目根>/agent-data`（开发期）
-///   3. 系统应用数据目录（发布版）
+/// ## 优先级（2026-10-12 起改成「三合一」分发形态）
+///   1. 环境变量 `ORBCAT_DATA_DIR`（开发 / 测试覆盖）
+///   2. **exe 同级的 `agent-data/`** —— 发布版的主路径，
+///      zip 三合一：`orbcat.exe` + `dist/` + `agent-data/`。
+///      解压即用、多开隔离、删文件夹即卸载。
+///   3. 源码树里的 `agent-data/` —— `cargo run` 的开发形态兜底。
+///      ⚠️ 它必须排在第 2 级**之后**：CARGO_MANIFEST_DIR 是编译期常量，
+///      在开发机上永远存在，排前面会让发布 exe 一直读仓库那份。
 ///
-/// 注：`agent-data/` 是**运行时数据**（API key、会话、截图、日记），
-/// 已在 `.gitignore` 里排除 —— 仓库里只保留 `初始化.md`，
-/// 新克隆的用户让 agent 读它即可自建整套结构。
+/// ## 为什么不再以 `%APPDATA%\com.orbcat.desktop` 为主
+/// 那会让「数据到底在哪」取决于机器而不是安装位置：用户找不着文件，
+/// 也没法靠删文件夹清干净，多开更是完全做不到隔离。
+///
+/// ⚠️ 第 3 级在 **release** 下「不存在就创建」，debug 下**不创建** ——
+///    否则 `target/debug/agent-data` 会被建出来并抢在第 2 级前面，
+///    开发时读到的就是空目录而不是仓库里那份。
 fn resolve_data_dir(app: &tauri::AppHandle) -> PathBuf {
     if let Ok(p) = std::env::var("ORBCAT_DATA_DIR") {
         let p = PathBuf::from(p);
@@ -407,17 +415,48 @@ fn resolve_data_dir(app: &tauri::AppHandle) -> PathBuf {
         }
     }
 
+    // 发布版：exe 同级的 agent-data/（zip 三合一里就带这个目录）
+    //
+    // ⚠️ 必须在开发期路径**之前**判。CARGO_MANIFEST_DIR 是编译期常量，
+    //    写死在 exe 里；在开发机上那条路径永远存在，所以只要它排在前面，
+    //    发布 exe 就会一直读到仓库那份 —— 2026-10-12 端到端实测踩到：
+    //    从隔离目录启动，数据目录仍然是 D:\...\orbcat\src-tauri\..\agent-data。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(p) = data_dir_beside_exe(&exe) {
+            if p.is_dir() {
+                return p;
+            }
+            // release 下就地创建；debug 下不创建，让位给下面的开发态路径
+            #[cfg(not(debug_assertions))]
+            if std::fs::create_dir_all(&p).is_ok() {
+                eprintln!("[orbcat] 已在 exe 旁创建数据目录: {}", p.display());
+                return p;
+            }
+        }
+    }
+
     // 开发期：CARGO_MANIFEST_DIR = <项目根>/orbcat/src-tauri
     // 往上**一级**即 orbcat/，故 agent-data 与 src-tauri 平级。
     // ⚠️ 这是编译期常量 —— 改动后必须重新构建，否则跑的还是旧路径。
+    //    只在 release exe 旁边没有 agent-data 时才轮到它。
     let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-data");
     if dev.exists() {
         return dev;
     }
 
+    // current_exe() 拿不到 + 开发路径也没有，才会到这（几乎不可能）
     app.path()
         .app_data_dir()
         .unwrap_or_else(|_| PathBuf::from("./agent-data"))
+}
+
+/// 从「exe 所在目录」推出发布版的 agent-data 路径。
+///
+/// 单独抽出来是为了可测：原函数收 `&tauri::AppHandle`，
+/// 在单测里根本构造不出来（要起整个 app）。
+/// 抽成纯函数后，测试可以直接喂各种 exe 路径断言。
+fn data_dir_beside_exe(exe: &Path) -> Option<PathBuf> {
+    exe.parent().map(|dir| dir.join("agent-data"))
 }
 
 // ---------------------------------------------------------------------------

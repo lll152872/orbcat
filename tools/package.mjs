@@ -92,12 +92,56 @@ function copyTree(src, dest) {
 }
 
 /**
- * 装配 Windows 发布形态：<out>/<exe> + <out>/dist/**。
+ * 数据目录名 —— 与 `resolve_data_dir()` 的发布版分支逐字对应。
+ *
+ *   // src-tauri/src/lib.rs
+ *   let p = dir.join("agent-data");
+ *
+ * 运行时 exe 旁边找不到这个目录就**就地创建**（release），
+ * 所以 zip 里带不带都能跑；带是为了解压即有完整骨架、不用再点初始化。
+ */
+export const DATA_SUBDIR = "agent-data";
+
+/**
+ * 把**空骨架**铺进 `<out>/agent-data/`。
+ *
+ * ## 为什么只铺 skeleton/，绝不铺仓库根的 agent-data/
+ *
+ * zip 是三合一分发（exe + dist/ + agent-data/）。空骨架 = 编译期固定内容
+ * （memory/pending/projects/skills 的 README、内置技能），
+ * `src-tauri/skeleton/` 是它的唯一来源，build.rs 的白名单闸门管着。
+ *
+ * 而仓库根的 `agent-data/` 是**运行时数据**：API key、会话、截图、日记。
+ * 把它打进去等于把作者的凭据公开发布。
+ * `tools/check-no-user-data.mjs` 的 d) 项就是拦这件事的 ——
+ * 它认「源路径含 skeleton」，所以这里刻意用含 skeleton 的形参名。
+ *
+ * ## 刻意不放 models.json
+ *
+ * 用户填了 key 的 models.json 在 `<data_dir>/models.json`。
+ * zip 里放一个同名文件的话，**更新时覆盖解压会把用户的 key 冲掉**。
+ * 不放 → 首次启动由 `bootstrap_data` 建空数组，用户自己加模型。
+ */
+export function stageSkeleton(skeletonDir, outDir) {
+  if (!existsSync(skeletonDir)) {
+    throw new Error(`骨架目录不存在：${skeletonDir}`);
+  }
+  copyTree(skeletonDir, path.join(outDir, DATA_SUBDIR));
+}
+
+/**
+ * 装配 Windows 发布形态：<out>/<exe> + <out>/dist/** + <out>/agent-data/**。
  *
  * 刻意**不**提供「把 dist 内容平铺进 out/」的选项 —— 那正是事故的成因，
  * 留着开关等于留着同一个坑。
  */
-export function stageWindowsRelease({ exePath, distDir, outDir, files = [] }) {
+export function stageWindowsRelease({
+  exePath,
+  distDir,
+  outDir,
+  skeletonDir = null,
+  files = [],
+}) {
   if (!isFile(exePath)) {
     throw new Error(`exe 不存在：${exePath}`);
   }
@@ -117,6 +161,11 @@ export function stageWindowsRelease({ exePath, distDir, outDir, files = [] }) {
   // ⚠️ 关键一行：dist 是 **子目录**。这里写错就是 2026-10-12 那个事故。
   copyTree(distDir, path.join(outDir, DIST_SUBDIR));
 
+  // 三合一：空骨架也进 zip（不含 models.json，见 stageSkeleton 的说明）
+  if (skeletonDir) {
+    stageSkeleton(skeletonDir, outDir);
+  }
+
   for (const f of files) {
     if (!isFile(f)) throw new Error(`附加文件不存在：${f}`);
     copyFileSync(f, path.join(outDir, path.basename(f)));
@@ -126,7 +175,9 @@ export function stageWindowsRelease({ exePath, distDir, outDir, files = [] }) {
 }
 
 /**
- * 校验产物布局满足 `compute_dist_dir()` 的契约。
+ * 校验产物布局满足运行时的两条契约：
+ *   · `compute_dist_dir()`  —— `<exe 旁>/dist/index.html`
+ *   · `resolve_data_dir()`  —— `<exe 旁>/agent-data/`（三合一分发）
  *
  * 失败时**必须抛异常**，不能只返回 false —— 上游是 CI 步骤和本地发布脚本，
  * 返回 false 只会变成又一个被忽略的返回值。事故的直接原因就是
@@ -134,9 +185,15 @@ export function stageWindowsRelease({ exePath, distDir, outDir, files = [] }) {
  *
  * 错误信息区分三种成因，因为它们要修的地方完全不同：
  * 平铺（改打包脚本）、缺失（查 dist 是否构建）、放错层（查 .app 结构）。
+ *
+ * ⚠️ `agent-data` 缺失**不**算失败：release 下 `resolve_data_dir()` 会就地
+ *    创建，界面也有「建出目录结构」按钮。它只是提示解压体验差一点
+ *    （首次要自己点一下），而不是发布阻断项。
+ *    但带了对的内容也不校验 —— 见 `verifyNoUserData`，那个才是硬闸。
  */
-export function verifyReleaseLayout(dir, { exeName = null } = {}) {
+export function verifyReleaseLayout(dir, { exeName = null, wantSkeleton = false } = {}) {
   const errors = [];
+  const notes = [];
 
   // exe 名不确定时：只要目录里有 *.exe / *.dmg 就算有 exe。
   const hasExe =
@@ -171,11 +228,68 @@ export function verifyReleaseLayout(dir, { exeName = null } = {}) {
     }
   }
 
+  // ---- 三合一的第二半：agent-data ----------------------------------------
+  // `wantSkeleton` 由调用方传入：装配时传了 --skeleton 就没理由再提示
+  // 「zip 里没有 agent-data」，否则会出现"明明带了却说没带"的自相矛盾输出。
+  const dataDir = path.join(dir, DATA_SUBDIR);
+  if (!existsSync(dataDir)) {
+    if (!wantSkeleton) {
+      notes.push(
+        `zip 里没有 ${DATA_SUBDIR}/：解压后首次启动会在 exe 旁创建，` +
+          `用户要自己点一次「建出目录结构」。` +
+          `（想让解压即用就在装配时加 --skeleton src-tauri/skeleton）`
+      );
+    }
+  } else if (!readdirSync(dataDir).some((f) => f === "memory")) {
+    notes.push(
+      `${DATA_SUBDIR}/ 存在但里面没有 memory/：骨架不完整，` +
+        `启动后仍会走一遍 bootstrap 补缺项。`
+    );
+  }
+
   if (errors.length > 0) {
     throw new Error(`发布产物布局校验失败：\n  - ${errors.join("\n  - ")}`);
   }
 
-  return { distDir: path.join(dir, DIST_SUBDIR), ok: true };
+  return { distDir: path.join(dir, DIST_SUBDIR), dataDir, ok: true, notes };
+}
+
+/**
+ * **硬闸**：确认 zip 里的 agent-data 只是空骨架，没有夹带用户数据。
+ *
+ * 为什么单独一个函数而不并进 `verifyReleaseLayout`：那条的失败是「产物坏了」
+ * （发布阻断），这条的失败是「泄露了」（安全事故）。两者的严重程度和
+ * 处理方式不同，混在一起会让"缺个目录"和"密钥外泄"看起来一样重。
+ *
+ * 拦的东西：
+ *   · `models.json` —— 里面是 API key。zip 里放它 = 覆盖解压时冲掉用户的 key，
+ *     公开发布时更是直接把作者的凭据交出去。
+ *   · `sessions/`、`pmem.sqlite` —— 会话历史与长期记忆，纯用户数据。
+ *   · `screenshots/`、`images/`、`diag.log` —— 同理。
+ */
+export function verifyNoUserData(dir) {
+  const dataDir = path.join(dir, DATA_SUBDIR);
+  if (!existsSync(dataDir)) return { ok: true, checked: false };
+
+  const forbidden = [
+    "models.json",
+    "sessions",
+    "pmem.sqlite",
+    "diag.log",
+    "screenshots",
+    "images",
+    ".trash",
+    ".skeleton-state.json",
+  ];
+  const found = forbidden.filter((f) => existsSync(path.join(dataDir, f)));
+  if (found.length > 0) {
+    throw new Error(
+      `产物 ${DATA_SUBDIR}/ 里夹带了用户数据：${found.join(", ")}\n` +
+        `        zip 只该带 src-tauri/skeleton 的空骨架。\n` +
+        `        models.json 尤其不能进 —— 它含 API key，且覆盖解压会冲掉用户自己那份。`
+    );
+  }
+  return { ok: true, checked: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -204,16 +318,23 @@ function main() {
   const args = parseArgs(process.argv.slice(2));
 
   if (args.verify) {
-    verifyReleaseLayout(args.verify, { exeName: args["exe-name"] ?? null });
+    const r = verifyReleaseLayout(args.verify, { exeName: args["exe-name"] ?? null });
+    verifyNoUserData(args.verify);
     console.log(`OK: 产物布局合法 ${path.join(args.verify, DIST_SUBDIR, DIST_ENTRY)}`);
+    for (const n of r.notes ?? []) console.log(`  提示: ${n}`);
     return;
   }
 
   if (!args.exe || !args.dist || !args.out) {
     console.error(
       "用法：\n" +
-        "  node tools/package.mjs --exe <exe> --dist <dist> --out <dir> [--file <f> ...]\n" +
-        "  node tools/package.mjs --verify <dir> [--exe-name <name>]"
+        "  node tools/package.mjs --exe <exe> --dist <dist> --out <dir>\n" +
+        "                         [--skeleton src-tauri/skeleton] [--file <f> ...]\n" +
+        "  node tools/package.mjs --verify <dir> [--exe-name <name>]\n" +
+        "\n" +
+        "  --skeleton  把空骨架铺进 <out>/agent-data/（三合一分发）。\n" +
+        "              只能指向 src-tauri/skeleton —— 铺真实 agent-data/ 会被\n" +
+        "              verifyNoUserData 拦下，那等于把 API key 打进发布包。"
     );
     process.exit(2);
   }
@@ -222,10 +343,19 @@ function main() {
     exePath: args.exe,
     distDir: args.dist,
     outDir: args.out,
+    skeletonDir: args.skeleton ?? null,
     files: args.file ?? [],
   });
-  verifyReleaseLayout(args.out, { exeName });
-  console.log(`OK: 已装配并自检通过 ${args.out}（${exeName} + ${DIST_SUBDIR}/）`);
+  const { notes } = verifyReleaseLayout(args.out, {
+    exeName,
+    wantSkeleton: !!args.skeleton,
+  });
+  verifyNoUserData(args.out);
+  console.log(
+    `OK: 已装配并自检通过 ${args.out}（${exeName} + ${DIST_SUBDIR}/` +
+      `${args.skeleton ? ` + ${DATA_SUBDIR}/` : ""}）`
+  );
+  for (const n of notes ?? []) console.log(`  提示: ${n}`);
 }
 
 // 直接运行本文件时才进 main()。

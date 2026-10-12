@@ -33,9 +33,12 @@ import { fileURLToPath } from "node:url";
 
 import {
   stageWindowsRelease,
+  stageSkeleton,
   verifyReleaseLayout,
+  verifyNoUserData,
   DIST_ENTRY,
   DIST_SUBDIR,
+  DATA_SUBDIR,
 } from "../../tools/package.mjs";
 
 const REPO_ROOT = path.resolve(
@@ -262,4 +265,81 @@ describe("「手动跑只出产物、不发布」这个约定不能被悄悄拆�
     const n = (ci.match(TAG_GATE) ?? []).length;
     expect(n).toBeGreaterThanOrEqual(2);
   });
+
+// ---------------------------------------------------------------------------
+// 三合一分发：zip = exe + dist/ + agent-data/（2026-10-12 用户需求）
+// ---------------------------------------------------------------------------
+
+describe("三合一：agent-data 空骨架进 zip", () => {
+  it("--skeleton 铺出 <out>/agent-data/，且含 memory/（resolve_data_dir 的判据）", () => {
+    const out = path.join(tmp, "out");
+    const skel = path.join(tmp, "skel");
+    // 造一个最小骨架：与 src-tauri/skeleton 同形
+    mkdirSync(path.join(skel, "memory"), { recursive: true });
+    mkdirSync(path.join(skel, "skills"), { recursive: true });
+    writeFileSync(path.join(skel, "manifest.json"), '{"kind":"orbcat-skeleton"}');
+    writeFileSync(path.join(skel, "memory", "MEMORY.md"), "# mem");
+
+    stageWindowsRelease({
+      exePath: makeExe(),
+      distDir: makeDist(),
+      outDir: out,
+      skeletonDir: skel,
+    });
+
+    expect(() => readFileSync(path.join(out, DATA_SUBDIR, "memory", "MEMORY.md"))).not.toThrow();
+    expect(() => readFileSync(path.join(out, DATA_SUBDIR, "manifest.json"))).not.toThrow();
+    // 布局校验不该再提示"zip 里没有 agent-data"
+    const { notes } = verifyReleaseLayout(out, {
+      exeName: "orbcat.exe",
+      wantSkeleton: true,
+    });
+    expect(notes.join(" ")).not.toContain("没有 agent-data");
+  });
+
+  // ★ 反向用例：zip 里带 models.json = 把用户的 API key 公开发布，
+  //   且更新时覆盖解压会把它冲掉。这是安全事故，必须硬拦。
+  it("agent-data 里出现 models.json 必须抛错（不能把 key 打进发布包）", () => {
+    const out = path.join(tmp, "out");
+    stageWindowsRelease({
+      exePath: makeExe(),
+      distDir: makeDist(),
+      outDir: out,
+      skeletonDir: (() => {
+        const skel = path.join(tmp, "skel-with-key");
+        mkdirSync(skel, { recursive: true });
+        writeFileSync(path.join(skel, "models.json"), '[{"id":"x","url":"y","apiKey":"sk-secret"}]');
+        return skel;
+      })(),
+    });
+
+    expect(() => verifyNoUserData(out)).toThrow(/models.json/);
+    expect(() => verifyNoUserData(out)).toThrow(/API key/);
+  });
+
+  it("sessions/ 与 diag.log 同样算用户数据，一并拦下", () => {
+    const out = path.join(tmp, "out");
+    const skel = path.join(tmp, "skel-2");
+    mkdirSync(path.join(skel, "sessions"), { recursive: true });
+    writeFileSync(path.join(skel, "sessions", "s1.json"), "{}");
+    writeFileSync(path.join(skel, "diag.log"), "log");
+    stageWindowsRelease({
+      exePath: makeExe(),
+      distDir: makeDist(),
+      outDir: out,
+      skeletonDir: skel,
+    });
+    expect(() => verifyNoUserData(out)).toThrow(/sessions|diag\.log/);
+  });
+
+  // 没传 skeleton 时给提示（告诉装配方怎么让解压即用），
+  // 且**不算失败** —— release 下 resolve_data_dir 会就地创建目录。
+  it("不铺骨架时：给提示但不抛错", () => {
+    const out = path.join(tmp, "out");
+    stageWindowsRelease({ exePath: makeExe(), distDir: makeDist(), outDir: out });
+    const { notes } = verifyReleaseLayout(out, { exeName: "orbcat.exe" });
+    expect(notes.join(" ")).toContain("没有 agent-data");
+    expect(() => verifyNoUserData(out)).not.toThrow();
+  });
+});
 });

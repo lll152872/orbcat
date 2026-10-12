@@ -426,7 +426,12 @@ jobs:
           #    只有真跑 exe 的用户看得见。
           #    现在布局被 tests/tools/package.test.ts 锁住（npm test 会跑），
           #    装配/自检只有这一份实现，改错会直接红在那个测试上。
-          node tools/package.mjs --exe src-tauri/target/release/orbcat.exe --dist dist --out pkg --file README.md
+          # 三合一分发：exe + dist/ + agent-data/（空骨架）。
+          #   · --skeleton 只能指向 src-tauri/skeleton —— 那是编译期固定的空骨架。
+          #     铺真实 agent-data/ 会被 verifyNoUserData 拦下（那等于把 API key 打进发布包）。
+          #   · 刻意**不放** models.json：用户填了 key 的那个在 <exe 旁>/agent-data/models.json，
+          #     zip 里放同名文件的话，更新时覆盖解压会把它冲掉。首次启动由 bootstrap 建空数组。
+          node tools/package.mjs --exe src-tauri/target/release/orbcat.exe --dist dist --out pkg --skeleton src-tauri/skeleton --file README.md
           Compress-Archive -Path pkg/* -DestinationPath "orbcat-${{ matrix.artifact }}.zip" -Force
           # 解压后再验一次：真正发出去的是 zip，验的必须是 zip 的内容
           Remove-Item -Recurse -Force verify -ErrorAction SilentlyContinue

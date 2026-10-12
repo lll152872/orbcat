@@ -151,24 +151,100 @@ function checkTauriBundle() {
 }
 
 // ---------------------------------------------------------------------------
-// d) build-release.sh 的拷贝目标
+// d) 发布脚本 / 打包脚本的拷贝目标
 // ---------------------------------------------------------------------------
-function checkReleaseScript() {
-  const p = join(ROOT, 'tools', 'build-release.sh');
-  if (!existsSync(p)) {
-    notes.push('跳过 d)：找不到 tools/build-release.sh');
-    return;
-  }
-  const text = readFileSync(p, 'utf8');
-  text.split('\n').forEach((line, i) => {
-    // 只看拷贝/移动类命令，注释里的提及不算
-    if (!/\b(cp|mv|rsync|tar|zip|7z|install)\b/.test(line)) return;
-    if (line.trimStart().startsWith('#')) return;
-    if (line.includes(DATA)) {
-      fail('d) build-release.sh', `第 ${i + 1} 行`, `${line.trim()}\n        发布脚本拷贝了 ${DATA} —— 这正是「打包夹带用户数据」那条路`);
+//
+// ## 2026-10-12 起放开「从 skeleton/ 铺空骨架」
+//
+// zip 改成三合一形态（exe + dist/ + agent-data/）之后，打包需要把
+// `src-tauri/skeleton/` 铺进产物里的 agent-data/ —— 这是**编译期固定内容**
+// （memory/pending/projects/skills 的 README 与内置技能），build.rs 的
+// 白名单闸门（下面 e 项）本来就在管它，不含任何用户数据。
+//
+// 而 `agent-data/` 本身仍是**禁区**：那里面有 API key、会话、截图、日记。
+//
+// 所以这里从「提到 agent-data 就fail」改成**看拷贝的源路径**：
+//   · 源是 `src-tauri/skeleton/`  → 允许（空骨架，可公开分发）
+//   · 源是仓库根的 `agent-data/` → 仍然 fail（用户数据）
+//   · 目标是数据目录但源不明    → fail（保守，宁枉勿纵）
+//
+// ## ⚠️ 为什么不能只匹配字面量 "agent-data"（2026-10-12 实测漏洞）
+//
+// 第一版写的是 `line.includes(DATA)`，变异验证时被绕过：
+// 把拷贝目标写成常量名 `DATA_SUBDIR`（而非字面 "agent-data"），
+// 闸门就完全不看这一行 —— 一次变异注入、零告警。
+// **凡是"禁止出现某物"的闸门，都必须假设对手会改名。**
+// 所以改成同时认字面量与常量名，且**默认拒绝**：
+// 认不出源是 skeleton 的行一律 fail，而不是放过。
+const DATA_LITERAL = 'agent-data';
+const DATA_CONST = /\bDATA_SUBDIR\b/;
+
+// ⚠️ 两套命令形态，**必须分开判**：
+//   · shell（build-release.sh）：`cp -rf x y` / `rsync x y` —— 命令后跟参数，无括号
+//   · JS（package.mjs）：`copyTree(x, y)` —— 函数调用，必须带 `(`
+//
+// 2026-10-12 两次踩坑都是想用一套正则通吃：
+//   第一次 `\b(cp|zip|install|...)\b` 匹配整行 → 模板字符串里的
+//     "zip 里没有 ${DATA_SUBDIR}/" 被当成违规命令，误报；
+//   第二次改成"必须带 (" → bash 的 `cp -rf agent-data "$REL/"` 全放过了，
+//     本地发布脚本反而成了盲区（变异验证抓出来的，正常代码全绿）。
+// 教训：给"禁止出现某物"的闸门做变异验证时，**每一种被测文件的语法
+// 都要各试一次**，否则你测的只是你脑子里那种写法。
+const COPY_CMD_SHELL = /^\s*(?:cp|mv|rsync|tar|7z|install)\s+/;
+const COPY_CMD_JS = /(?:\b(?:copyFileSync|cpSync|copyTree)\s*\()|(?:\binstall\s*\()/;
+
+function copyCmdFor(rel) {
+  return rel.endsWith('.sh') ? COPY_CMD_SHELL : COPY_CMD_JS;
+}
+
+function checkPackagingScripts() {
+  const scripts = ['tools/build-release.sh', 'tools/package.mjs'];
+  let anyFound = false;
+
+  for (const rel of scripts) {
+    const p = join(ROOT, rel);
+    if (!existsSync(p)) {
+      notes.push(`跳过 d)：找不到 ${rel}`);
+      continue;
     }
-  });
-  console.log(`${ok('d) 发布脚本')}  ${dim(`拷贝目标未提及 ${DATA}`)}`);
+    anyFound = true;
+    const lines = readFileSync(p, 'utf8').split('\n');
+
+    lines.forEach((line, i) => {
+      // 只看拷贝/移动类命令，注释里的提及不算。
+      // ⚠️ `*` 与 `/**` 也要跳过 —— package.mjs 的块注释续行是 ` * xxx`，
+      //    doc 注释首行是 `/** ... */`。2026-10-12 实测漏了这两种，
+      //    结果"讲清楚为什么不许铺 agent-data"的注释本身被当成违规命令报出来。
+      const t = line.trimStart();
+      if (t.startsWith('#') || t.startsWith('//')) return;
+      if (t.startsWith('*') || t.startsWith('/**')) return;
+
+      if (!copyCmdFor(rel).test(line)) return;
+
+      // 这一行到底有没有"往数据目录里写"的意图？
+      // 字面量或常量名都算 —— 只认字面量会被 `DATA_SUBDIR` 绕过去。
+      const mentionsData =
+        line.includes(DATA_LITERAL) || DATA_CONST.test(line);
+      if (!mentionsData) return;
+
+      // 允许：源路径指向骨架目录（编译期固定内容，e) 项另有白名单闸门）
+      // 例：copyTree(SKELETON, path.join(outDir, DATA))
+      // 判据看**整行**里有没有 skeleton —— 只要出现就算把来源讲清楚了，
+      // 不要求它精确出现在 DATA 之前（那太容易因参数顺序不同而漏判）。
+      if (/skeleton/i.test(line)) return;
+
+      fail(
+        `d) ${rel}`,
+        `第 ${i + 1} 行`,
+        `${line.trim()}\n        这条命令涉及 ${DATA} 且源不是 src-tauri/skeleton/ ——\n` +
+          `        要么你铺的是真实用户数据（绝不允许），要么请把源改成 skeleton/。`,
+      );
+    });
+  }
+
+  if (anyFound) {
+    console.log(`${ok('d) 发布脚本')}  ${dim(`拷贝目标未夹带用户 ${DATA}`)}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +324,7 @@ console.log('防夹带闸门 · 仓库级\n');
 checkGitTracking();
 checkIncludes();
 checkTauriBundle();
-checkReleaseScript();
+checkPackagingScripts();
 checkSkeletonWhitelist();
 checkSkeletonClean();
 console.log('');
