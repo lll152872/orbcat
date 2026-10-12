@@ -1184,16 +1184,7 @@ async function showNewMenu(x: number, y: number): Promise<void> {
   const modeItems = ordered.length
     ? ordered
         .map((m) => {
-          // 模式里写了 MCP 里不存在的组名 → 这行**必须**看得见。
-          //   之前这个提示长在「设置 › 行为」的模式卡片上，
-          //   模式选择器搬进菜单后一并跟过来；丢了它就是"手编 modes.json 打错组名
-          //   却毫无反馈"，那种静默失效最难查。）
-          const bad = m.unknownGroups.length
-            ? `<div class="ctx-sub">⚠️ 模式里写了不存在的组：${m.unknownGroups
-                .map((u) => esc(u))
-                .join("、")}</div>`
-            : "";
-          return `
+        return `
       <div class="ctx-item" data-act="sess" data-mode="${esc(m.id)}" title="${esc(
         m.description,
       )}">
@@ -1201,7 +1192,7 @@ async function showNewMenu(x: number, y: number): Promise<void> {
           MODE_ICON[m.id] ?? "🧩"
         }</span><span class="ctx-item-name">${esc(m.name)}</span>${
           m.id === def ? `<span class="ctx-item-note">默认</span>` : ""
-        }</div>${bad}
+        }</div>
       </div>`;
         })
         .join("")
@@ -1990,11 +1981,16 @@ const EXEC_TRUST_LABEL: Record<string, { icon: string; short: string; full: stri
 
 /**
  * Agent 模式（`agent-data/modes.json`）—— 管**两件正交的事**：
- *   1. 哪些 MCP 外部工具组对模型可见（`mcpGroupsPreload`）
- *   2. 工具以什么形态出现（`toolPresentation`：native 逐个给 / ptc 坍缩成 run_code）
+ *   1. 工具以什么形态出现（`toolPresentation`：native 逐个给 / ptc 坍缩成 run_code）
+ *   2. 正文能不能发图（`imageReplies`）、场景上下文（`promptExtra`）、聊天式呈现（`chatty`）
+ *
+ * ⚠️ 模式**不再管 MCP 外部工具组**。`mcpGroupsPreload` 仍会从用户已有的
+ * `modes.json` 读出来（不能因为改了语义就让人打不开自己的配置），但它
+ * 不影响任何行为 —— 能不能用某个组只看用户在设置页的组开关。
+ * 曾经的闸门在后端 `mcp::ToolRegistry::mode_allows`（现在恒为 true）。
  *
  * 与执行权限（`execTrust`）是两层互不干涉的闸门：
- *   模式 = 哪些工具存在、以什么形态存在   /   权限 = 用它们时问不问
+ *   模式 = 工具以什么形态出现   /   权限 = 用它们时问不问
  * 所以模式**不碰** `run_command` 的弹卡，`execTrust` 也**不碰**工具可见性。
  */
 let activeModeId = "standard";
@@ -2013,12 +2009,6 @@ interface ModeView {
   id: string;
   name: string;
   description: string;
-  /** `"all"` 或组名数组 —— 原样来自 Rust（`modes::GroupSel`） */
-  mcpGroupsPreload: string | string[];
-  /** 允许的组数；`null` = 全给（含未来新增的组） */
-  allowedCount: number | null;
-  /** 模式里写了、但当前 MCP 里不存在的组 → 菜单里标灰 */
-  unknownGroups: string[];
   /** 工具呈现方式：`native` / `ptc`（老后端不返回时按 native 处理） */
   toolPresentation?: "native" | "ptc";
   /**

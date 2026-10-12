@@ -1957,61 +1957,17 @@ fn exe_path() -> String {
 // Tauri 命令 —— MCP
 // ---------------------------------------------------------------------------
 
-/// 把「当前模式允许的组」算成注册表要的形式（**唯一**的入口）。
+/// 重新算一次 MCP 活跃组。
 ///
-/// 为什么收成一个函数：`apply_snapshot_with_settings` 有 4 个调用点
-/// （启动后台拉取、保存 server、改 URL、手动刷新、切模式），
-/// 每个点各写一遍"读 modes.json + 展开哨兵"，迟早有一处忘掉 ——
-/// 而漏掉的那一处会变成"切了模式但工具没变"这种最难查的 bug。
-fn allowed_for_dir(state: &AppState) -> std::collections::HashSet<String> {
-    allowed_for_dir_of(&state.data_dir, &state.mcp)
-}
-
-/// 同 [`allowed_for_dir`]，但接收裸参数（启动期还没有 `State` 时用）
+/// 活跃集只由用户设置决定（模式不再参与，见 `mcp::ToolRegistry::mode_allows`），
+/// 所以这个函数现在只是"把用户的开关重新落到注册表上"。
 ///
-/// ⚠️ 模式**跟会话走**了，所以这里不能再读 `settings.activeMode`
-/// —— 那现在是"新建会话的默认模式"，跟正在用的这个会话没关系。
-/// 改成问 `sessions::effective_mode`（当前会话 → 它自带的模式）。
-/// 漏改的表现：切到「闲聊」后重新拉一次 MCP 快照，工具组又满血复活。
-fn allowed_for_dir_of(
-    data_dir: &std::path::Path,
-    mcp: &std::sync::Arc<tokio::sync::Mutex<mcp::ToolRegistry>>,
-) -> std::collections::HashSet<String> {
-    // 组名清单只能从注册表拿（modes.json 里写的是名字，不知道 MCP 当前有什么组）。
-    // `try_lock`：所有调用点都是"锁外算好、锁内套用"，所以这里正常能拿到锁；
-    // 万一拿不到也不 `.await` —— 那会在这条路径上引出一个死锁可能
-    // （调用方可能正持锁）。退化结果 = 白名单里的组暂时全被当成未知，
-    // 下次快照即恢复，比死锁好得多。
-    let available: Vec<String> = match mcp.try_lock() {
-        Ok(reg) => reg.groups().iter().map(|g| g.name.clone()).collect(),
-        Err(_) => Vec::new(),
-    };
-    // ⚠️ 用 `current_or_main` 而不是 `current_id`：后者只看指针文件，
-    //    指针缺失（真实发生过：`sessions/current` 不存在）会返回 None →
-    //    兜到内置默认模式，而界面/agent 走 `ensure_current` 落到的是另一条会话
-    //    → "界面在闲聊会话里、MCP 工具组却按标准模式算"。两边都说得通，极难排查。
-    //    也刻意不用 `ensure_current`：那条路径会**写盘**（自愈/落指针），
-    //    而这里跑在后台线程里，不该有副作用。
-    let cur = crate::sessions::current_or_main(data_dir);
-    let mode = crate::sessions::effective_mode(data_dir, Some(&cur.id));
-    modes::allowed_groups_for(data_dir, Some(&mode.id), &available).as_registry_set()
-}
-
-/// 换了会话 → 它自带模式 → **MCP 活跃组必须跟着重算**。
-///
-/// 为什么非得显式做一次：`allowed_for_dir` 只在"新快照 / 改设置 / 手动刷新"三条
-/// 路径上跑，切会话一条都不触发。少了这一步，从「标准」切到「闲聊」后工具组
-/// 还是满的 —— 表现出来就是"切了闲聊它照样能调 MCP"，而工具表里
-/// `send_meme` 之类按模式走的闸门又是对的，两处不一致最难查。
-///
-/// 与 `mcp_set_all_groups` / `resync_mode_groups` 用的是同一套（`allowed_for_dir` +
-/// `restore_active_from_settings`），所以"模式只能收窄、用户关掉的组开不回来"
-/// 这条语义自动成立。
+/// ⚠️ 仍然需要显式调用：换会话 / 改 server 之后，
+/// 注册表里的组集合变了，必须重算一次，否则新增的组要等下次拉快照才生效。
 async fn resync_mode_groups(state: &AppState) -> usize {
-    let allowed = allowed_for_dir(state);
     let s = config::load_settings(&state.data_dir);
     let mut reg = state.mcp.lock().await;
-    reg.restore_active_from_settings(&s, Some(allowed))
+    reg.restore_active_from_settings(&s)
 }
 
 #[derive(serde::Serialize)]
@@ -2080,12 +2036,11 @@ async fn mcp_refresh(state: State<'_, AppState>) -> Result<(), String> {
     let clients = state.mcp.lock().await.clients_clone();
     let snap = mcp::ToolRegistry::fetch_snapshot(&clients).await;
     let settings = config::load_settings(&state.data_dir);
-    let allowed = allowed_for_dir(&state);
     state
         .mcp
         .lock()
         .await
-        .apply_snapshot_with_settings(snap, &settings, Some(allowed));
+        .apply_snapshot_with_settings(snap, &settings);
     Ok(())
 }
 
@@ -2142,12 +2097,11 @@ async fn mcp_servers_save(
     let clients = state.mcp.lock().await.clients_clone();
     let snap = mcp::ToolRegistry::fetch_snapshot(&clients).await;
     let settings = config::load_settings(&state.data_dir);
-    let allowed = allowed_for_dir(&state);
     state
         .mcp
         .lock()
         .await
-        .apply_snapshot_with_settings(snap, &settings, Some(allowed));
+        .apply_snapshot_with_settings(snap, &settings);
     Ok(())
 }
 
@@ -2170,12 +2124,11 @@ async fn mcp_set_url(state: State<'_, AppState>, url: String) -> Result<(), Stri
     let clients = state.mcp.lock().await.clients_clone();
     let snap = mcp::ToolRegistry::fetch_snapshot(&clients).await;
     let settings = config::load_settings(&state.data_dir);
-    let allowed = allowed_for_dir(&state);
     state
         .mcp
         .lock()
         .await
-        .apply_snapshot_with_settings(snap, &settings, Some(allowed));
+        .apply_snapshot_with_settings(snap, &settings);
     Ok(())
 }
 
@@ -2456,9 +2409,8 @@ async fn mcp_set_all_groups(
         s.mcp_group_enabled.clear();
     }
     config::save_settings(&state.data_dir, &s)?;
-    let allowed = allowed_for_dir(&state);
     let mut reg = state.mcp.lock().await;
-    reg.restore_active_from_settings(&s, Some(allowed));
+    reg.restore_active_from_settings(&s);
     Ok(())
 }
 
@@ -4372,11 +4324,10 @@ pub fn run() {
                     // 启动即按设置 + 当前模式恢复组开关（决策：**默认全给**，
                     // 模式再收窄一层 —— 见 `modes.rs` 顶部）
                     let st = config::load_settings(&data_dir_for_mcp);
-                    let allowed = allowed_for_dir_of(&data_dir_for_mcp, &bg);
                     let n = bg
                         .lock()
                         .await
-                        .apply_snapshot_with_settings(snap, &st, Some(allowed));
+                        .apply_snapshot_with_settings(snap, &st);
                     eprintln!("[orbcat] MCP 活跃工具组：{n} 个（按设置 + 模式恢复）");
                 });
             }

@@ -875,13 +875,6 @@ pub struct ToolRegistry {
     instructions: Vec<(String, String)>,
     /// 已加载进活跃集的组名
     active: HashSet<String>,
-    /// **模式允许的组名**（见 `crate::modes`）：`None` = 不设限（单测与
-    /// "模式功能上线前的行为"）。`Some` 里含 `modes::ALL` 哨兵 = 全给。
-    ///
-    /// 为什么存在注册表里而不是每次现算：`load_tool_group` 是**模型主动调**的
-    /// （`tools.rs` 里只拿得到注册表，拿不到 `data_dir`），没有一个落在这里的
-    /// 允许集，模型就能绕开模式约束把任意组装进上下文。
-    allowed: Option<HashSet<String>>,
     /// 索引缓存写到哪（`<data_dir>/mcp_tool_index.txt`）。
     ///
     /// `None` = 不落盘（单测默认如此：测试不该往磁盘上留状态）。
@@ -905,7 +898,6 @@ impl ToolRegistry {
             groups: Vec::new(),
             instructions: Vec::new(),
             active: HashSet::new(),
-            allowed: None,
             index_dir: None,
             connected: false,
             error: None,
@@ -932,7 +924,6 @@ impl ToolRegistry {
             groups: Vec::new(),
             instructions: Vec::new(),
             active: HashSet::new(),
-            allowed: None,
             index_dir: None,
             connected: false,
             error: None,
@@ -1168,10 +1159,9 @@ impl ToolRegistry {
         &mut self,
         res: Result<(Option<String>, Vec<(String, Vec<McpTool>, Option<String>)>), String>,
         settings: &crate::config::AgentSettings,
-        allowed: Option<HashSet<String>>,
     ) -> usize {
         self.apply_snapshot(res);
-        self.restore_active_from_settings(settings, allowed)
+        self.restore_active_from_settings(settings)
     }
 
     /// 按设置重建活跃集。组名不存在的条目会被忽略（server 下线 / 改名）。
@@ -1191,9 +1181,8 @@ impl ToolRegistry {
     pub fn restore_active_from_settings(
         &mut self,
         settings: &crate::config::AgentSettings,
-        allowed: Option<HashSet<String>>,
     ) -> usize {
-        let n = self.recompute_active(settings, allowed.as_ref());
+        let n = self.recompute_active(settings);
         // 活跃集刚被重算 → 索引里的「已加载 / 未加载」标记要跟着刷新。
         // 调用链是 apply_snapshot → persist_index（那时 active 还是空的）→ 这里，
         // 所以必须在本函数收尾再刷一次，否则缓存里会写着"全部未加载"。
@@ -1201,23 +1190,15 @@ impl ToolRegistry {
         n
     }
 
-    fn recompute_active(
-        &mut self,
-        settings: &crate::config::AgentSettings,
-        allowed: Option<&HashSet<String>>,
-    ) -> usize {
+    /// 活跃集 = **只由用户在设置页的开关决定**（`mcp_group_enabled` / `mcp_all_groups`）。
+    ///
+    /// 原来这里还要再和模式白名单取一次交集（`allowed_names`），那道闸门已删：
+    /// 模式不该管用户能用哪些外部工具组。
+    fn recompute_active(&mut self, settings: &crate::config::AgentSettings) -> usize {
         self.active.clear();
-        self.allowed = allowed.cloned();
         if !self.connected {
             return 0;
         }
-        let names: Vec<String> = self.groups.iter().map(|g| g.name.clone()).collect();
-        // 哨兵 → 展开成"当前真实存在的全部组"：`"all"` 必须自动包含**未来新增**的组，
-        // 所以不能把当时的组名快照下来。
-        let allowed_names = match allowed {
-            None => None,
-            Some(s) => Some(crate::modes::expand_allowed(s, &names)),
-        };
         for g in &self.groups {
             // 未记录过的组：按全局开关决定（默认全开）
             let enabled = *settings
@@ -1227,12 +1208,9 @@ impl ToolRegistry {
             if !enabled {
                 continue;
             }
-            // 模式不许可 → 不活跃（但**不进** mcp_group_enabled，用户的设置不动）
-            if let Some(a) = &allowed_names {
-                if !a.contains(&g.name) {
-                    continue;
-                }
-            }
+            // 原来这里还有第二道闸门：模式不许可的组不进入活跃集。
+            // 现在模式不管这件事（见 [`Self::mode_allows`]）——
+            // 用户在设置页勾的组就是他要的组，再被模式收一次没有道理。
             self.active.insert(g.name.clone());
         }
         self.active.len()
@@ -1240,28 +1218,33 @@ impl ToolRegistry {
 
     /// 这个组**当前模式**允不允许。
     ///
-    /// `true` 的两种情况：没设限（`None`）、组在白名单里 / 哨兵全给。
-    /// 组名不存在时：全给 → 允许（新增组自动放行）；白名单 → 由
-    /// [`crate::modes::AllowedGroups`] 侧归入 `unknown`，这里只认名字。
-    pub fn mode_allows(&self, group: &str) -> bool {
-        match &self.allowed {
-            None => true,
-            Some(s) => {
-                crate::modes::set_is_all(s) || s.contains(group)
-            }
-        }
+    /// ## 现在恒为 `true` —— 模式不再管 MCP 组
+    ///
+    /// 用户原话：「也别限制了,统统用户自己管理,用户不想用就不用,想用就用」。
+    ///
+    /// 这一维原本是**约束层**：生效的组 = 用户设置 ∩ 模式白名单
+    /// （`modes.json` 的 `mcpGroupsPreload`）。实际后果是：在
+    /// `mcpGroupsPreload: []` 的模式下，用户在设置页勾「给模型」会直接被
+    /// 后端 `load()` 拒掉，报「当前 agent 模式不允许使用组「X」」——
+    /// 而且**开关连 `settings.json` 都写不进去**（错误发生在保存之前）。
+    /// 用户想用某个工具组，却要先去改一个 JSON 文件才能用上。
+    ///
+    /// 现在保留这个函数（而不是删掉全部调用点）是因为它是**唯一的策略收口处**：
+    /// `groups_summary` / `capability_index` / `search_tools` 都经过它，
+    /// 全部组一律对模型可见。
+    ///
+    /// `allowed` 字段照旧从模式解析（`mcpGroupsPreload` 在用户已有的
+    /// `modes.json` 里还要能读得出来），但不再参与任何判定。
+    pub fn mode_allows(&self, _group: &str) -> bool {
+        true
     }
 
-    /// 当前模式不允许、但 MCP 里真实存在的组（面板里标"本模式不给"）。
+    /// 当前模式不允许的组 —— 恒为空。
+    ///
+    /// 留着是为了让 `mode_denied_hint()` 自然返回空串：那段提示原本是告诉
+    /// 模型「有一组被当前模式收起来了，切 PTC 才有」，现在没有这回事了。
     pub fn mode_denied(&self) -> Vec<String> {
-        if self.allowed.is_none() {
-            return Vec::new();
-        }
-        self.groups
-            .iter()
-            .filter(|g| !self.mode_allows(&g.name))
-            .map(|g| g.name.clone())
-            .collect()
+        Vec::new()
     }
 
     /// **仅测试用**：按设置恢复活跃集、不设模式限制（等价于上线前的行为）。
@@ -1270,7 +1253,7 @@ impl ToolRegistry {
         &mut self,
         settings: &crate::config::AgentSettings,
     ) -> usize {
-        let n = self.recompute_active(settings, None);
+        let n = self.recompute_active(settings);
         self.persist_index();
         n
     }
@@ -1516,16 +1499,12 @@ impl ToolRegistry {
 
     /// 加载一个组。返回给模型看的说明文本。
     pub fn load(&mut self, name: &str) -> Result<String, String> {
-        // 模式闸门**先于**"有没有这个组"：模式不让给的组，连"存在"都不该被确认。
-        // 不拦的话模型可以用 load_tool_group 把模式收起来的组重新装回活跃集，
-        // 那一层约束就等于不存在。
-        if !self.mode_allows(name) {
-            return Err(format!(
-                "当前 agent 模式不允许使用组「{name}」。\
-                 需要它时请让用户切到 PTC 模式（或改 agent-data/modes.json 里当前模式的\
-                 mcpGroupsPreload）。"
-            ));
-        }
+        // 原来这里有一道模式闸门（`if !self.mode_allows(name) { return Err(...) }`），
+        // 现在删掉了 —— 能不能用某个组**只由用户在设置页的开关决定**。
+        //
+        // 保留过的理由（已不适用）：当时认为模型会用 `load_tool_group` 把模式
+        // 收起来的组装回活跃集。实测那个担心站不住：用户自己在设置页勾的组
+        // 本来就是他想要的，而模式白名单挡住的恰恰是用户自己的选择。
         let g = self
             .groups
             .iter()
@@ -2238,7 +2217,7 @@ while ($true) {
             Err(e) => eprintln!("[dbg] snapshot Err: {e}"),
         }
         let st = crate::config::AgentSettings::default();
-        reg.apply_snapshot_with_settings(snap, &st, None);
+        reg.apply_snapshot_with_settings(snap, &st);
 
         assert!(
             !reg.instructions.is_empty(),
@@ -2547,12 +2526,16 @@ exit 3
 
     /// 模式是**约束层**：与用户设置取交集，且只能收窄不能放宽。
     ///
-    /// 这是整个「模式」功能的语义底线，写死在这里：
-    ///   1. 用户关掉的组，模式给不回来（否则设置页的开关形同虚设）；
-    ///   2. 模式没点名的组，用户开着也不给（否则模式什么也管不住）；
-    ///   3. `"all"` 哨兵 = 当前全部组（含未来新增的）。
+    /// 活跃集**只由用户设置决定** —— 模式不参与。
+    ///
+    /// 这是原来那条「模式层与用户设置取交集、且只能收窄」的语义被用户否决后的
+    /// 版本（用户原话：「模式管理对 mcp 也别限制了,统统用户自己弄」）。
+    /// 现在写死这三条：
+    ///   1. 用户开的组就活跃；
+    ///   2. 用户关掉的组**任何模式都开不回来**（开关仍说了算）；
+    ///   3. 模式里写什么都不影响活跃集。
     #[test]
-    fn mode_layer_intersects_user_settings_and_only_narrows() {
+    fn user_settings_alone_decide_active_groups() {
         let mut reg = ToolRegistry::new("http://127.0.0.1:1/mcp");
         let g = |n: &str| McpGroup {
             name: n.into(),
@@ -2566,40 +2549,30 @@ exit 3
         let mut st = crate::config::AgentSettings::default();
         st.mcp_all_groups = true;
 
-        // 白名单只给 github → 只有它活跃，用户那边什么设置都没改
-        let only_github: HashSet<String> = ["github".to_string()].into_iter().collect();
-        let n = reg.restore_active_from_settings(&st, Some(only_github.clone()));
-        assert_eq!(n, 1);
-        assert!(reg.is_active("github"));
-        assert!(!reg.is_active("mysql") && !reg.is_active("ssh"));
-        assert!(!st.mcp_group_enabled.contains_key("mysql"), "模式不得改写用户设置");
-        assert_eq!(reg.mode_denied(), vec!["mysql".to_string(), "ssh".to_string()]);
-
-        // 用户**显式开**了 mysql，但模式仍不给 → 依然不活跃（模式只能收窄）
-        st.mcp_group_enabled.insert("mysql".into(), true);
-        let n = reg.restore_active_from_settings(&st, Some(only_github));
-        assert_eq!(n, 1);
-        assert!(!reg.is_active("mysql"), "模式收窄优先于用户的「开」");
-
-        // 模式给了 github + mysql，但用户显式关了 github → 交集只剩 mysql
-        let pair: HashSet<String> = ["github".to_string(), "mysql".to_string()].into_iter().collect();
-        st.mcp_group_enabled.insert("github".into(), false);
-        let n = reg.restore_active_from_settings(&st, Some(pair));
-        assert_eq!(n, 1, "用户关掉的不该被模式开回来");
-        assert!(!reg.is_active("github") && reg.is_active("mysql"));
-
-        // 哨兵 "all" → 全部组（含任何后来新增的）
-        let all: HashSet<String> = [crate::modes::ALL.to_string()].into_iter().collect();
-        st.mcp_group_enabled.clear();
-        let n = reg.restore_active_from_settings(&st, Some(all));
+        // 默认全开 → 全活跃
+        let n = reg.restore_active_from_settings(&st);
         assert_eq!(n, 3);
+        assert!(reg.is_active("github") && reg.is_active("mysql") && reg.is_active("ssh"));
+
+        // 用户关掉 ssh → 只有它掉出去
+        st.mcp_group_enabled.insert("ssh".into(), false);
+        let n = reg.restore_active_from_settings(&st);
+        assert_eq!(n, 2);
+        assert!(!reg.is_active("ssh"), "用户关掉的组必须真的不活跃");
+        assert!(reg.is_active("github") && reg.is_active("mysql"));
+
+        // 用户重新打开 → 回来（没有任何模式能压住它）
+        st.mcp_group_enabled.insert("ssh".into(), true);
+        assert_eq!(reg.restore_active_from_settings(&st), 3);
+
+        // 不再有任何「被模式收起来」的组
         assert!(reg.mode_denied().is_empty());
     }
 
-    /// 模式收起来的组，模型不能靠 `load_tool_group` 自己装回来
-    /// —— 否则"模式"只是个建议。
+    /// 模型可以加载**任何真实存在**的组 —— 组是否可用只由用户的开关决定，
+    /// 模式不再拦一道（曾经 `load()` 会在这里报「当前 agent 模式不允许使用组」）。
     #[test]
-    fn mode_denied_group_cannot_be_loaded_by_model() {
+    fn model_can_load_any_existing_group() {
         let mut reg = ToolRegistry::new("http://127.0.0.1:1/mcp");
         reg.groups = vec![
             McpGroup {
@@ -2617,19 +2590,20 @@ exit 3
         ];
         reg.connected = true;
         let st = crate::config::AgentSettings::default();
-        let only_github: HashSet<String> = ["github".to_string()].into_iter().collect();
-        reg.restore_active_from_settings(&st, Some(only_github));
+        reg.restore_active_from_settings(&st);
 
-        let err = reg.load("ssh").unwrap_err();
-        assert!(err.contains("不允许"), "{err}");
-        assert!(!reg.is_active("ssh"));
-        // 被收起来的组不该出现在给模型看的两份清单里
-        assert!(!reg.describe_groups().contains("**ssh**"), "{}", reg.describe_groups());
-        assert!(!reg.capability_index().contains("run-command"));
-        assert!(!reg.search_tools("ssh").contains("run-command"));
-
-        // 允许的组照常能加载
+        // 两个组都能加载 —— 不再有「模式不允许」这条错误
         assert!(reg.load("github").is_ok());
+        assert!(reg.load("ssh").is_ok());
+
+        // 且都出现在给模型看的三份清单里
+        assert!(reg.describe_groups().contains("**ssh**"), "{}", reg.describe_groups());
+        assert!(reg.capability_index().contains("run-command"));
+        assert!(reg.search_tools("ssh").contains("run-command"));
+
+        // 不存在的组仍然报「没有这个组」—— 删的是模式闸门，不是存在性校验
+        let err = reg.load("nope").unwrap_err();
+        assert!(err.contains("没有") || err.contains("不存在"), "{err}");
     }
 
     #[test]

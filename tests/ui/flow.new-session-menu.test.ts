@@ -96,16 +96,10 @@ describe("「＋」菜单 · 新建会话时选模式", () => {
     expect(ptc.title, "说明要跟 modes.json 一致").toContain("写成程序");
   });
 
-  it("模式里写了不存在的组名 → 菜单里要看得见（不许静默失效）", async () => {
-    await bootApp();
-    await openPanel();
-    const menu = await openNewMenu();
-    const creator = menu.querySelector<HTMLElement>('.ctx-item[data-mode="creator"]')!;
-    const warn = creator.querySelector(".ctx-sub");
-    expect(warn, "写错的组名必须提示").toBeTruthy();
-    expect(warn!.textContent).toContain("打错的组名");
-    expect(warn!.textContent).toContain("不存在");
-  });
+  // 原先这里有一条「模式里写了不存在的组名 → 菜单里要提示」的测试，已随
+// 「模式不再管 MCP 组」删除：`mcpGroupsPreload` 现在完全不影响行为，
+// 所以组名写错既不会静默失效、也没有任何后果 —— 为一个无效果的字段
+// 做"不许静默失效"的提示是纯噪音。
 
   it("读不到模式表也要能开新会话（退回默认模式）", async () => {
     await bootApp();

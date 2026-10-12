@@ -2,22 +2,9 @@
 //!
 //! ## 模式管什么、不管什么
 //!
-//! 一个模式管**两件正交的事**：
+//! 一个模式管**这几件正交的事**：
 //!
-//! 1. **哪些 MCP 外部工具组对模型可见**（`mcpGroupsPreload`）
-//!
-//! ```text
-//!   生效的组 = 用户设置（mcp_all_groups / mcp_group_enabled）
-//!              ∩ 模式允许的组（mcpGroupsPreload）
-//! ```
-//!
-//! 也就是说这一维是**约束层**，不是开关层：
-//!   - 用户显式关掉的组，模式开不回来（模式只能收窄，不能放宽）；
-//!   - `mcpGroupsPreload = []` 的取反语义 ——「什么都不预载」= 组全部收起来，
-//!     模型只能靠 `list_tool_groups` / `search_tools` / `load_tool_group`
-//!     按需加载。
-//!
-//! 2. **工具以什么形态出现**（`toolPresentation`，见 [`ToolPresentation`]）
+//! 1. **工具以什么形态出现**（`toolPresentation`，见 [`ToolPresentation`]）
 //!
 //! ```text
 //!   native = 每个工具的 schema 直接进工具列表（默认）
@@ -274,21 +261,6 @@ impl AllowedGroups {
 /// 注册表里「全给」的哨兵值（不是合法组名，不会与真实组撞）
 pub const ALL: &str = "*";
 
-/// 把 [`AllowedGroups::as_registry_set`] 的哨兵集合展开成"允许哪些真实组"。
-///
-/// `available` = 当前注册表里的全部组名。哨兵 → 全部可用组。
-pub fn expand_allowed(set: &HashSet<String>, available: &[String]) -> HashSet<String> {
-    if set.contains(ALL) {
-        available.iter().cloned().collect()
-    } else {
-        set.iter().cloned().collect()
-    }
-}
-
-/// 哨兵集合是否表示「全给」
-pub fn set_is_all(set: &HashSet<String>) -> bool {
-    set.contains(ALL)
-}
 
 /// 全部内置模式（JSON 文件不存在 / 写坏时的兜底，也是初始化时落盘的模板）
 pub fn builtin() -> Vec<Mode> {
@@ -446,7 +418,7 @@ pub fn default_file_text() -> String {
     let body = serde_json::to_string_pretty(&f).unwrap_or_else(|_| "{}".into());
     // JSON 里插注释块不合法，所以说明放在**外层包一层对象**也不行 ——
     // 直接把说明写成额外键 `_comment`（serde 忽略未知键，解析不受影响）。
-    let doc = "{\n  \"_comment\": [\n    \"Agent 模式定义。改这个文件不用重新编译。\",\n    \"一个模式管两件正交的事：\",\n    \"  1) mcpGroupsPreload —— 哪些 MCP 外部工具组对模型可见；\",\n    \"       \\\"all\\\" = 全部组直接给模型；[] = 一个都不预载（按需 load_tool_group）；\",\n    \"       [\\\"github\\\", \\\"mysql\\\"] = 只给这几组。\",\n    \"  2) toolPresentation —— 工具以什么形态出现（可选，缺省 native）：\",\n    \"       \\\"native\\\" = 每个工具的 schema 直接进工具列表；\",\n    \"       \\\"ptc\\\"    = 坍缩成 run_code 一个工具，其余作为程序内 SDK 绑定\",\n    \"                  （模型写 TypeScript 调工具，中间结果不进上下文）。\",\n    \"生效组 = 用户设置（设置›MCP 的组开关）∩ 模式允许的组 —— 模式只能收窄，不能放宽。\",\n    \"写了当前 MCP 里不存在的组名不会报错，面板里会把那一条标灰。\",\n    \"  3) imageReplies —— 正文里能不能发图（可选，缺省 work）：\",\n    \"       \\\"work\\\" = 只贴工作产物（截图 / 图表）；\\\"free\\\" = 含表情包，闲聊用。\",\n    \"  4) promptExtra —— 这个模式的场景上下文（可选，内联短文本）。\",\n    \"       ⚠️ 只支持内联，刻意不支持引用文件：这份文件会被复制分享，\",\n    \"          开\\\"读任意文件进 prompt\\\"的口子等于给别人一条外泄通道。\",\n    \"          长规则请写进项目包的 promptParts。\",\n    \"  5) chatty —— 聊天式呈现（可选，缺省 false）：\",\n    \"       true = 一条回复在界面上拆成多个气泡，且**不显示「过程」**。\",\n    \"       只有闲聊模式该开 —— 工作模式的结构化长答案切成几个气泡会很难读。\"\n  ],\n";
+    let doc = "{\n  \"_comment\": [\n    \"Agent 模式定义。改这个文件不用重新编译。\",\n    \"一个模式管这几件正交的事：\",\n    \"  1) toolPresentation —— 工具以什么形态出现（可选，缺省 native）：\",\n    \"       \\\"native\\\" = 每个工具的 schema 直接进工具列表；\",\n    \"       \\\"ptc\\\"    = 坍缩成 run_code 一个工具，其余作为程序内 SDK 绑定\",\n    \"                  （模型写 TypeScript 调工具，中间结果不进上下文）。\",\n    \"  2) imageReplies —— 正文里能不能发图（可选，缺省 work）：\",\n    \"       \\\"work\\\" = 只贴工作产物（截图 / 图表）；\\\"free\\\" = 含表情包，闲聊用。\",\n    \"  3) promptExtra —— 这个模式的场景上下文（可选，内联短文本）。\",\n    \"       ⚠️ 只支持内联，刻意不支持引用文件：这份文件会被复制分享，\",\n    \"          开\\\"读任意文件进 prompt\\\"的口子等于给别人一条外泄通道。\",\n    \"          长规则请写进项目包的 promptParts。\",\n    \"  4) chatty —— 聊天式呈现（可选，缺省 false）：\",\n    \"       true = 一条回复在界面上拆成多个气泡，且**不显示「过程」**。\",\n    \"       只有闲聊模式该开 —— 工作模式的结构化长答案切成几个气泡会很难读。\",\n    \"⚠️ mcpGroupsPreload 已经**不再生效**（保留字段只为老配置文件还能读）。\",\n    \"   能不能用某个 MCP 外部工具组，现在**只由用户在设置页的组开关决定**：\",\n    \"   想用就勾上，不想用就别勾，模式不再插手。\"\n  ],\n";
     // 把 pretty 输出里紧跟在 `{` 后的换行替换成我们的注释块
     if let Some(rest) = body.strip_prefix("{\n") {
         format!("{doc}{rest}")
@@ -718,24 +690,24 @@ mod tests {
         assert_eq!(resolve(&d, Some("  ")).id, DEFAULT_MODE_ID);
     }
 
-    /// 哨兵集合的语义：`all` → `*`；展开时 `*` → 当前全部可用组
+    /// 哨兵集合的语义：`all` → `*`。
+    ///
+    /// ⚠️ 这里曾经还断言「展开时 `*` → 当前全部可用组」，那对
+    /// `expand_allowed` / `set_is_all` 的调用已随**模式不再管 MCP 组**
+    /// 一并删除（见 `mcp::ToolRegistry::mode_allows`）。
+    /// `mcpGroupsPreload` 仍会被解析（用户已有的 `modes.json` 要读得出来），
+    /// 但不再影响任何行为。
     #[test]
     fn registry_set_uses_star_sentinel_for_all() {
         let all = AllowedGroups { all: true, ..Default::default() };
-        let s = all.as_registry_set();
-        assert!(set_is_all(&s));
-        let avail = vec!["a".to_string(), "b".to_string()];
-        let e = expand_allowed(&s, &avail);
-        assert_eq!(e.len(), 2, "全给要自动包含未来新增的组");
+        assert!(all.as_registry_set().contains(ALL));
 
         let one = AllowedGroups {
             all: false,
             allowed: ["a".to_string()].into_iter().collect(),
             unknown: Default::default(),
         };
-        let s2 = one.as_registry_set();
-        assert!(!set_is_all(&s2));
-        assert_eq!(expand_allowed(&s2, &avail).len(), 1);
+        assert!(!one.as_registry_set().contains(ALL));
     }
 
     /// 落盘的初始文件必须能被自己解析回来（带 `_comment` 键也不行）
