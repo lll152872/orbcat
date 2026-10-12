@@ -394,7 +394,27 @@ body {
   overflow-y: auto;
   font-size: 13px;
   line-height: 1.65;
-  opacity: 0.75;
+  /* ⚠️ 这里曾经有 `opacity: 0.75`（初始提交带进来的，从没注释过为什么），
+     一次都没被人改过 —— 连 3dfd55a「面板前端改版 v1」重挑了它左右每一个
+     文字色（.panel-hint、滚动条、边框、按钮）都漏掉了它，是遗留物不是设计。
+
+     它是这批「什么都看不清」的**单一最大来源**：面板正文里所有内容都被按 0.75
+     与底色 #14120f 合成，于是实测对比度全被系统性压低一档：
+
+       #F2F2F4  16.72:1 → 9.66:1   （还行）
+       #9C9CA2   6.85:1 → 4.37:1   （掉到不合格）
+       #8E8E94   5.74:1 → 3.75:1   （掉到不合格）
+       #7C7C82   4.51:1 → 3.08:1
+       #7C8479   4.84:1 → 3.26:1   （--cream-3，实际不合格）
+
+     注意这一条对**两套检测方法都是隐形的**：
+       - 静态 grep 只读 color 声明，看不到 opacity；
+       - getComputedStyle().color 返回的是**指定色**，不是合成后的像素
+         （opacity 走的是合成/层叠，不参与 color 计算）。
+     所以「浏览器实测 126 处不达标」这个数在两套方法下都漏掉了整块衰减。
+
+     要压暗正文请改具体色值（现在正文是 #F2F2F4，本身 16.7:1 很安全），
+     不要在这里给整块盖 opacity —— 盖一层等于把里面每个元素各扣 25%。 */
 }
 
 .panel-hint {
@@ -459,7 +479,7 @@ body {
 /* 组别行：小一号、弱化，给"模型名"当上下文 */
 .mc-group {
   font-size: 9.5px;
-  color: #707076;
+  color: #97979E;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -478,7 +498,7 @@ body {
 
 .mc-caret {
   font-size: 9px;
-  color: #707076;
+  color: #97979E;
   position: absolute;
   right: 6px;
   top: 50%;
@@ -662,13 +682,13 @@ body {
 
 .fg-empty {
   cursor: default;
-  color: #5C5C62;
+  color: #7C7C82;
   font-style: italic;
 }
 
 .fg-empty:hover {
   background: transparent;
-  color: #5C5C62;
+  color: #7C7C82;
 }
 
 /* --- macOS 前台上下文：渐进式授权引导 -------------------------------------
@@ -693,7 +713,7 @@ body {
 /* 等待用户去系统设置勾选的状态：留一点呼吸感，别像坏了 */
 .fg-perm-wait {
   font-style: italic;
-  color: #5C5C62;
+  color: #7C7C82;
 }
 
 /* 「授权」主按钮。用项目主色薄荷绿，和 orb 状态色一致 */
@@ -757,7 +777,7 @@ body {
 }
 
 .empty {
-  color: #6C6C72;
+  color: #8E8E94;
   font-size: 12px;
   text-align: center;
   margin-top: 28px;
@@ -863,7 +883,7 @@ body {
 
 .init-body {
   font-size: 12px;
-  color: #78787E;
+  color: #9C9CA2;
   line-height: 1.7;
 }
 
@@ -945,7 +965,7 @@ body {
 }
 
 .panel-input textarea::placeholder {
-  color: #5C5C62;
+  color: #7C7C82;
 }
 
 /* Windows 上 WebView2 的默认滚动条带箭头，很碍眼 —— 直接隐藏（文本区高度会自动增长） */
@@ -1314,7 +1334,7 @@ body {
 
 .md .md-code-lang {
   font-size: 10.5px;
-  color: #66666C;
+  color: #85858B;
   letter-spacing: 0.03em;
   text-transform: lowercase;
   user-select: none;
@@ -1407,7 +1427,7 @@ body {
   align-items: center;
   justify-content: center;
   font-size: 11px;
-  color: #5C5C62;
+  color: #7C7C82;
   background: rgba(168, 230, 207, 0.05);
 }
 
@@ -1499,7 +1519,7 @@ body {
   margin: 12px 0 7px;
   font-size: 10.5px;
   letter-spacing: 0.04em;
-  color: #66666C;
+  color: #85858B;
   border-bottom: 1px solid rgba(168, 230, 207, 0.07);
   padding-bottom: 5px;
 }
@@ -1551,7 +1571,7 @@ body {
 
 .sess-meta {
   font-size: 10.5px;
-  color: #66666C;
+  color: #85858B;
 }
 
 .sess-item.cur .sess-open {
@@ -1713,7 +1733,7 @@ body {
 .mem-meta {
   margin-top: 4px;
   font-size: 10.5px;
-  color: #6C6C72;
+  color: #8E8E94;
 }
 
 .mem-actions {
@@ -1751,7 +1771,7 @@ body {
 }
 
 .mem-loading {
-  color: #6C6C72;
+  color: #8E8E94;
   font-size: 12px;
   text-align: center;
   margin-top: 28px;
@@ -1800,7 +1820,7 @@ body {
 
 .perm-k {
   flex: 0 0 30px;
-  color: #6C6C72;
+  color: #8E8E94;
 }
 
 .perm-v {
@@ -1896,7 +1916,7 @@ body {
 .perm-hint {
   margin-top: 7px;
   font-size: 10.5px;
-  color: #525a50;
+  color: #7C8479;
 }
 
 /* 拒绝理由输入框：跟卡片同宽，别把按钮挤到换行外面去 */
@@ -1919,7 +1939,7 @@ body {
 }
 
 .perm-reason::placeholder {
-  color: #525a50;
+  color: #7C8479;
 }
 
 /* ---------------- 命令权限卡（决策 9.1） ---------------- */
@@ -2145,7 +2165,7 @@ body {
 
 .lm-chev {
   font-size: 10px;
-  color: #6C6C72;
+  color: #8E8E94;
   width: 10px;
   flex: 0 0 auto;
 }
@@ -2161,7 +2181,7 @@ body {
 .lm-count {
   font-size: 10px;
   font-weight: 500;
-  color: #6C6C72;
+  color: #8E8E94;
   background: rgba(168, 230, 207, 0.07);
   border-radius: 8px;
   padding: 1px 6px;
@@ -2179,7 +2199,7 @@ body {
   border: none;
   border-radius: 6px;
   background: none;
-  color: #707076;
+  color: #97979E;
   font-size: 12px;
   line-height: 1;
   cursor: pointer;
@@ -2254,7 +2274,7 @@ body {
 .lm-th {
   padding: 6px 11px 4px 24px;
   font-size: 10px;
-  color: #525a50;
+  color: #7C8479;
   letter-spacing: 0.03em;
   border-bottom: 1px solid rgba(168, 230, 207, 0.05);
 }
@@ -2283,7 +2303,7 @@ body {
 .lm-eye {
   border: none;
   background: none;
-  color: #40483e;
+  color: #7F8F7B;
   font-size: 13px;
   line-height: 1;
   padding: 0 2px;
@@ -2312,7 +2332,7 @@ body {
 
 .lm-api {
   font-size: 10px;
-  color: #6C6C72;
+  color: #8E8E94;
   font-family: ui-monospace, "Cascadia Mono", Consolas, "Cascadia Mono", Consolas, ui-monospace, monospace;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2611,7 +2631,7 @@ body {
 
 .set-url {
   font-size: 10.5px;
-  color: #6C6C72;
+  color: #8E8E94;
   margin: 3px 0 6px;
   overflow-wrap: anywhere;
 }
@@ -2687,7 +2707,7 @@ body {
 .ctx-title {
   padding: 4px 8px 6px;
   font-size: 10.5px;
-  color: #78787E;
+  color: #9C9CA2;
 }
 
 .ctx-item {
@@ -2767,7 +2787,7 @@ body {
 .ctx-sub {
   margin-top: 2px;
   font-size: 10px;
-  color: #78787E;
+  color: #9C9CA2;
   line-height: 1.4;
 }
 
@@ -2781,7 +2801,7 @@ body {
 
 /* 组影响那一行：允许 / 收起 / 写了但不存在（标灰）—— 现在只在「设置 › 行为」页出现 */
 .mg-label {
-  color: #6C6C72;
+  color: #8E8E94;
   margin-right: 5px;
 }
 .mg-line {
@@ -2795,7 +2815,7 @@ body {
 }
 
 .mg-off {
-  color: #78787E;
+  color: #9C9CA2;
 }
 
 .mg-unknown {
@@ -2807,7 +2827,7 @@ body {
    用户切到 PTC 后能直接调的工具会整个变掉，界面必须说明白，
    否则看起来像"工具全没了"。 */
 .mg-label2 {
-  color: #78787E;
+  color: #9C9CA2;
 }
 
 .mg-ptc {
@@ -2821,7 +2841,7 @@ body {
 }
 
 .life-kind {
-  color: #78787E;
+  color: #9C9CA2;
   font-size: 10px;
   margin-left: 6px;
 }
@@ -2916,7 +2936,7 @@ body {
 
 .fld > span {
   font-size: 10.5px;
-  color: #78787E;
+  color: #9C9CA2;
   letter-spacing: 0.02em;
 }
 
@@ -3065,7 +3085,7 @@ button.fetch-id {
 
 .id-pick .remote-meta {
   font-size: 11px;
-  color: #78787E;
+  color: #9C9CA2;
 }
 
 .set-form input[type="text"],
@@ -3139,7 +3159,7 @@ button.fetch-id {
 
 .mem-empty {
   font-size: 11.5px;
-  color: #6C6C72;
+  color: #8E8E94;
   line-height: 1.6;
   margin-bottom: 12px;
 }
@@ -3166,7 +3186,7 @@ button.fetch-id {
 .mem-file summary i {
   font-style: normal;
   font-size: 10.5px;
-  color: #6C6C72;
+  color: #8E8E94;
 }
 .mem-file pre {
   white-space: pre-wrap;
@@ -3185,7 +3205,7 @@ button.fetch-id {
 .mem-file-empty {
   padding: 8px 11px;
   font-size: 11.5px;
-  color: #6C6C72;
+  color: #8E8E94;
   border: 1px dashed rgba(168, 230, 207, 0.12);
   border-radius: 9px;
   margin-bottom: 8px;
@@ -3439,7 +3459,7 @@ button.fetch-id {
 }
 
 .set-form textarea::placeholder {
-  color: #5C5C62;
+  color: #7C7C82;
   font-family: inherit;
 }
 
@@ -3591,7 +3611,7 @@ button.fetch-id {
 .set-entry-arrow {
   flex-shrink: 0;
   font-size: 17px;
-  color: #5C5C62;
+  color: #7C7C82;
 }
 
 /* ---------------- 实时进度气泡 ---------------- */
@@ -3652,12 +3672,12 @@ button.fetch-id {
 
 .run-timeline .tl-line i {
   font-style: normal;
-  color: #6C6C72;
+  color: #8E8E94;
 }
 
 /* 链路状态（限流退避重试）：只作说明，比工具行更淡 */
 .tl-line.tl-status {
-  color: #6C6C72;
+  color: #8E8E94;
 }
 
 /* 工具执行失败：黄；本轮失败（error 条目）：红 */
@@ -3703,7 +3723,7 @@ button.fetch-id {
 
 .run-note {
   font-size: 10.5px;
-  color: #6C6C72;
+  color: #8E8E94;
   margin-top: 5px;
 }
 
@@ -3741,7 +3761,7 @@ details.tl-tool > summary:hover {
 }
 /* 返回行比调用行更淡一点：一调一返回是同一件事 */
 details.tl-tool.tl-res > summary {
-  color: #6C6C72;
+  color: #8E8E94;
 }
 .tl-tool-pre {
   margin: 4px 0 0;
@@ -4513,7 +4533,7 @@ body.models-page {
 
 .mc-mi-group {
   font-size: 9.5px;
-  color: #707076;
+  color: #97979E;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4609,7 +4629,7 @@ body.models-page {
 .rec-meta {
   flex-shrink: 0;
   font-size: 10px;
-  color: #6C6C72;
+  color: #8E8E94;
   font-variant-numeric: tabular-nums;
 }
 
