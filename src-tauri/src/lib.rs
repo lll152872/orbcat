@@ -391,22 +391,31 @@ fn active_project_dir(data_dir: &Path) -> Option<(PathBuf, String)> {
 
 /// 解析 `agent-data/` 数据目录。
 ///
-/// ## 优先级（2026-10-12 起改成「三合一」分发形态）
-///   1. 环境变量 `ORBCAT_DATA_DIR`（开发 / 测试覆盖）
-///   2. **exe 同级的 `agent-data/`** —— 发布版的主路径，
-///      zip 三合一：`orbcat.exe` + `dist/` + `agent-data/`。
-///      解压即用、多开隔离、删文件夹即卸载。
-///   3. 源码树里的 `agent-data/` —— `cargo run` 的开发形态兜底。
-///      ⚠️ 它必须排在第 2 级**之后**：CARGO_MANIFEST_DIR 是编译期常量，
-///      在开发机上永远存在，排前面会让发布 exe 一直读仓库那份。
+/// ## 一条规则：exe 旁边就是数据
 ///
-/// ## 为什么不再以 `%APPDATA%\com.orbcat.desktop` 为主
-/// 那会让「数据到底在哪」取决于机器而不是安装位置：用户找不着文件，
-/// 也没法靠删文件夹清干净，多开更是完全做不到隔离。
+///   1. 环境变量 `ORBCAT_DATA_DIR` —— 测试 / 临时覆盖，最高优先。
+///   2. **exe 同级的 `agent-data/`** —— 唯一主路径，不存在就地创建。
 ///
-/// ⚠️ 第 3 级在 **release** 下「不存在就创建」，debug 下**不创建** ——
-///    否则 `target/debug/agent-data` 会被建出来并抢在第 2 级前面，
-///    开发时读到的就是空目录而不是仓库里那份。
+/// 完整形态就是 zip 三合一：`orbcat.exe` + `dist/` + `agent-data/`。
+/// 开发机上也一样 —— 仓库根的 `orbcat.exe` 旁边就是真实的 `agent-data/`，
+/// 所以开发和发布**走的是同一条路径**，不再有"开发态兜底"这种分支。
+/// 好处是行为完全一致：你本地怎么跑，用户解压后就是怎么跑。
+///
+/// ## ⚠️ 曾经踩过的两个坑（都记在这里防回归）
+///
+/// **坑一：把编译期路径排在 exe 同级之前。**
+/// `env!("CARGO_MANIFEST_DIR")` 是编译期烤进二进制的绝对路径，
+/// 在开发机上恒存在，排前面会让发布 exe 一直读仓库那份 ——
+/// 端到端实测（从隔离目录启动）才发现 exe 报告的数据目录仍然是仓库路径。
+/// 顺序上必须**运行时信息优先于编译期常量**。
+///
+/// **坑二：只让 release 创建目录（`#[cfg(not(debug_assertions))]`）。**
+/// CI 的 build-windows job 出的是 **debug** 包，它拿不到 exe 旁的
+/// agent-data，于是掉到 `%APPDATA%\com.orbcat.desktop` ——
+/// 行为与 release 包不一致，用户找不到自己的数据（2026-10-12 用户实测报的）。
+/// 现在 debug 与 release 走同一条路。
+///
+/// 兜底 `app_data_dir()` 只在"exe 所在盘只读且创建失败"这种极端情况下才用到。
 fn resolve_data_dir(app: &tauri::AppHandle) -> PathBuf {
     if let Ok(p) = std::env::var("ORBCAT_DATA_DIR") {
         let p = PathBuf::from(p);
@@ -415,19 +424,16 @@ fn resolve_data_dir(app: &tauri::AppHandle) -> PathBuf {
         }
     }
 
-    // 发布版：exe 同级的 agent-data/（zip 三合一里就带这个目录）
-    //
-    // ⚠️ 必须在开发期路径**之前**判。CARGO_MANIFEST_DIR 是编译期常量，
-    //    写死在 exe 里；在开发机上那条路径永远存在，所以只要它排在前面，
-    //    发布 exe 就会一直读到仓库那份 —— 2026-10-12 端到端实测踩到：
-    //    从隔离目录启动，数据目录仍然是 D:\...\orbcat\src-tauri\..\agent-data。
+    // exe 同级的 agent-data/ —— 开发机与发布包**同一条规则**。
+    // 开发机上仓库根就放着 orbcat.exe，旁边就是真实数据；
+    // 用户解压 zip 后同样是自己 exe 旁那份。
     if let Ok(exe) = std::env::current_exe() {
         if let Some(p) = data_dir_beside_exe(&exe) {
             if p.is_dir() {
                 return p;
             }
-            // release 下就地创建；debug 下不创建，让位给下面的开发态路径
-            #[cfg(not(debug_assertions))]
+            // ⚠️ 不带 #[cfg(debug_assertions)]：debug 包也要同样行为，
+            //    否则它掉到 %APPDATA%，用户找不到数据。
             if std::fs::create_dir_all(&p).is_ok() {
                 eprintln!("[orbcat] 已在 exe 旁创建数据目录: {}", p.display());
                 return p;
@@ -435,16 +441,10 @@ fn resolve_data_dir(app: &tauri::AppHandle) -> PathBuf {
         }
     }
 
-    // 开发期：CARGO_MANIFEST_DIR = <项目根>/orbcat/src-tauri
-    // 往上**一级**即 orbcat/，故 agent-data 与 src-tauri 平级。
-    // ⚠️ 这是编译期常量 —— 改动后必须重新构建，否则跑的还是旧路径。
-    //    只在 release exe 旁边没有 agent-data 时才轮到它。
-    let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-data");
-    if dev.exists() {
-        return dev;
-    }
-
-    // current_exe() 拿不到 + 开发路径也没有，才会到这（几乎不可能）
+    // 兜底：exe 所在盘只读、创建失败时才到这。
+    // ⚠️ 刻意**不**把 CARGO_MANIFEST_DIR 的开发路径放在这里 ——
+    //    它是编译期常量，在开发机上恒存在，会盖住上面那条正式规则。
+    //    开发机要跑就得把 exe 放在仓库根（旁边有 agent-data/）。
     app.path()
         .app_data_dir()
         .unwrap_or_else(|_| PathBuf::from("./agent-data"))

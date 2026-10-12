@@ -97,7 +97,21 @@ function Emit-Output {
 }
 
 # 候选位置。只有旁边带 dist/ 的目录才可能合格；_old_builds/ 因此自动出局。
+#
+# ⚠️ 运行态与开发态**物理分开**（2026-10-12 起）：
+#    · 仓库（本文件所在）只放代码与编译中间产物；
+#    · 真正跑的那份放在仓库**外面**的 orbcat-portable\：
+#          D:\workplace\悬浮小agent\orbcat-portable\
+#              orbcat.exe + dist\ + agent-data\
+#      三者平级 = 三合一分发形态，开发与发布走**同一条**数据路径。
+#
+#    这样 `git status` 永远干净，`cargo clean` 也碰不到真实数据。
+#
+#    `..\orbcat-portable\orbcat.exe` 就是那个位置（本文件在 <仓库>\tools\ 下）。
+#    它排在 target\release 之前：那份才是当前真正在用的。
 $patterns = @(
+    '..\orbcat-portable\orbcat.exe',             # 运行态（平时双击用的就是它）
+    'orbcat.exe',                                # 仓库根（临时放一份也能启动）
     'src-tauri\target\release\orbcat.exe',       # 正式产物（build-release.sh 的落点）
     'src-tauri\target\release-fast\orbcat.exe',  # 快速档产物
     'tmp\pkg\*\orbcat.exe'                       # 打包目录（兜底）
@@ -148,7 +162,18 @@ $ranked = $valid | ForEach-Object {
         Freshness = if ($_.LastWriteTime -lt $distTime) { $_.LastWriteTime } else { $distTime }
     }
 } | Sort-Object -Property @{ Expression = { $_.Freshness }; Descending = $true },
-                          @{ Expression = { if ($_.Exe.DirectoryName -like '*\release') { 0 } else { 1 } } }
+                          # 新鲜度打平时按「该用哪个」排：
+                          #   0 = orbcat-portable（运行态，平时双击用的）
+                          #   1 = 仓库根（临时放的）
+                          #   2 = target\release
+                          #   3 = 其他
+                          @{ Expression = {
+                                $d = $_.Exe.DirectoryName
+                                if ($d -like '*orbcat-portable') { 0 }
+                                elseif ($d -eq $repoRoot) { 1 }
+                                elseif ($d -like '*\release') { 2 }
+                                else { 3 }
+                             } }
 
 $best = ($ranked | Select-Object -First 1).Exe
 
