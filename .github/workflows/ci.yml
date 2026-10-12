@@ -23,11 +23,24 @@
 #
 # 真正的端到端验证（授权弹窗、系统设置跳转）需要在有人使用的 Mac 上手动走查。
 
+# ## 触发条件
+#
+# 三类：
+#   1. 分支 push（master / feat/** / fix/**）—— 日常回归
+#   2. PR → master —— 合入前校验
+#   3. **`v*` tag push** —— 发版。
+#      没有第 3 类的话，打 tag 推上去 CI 根本不会跑，release 就成了
+#      "没有三个平台编译证据的裸发布"。2026-10-12 重打 v1.0.0 时补上。
+#
+# ⚠️ `workflow_dispatch` 保留：tag 推送偶发不触发（或想在发版前先空跑一遍）时
+#    可以手动拉起来，不必靠删 tag 重推。
+
 name: CI
 
 on:
   push:
     branches: [master, "feat/**", "fix/**"]
+    tags: ["v*"]
   pull_request:
     branches: [master]
   workflow_dispatch:
@@ -318,3 +331,126 @@ jobs:
           name: orbcat-windows-arm64-debug
           path: out/
           retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Release —— 只在 tag push 上跑，产物直接挂到 GitHub Release
+  #
+  # 与上面三个 job 的分工：那些是**回归闸门**（跑测试、证明能编），
+  # 这个只回答「要发布的东西有没有编出来」。所以它**不跑测试** ——
+  # 测试由同一 tag 触发的那三个 job 负责，红一个就不该走到发布。
+  #
+  # 三个平台的产物形态各不相同，各有各的坑：
+  #   · Windows x64 —— exe + dist/ 分开（见 tools/build-release.sh：exe 不自包含前端）
+  #   · Windows arm64 —— 同上，但要先验 PE machine 是不是 0xAA64
+  #   · macOS arm64 —— .app 里 dist 在 Contents/Resources/dist，与 MacOS/ 不同目录
+  #
+  # ⚠️ 全部未签名未公证。Windows 会弹 SmartScreen，macOS 会被 Gatekeeper 拦
+  #   （右键 → 打开）。这是预期的，发布说明里要写明。
+  # ---------------------------------------------------------------------------
+  release:
+    name: Release artifacts (${{ matrix.artifact }})
+    # tag push 才跑；日常分支 push / PR 直接跳过整个 matrix
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一个平台挂了不要拖掉另外两个的产物
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: windows-x64
+            pkg: zip
+          - os: macos-14
+            artifact: macos-arm64
+            pkg: dmg
+          - os: windows-11-arm
+            artifact: windows-arm64
+            pkg: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: npm ci
+        run: npm ci
+
+      # ⚠️ 必须在任何 cargo 命令**之前**跑（2026-10-11 实测踩坑）：
+      #   tauri-build 编译期解析 bundle.resources，而它走的是 Walk 不是 glob ——
+      #   源目录 ../dist 不存在就直接 `resource path '../dist' doesn't exist`，
+      #   build script exit 101。dist/ 在 .gitignore 里，CI 全新 checkout 没有它。
+      - name: Frontend build (dist must exist before cargo)
+        run: npm run build
+
+      # ---- Windows（x64 / arm64）------------------------------------------
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --manifest-path src-tauri/Cargo.toml --bin orbcat
+          $machine = [System.BitConverter]::ToUInt16(
+            [System.IO.File]::ReadAllBytes("src-tauri/target/release/orbcat.exe"), 4)
+          Write-Output ("PE machine = 0x{0:X4}" -f $machine)
+          $want = if ("${{ matrix.artifact }}" -eq "windows-arm64") { 0xAA64 } else { 0x8664 }
+          if ($machine -ne $want) {
+            throw ("产物架构不对！machine=0x{0:X4}，期望 0x{1:X4}" -f $machine, $want)
+          }
+          New-Item -ItemType Directory -Force -Path pkg | Out-Null
+          Copy-Item src-tauri/target/release/orbcat.exe "pkg/orbcat.exe"
+          Copy-Item -Recurse -Force dist/* pkg/
+          # README + 使用说明：下载的人得知道 exe 不能单独拷走
+          Copy-Item README.md pkg/
+          Compress-Archive -Path pkg/* -DestinationPath "orbcat-${{ matrix.artifact }}.zip" -Force
+          Write-Output "=== zip 内容 ==="
+          Expand-Archive -Path "orbcat-${{ matrix.artifact }}.zip" -DestinationPath verify -Force
+          Get-ChildItem -Recurse verify | ForEach-Object {
+            "{0,10}  {1}" -f $_.Length, $_.FullName.Substring((Resolve-Path verify).Path.Length + 1)
+          }
+
+      # ---- macOS（arm64）---------------------------------------------------
+      # ⚠️ 必须显式带 `app`：`--bundles dmg` 时 Tauri 会把打完 dmg 的中间
+      #    .app **删掉**（日志里一行 `Cleaning .../bundle/macos/orbcat.app`）。
+      #    下面的校验要看 .app 内部结构，所以两个都要。
+      - name: Bundle macOS (app + dmg, unsigned)
+        if: runner.os == 'macOS'
+        run: |
+          npm run tauri -- build --bundles app,dmg
+          APP="src-tauri/target/release/bundle/macos/orbcat.app"
+          if [ ! -f "$APP/Contents/Resources/dist/index.html" ]; then
+            echo "FAIL: .app 里没有 Contents/Resources/dist/index.html —— 装上去是白窗"
+            exit 1
+          fi
+          echo "OK: dist 已进包"
+          ls -lh src-tauri/target/release/bundle/dmg/
+          lipo -archs "$APP/Contents/MacOS/orbcat"
+
+      # ---- 挂到 Release -----------------------------------------------------
+      # `softprops/action-gh-release` 在 tag 存在但 Release 不存在时会自动创建，
+      # 所以不需要额外一步 `gh release create`。
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: orbcat ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          # 发布说明直接引用仓库里的 CHANGELOG，避免在 workflow 里再抄一份
+          # （抄两份必然对不上，这是 BUGS.md 里 BUG-014 同类的问题）。
+          body_path: CHANGELOG.md
+          files: |
+            orbcat-${{ matrix.artifact }}.zip
+            src-tauri/target/release/bundle/dmg/*.dmg
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
