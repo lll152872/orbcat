@@ -5021,7 +5021,7 @@ function renderBody(): void {
         if (view !== "recovery") return;
         b.innerHTML = renderRecoveryView(st, subHeader("备份与回收站"));
         b.scrollTop = keep;
-        bindRecoveryView(b, () => renderBody(), () => void switchView("settings"));
+        bindRecoveryView(b, () => renderBody());
       })
       .catch((e) => {
         if (view !== "recovery") return;

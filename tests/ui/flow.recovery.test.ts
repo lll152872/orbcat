@@ -157,6 +157,52 @@ describe("设置 › 备份与回收站", () => {
     (document.getElementById("rec-diag") as HTMLButtonElement).click();
     await waitFor(() => callsOf("recovery_diagnostic").length > 0, 3000, "diag invoked");
   });
+
+  // 回归：曾报「在备份与回收站点『设置』直接跳到会话」。
+  // 根因是 `#sub-back` 被绑了**两个** click handler —— `renderSubBar` 绑了一个
+  // `switchView("settings")`，`bindRecoveryView` 又叠了一个。一次点击跑两遍，
+  // 第二遍撞上 `switchView` 的 toggle（同一非 chat 视图再点 → 退回对话），
+  // 返回键就变成了「回对话」。其余 8 个子页都有防复绑的注释，这里曾经是例外，
+  // 所以这个视图也缺一条「返回真的回设置」的测试 —— 现在补上。
+  it("顶部「‹ 设置」返回到设置入口页，不是对话页", async () => {
+    await bootApp();
+    await openRecoveryView();
+
+    const back = document.querySelector<HTMLElement>("#sub-bar #sub-back");
+    expect(back, "返回按钮应在固定的 #sub-bar 内").toBeTruthy();
+    expect(back!.textContent).toContain("设置");
+    back!.click();
+
+    await waitFor(() => !!document.querySelector(".set-entry"), 3000, "回到设置入口");
+    // 对话页的输入框是「在设置页」和「在对话页」最快的区分点：
+    // renderBody 把它 display 切成 none/flex。双绑时这里会是 flex（= 跳去了对话）。
+    const input = document.querySelector<HTMLElement>(".panel-input");
+    expect(input?.style.display, "不该回到对话页").toBe("none");
+  });
+
+  it("点安全闸门里的「去命令策略 ›」跳到命令策略页", async () => {
+    // BUG-001 的可达性回归：这个 <a> 是安全闸门页**唯一**通往命令策略的路径
+    // （设置入口把「文件权限」和「命令策略」并成了一行之后）。
+    await bootApp();
+    await openPanel();
+    document.getElementById("btn-gear")!.click();
+    await waitFor(() => !!document.querySelector(".set-entry"), 3000, "settings entries");
+    const entry = Array.from(document.querySelectorAll<HTMLButtonElement>(".set-entry")).find(
+      (b) => b.dataset.act === "perm",
+    );
+    if (!entry) throw new Error("设置里找不到「安全闸门」入口");
+    entry.click();
+
+    await waitFor(() => !!document.querySelector(".goto-cmdpolicy"), 3000, "安全闸门页");
+    const link = document.querySelector<HTMLAnchorElement>(".goto-cmdpolicy")!;
+    link.click();
+
+    await waitFor(
+      () => !!document.querySelector("#cp-reload"),
+      3000,
+      "命令策略页（#cp-reload 是它的刷新按钮）",
+    );
+  });
 });
 
 describe("「又启动了一次 exe」→ 打开面板", () => {

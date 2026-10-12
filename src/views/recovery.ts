@@ -175,12 +175,13 @@ export function renderRecoveryView(st: RecoveryState, headerHtml: string): strin
     </div>`;
 }
 
-export function bindRecoveryView(
-  root: HTMLElement,
-  onReload: () => void,
-  onBack: () => void,
-): void {
-  document.getElementById("sub-back")?.addEventListener("click", () => void onBack());
+export function bindRecoveryView(root: HTMLElement, onReload: () => void): void {
+  // 返回按钮已挪到滚动区之外的 `#sub-bar`，绑定统一在 main 的 `renderSubBar` 里做。
+  // ⚠️ 这里**曾经**再绑一次 `onBack` → 那正是「点『设置』直接跳回对话」的根因：
+  //    `#sub-back` 已被 `renderSubBar` 绑成 `switchView("settings")`，这里再绑一个
+  //    `switchView("settings")`，一次点击就跑两遍 —— 第二遍撞上 `switchView` 的
+  //    toggle（同一非 chat 视图再点一次 → 退回对话），于是返回键变成了「回对话」。
+  //    其余 8 个子页的 bind 函数开头都有同样的警告注释，这里曾经是唯一的例外。
 
   const setMsg = (msg: string, ok: boolean) => {
     const el = document.getElementById("rec-msg");
