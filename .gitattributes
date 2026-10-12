@@ -1,0 +1,57 @@
+# ============================================================================
+# 行尾规范：源码一律 LF，Windows 脚本例外保留 CRLF
+# ============================================================================
+#
+# ## 为什么必须写死（2026-10-12 实测事故）
+#
+# GitHub Actions 的 windows-latest runner 默认 `core.autocrlf=true`，
+# checkout 时会把**所有**文本文件转成 CRLF。本机是 LF，所以本地永远测不出来，
+# 只有 CI 会红 —— 这正是它危险的地方。
+#
+# 具体的坑：vite/vitest 加载一个 **CRLF + `#!/usr/bin/env node` shebang** 的
+# `.mjs` 时，shebang 行尾的 `\r` 剥离不干净，会在模块最前面留下一个游离的
+# 回车字符：
+#
+#     SyntaxError: Invalid or unexpected token
+#      ❯ tests/tools/package.test.ts:34:1
+#
+# 已定位并验证（把 package.mjs 转成 CRLF 必红、去掉 shebang 必绿、只加
+# 一个 CRLF 的 shebang 最小复现也必红）：
+#
+#   · 无 shebang + CRLF ......... PASS
+#   · `#!/usr/bin/env node` + CRLF ... FAIL  ← 就是它
+#   · `#!/usr/bin/env node` + LF ..... PASS
+#   · 真实 package.mjs 去 shebang + CRLF . PASS
+#
+# 注意 `tools/check-no-user-data.mjs` 同样带 shebang 却从没炸过 ——
+# 因为它只被当 CLI 直接 `node xxx.mjs` 跑，**从不 import**。
+# `tools/package.mjs` 是第一个会被测试 import 的 .mjs，所以只有它中招。
+# 结论：行尾不是"风格偏好"，是会让构建结果依赖 checkout 方式的环境变量。
+#
+# ============================================================================
+
+# 默认：所有文本一律 LF（CI 与本机保持一致）
+* text=auto eol=lf
+
+# ---------------------------------------------------------------------------
+# 例外：Windows 对 LF 敏感的批处理与脚本，必须 CRLF
+# ---------------------------------------------------------------------------
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.vbs text eol=crlf
+
+# ---------------------------------------------------------------------------
+# 二进制：不要让 git 尝试做行尾转换（会直接损坏文件）
+# ---------------------------------------------------------------------------
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.exe   binary
+*.dll   binary
+*.pdf   binary
+*.zip   binary
+*.dmg   binary
