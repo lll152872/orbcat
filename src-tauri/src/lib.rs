@@ -3246,8 +3246,24 @@ fn session_state(state: State<'_, AppState>) -> serde_json::Value {
 /// 目录在 = 用户有数据（哪怕某人删空了配置文件，那也是他的选择，不该被当成新装）。
 #[tauri::command]
 fn boot_state(state: State<'_, AppState>) -> serde_json::Value {
-    let needs_init = !state.data_dir.exists();
-    // 没有模型就聊不了 —— 前端据此把「去设置加模型」做成首要引导
+    // ⚠️ 不能只看 `data_dir` 目录在不在 —— 那是 `needsInit` 最初的写法，
+    //    2026-10-12 被用户抓出：**发布版永远等不到「初始化」按钮**。
+    //
+    //    原因：`data_dir` 是 `%APPDATA%\com.orbcat.desktop`，程序一启动就会
+    //    往里面写 `diag.log` / `permissions.json` / `settings.json` /
+    //    `pmem.sqlite` —— **目录在第一次启动时就被创建了**，而骨架目录
+    //    （memory / pending / projects / skills）和 manifest.json 一个都没铺。
+    //    于是 `!exists()` 恒为 false，「建出目录结构」按钮永远不出现。
+    //
+    //    改成查骨架完成标志：`.skeleton-state.json` 是 bootstrap 铺完时写的状态文件，
+    //    它在 = 初始化完成；不在 = 需要初始化。这个判据与「目录里碰巧有
+    //    别的文件」完全无关。
+    //
+    //    ⚠️ 刻意**不**引用 `bootstrap::SKELETON_DIRS`：那个常量由 build.rs
+    //    在 OUT_DIR 生成（include!），在 lib.rs 里引不到；而且骨架清单会随
+    //    版本增删，硬编码一份必然漂移。manifest.json 是唯一完成标志，最稳。
+    let needs_init = !state.data_dir.join(".skeleton-state.json").is_file();
+    // 没模型不等于没初始化 —— 先去设置里把模型加上，这里照样放行
     let has_models = config::load_models(&state.data_dir)
         .map(|m| !m.is_empty())
         .unwrap_or(false);
@@ -4234,9 +4250,16 @@ pub fn run() {
         .setup(|app| {
             // --- 初始化权限网关 ---
             let data_dir = resolve_data_dir(app.handle());
-            let app_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .map(Path::to_path_buf)
+            // ⚠️ app_dir 必须是**运行时**的 exe 所在目录，不能用
+            //    `env!("CARGO_MANIFEST_DIR")` —— 那是**编译期常量**。
+            //    2026-10-12 实测事故：CI 上编出来的 release exe 里这个常量是
+            //    `D:/a/orbcat/orbcat/src-tauri`，于是权限面板给用户凭空加了一条
+            //    「D:\a\orbcat\orbcat · 只读 · agent 程序目录（程序自身）」——
+            //    那是 GitHub runner 的路径，用户机器上根本不存在，也永远建不出来。
+            //    与 disk_assets::compute_dist_dir 用同一个来源：exe 同目录。
+            let app_dir = std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(Path::to_path_buf))
                 .unwrap_or_else(|| PathBuf::from("."));
 
             eprintln!("[orbcat] agent-data 目录: {}", data_dir.display());

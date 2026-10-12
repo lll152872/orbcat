@@ -643,6 +643,55 @@ mod tests {
             assert!(!d.join(f).exists(), "{f} 不该由 bootstrap 创建");
         }
 
+        // ── `boot_state` 的 needsInit 判据（2026-10-12 用户反馈）──
+        //
+        // 原先的判据是 `!data_dir.exists()`，发布版**永远等不到「初始化」按钮**：
+        // data_dir 是 `%APPDATA%\com.orbcat.desktop`，程序第一次启动就会往里面
+        // 写 diag.log / permissions.json / settings.json —— 目录被这些文件创建了，
+        // 而骨架一个都没铺。`!exists()` 于是恒为 false。
+        //
+        // 现在的判据是 `manifest.json` 在不在。这里锁住两件事：
+        //   ① bootstrap 确实会铺出 manifest.json（否则判据永远为 true，按钮永远在）；
+        //   ② 只建目录不铺文件时，manifest 不在（否则判据永远为 false，按钮永远不在）。
+        assert!(
+            d.join(STATE_FILE).is_file(),
+            "bootstrap 必须写 STATE_FILE —— boot_state 拿它当初始化完成的判据"
+        );
+    }
+
+    /// 反向对照：一个"被别的文件抢先创建"的空目录**不算已初始化**。
+    ///
+    /// 这正是用户机器上的真实状态（diag.log / permissions.json 已经把
+    /// `%APPDATA%\com.orbcat.desktop` 建出来了，骨架却一个都没有），
+    /// 而旧的 `!exists()` 判据在这种情况下给出 `needsInit == false`。
+    #[test]
+    fn dir_created_by_other_files_is_not_initialized() {
+        let d = tmp("partial");
+        std::fs::create_dir_all(&d).unwrap();
+        // 程序启动时会写的那些东西
+        std::fs::write(d.join("diag.log"), "启动正常\n").unwrap();
+        std::fs::write(d.join("permissions.json"), "{\"rules\":[]}").unwrap();
+        std::fs::write(d.join("settings.json"), "{}").unwrap();
+
+        assert!(
+            !d.join(STATE_FILE).is_file(),
+            "测试前提失效：这个目录不该有 manifest.json"
+        );
+
+        // 判据必须说"需要初始化"
+        let needs_init = !d.join(STATE_FILE).is_file();
+        assert!(
+            needs_init,
+            "目录存在但骨架没铺 → 必须判定为「需要初始化」，\
+             否则用户看不到「建出目录结构」按钮（2026-10-12 实际发生）"
+        );
+
+        // 补跑一次 bootstrap 之后才该变成 false
+        bootstrap_agent_data(&d).expect("初始化应成功");
+        assert!(
+            !(!d.join(STATE_FILE).is_file()),
+            "bootstrap 跑完就必须算已初始化"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

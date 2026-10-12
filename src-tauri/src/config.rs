@@ -3,9 +3,16 @@
 //! ## 数据源优先级
 //!   1. 环境变量 `ORBCAT_MODELS_JSON` 指向的文件
 //!   2. `<data_dir>/models.json` —— 用户自己的模型列表（**含 API key，已 gitignore**）
-//!      这是**主数据源**：只要存在就用它，不再往后找。
-//!   3. `%USERPROFILE%\.workbuddy\models.json`（WorkBuddy 现有的模型列表，只读导入）
+//!      这是**唯一的数据源**：存在就用它，不存在就报"还没有模型"。
 //!
+//!   ⚠️ 2026-10-12 删掉了原先的第 3 级 `%USERPROFILE%\.workbuddy\models.json`
+//!      （WorkBuddy 模型的静默只读导入）。删的原因不是功能不好，而是**它让人
+//!      误以为发布包"自带模型"**：新下载的 exe 旁边没有 models.json，这条回退
+//!      就生效了，10 个模型凭空冒出来（实测是用户自己 WorkBuddy 里的配置）。
+//!      对熟悉的人它是便利，对第一次拿到包的人它是灵异事件 —— 而且它会把
+//!      WorkBuddy 的 apiKey 一起带进进程（`save_models` 首次保存时整份拷贝
+//!      到 data_dir）。用户明确要求：直接删掉。
+
 //! ## ⚠️ 与"初始化"的关系（重要）
 //! `models.json` **必须由用户先配好，agent 才能跑**。所以它不能是
 //! "agent 初始化时才生成"的产物 —— 那样就死锁了（没模型 → 初始化跑不了）。
@@ -173,8 +180,13 @@ impl From<&ModelConfig> for ModelView {
 /// 写死的路径有两个问题 ——
 ///   ① `env!("CARGO_MANIFEST_DIR")` 是**编译期常量**，源码一挪位置就失效；
 ///   ② 发布版（exe）跑起来时根本没有源码树，那条路径永远不存在，
-///      于是悄悄退到 `~/.workbuddy/models.json`，用户会以为"我的配置丢了"。
+///      用户会以为"我的配置丢了"。
 /// 改成用运行时解析出来的 `data_dir`，两种形态（开发 / 发布）行为一致。
+///
+/// ⚠️ 这里**只有一条兜底**：没有就是没有，直接让 `load_models` 报
+///    "还没有配置模型"。曾经还有一级 `%USERPROFILE%\.workbuddy\models.json`
+///    的静默只读导入，2026-10-12 按用户要求删掉 —— 它会让新下载的包看起来
+///    "自带 10 个模型"，而且 WorkBuddy 的 apiKey 会跟着进内存。见文件头说明。
 pub fn models_json_path(data_dir: &Path) -> PathBuf {
     if let Ok(p) = std::env::var("ORBCAT_MODELS_JSON") {
         let p = PathBuf::from(p);
@@ -183,28 +195,13 @@ pub fn models_json_path(data_dir: &Path) -> PathBuf {
         }
     }
 
-    // 主数据源：用户自己的模型列表
-    let local = local_models_path(data_dir);
-    if local.exists() {
-        return local;
-    }
-
-    // 只读导入：WorkBuddy 的模型列表（首次使用时帮用户省去手抄）
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let wb = PathBuf::from(home).join(".workbuddy").join("models.json");
-        if wb.exists() {
-            return wb;
-        }
-    }
-
-    // 都没有 → 返回本地路径（不存在），让 `load_models` 给出准确报错
-    local
+    // 唯一的数据源。用户自己的模型列表。
+    // 不存在时 load_models 返回空列表 → 前端显示「还没有模型 → 去设置里添加」。
+    // 刻意**不做**任何"去别处找一个 models.json 兜底"的回退。
+    local_models_path(data_dir)
 }
 
-/// **本地写入路径**：`<data_dir>/models.json`。
-///
-/// 一旦用户在设置里增删过模型，这里就成为主数据源（首次保存会把
-/// 当时读到的完整列表拷贝过来，之后 WorkBuddy 的文件不再参与）。
+/// **本地读写路径**：`<data_dir>/models.json`。
 fn local_models_path(data_dir: &Path) -> PathBuf {
     data_dir.join("models.json")
 }
@@ -1758,6 +1755,82 @@ mod tests {
         let s = load_settings(&dir);
         assert_eq!(s.selected_model.as_deref(), Some("glm-5.3-flash"));
         assert_eq!(s.selected_model_url, None, "缺 selectedModelUrl 应为 None");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- 模型读取路径：只认自己的 models.json（2026-10-12 用户反馈）----
+
+    /// 事故回归：原本的第 3 级 `%USERPROFILE%\.workbuddy\models.json` 静默只读
+    /// 导入被删掉了。删之前，新下载的包旁边没有 models.json，那条回退就生效，
+    /// 用户看到"凭空自带 10 个模型"——其实是他自己 WorkBuddy 里的配置。
+    ///
+    /// ⚠️ 诚实的局限：这条用例**只在测试机存在 `~/.workbuddy/models.json` 时
+    ///    才会对旧代码报错**（CI runner 没有那个目录）。所以它是一道"在需要的
+    ///    机器上一定生效"的闸，不是跨环境 100% 的闸。
+    ///
+    ///    之所以不改成显式设置 `USERPROFILE` 来构造场景：`project.rs` 的
+    ///    `perm_preset_rejects_too_broad_paths` 也读 `USERPROFILE`，而 cargo test
+    ///    默认多线程并行 —— 并发改这个全局变量会让那条用例随机失败
+    ///    （临时目录不是"范围过大"的路径，断言会反过来挂掉）。
+    ///    与其制造一个偶发红灯，不如承认这道闸的作用范围。
+    #[test]
+    fn models_path_never_escapes_data_dir() {
+        if std::env::var_os("ORBCAT_MODELS_JSON").is_some() {
+            // 开发机上可能指了别处，本用例的前提（唯一数据源是 data_dir）不成立
+            return;
+        }
+
+        let with_file =
+            std::env::temp_dir().join(format!("cfg-mp-with-{}", std::process::id()));
+        std::fs::create_dir_all(&with_file).unwrap();
+        std::fs::write(with_file.join("models.json"), "[]").unwrap();
+        assert_eq!(
+            models_json_path(&with_file),
+            with_file.join("models.json"),
+            "有本地文件时必须用它"
+        );
+
+        // 关键：本地文件不存在时，**仍然只能指向 data_dir**。
+        // 旧代码在这里会返回 ~/.workbuddy/models.json（若存在）。
+        let empty = std::env::temp_dir().join(format!("cfg-mp-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(
+            !empty.join("models.json").exists(),
+            "测试前提失效：本地 models.json 意外存在"
+        );
+        assert_eq!(
+            models_json_path(&empty),
+            empty.join("models.json"),
+            "没有本地文件时也不该去别处找一个来读"
+        );
+
+        let _ = std::fs::remove_dir_all(&with_file);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// 没有 models.json 时 `load_models` 必须返回**空列表**，而不是凭空
+    /// 出现一批模型。这正是用户能直接看到的症状（"从哪冒出来的 10 个模型"），
+    /// 所以单独锁一条。
+    ///
+    /// 注意不是 `is_err()`：`load_models` 对缺失文件返回 `Ok(vec![])` 是
+    /// **正确**行为 —— 前端据此显示「还没有模型 → 去设置里添加」，
+    /// 报错反而会让那个引导失效。
+    #[test]
+    fn load_models_is_empty_when_there_is_no_local_file() {
+        if std::env::var_os("ORBCAT_MODELS_JSON").is_some() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("cfg-lm-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!dir.join("models.json").exists(), "测试前提失效");
+
+        let got = load_models(&dir).unwrap();
+        assert!(
+            got.is_empty(),
+            "没有本地 models.json 时必须返回空列表，实际返回 {} 个 —— \
+             这只可能是从别处（当年的 ~/.workbuddy）读来的",
+            got.len()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
