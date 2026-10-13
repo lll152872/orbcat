@@ -394,7 +394,27 @@ body {
   overflow-y: auto;
   font-size: 13px;
   line-height: 1.65;
-  opacity: 0.75;
+  /* ⚠️ 这里曾经有 `opacity: 0.75`（初始提交带进来的，从没注释过为什么），
+     一次都没被人改过 —— 连 3dfd55a「面板前端改版 v1」重挑了它左右每一个
+     文字色（.panel-hint、滚动条、边框、按钮）都漏掉了它，是遗留物不是设计。
+
+     它是这批「什么都看不清」的**单一最大来源**：面板正文里所有内容都被按 0.75
+     与底色 #14120f 合成，于是实测对比度全被系统性压低一档：
+
+       #F2F2F4  16.72:1 → 9.66:1   （还行）
+       #9C9CA2   6.85:1 → 4.37:1   （掉到不合格）
+       #8E8E94   5.74:1 → 3.75:1   （掉到不合格）
+       #7C7C82   4.51:1 → 3.08:1
+       #7C8479   4.84:1 → 3.26:1   （--cream-3，实际不合格）
+
+     注意这一条对**两套检测方法都是隐形的**：
+       - 静态 grep 只读 color 声明，看不到 opacity；
+       - getComputedStyle().color 返回的是**指定色**，不是合成后的像素
+         （opacity 走的是合成/层叠，不参与 color 计算）。
+     所以「浏览器实测 126 处不达标」这个数在两套方法下都漏掉了整块衰减。
+
+     要压暗正文请改具体色值（现在正文是 #F2F2F4，本身 16.7:1 很安全），
+     不要在这里给整块盖 opacity —— 盖一层等于把里面每个元素各扣 25%。 */
 }
 
 .panel-hint {
@@ -459,7 +479,7 @@ body {
 /* 组别行：小一号、弱化，给"模型名"当上下文 */
 .mc-group {
   font-size: 9.5px;
-  color: #707076;
+  color: #97979E;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -478,7 +498,7 @@ body {
 
 .mc-caret {
   font-size: 9px;
-  color: #707076;
+  color: #97979E;
   position: absolute;
   right: 6px;
   top: 50%;
@@ -662,13 +682,13 @@ body {
 
 .fg-empty {
   cursor: default;
-  color: #5C5C62;
+  color: #7C7C82;
   font-style: italic;
 }
 
 .fg-empty:hover {
   background: transparent;
-  color: #5C5C62;
+  color: #7C7C82;
 }
 
 /* --- macOS 前台上下文：渐进式授权引导 -------------------------------------
@@ -681,7 +701,7 @@ body {
 /* 引导条本身不响应「点击复制路径」 */
 .fg-perm {
   cursor: default;
-  color: #6E6E76;
+  color: #7E7E87;
   padding-right: 0;
 }
 
@@ -693,7 +713,7 @@ body {
 /* 等待用户去系统设置勾选的状态：留一点呼吸感，别像坏了 */
 .fg-perm-wait {
   font-style: italic;
-  color: #5C5C62;
+  color: #7C7C82;
 }
 
 /* 「授权」主按钮。用项目主色薄荷绿，和 orb 状态色一致 */
@@ -757,7 +777,7 @@ body {
 }
 
 .empty {
-  color: #6C6C72;
+  color: #8E8E94;
   font-size: 12px;
   text-align: center;
   margin-top: 28px;
@@ -839,7 +859,7 @@ body {
 .steps-folded {
   margin-top: 6px;
   font-size: 11px;
-  color: #61695f;
+  color: #778174;
   line-height: 1.5;
   word-break: break-all;
 }
@@ -863,7 +883,7 @@ body {
 
 .init-body {
   font-size: 12px;
-  color: #78787E;
+  color: #9C9CA2;
   line-height: 1.7;
 }
 
@@ -945,7 +965,7 @@ body {
 }
 
 .panel-input textarea::placeholder {
-  color: #5C5C62;
+  color: #7C7C82;
 }
 
 /* Windows 上 WebView2 的默认滚动条带箭头，很碍眼 —— 直接隐藏（文本区高度会自动增长） */
@@ -1194,7 +1214,7 @@ body {
   max-width: 100%;
   padding: 2px 8px;
   font-size: 11px;
-  color: #8B7070;
+  color: #A28383;
   border: 1px solid rgba(247, 202, 190, 0.25);
   border-radius: 8px;
   background: rgba(247, 202, 190, 0.08);
@@ -1314,7 +1334,7 @@ body {
 
 .md .md-code-lang {
   font-size: 10.5px;
-  color: #66666C;
+  color: #85858B;
   letter-spacing: 0.03em;
   text-transform: lowercase;
   user-select: none;
@@ -1360,7 +1380,12 @@ body {
    1. 悬停才显现 + opacity 过渡时，任何整块重绘都会让过渡重放 → 肉眼看到闪一下；
    2. 更要命的是布局位移：流式输出时面板贴着底走，下方内容一长，
       停在按钮上的光标就被"推离"按钮 → hover 反复丢失/命中 → 按钮忽隐忽现。
-   常显（低对比）就没有这两种闪烁的物理基础了。 */
+   常显（低对比）就没有这两种闪烁的物理基础了。
+
+   ⚠️ 「低对比」有个下限：0.45 太低了。叠加 .msg-foot 规则给的 var(--cream-3)
+   (#7C8479) 之后，合成出来只有 **1.92:1** —— 这就是「消息底部那排按钮几乎
+   不存在」的实测原因。降到 0.85 仍保留「比正文淡」的意图（正文 #F2F2F4 是
+   16.7:1），但不再依赖 hover 才能看见。 */
 .msg-foot {
   display: flex;
   justify-content: flex-end;
@@ -1384,7 +1409,8 @@ body {
 
 .msg-copy,
 .msg-fork {
-  opacity: 0.45;
+  /* 0.45 → 0.85：见上方 .msg-foot 注释（1.92:1 → 5.25:1） */
+  opacity: 0.85;
 }
 
 .msg-fork {
@@ -1407,12 +1433,12 @@ body {
   align-items: center;
   justify-content: center;
   font-size: 11px;
-  color: #5C5C62;
+  color: #7C7C82;
   background: rgba(168, 230, 207, 0.05);
 }
 
 .thumb-bad {
-  color: #8B7070;
+  color: #A28383;
   background: rgba(247, 202, 190, 0.08);
 }
 
@@ -1499,7 +1525,7 @@ body {
   margin: 12px 0 7px;
   font-size: 10.5px;
   letter-spacing: 0.04em;
-  color: #66666C;
+  color: #85858B;
   border-bottom: 1px solid rgba(168, 230, 207, 0.07);
   padding-bottom: 5px;
 }
@@ -1551,7 +1577,7 @@ body {
 
 .sess-meta {
   font-size: 10.5px;
-  color: #66666C;
+  color: #85858B;
 }
 
 .sess-item.cur .sess-open {
@@ -1713,7 +1739,7 @@ body {
 .mem-meta {
   margin-top: 4px;
   font-size: 10.5px;
-  color: #6C6C72;
+  color: #8E8E94;
 }
 
 .mem-actions {
@@ -1751,7 +1777,7 @@ body {
 }
 
 .mem-loading {
-  color: #6C6C72;
+  color: #8E8E94;
   font-size: 12px;
   text-align: center;
   margin-top: 28px;
@@ -1800,7 +1826,7 @@ body {
 
 .perm-k {
   flex: 0 0 30px;
-  color: #6C6C72;
+  color: #8E8E94;
 }
 
 .perm-v {
@@ -1896,7 +1922,7 @@ body {
 .perm-hint {
   margin-top: 7px;
   font-size: 10.5px;
-  color: #525a50;
+  color: #7C8479;
 }
 
 /* 拒绝理由输入框：跟卡片同宽，别把按钮挤到换行外面去 */
@@ -1919,7 +1945,7 @@ body {
 }
 
 .perm-reason::placeholder {
-  color: #525a50;
+  color: #7C8479;
 }
 
 /* ---------------- 命令权限卡（决策 9.1） ---------------- */
@@ -2145,7 +2171,7 @@ body {
 
 .lm-chev {
   font-size: 10px;
-  color: #6C6C72;
+  color: #8E8E94;
   width: 10px;
   flex: 0 0 auto;
 }
@@ -2161,7 +2187,7 @@ body {
 .lm-count {
   font-size: 10px;
   font-weight: 500;
-  color: #6C6C72;
+  color: #8E8E94;
   background: rgba(168, 230, 207, 0.07);
   border-radius: 8px;
   padding: 1px 6px;
@@ -2179,7 +2205,7 @@ body {
   border: none;
   border-radius: 6px;
   background: none;
-  color: #707076;
+  color: #97979E;
   font-size: 12px;
   line-height: 1;
   cursor: pointer;
@@ -2254,7 +2280,7 @@ body {
 .lm-th {
   padding: 6px 11px 4px 24px;
   font-size: 10px;
-  color: #525a50;
+  color: #7C8479;
   letter-spacing: 0.03em;
   border-bottom: 1px solid rgba(168, 230, 207, 0.05);
 }
@@ -2283,7 +2309,7 @@ body {
 .lm-eye {
   border: none;
   background: none;
-  color: #40483e;
+  color: #7F8F7B;
   font-size: 13px;
   line-height: 1;
   padding: 0 2px;
@@ -2312,7 +2338,7 @@ body {
 
 .lm-api {
   font-size: 10px;
-  color: #6C6C72;
+  color: #8E8E94;
   font-family: ui-monospace, "Cascadia Mono", Consolas, "Cascadia Mono", Consolas, ui-monospace, monospace;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2611,7 +2637,7 @@ body {
 
 .set-url {
   font-size: 10.5px;
-  color: #6C6C72;
+  color: #8E8E94;
   margin: 3px 0 6px;
   overflow-wrap: anywhere;
 }
@@ -2687,7 +2713,7 @@ body {
 .ctx-title {
   padding: 4px 8px 6px;
   font-size: 10.5px;
-  color: #78787E;
+  color: #9C9CA2;
 }
 
 .ctx-item {
@@ -2767,7 +2793,7 @@ body {
 .ctx-sub {
   margin-top: 2px;
   font-size: 10px;
-  color: #78787E;
+  color: #9C9CA2;
   line-height: 1.4;
 }
 
@@ -2781,7 +2807,7 @@ body {
 
 /* 组影响那一行：允许 / 收起 / 写了但不存在（标灰）—— 现在只在「设置 › 行为」页出现 */
 .mg-label {
-  color: #6C6C72;
+  color: #8E8E94;
   margin-right: 5px;
 }
 .mg-line {
@@ -2795,7 +2821,7 @@ body {
 }
 
 .mg-off {
-  color: #78787E;
+  color: #9C9CA2;
 }
 
 .mg-unknown {
@@ -2807,7 +2833,7 @@ body {
    用户切到 PTC 后能直接调的工具会整个变掉，界面必须说明白，
    否则看起来像"工具全没了"。 */
 .mg-label2 {
-  color: #78787E;
+  color: #9C9CA2;
 }
 
 .mg-ptc {
@@ -2821,7 +2847,7 @@ body {
 }
 
 .life-kind {
-  color: #78787E;
+  color: #9C9CA2;
   font-size: 10px;
   margin-left: 6px;
 }
@@ -2916,7 +2942,7 @@ body {
 
 .fld > span {
   font-size: 10.5px;
-  color: #78787E;
+  color: #9C9CA2;
   letter-spacing: 0.02em;
 }
 
@@ -3065,7 +3091,7 @@ button.fetch-id {
 
 .id-pick .remote-meta {
   font-size: 11px;
-  color: #78787E;
+  color: #9C9CA2;
 }
 
 .set-form input[type="text"],
@@ -3101,6 +3127,25 @@ button.fetch-id {
   line-height: 1.5;
 }
 
+/* 安全闸门页里的「去命令策略 ›」页内跳转。
+   ⚠️ 这个类名曾经**根本没有对应规则** —— `<a>` 于是吃了浏览器默认值
+   （rgb(0,0,238) 纯蓝 + 下划线，10.5px 时对比度只有 1.99:1），在暖黑 + 薄荷绿的
+   深色主题里像贴进来的一块异物色。而它是安全闸门页**唯一**通往命令策略
+   （白名单 / 硬阻断 / 审计）的路径，样式缺失等于入口也等于隐形。
+   以后新加页内跳转时记得在这里登记，别让它裸奔。 */
+.goto-cmdpolicy {
+  color: var(--accent-1);
+  text-decoration: none;
+  border-bottom: 1px solid rgba(168, 230, 207, 0.4);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.goto-cmdpolicy:hover {
+  color: #c6f0dd;
+  border-bottom-color: rgba(168, 230, 207, 0.75);
+}
+
 /* 长期记忆全文 */
 .mem-long pre {
   white-space: pre-wrap;
@@ -3120,7 +3165,7 @@ button.fetch-id {
 
 .mem-empty {
   font-size: 11.5px;
-  color: #6C6C72;
+  color: #8E8E94;
   line-height: 1.6;
   margin-bottom: 12px;
 }
@@ -3147,7 +3192,7 @@ button.fetch-id {
 .mem-file summary i {
   font-style: normal;
   font-size: 10.5px;
-  color: #6C6C72;
+  color: #8E8E94;
 }
 .mem-file pre {
   white-space: pre-wrap;
@@ -3166,7 +3211,7 @@ button.fetch-id {
 .mem-file-empty {
   padding: 8px 11px;
   font-size: 11.5px;
-  color: #6C6C72;
+  color: #8E8E94;
   border: 1px dashed rgba(168, 230, 207, 0.12);
   border-radius: 9px;
   margin-bottom: 8px;
@@ -3236,7 +3281,10 @@ button.fetch-id {
 }
 
 .mcp-url-input::placeholder {
-  color: #45454B;
+  /* #45454B 只有 1.75:1 —— 而输入框真实底是 rgba(168,230,207,0.06) 盖在
+     #14120f 上（合成 #1D1F1B），比面板底更暗，占位符基本等于没有。
+     抬到 #8E8E94（5.1:1），仍明显淡于输入框正文 #DEDEE2。 */
+  color: #8E8E94;
 }
 
 /* 多 server 列表 */
@@ -3420,7 +3468,7 @@ button.fetch-id {
 }
 
 .set-form textarea::placeholder {
-  color: #5C5C62;
+  color: #7C7C82;
   font-family: inherit;
 }
 
@@ -3572,7 +3620,7 @@ button.fetch-id {
 .set-entry-arrow {
   flex-shrink: 0;
   font-size: 17px;
-  color: #5C5C62;
+  color: #7C7C82;
 }
 
 /* ---------------- 实时进度气泡 ---------------- */
@@ -3633,12 +3681,12 @@ button.fetch-id {
 
 .run-timeline .tl-line i {
   font-style: normal;
-  color: #6C6C72;
+  color: #8E8E94;
 }
 
 /* 链路状态（限流退避重试）：只作说明，比工具行更淡 */
 .tl-line.tl-status {
-  color: #6C6C72;
+  color: #8E8E94;
 }
 
 /* 工具执行失败：黄；本轮失败（error 条目）：红 */
@@ -3684,7 +3732,7 @@ button.fetch-id {
 
 .run-note {
   font-size: 10.5px;
-  color: #6C6C72;
+  color: #8E8E94;
   margin-top: 5px;
 }
 
@@ -3722,7 +3770,7 @@ details.tl-tool > summary:hover {
 }
 /* 返回行比调用行更淡一点：一调一返回是同一件事 */
 details.tl-tool.tl-res > summary {
-  color: #6C6C72;
+  color: #8E8E94;
 }
 .tl-tool-pre {
   margin: 4px 0 0;
@@ -3836,7 +3884,9 @@ details.tl-tool.tl-res > summary {
 .run-reason-len {
   margin-left: 4px;
   font-size: 10.5px;
-  color: #4E4E54;
+  /* #4E4E54 在过程块卡片底上只有 1.97:1。抬到 #9C9CA2 并让它跟随
+     summary 的色（#7C7C82），字数为辅助信息，不该比标题还难读。 */
+  color: #9C9CA2;
 }
 
 /* 思考块正文容器。
@@ -3966,7 +4016,7 @@ details.tl-tool.tl-res > summary {
   margin-right: 6px;
   cursor: pointer;
   user-select: none;
-  opacity: 0.45;
+  opacity: 0.85; /* 0.45 → 0.85，见 .msg-foot 处的说明 */
   transition: background 0.12s, color 0.12s;
 }
 
@@ -3996,7 +4046,7 @@ details.tl-tool.tl-res > summary {
   margin-right: 6px;
   cursor: pointer;
   user-select: none;
-  opacity: 0.45;
+  opacity: 0.85; /* 0.45 → 0.85，见 .msg-foot 处的说明 */
   transition: background 0.12s, color 0.12s;
 }
 
@@ -4494,7 +4544,7 @@ body.models-page {
 
 .mc-mi-group {
   font-size: 9.5px;
-  color: #707076;
+  color: #97979E;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4590,7 +4640,7 @@ body.models-page {
 .rec-meta {
   flex-shrink: 0;
   font-size: 10px;
-  color: #6C6C72;
+  color: #8E8E94;
   font-variant-numeric: tabular-nums;
 }
 
@@ -4651,7 +4701,7 @@ body.models-page {
   margin-right: 6px;
   cursor: pointer;
   user-select: none;
-  opacity: 0.45;
+  opacity: 0.85; /* 0.45 → 0.85，见 .msg-foot 处的说明 */
   transition: background 0.12s, color 0.12s;
 }
 
@@ -5067,7 +5117,10 @@ body.models-page {
 .msg-foot .msg-regen,
 .msg-foot .msg-fork {
   font-size: var(--fs-1);
-  color: var(--cream-3);
+  /* var(--cream-3) → #9C9CA2：cream-3 本身 4.84:1 勉强够，但它还要再乘
+     本组按钮的 opacity（0.85），合成后掉到 3.82:1 就又不合格了。
+     抬到 #9C9CA2 后合成是 5.25:1，仍然明显淡于正文 #F2F2F4。 */
+  color: #9C9CA2;
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--r-xs);

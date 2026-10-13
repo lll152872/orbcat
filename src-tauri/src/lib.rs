@@ -389,16 +389,33 @@ fn active_project_dir(data_dir: &Path) -> Option<(PathBuf, String)> {
 // 数据目录解析
 // ---------------------------------------------------------------------------
 
-/// 解析 agent-data 目录。
+/// 解析 `agent-data/` 数据目录。
 ///
-/// 优先级：
-///   1. 环境变量 `ORBCAT_DATA_DIR`
-///   2. 源码树里的 `<项目根>/agent-data`（开发期）
-///   3. 系统应用数据目录（发布版）
+/// ## 一条规则：exe 旁边就是数据
 ///
-/// 注：`agent-data/` 是**运行时数据**（API key、会话、截图、日记），
-/// 已在 `.gitignore` 里排除 —— 仓库里只保留 `初始化.md`，
-/// 新克隆的用户让 agent 读它即可自建整套结构。
+///   1. 环境变量 `ORBCAT_DATA_DIR` —— 测试 / 临时覆盖，最高优先。
+///   2. **exe 同级的 `agent-data/`** —— 唯一主路径，不存在就地创建。
+///
+/// 完整形态就是 zip 三合一：`orbcat.exe` + `dist/` + `agent-data/`。
+/// 开发机上也一样 —— 仓库根的 `orbcat.exe` 旁边就是真实的 `agent-data/`，
+/// 所以开发和发布**走的是同一条路径**，不再有"开发态兜底"这种分支。
+/// 好处是行为完全一致：你本地怎么跑，用户解压后就是怎么跑。
+///
+/// ## ⚠️ 曾经踩过的两个坑（都记在这里防回归）
+///
+/// **坑一：把编译期路径排在 exe 同级之前。**
+/// `env!("CARGO_MANIFEST_DIR")` 是编译期烤进二进制的绝对路径，
+/// 在开发机上恒存在，排前面会让发布 exe 一直读仓库那份 ——
+/// 端到端实测（从隔离目录启动）才发现 exe 报告的数据目录仍然是仓库路径。
+/// 顺序上必须**运行时信息优先于编译期常量**。
+///
+/// **坑二：只让 release 创建目录（`#[cfg(not(debug_assertions))]`）。**
+/// CI 的 build-windows job 出的是 **debug** 包，它拿不到 exe 旁的
+/// agent-data，于是掉到 `%APPDATA%\com.orbcat.desktop` ——
+/// 行为与 release 包不一致，用户找不到自己的数据（2026-10-12 用户实测报的）。
+/// 现在 debug 与 release 走同一条路。
+///
+/// 兜底 `app_data_dir()` 只在"exe 所在盘只读且创建失败"这种极端情况下才用到。
 fn resolve_data_dir(app: &tauri::AppHandle) -> PathBuf {
     if let Ok(p) = std::env::var("ORBCAT_DATA_DIR") {
         let p = PathBuf::from(p);
@@ -407,17 +424,39 @@ fn resolve_data_dir(app: &tauri::AppHandle) -> PathBuf {
         }
     }
 
-    // 开发期：CARGO_MANIFEST_DIR = <项目根>/orbcat/src-tauri
-    // 往上**一级**即 orbcat/，故 agent-data 与 src-tauri 平级。
-    // ⚠️ 这是编译期常量 —— 改动后必须重新构建，否则跑的还是旧路径。
-    let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-data");
-    if dev.exists() {
-        return dev;
+    // exe 同级的 agent-data/ —— 开发机与发布包**同一条规则**。
+    // 开发机上仓库根就放着 orbcat.exe，旁边就是真实数据；
+    // 用户解压 zip 后同样是自己 exe 旁那份。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(p) = data_dir_beside_exe(&exe) {
+            if p.is_dir() {
+                return p;
+            }
+            // ⚠️ 不带 #[cfg(debug_assertions)]：debug 包也要同样行为，
+            //    否则它掉到 %APPDATA%，用户找不到数据。
+            if std::fs::create_dir_all(&p).is_ok() {
+                eprintln!("[orbcat] 已在 exe 旁创建数据目录: {}", p.display());
+                return p;
+            }
+        }
     }
 
+    // 兜底：exe 所在盘只读、创建失败时才到这。
+    // ⚠️ 刻意**不**把 CARGO_MANIFEST_DIR 的开发路径放在这里 ——
+    //    它是编译期常量，在开发机上恒存在，会盖住上面那条正式规则。
+    //    开发机要跑就得把 exe 放在仓库根（旁边有 agent-data/）。
     app.path()
         .app_data_dir()
         .unwrap_or_else(|_| PathBuf::from("./agent-data"))
+}
+
+/// 从「exe 所在目录」推出发布版的 agent-data 路径。
+///
+/// 单独抽出来是为了可测：原函数收 `&tauri::AppHandle`，
+/// 在单测里根本构造不出来（要起整个 app）。
+/// 抽成纯函数后，测试可以直接喂各种 exe 路径断言。
+fn data_dir_beside_exe(exe: &Path) -> Option<PathBuf> {
+    exe.parent().map(|dir| dir.join("agent-data"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1879,26 +1918,134 @@ mod autostart {
         crate::win32::read_hkcu_sz(RUN_KEY, VALUE_NAME).is_some()
     }
 
-    /// 启动时校准：若注册表里的自启项指向 debug exe，而 release exe 已存在，
-    /// 就改写指向 release —— 否则开机永远弹黑框（debug 构建带控制台）。
+    /// 启动时校准自启项，让它指向**当前正在运行的这只 exe**。
+    ///
+    /// ## 为什么要做「指向当前 exe」而不是只做 debug→release
+    ///
+    /// 历史上这里只处理「注册表指向 debug」一种情况，于是踩了个很坑的坑：
+    /// 自启项一旦指向 `...\orbcat\src-tauri\target\release\orbcat.exe`，
+    /// **就再也不会被纠正** —— 那个路径里没有 "debug" 字样，函数直接 return。
+    ///
+    /// 后果不是"多启动一份"，而是**用户数据整个不见**：
+    /// exe 在**同级**找 `agent-data\`（见 `resolve_data_dir`），
+    /// 而 `target\release\` 旁边根本没有 agent-data，
+    /// 于是开机启动的是一个数据目录为空的白板 —— 面板显示
+    /// 「尚未初始化 / 数据目录 agent-data/ 还不存在」。
+    /// 真实数据还躺在运行态目录里，只是开机那次根本没去看它。
+    ///
+    /// ## 判定规则（保守，宁可不改也不改错）
+    ///
+    /// 只有同时满足下面两条才改写：
+    /// 1. 注册表里现有的 exe **同级没有 agent-data**（它一定是错的，指向白板）；
+    /// 2. **当前 exe 同级有 agent-data**（我们自己才是对的那个）。
+    ///
+    /// 这样"用户手动在别处装了一份"不会被我们覆盖 —— 那时条件 1 通常不成立
+    /// （对方也有 agent-data）。
+    ///
+    /// debug→release 那条保留（debug 构建带控制台窗口，
+    /// `windows_subsystem="windows"` 只在 release 生效），但**只在 release
+    /// 同级也有 agent-data 时**才替换 —— 否则等于用一个空数据目录换一个黑框。
     pub fn sync_to_release() {
         let Some(cur) = crate::win32::read_hkcu_sz(RUN_KEY, VALUE_NAME) else {
             return; // 没设自启，不用管
         };
-        if !cur.to_lowercase().contains("debug") {
-            return; // 已经指向别处（release / 安装版）
+        let Ok(exe) = std::env::current_exe() else { return };
+        let target = preferred_autostart_exe(&exe);
+
+        let cur_path = std::path::PathBuf::from(cur.trim().trim_matches('"'));
+        if paths_equal(&cur_path, &target) {
+            return; // 已经指向对的那个
         }
-        if release_sibling_path().is_none() {
-            return; // release 还没构建，等构建后再说
+        // 条件 1：现有自启项同级**没有真实数据** —— 它一定是错的（只会开出白板）
+        if is_real_data_dir(&cur_path) {
+            return;
         }
-        if set(true).is_ok() {
-            eprintln!("[orbcat] 开机自启已改指向 release exe（无控制台黑框）");
+        // 条件 2：当前 exe 同级**确实有真实数据** —— 我们才是对的那个
+        if !is_real_data_dir(&target) {
+            return;
+        }
+
+        if set_to(&target).is_ok() {
+            eprintln!(
+                "[orbcat] 开机自启已改指向 {}（原先 {} 旁边没有 agent-data，开机会启动空数据目录）",
+                target.display(),
+                cur_path.display()
+            );
         }
     }
 
-    fn release_sibling_path() -> Option<std::path::PathBuf> {
-        let exe = std::env::current_exe().ok()?;
-        release_sibling(&exe)
+    /// 「这个 exe 同级那份 agent-data 里有真实数据吗？」
+    ///
+    /// ## 为什么不能只看 `is_dir()`
+    ///
+    /// 坏自启已经造出一个 `target\release\agent-data\` 了，**里面躺着 5 个文件**：
+    /// `permissions.json`（默认规则）、`pmem.sqlite`（空库，24KB 只是 sqlite 的空页）、
+    /// `diag.log`、`sessions\current.txt`、还有一个 **143 字节的空会话**。
+    /// 只判 `is_dir()` 会把它当成"有数据"→ 我们的自动纠正永远不触发。
+    ///
+    /// ## 判据
+    ///
+    /// 每次启动都会自动生成的那几个文件不算数；剩下还要**超过 1KB**
+    /// 才算实质内容 —— 真实会话是 21KB~775KB，真实 settings/models/mcp 也是几百字节到几十 KB，
+    /// 而空壳里那些都是 0~24KB 的生成物。这样两条都判得开。
+    fn is_real_data_dir(exe: &std::path::Path) -> bool {
+        const MIN_REAL_BYTES: u64 = 1024;
+        /// 每次启动都会自动生成 / 与用户内容无关
+        const BOOTSTRAP: &[&str] = &[
+            "permissions.json",
+            "pmem.sqlite",
+            "diag.log",
+            "permissions.json.bak",
+            "current.txt",
+        ];
+        fn scan(dir: &std::path::Path, bootstrap: &[&str], min: u64) -> Option<bool> {
+            let mut it = std::fs::read_dir(dir).ok()?.flatten().peekable();
+            if it.peek().is_none() {
+                return Some(false); // 目录不存在或为空
+            }
+            for e in it {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().into_owned();
+                if p.is_dir() {
+                    if name == "sessions" && scan(&p, bootstrap, min) == Some(true) {
+                        return Some(true);
+                    }
+                    continue;
+                }
+                if bootstrap.contains(&name.as_str()) {
+                    continue;
+                }
+                if e.metadata().map(|m| m.len() > min).unwrap_or(false) {
+                    return Some(true);
+                }
+            }
+            Some(false)
+        }
+        let Some(dir) = crate::data_dir_beside_exe(exe) else {
+            return false;
+        };
+        scan(&dir, BOOTSTRAP, MIN_REAL_BYTES).unwrap_or(false)
+    }
+
+    /// Windows 路径不区分大小写，比较时统一一下。
+    fn paths_equal(a: &std::path::Path, b: &std::path::Path) -> bool {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    }
+
+    /// 该指向哪个 exe：debug 构建且 release 同级也有真实数据时用 release，否则当前 exe。
+    fn preferred_autostart_exe(exe: &std::path::Path) -> std::path::PathBuf {
+        if let Some(rel) = release_sibling(exe) {
+            if is_real_data_dir(&rel) {
+                return rel;
+            }
+        }
+        exe.to_path_buf()
+    }
+
+    /// 按给定路径写注册表（`set(true)` 的可复用内核）
+    fn set_to(exe: &std::path::Path) -> Result<(), String> {
+        let cmd = format!("\"{}\"", exe.display());
+        crate::win32::write_hkcu_sz(RUN_KEY, VALUE_NAME, &cmd)
     }
 
     /// 设置/取消开机自启。
@@ -1957,61 +2104,17 @@ fn exe_path() -> String {
 // Tauri 命令 —— MCP
 // ---------------------------------------------------------------------------
 
-/// 把「当前模式允许的组」算成注册表要的形式（**唯一**的入口）。
+/// 重新算一次 MCP 活跃组。
 ///
-/// 为什么收成一个函数：`apply_snapshot_with_settings` 有 4 个调用点
-/// （启动后台拉取、保存 server、改 URL、手动刷新、切模式），
-/// 每个点各写一遍"读 modes.json + 展开哨兵"，迟早有一处忘掉 ——
-/// 而漏掉的那一处会变成"切了模式但工具没变"这种最难查的 bug。
-fn allowed_for_dir(state: &AppState) -> std::collections::HashSet<String> {
-    allowed_for_dir_of(&state.data_dir, &state.mcp)
-}
-
-/// 同 [`allowed_for_dir`]，但接收裸参数（启动期还没有 `State` 时用）
+/// 活跃集只由用户设置决定（模式不再参与，见 `mcp::ToolRegistry::mode_allows`），
+/// 所以这个函数现在只是"把用户的开关重新落到注册表上"。
 ///
-/// ⚠️ 模式**跟会话走**了，所以这里不能再读 `settings.activeMode`
-/// —— 那现在是"新建会话的默认模式"，跟正在用的这个会话没关系。
-/// 改成问 `sessions::effective_mode`（当前会话 → 它自带的模式）。
-/// 漏改的表现：切到「闲聊」后重新拉一次 MCP 快照，工具组又满血复活。
-fn allowed_for_dir_of(
-    data_dir: &std::path::Path,
-    mcp: &std::sync::Arc<tokio::sync::Mutex<mcp::ToolRegistry>>,
-) -> std::collections::HashSet<String> {
-    // 组名清单只能从注册表拿（modes.json 里写的是名字，不知道 MCP 当前有什么组）。
-    // `try_lock`：所有调用点都是"锁外算好、锁内套用"，所以这里正常能拿到锁；
-    // 万一拿不到也不 `.await` —— 那会在这条路径上引出一个死锁可能
-    // （调用方可能正持锁）。退化结果 = 白名单里的组暂时全被当成未知，
-    // 下次快照即恢复，比死锁好得多。
-    let available: Vec<String> = match mcp.try_lock() {
-        Ok(reg) => reg.groups().iter().map(|g| g.name.clone()).collect(),
-        Err(_) => Vec::new(),
-    };
-    // ⚠️ 用 `current_or_main` 而不是 `current_id`：后者只看指针文件，
-    //    指针缺失（真实发生过：`sessions/current` 不存在）会返回 None →
-    //    兜到内置默认模式，而界面/agent 走 `ensure_current` 落到的是另一条会话
-    //    → "界面在闲聊会话里、MCP 工具组却按标准模式算"。两边都说得通，极难排查。
-    //    也刻意不用 `ensure_current`：那条路径会**写盘**（自愈/落指针），
-    //    而这里跑在后台线程里，不该有副作用。
-    let cur = crate::sessions::current_or_main(data_dir);
-    let mode = crate::sessions::effective_mode(data_dir, Some(&cur.id));
-    modes::allowed_groups_for(data_dir, Some(&mode.id), &available).as_registry_set()
-}
-
-/// 换了会话 → 它自带模式 → **MCP 活跃组必须跟着重算**。
-///
-/// 为什么非得显式做一次：`allowed_for_dir` 只在"新快照 / 改设置 / 手动刷新"三条
-/// 路径上跑，切会话一条都不触发。少了这一步，从「标准」切到「闲聊」后工具组
-/// 还是满的 —— 表现出来就是"切了闲聊它照样能调 MCP"，而工具表里
-/// `send_meme` 之类按模式走的闸门又是对的，两处不一致最难查。
-///
-/// 与 `mcp_set_all_groups` / `resync_mode_groups` 用的是同一套（`allowed_for_dir` +
-/// `restore_active_from_settings`），所以"模式只能收窄、用户关掉的组开不回来"
-/// 这条语义自动成立。
+/// ⚠️ 仍然需要显式调用：换会话 / 改 server 之后，
+/// 注册表里的组集合变了，必须重算一次，否则新增的组要等下次拉快照才生效。
 async fn resync_mode_groups(state: &AppState) -> usize {
-    let allowed = allowed_for_dir(state);
     let s = config::load_settings(&state.data_dir);
     let mut reg = state.mcp.lock().await;
-    reg.restore_active_from_settings(&s, Some(allowed))
+    reg.restore_active_from_settings(&s)
 }
 
 #[derive(serde::Serialize)]
@@ -2080,12 +2183,11 @@ async fn mcp_refresh(state: State<'_, AppState>) -> Result<(), String> {
     let clients = state.mcp.lock().await.clients_clone();
     let snap = mcp::ToolRegistry::fetch_snapshot(&clients).await;
     let settings = config::load_settings(&state.data_dir);
-    let allowed = allowed_for_dir(&state);
     state
         .mcp
         .lock()
         .await
-        .apply_snapshot_with_settings(snap, &settings, Some(allowed));
+        .apply_snapshot_with_settings(snap, &settings);
     Ok(())
 }
 
@@ -2142,12 +2244,11 @@ async fn mcp_servers_save(
     let clients = state.mcp.lock().await.clients_clone();
     let snap = mcp::ToolRegistry::fetch_snapshot(&clients).await;
     let settings = config::load_settings(&state.data_dir);
-    let allowed = allowed_for_dir(&state);
     state
         .mcp
         .lock()
         .await
-        .apply_snapshot_with_settings(snap, &settings, Some(allowed));
+        .apply_snapshot_with_settings(snap, &settings);
     Ok(())
 }
 
@@ -2170,12 +2271,11 @@ async fn mcp_set_url(state: State<'_, AppState>, url: String) -> Result<(), Stri
     let clients = state.mcp.lock().await.clients_clone();
     let snap = mcp::ToolRegistry::fetch_snapshot(&clients).await;
     let settings = config::load_settings(&state.data_dir);
-    let allowed = allowed_for_dir(&state);
     state
         .mcp
         .lock()
         .await
-        .apply_snapshot_with_settings(snap, &settings, Some(allowed));
+        .apply_snapshot_with_settings(snap, &settings);
     Ok(())
 }
 
@@ -2456,9 +2556,8 @@ async fn mcp_set_all_groups(
         s.mcp_group_enabled.clear();
     }
     config::save_settings(&state.data_dir, &s)?;
-    let allowed = allowed_for_dir(&state);
     let mut reg = state.mcp.lock().await;
-    reg.restore_active_from_settings(&s, Some(allowed));
+    reg.restore_active_from_settings(&s);
     Ok(())
 }
 
@@ -3294,8 +3393,24 @@ fn session_state(state: State<'_, AppState>) -> serde_json::Value {
 /// 目录在 = 用户有数据（哪怕某人删空了配置文件，那也是他的选择，不该被当成新装）。
 #[tauri::command]
 fn boot_state(state: State<'_, AppState>) -> serde_json::Value {
-    let needs_init = !state.data_dir.exists();
-    // 没有模型就聊不了 —— 前端据此把「去设置加模型」做成首要引导
+    // ⚠️ 不能只看 `data_dir` 目录在不在 —— 那是 `needsInit` 最初的写法，
+    //    2026-10-12 被用户抓出：**发布版永远等不到「初始化」按钮**。
+    //
+    //    原因：`data_dir` 是 `%APPDATA%\com.orbcat.desktop`，程序一启动就会
+    //    往里面写 `diag.log` / `permissions.json` / `settings.json` /
+    //    `pmem.sqlite` —— **目录在第一次启动时就被创建了**，而骨架目录
+    //    （memory / pending / projects / skills）和 manifest.json 一个都没铺。
+    //    于是 `!exists()` 恒为 false，「建出目录结构」按钮永远不出现。
+    //
+    //    改成查骨架完成标志：`.skeleton-state.json` 是 bootstrap 铺完时写的状态文件，
+    //    它在 = 初始化完成；不在 = 需要初始化。这个判据与「目录里碰巧有
+    //    别的文件」完全无关。
+    //
+    //    ⚠️ 刻意**不**引用 `bootstrap::SKELETON_DIRS`：那个常量由 build.rs
+    //    在 OUT_DIR 生成（include!），在 lib.rs 里引不到；而且骨架清单会随
+    //    版本增删，硬编码一份必然漂移。manifest.json 是唯一完成标志，最稳。
+    let needs_init = !state.data_dir.join(".skeleton-state.json").is_file();
+    // 没模型不等于没初始化 —— 先去设置里把模型加上，这里照样放行
     let has_models = config::load_models(&state.data_dir)
         .map(|m| !m.is_empty())
         .unwrap_or(false);
@@ -4282,9 +4397,16 @@ pub fn run() {
         .setup(|app| {
             // --- 初始化权限网关 ---
             let data_dir = resolve_data_dir(app.handle());
-            let app_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .map(Path::to_path_buf)
+            // ⚠️ app_dir 必须是**运行时**的 exe 所在目录，不能用
+            //    `env!("CARGO_MANIFEST_DIR")` —— 那是**编译期常量**。
+            //    2026-10-12 实测事故：CI 上编出来的 release exe 里这个常量是
+            //    `D:/a/orbcat/orbcat/src-tauri`，于是权限面板给用户凭空加了一条
+            //    「D:\a\orbcat\orbcat · 只读 · agent 程序目录（程序自身）」——
+            //    那是 GitHub runner 的路径，用户机器上根本不存在，也永远建不出来。
+            //    与 disk_assets::compute_dist_dir 用同一个来源：exe 同目录。
+            let app_dir = std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(Path::to_path_buf))
                 .unwrap_or_else(|| PathBuf::from("."));
 
             eprintln!("[orbcat] agent-data 目录: {}", data_dir.display());
@@ -4372,11 +4494,10 @@ pub fn run() {
                     // 启动即按设置 + 当前模式恢复组开关（决策：**默认全给**，
                     // 模式再收窄一层 —— 见 `modes.rs` 顶部）
                     let st = config::load_settings(&data_dir_for_mcp);
-                    let allowed = allowed_for_dir_of(&data_dir_for_mcp, &bg);
                     let n = bg
                         .lock()
                         .await
-                        .apply_snapshot_with_settings(snap, &st, Some(allowed));
+                        .apply_snapshot_with_settings(snap, &st);
                     eprintln!("[orbcat] MCP 活跃工具组：{n} 个（按设置 + 模式恢复）");
                 });
             }

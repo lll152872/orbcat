@@ -112,6 +112,49 @@ mkdir -p "$REL/dist"
 rm -rf "$REL/dist/assets" 2>/dev/null || true
 cp -rf dist/. "$REL/dist/"
 
+# ---- 部署到运行态目录（2026-10-12 加）----
+#
+# 为什么不直接让桌面图标用 $REL（target/release/）：
+#   orbcat 的 exe 会在**同级**找 agent-data\。用 target/release/ 当运行态，
+#   就等于把用户的真实数据（API key / 会话 / 记忆 / 截图）放进 git 仓库目录里。
+#   即使 .gitignore 挡住了也不放心 —— 那是"靠配置保证不泄漏"，不是结构上不可能。
+#
+# 为什么不能省掉这一步、让运行态保持手动拷贝：
+#   启动器按「新鲜度 min(exe 时间, dist\index.html 时间)」排序。
+#   不部署的话，构建完 $REL 是新的、$RUNTIME 是旧的，
+#   双击桌面图标启动的一直是旧的 —— 就是上面注释里写的"新内核 + 旧界面"。
+#
+# RUNTIME 必须同时满足三个条件（实测，详见 BUG-orb-window-missing.md）：
+#   1. 在 git 仓库外面；2. 在 D:\ 根部；3. 不在 D:\workplace\悬浮小agent\ 底下
+#      —— 那条路径上的 exe **100% 起不来**（WebView2 子进程数为 0，orb 窗口不出现）。
+RUNTIME=${ORBCAT_RUNTIME_DIR:-D:/orbcat}
+
+echo "==> 部署到运行态 $RUNTIME"
+mkdir -p "$RUNTIME"
+# 运行中的 orbcat 可能占着 exe —— 部署失败不致命，下面的体检会提示用户先退出。
+cp -f "$REL/orbcat.exe" "$RUNTIME/orbcat.exe"
+# dist 同样先清 assets 再整份覆盖，保证运行态里不会攒下旧 bundle。
+rm -rf "$RUNTIME/dist/assets" 2>/dev/null || true
+mkdir -p "$RUNTIME/dist"
+cp -rf "$REL/dist/." "$RUNTIME/dist/"
+
+echo "==> 同步 agent-data（运行态的 init 指引，不覆盖已有内容）"
+# ⚠️ 只从**骨架目录**取，绝不从仓库根的 agent-data/ 取 ——
+#    后者是开发机上的真实用户数据（API key / 会话 / 记忆 / 截图）。
+#    CI 的 tools/check-no-user-data.mjs 会盯着这条命令，抓到真实数据就直接拒绝提交。
+# 只在运行态还没有 agent-data\ 时放一份 init 指引过去 —— 用户的数据**绝不能**被拷贝覆盖。
+if [ ! -d "$RUNTIME/agent-data" ]; then
+  mkdir -p "$RUNTIME/agent-data"
+  if [ -f src-tauri/skeleton/agent-data/初始化.md ]; then
+    cp -f src-tauri/skeleton/agent-data/初始化.md "$RUNTIME/agent-data/初始化.md"
+    echo "  已放入骨架的 init 指引"
+  else
+    echo "  ⚠ 骨架里没有 agent-data/初始化.md，跳过（首次运行会自行生成）"
+  fi
+else
+  echo "  已存在，保持原样（绝不覆盖用户数据）"
+fi
+
 echo "==> 检查桌面快捷方式"
 # 2026-10-01 起，桌面快捷方式不再指向任何 exe：它指向 tools\orbcat-launch.vbs
 # → orbcat-launch.ps1，由启动器在每次双击时挑出"当前能用的那份"构建。
@@ -131,4 +174,7 @@ echo
 echo "完成："
 ls -la "$REL/orbcat.exe"
 echo
-echo "桌面图标每次双击都会重新挑一次构建，本次无需同步任何副本。"
+echo "已部署到运行态（桌面图标下次双击就是这份）："
+ls -la "$RUNTIME/orbcat.exe"
+echo
+echo "运行态 agent-data 未被改动。"

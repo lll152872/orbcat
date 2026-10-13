@@ -62,3 +62,60 @@ fn empty_memory_file_is_not_injected() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// resolve_data_dir 的发布版分支（2026-10-12 三合一分发）
+// ---------------------------------------------------------------------------
+
+/// exe 同级的 agent-data —— zip 三合一形态的**唯一**发布版路径。
+///
+/// 锁的是「不再回退 %APPDATA%」：回退会让"数据在哪"取决于机器而不是
+/// 安装位置，用户找不着文件、没法靠删文件夹清干净、多开也无法隔离。
+#[test]
+/// exe 同级的 agent-data —— zip 三合一形态的路径。
+///
+/// 锁的是「发布包不回退 %APPDATA%」：回退会让"数据在哪"取决于机器
+/// 而不是安装位置，用户找不着文件、没法靠删文件夹清干净、多开无法隔离。
+///
+/// ⚠️ 平台分支是必须的：macOS 上 `Path::new(r"D:\x\y.exe").parent()`
+///    返回空（整串在 Unix 语义里是一个文件名，没有分隔符），
+///    断言会变成 left="agent-data" right="D:\...\agent-data"。
+///    这正是 2026-10-12 CI 上 macos-14 runner 抓到的失败 ——
+///    permission.rs 里那组测试早就因为同样的原因加了 #[cfg(windows)]。
+#[cfg(windows)]
+#[test]
+fn data_dir_beside_exe_is_exe_sibling() {
+    let exe = std::path::Path::new(r"D:\portable\orbcat\orbcat.exe");
+    let got = crate::data_dir_beside_exe(exe).expect("应推出路径");
+    assert_eq!(
+        got,
+        std::path::Path::new(r"D:\portable\orbcat\agent-data")
+    );
+    // 必须是**子目录**，不是把内容摊到 exe 旁边
+    assert_eq!(got.file_name().unwrap(), "agent-data");
+}
+
+/// 跨平台都能跑的那条：只断言「父目录 + 固定子目录名」这个不变式，
+/// 不依赖任何平台特有的路径语法。
+#[test]
+fn data_dir_beside_exe_appends_agent_data() {
+    for exe in [
+        "/opt/orbcat/orbcat",
+        "/Applications/orbcat.app/Contents/MacOS/orbcat",
+    ] {
+        let exe = std::path::Path::new(exe);
+        let got = crate::data_dir_beside_exe(exe).expect("应推出路径");
+        assert_eq!(got.parent(), exe.parent());
+        assert_eq!(got.file_name().unwrap(), "agent-data");
+    }
+}
+
+/// Unix 形态（macOS 上 bare 可执行文件）也要能推。
+/// .app 包走 bundle.resources，dist 由 compute_dist_dir 特判 Resources/；
+/// 但数据目录没有那种映射，所以就是 MacOS/ 下的 agent-data。
+#[test]
+fn data_dir_beside_exe_works_for_unix_path() {
+    let exe = std::path::Path::new("/opt/orbcat/orbcat");
+    let got = crate::data_dir_beside_exe(exe).expect("应推出路径");
+    assert_eq!(got, std::path::Path::new("/opt/orbcat/agent-data"));
+}

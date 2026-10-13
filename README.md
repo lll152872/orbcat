@@ -2,7 +2,11 @@
 
 > 悬浮球形态的私人 agent —— 一个记得住你的桌面助手。
 >
-> **v1.0.0**（2026-10-09）· Windows / macOS 双平台
+> **v1.0.0**（2026-10-13）· Windows（x64 / arm64）+ macOS（Apple Silicon）
+>
+> 下载见 [Releases](https://github.com/lll152872/orbcat/releases)。zip 是**三件套**
+> （`orbcat.exe` + `dist/` + `agent-data/`），**解压即用，但首次启动要点一次
+> [「建出目录结构」](#首次运行两段式初始化)**。
 
 orbcat 平时是屏幕上的一颗小球，点开是一个能读文件、跑命令、查网页、写日记的
 agent。它和通用 AI 助手的区别在于两件事：**它记得你是谁**，以及**它把你的偏好
@@ -79,14 +83,32 @@ agent。它和通用 AI 助手的区别在于两件事：**它记得你是谁**�
 
 ### 首次运行（两段式初始化）
 
+**解压即用不等于零步骤 —— 新用户一定要点一次「建出目录结构」。**
+
+| 你拿到的东西 | `agent-data/` 有没有 | 要做什么 |
+|---|---|---|
+| **Release zip** | ✅ 已带完整空骨架 | **仍要点一次「建出目录结构」**（原因见下） |
+| **git clone 源码** | ❌ 仓库里没有 | 点「建出目录结构」 |
+
+> **为什么 zip 用户明明已经有骨架，还要再点一次？**
+> 骨架完成标志是 `agent-data/.skeleton-state.json`（判据见
+> `src-tauri/src/lib.rs` 的 `boot_state`）。这个文件**刻意不进 zip** ——
+> 它在 `tools/package.mjs` 的 `verifyNoUserData()` 禁列里，属于运行时状态而非骨架内容。
+> 所以新用户首次启动时 `needsInit` 必定为 `true`，面板会显示引导屏。
+>
+> **这一步是幂等的**：已存在的文件一个都不动（铁律：用户改过的东西不能被升级冲掉），
+> 你点了不会有任何覆盖风险，只是补齐状态文件。
+
+为什么拆成两段：
+
 新克隆的仓库里**没有** `agent-data/`，而模型配置又存在 `agent-data/` 里 ——
-要 agent 自己建目录会撞上死锁。所以拆成两段：
+要 agent 自己建目录会撞上死锁（要跑模型得有 `models.json`，
+而 `models.json` 就在还没建出来的 `agent-data/` 里，让 agent 自己建就是死锁）。
 
 **第一段（不需要模型，按钮直接调后端）**
 
 启动 orbcat，空态上点**「建出目录结构」**。这一步**不让模型参与** ——
-要跑模型得有 `models.json`，而 `models.json` 就在还没建出来的 `agent-data/` 里，
-让 agent 自己建就是死锁。所以按钮 `bootstrap_data` 直连 Rust 干活：
+按钮 `bootstrap_data` 直连 Rust 干活：
 
 - 建出 8 个目录：`daily` / `images` / `memory` / `pending` / `projects` /
   `screenshots` / `sessions` / `skills`
@@ -150,19 +172,57 @@ bash tools/build-release.sh --fast   # 快速档，给人真机测试用
 （否则每次改一行 CSS 都要重链一次）。
 
 代价：**`orbcat.exe` 必须和 `dist/` 同目录分发**，不能只拷一个 exe 走。
-`tools/build-release.sh` 已经把拷贝 `dist/` 这一步焊进流程。
+
+### 发布 zip 是**三件套**，不是两个文件
 
 ```
 发布目录/
 ├── orbcat.exe
-└── dist/
-    ├── index.html
-    ├── models.html
-    └── assets/...
+├── dist/                    ← 真前端（缺了会退化成占位页）
+│   ├── index.html
+│   ├── models.html
+│   ├── orb/...
+│   └── assets/...
+├── agent-data/              ← 空骨架，解压即有内置技能与记忆模板
+│   ├── manifest.json
+│   ├── memory/MEMORY.md
+│   ├── skills/{dual-token-dashboard,self-rebuild,token-usage-report}/
+│   ├── pending/README.md
+│   └── projects/README.md
+└── README.md
 ```
 
-> 找不到 `dist/` 时会回退到编译期嵌入的 `stub-dist` 占位页，
-> 启动日志里会写 `前端资源: 未找到外部 dist/，回退内置占位页`。
+三个目录各有各的硬契约，少任何一个都会静默降级：
+
+| 缺什么 | 后果 |
+|---|---|
+| `dist/` | 回退到编译期嵌入的占位页。启动 stderr 打 `[orbcat] 未找到外部 dist/，使用内置占位页（stub-dist）`；`diag.log` 里记 `前端资源: 未找到外部 dist/，回退内置占位页` |
+| `agent-data/` | exe 会在同侧**自动创建**，但骨架要用户点一次「建出目录结构」才铺 |
+| 目录被**平铺**（`index.html` 跑到根目录） | `compute_dist_dir()` 找不到 `<exe 同目录>/dist/index.html`，同样退化成占位页 |
+
+> ⚠️ **平铺这一条不是假设，是 2026-10-12 真实发出去过的事故**：
+> CI 里写了 `Copy-Item dist/* pkg/`，dist 并没丢，只是摊平了。
+> CI 全绿、Release 照发，只有真跑 exe 的用户看见占位页。
+> 现在装配与布局校验**只有 `tools/package.mjs` 这一份实现**，
+> 且 `tests/tools/package.test.ts` 把布局锁住。
+
+### 装配由一个脚本统一，CI 不自带复制逻辑
+
+```bash
+# 装配 + 自检（dist 是子目录，不是平铺）
+node tools/package.mjs --exe src-tauri/target/release/orbcat.exe \
+                       --dist dist --out pkg --skeleton src-tauri/skeleton
+
+# 只校验已有产物（CI 解压回验用的就是这条）
+node tools/package.mjs --verify pkg --exe-name orbcat.exe
+```
+
+`--skeleton` **只能指向 `src-tauri/skeleton`** —— 那是编译期固定的空骨架。
+铺真实的 `agent-data/` 会被 `verifyNoUserData()` 拦下（那等于把 API key 打进发布包）。
+
+> **`models.json` 刻意不进 zip**：用户填了 key 的那个在 `<exe 旁>/agent-data/models.json`。
+> zip 里放同名文件的话，**更新时覆盖解压会把用户的 key 冲掉**。
+> 首次启动由 `bootstrap_data` 建空数组，用户自己在设置面板加模型。
 
 ### 从源码构建时的桌面快捷方式
 
@@ -264,6 +324,8 @@ orbcat 能读写你的文件、跑命令，所以权限是分层的，**默认�
 
 | 限制 | 说明 |
 |---|---|
+| **首次运行要点一次「建出目录结构」** | 完成标志 `agent-data/.skeleton-state.json` **刻意不进 zip**（它在 `verifyNoUserData()` 禁列里，属运行时状态）。所以新用户首次启动 `needsInit` 必为 `true`。**幂等，不会覆盖任何已有文件**，点一下只是补齐状态 |
+| **exe 依赖 VC++ 运行时** | 动态链接 `vcruntime140.dll` / `vcruntime140_1.dll`。Win10/11 自带所以正常；**Windows LTSC / Server Core / 精简镜像不保证有**，缺了 exe 起不来。要彻底自包含需在 `Cargo.toml` 开 `+crt-static`（会增大体积 ~2 MB） |
 | **隐形桌面没有合成键鼠** | 「后台模式」能建一张你看不见的桌面并真跑 GUI 程序（实测 WPS 打开 docx 导出 PDF），但**跨桌面注入键鼠被内核拒绝**。因此后台模式的输入通道必须是应用自身的自动化接口（COM / CLI / UIA Pattern / HTTP） |
 | **UIA 选区对 Electron 不可靠** | VSCode 需 `--force-renderer-accessibility` 启动且不稳定；Typora 本机为改造版。Win32/WinUI 完全可用 |
 | **命令策略编辑器** | 设置页可编辑白名单与硬阻断表，保存写 `command_policy.json` 并立即生效 |
@@ -307,18 +369,27 @@ orbcat/
 │   ├── skeleton/            内置技能骨架（manifest.json 声明式安装）
 │   └── Cargo.toml
 ├── tests/
-│   ├── ui/                  vitest（happy-dom，16 文件）
+│   ├── ui/                  vitest UI（happy-dom，17 文件）
+│   ├── tools/               产物布局 / 行尾（2 文件，锁发布闸门）
 │   └── e2e/                 真实链路（mock / live）
 ├── tools/
-│   ├── build-release.sh         发布构建
+│   ├── build-release.sh         发布构建（+ 部署到运行态）
+│   ├── package.mjs              **发布产物装配 + 布局自检**（CI 唯一实现）
 │   ├── check-no-user-data.mjs    防夹带闸门（CI + npm test 都跑）
+│   ├── gen-release-notes.mjs    从 CHANGELOG 生成 Release 说明
 │   ├── install-shortcut.ps1     装/修/体检桌面快捷方式
 │   ├── orbcat-launch.vbs        无控制台入口（快捷方式指向它）
 │   └── orbcat-launch.ps1        运行时挑出"能用的那份"构建
 ├── agent-data/              运行时数据（**不进版本库**）
 ├── 初始化.md                两段式初始化说明（给 agent 读）
-└── CHANGELOG.md
+├── CHANGELOG.md
+├── RELEASE_NOTES.md         发版说明（由 gen-release-notes.mjs 生成）
+└── README.md
 ```
+
+> ⚠️ `package.mjs` 是**唯一**的装配实现，CI 不允许自带一份 `Copy-Item`。
+> 历史上正是「同一个仓库里三份怎么摆 dist 的约定、其中一份写错」造成了
+> 发出去的 zip 没有前端。详见 §三。
 
 ### 平台抽象层
 
@@ -339,11 +410,15 @@ orbcat/
 
 ```bash
 npm test              # 防夹带闸门 + 前端 + Rust 全跑
-npm run test:ui       # vitest（16 文件 / 112 用例）
-npm run test:rust     # cargo test --lib（532 用例）
+npm run test:ui       # vitest（19 文件 / 140 用例：tests/ui 17 + tests/tools 2）
+npm run test:rust     # cargo test --lib（541 用例）
 npx tsc --noEmit      # 类型检查
 npm run check:no-user-data   # 防夹带闸门：用户数据不进产物
 ```
+
+> `tests/tools/` 下那两个（`package.test.ts` / `line-endings.test.ts`）不是 UI 测试：
+> 前者把发布产物的目录布局锁死（dist 必须是子目录、agent-data 只能是空骨架），
+> 后者锁行尾规范 —— 两者都是 2026-10-12 那次「zip 里没有前端」事故补的闸门。
 
 E2E：
 
@@ -360,21 +435,56 @@ npm run test:e2e:live   # 真实链路
 - **后端**：Rust、Tauri 2、tokio、reqwest（native-tls）
 - **存储**：SQLite（`rusqlite`，仅索引）+ Markdown（长期记忆）
 
-## 九、CI（跨平台编译验证）
+## 九、CI（跨平台编译验证 + 发版）
 
-`.github/workflows/ci.yml`，三个 job：
+`.github/workflows/ci.yml`，**六个 job，分两组**。
+
+### 9.1 防回归组（每次 push / PR 都跑）
 
 | job | 平台 | 验证什么 |
 |---|---|---|
-| `build-windows` | windows-latest (x64) | 防回归：532 个 Rust 测试 + 112 个前端测试 + tsc + 防夹带闸门，然后出包 |
+| `build-windows` | windows-latest (x64) | 防回归：**541** 个 Rust 测试 + **140** 个前端测试 + tsc + 防夹带闸门，然后出包 |
 | `build-windows-arm` | windows-11-arm (arm64) | 能编出**真的是 ARM64** 的可执行文件（读 PE 头 `machine == 0xAA64` 断言，不是"编过了"就算） |
 | `build-macos` | macos-14 (arm64) | **Mac 版能编译** + 跑 lib 测试 |
 
-三个 job 各自产出可下载的 artifact（保留 14 天）：
+产出可下载 artifact（保留 14 天）：
+`orbcat-windows-x64-debug` / `orbcat-windows-arm64-debug` / `orbcat-macos-arm64-dmg`
 
-- `orbcat-windows-x64-debug`
-- `orbcat-windows-arm64-debug`
-- `orbcat-macos-arm64-debug`
+### 9.2 发版组（tag push，或手动 `workflow_dispatch`）
+
+`release` job，matrix 三平台并行，各自出包。
+**手动跑（`workflow_dispatch`）只出产物、不发布** —— 挂 Release 那一步自己再闸一次 tag。
+
+每平台的 Windows 打包流程里，有两道机器可验证的闸门：
+
+1. **PE 架构断言** —— 读 `e_lfanew + 4` 处的 `machine` 字段，必须等于期望值
+   （x64 = `0x8664`，arm64 = `0xAA64`）
+2. **布局回验** —— `Compress-Archive` 打 zip 后**解压回来再验一次**
+   （真正发出去的是 zip，验的必须是 zip 的内容）：
+   `node tools/package.mjs --verify verify --exe-name orbcat.exe`
+
+### 9.3 ⚠️ 发版前必须知道的两件事
+
+**① 仓库的 Actions 权限必须是 Read and write。**
+
+默认只读时，`GITHUB_TOKEN` 拿不到 `Contents: write`，
+最后一步 `Upload to GitHub Release` 会**三个平台一起稳定 403**：
+
+```
+##[error]Resource not accessible by integration - .../releases#create-a-release
+```
+
+**构建本身全绿，只有最后一步挂** —— 容易误判成打包问题。
+修法：`Settings → Actions → General → Workflow permissions → Read and write`。
+
+> v1.0.0 就踩了这个坑（2026-10-13 修复）。好在前面有 `Keep artifacts` 那一步，
+> 产物先存下来了。**但 GitHub 只支持整 job 重跑，不能只重跑某一步**，
+> 修完权限三个平台会重新编译一遍（约 9 分钟）——
+> 注释里那句"修权限后重跑本步骤即可，不必重新编译"**不准确**。
+
+**② tag 推上去不等于 Release 建好了。**
+
+`gh release view v1.0.0` 才是最终判据。构建成功 ≠ Release 存在。
 
 > ⚠️ **macOS 上跑不了前台上下文相关测试** —— 那些需要真实 Accessibility 授权与
 > 前台窗口，CI 没有 GUI 会话。`platform/macos.rs` 的 `osascript` 调用失败后降级，

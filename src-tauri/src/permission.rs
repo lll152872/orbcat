@@ -400,6 +400,14 @@ struct RulesFile {
 ///   - 程序自身目录：agent-data 完全控制 / 程序目录只读 / 临时区读写
 ///   - **不预置任何业务目录的写权限** —— 要写某个目录，由用户显式授权。
 ///     没授权时会明确拒绝并提示去哪加规则，而不是悄悄放行。
+///
+/// ⚠️ **只登记真实存在的目录**。2026-10-12 用户反馈：权限面板里出现了一条
+///    `D:\a\orbcat\orbcat`（GitHub runner 的路径，来自编译期常量
+///    `CARGO_MANIFEST_DIR`），本机根本不存在、也建不出来，纯属噪音。
+///    根因在调用方（现已改成 `current_exe()` 的父目录），但这里再加一道闸：
+///    **路径不存在就不登记**，这样无论调用方传什么都不会漏出幽灵规则。
+///    agent_data_dir 是程序自己正在用的目录，它不存在就意味着别的问题，
+///    那里不设闸（否则会静默丢掉唯一那条「完全控制」规则，更难查）。
 pub fn bootstrap_gate(agent_data_dir: impl AsRef<Path>, app_dir: impl AsRef<Path>) -> PermissionGate {
     let mut gate = PermissionGate::new();
 
@@ -409,7 +417,17 @@ pub fn bootstrap_gate(agent_data_dir: impl AsRef<Path>, app_dir: impl AsRef<Path
         Access::Full,
         "agent 数据目录（程序自身）",
     );
-    gate.add_rule(app_dir.as_ref(), Access::Read, "agent 程序目录（程序自身）");
+    let app_dir = app_dir.as_ref();
+    if app_dir.exists() {
+        gate.add_rule(app_dir, Access::Read, "agent 程序目录（程序自身）");
+    } else {
+        // 路径不存在就不登记，但一定要留痕：这不是"安静地少一条规则"，
+        // 而是一个应该在开发期就被发现的 bug。
+        eprintln!(
+            "[orbcat] ⚠️ 程序目录 {} 不存在，已跳过该只读规则",
+            app_dir.display()
+        );
+    }
 
     let tmp = std::env::temp_dir();
     gate.add_rule(
@@ -431,7 +449,13 @@ pub fn bootstrap_gate(agent_data_dir: impl AsRef<Path>, app_dir: impl AsRef<Path
     }
 
     // ---- 用户主目录：只读 ----
-    if let Ok(home) = std::env::var("USERPROFILE") {
+    // ⚠️ 必须 USERPROFILE 与 HOME 都试（2026-10-12 补）：
+    //    USERPROFILE 是 Windows 约定，Mac/Linux 上是 HOME。
+    //    原先只读 USERPROFILE → Mac 用户**压根没有主目录这条规则**，
+    //    Windows 有、Mac 没有，属于平台行为不一致（不是设计）。
+    //    life.rs:416 读主目录时就是两个都试的，这里对齐它。
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    if let Some(home) = home {
         let h = PathBuf::from(&home);
         if h.exists() {
             gate.add_rule(&h, Access::Read, "用户主目录（只读，可改）");
@@ -1311,5 +1335,74 @@ mod tests {
         assert_eq!(back.tier, GrantTier::Task);
         assert_eq!(back.reason, "批量重命名");
         assert_eq!(back.remaining, None, "无限次档位 remaining 为 None");
+    }
+
+    // ---- 自举规则：幽灵路径不能变成权限条目（2026-10-12 用户反馈）----
+
+    /// 事故回归：调用方传了一个**不存在的**程序目录（当时是编译期常量
+    /// `CARGO_MANIFEST_DIR`，在 CI 上编出来是 `D:/a/orbcat/orbcat`），
+    /// 权限面板就凭空多出一条「D:\a\orbcat\orbcat · 只读 · agent 程序目录」——
+    /// 用户机器上不存在、也建不出来。现在不存在的路径一律不登记。
+    #[test]
+    fn bootstrap_skips_nonexistent_app_dir() {
+        let data = std::env::temp_dir().join("orbcat-bs-ghost");
+        let ghost = std::env::temp_dir().join("orbcat-bs-does-not-exist-xyz");
+        // 前置条件：这个路径确实不存在，否则本用例是空转
+        assert!(!ghost.exists(), "测试前提失效：幽灵路径意外存在");
+
+        let g = bootstrap_gate(&data, &ghost);
+        let prefixes: Vec<String> = g
+            .export_rules()
+            .into_iter()
+            .map(|r| r.prefix.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !prefixes.iter().any(|p| p == &ghost.to_string_lossy().to_string()),
+            "不存在的程序目录不该进规则表，实际拿到：{prefixes:?}"
+        );
+    }
+
+    /// 反向对照：真实存在的程序目录**仍然要**登记只读规则 ——
+    /// 只测上一条会漏掉"闸门开太大"这个方向的回归。
+    #[test]
+    fn bootstrap_registers_existing_app_dir() {
+        let data = std::env::temp_dir().join("orbcat-bs-real-data");
+        let app = std::env::temp_dir().join("orbcat-bs-real-app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+
+        let g = bootstrap_gate(&data, &app);
+        let rules = g.export_rules();
+
+        // ⚠️ `add_rule` 内部会 `best_effort_canonicalize`，Windows 上临时目录
+        //    可能被解析成 8.3 短名或展开联接 —— 所以要拿**同样规范化后**的
+        //    路径去比，否则这条用例会因为路径形态不同而误报。
+        let app_norm = best_effort_canonicalize(&app);
+        let data_norm = best_effort_canonicalize(&data);
+
+        let hit = rules
+            .iter()
+            .find(|r| r.prefix == app_norm)
+            .unwrap_or_else(|| {
+                panic!(
+                    "存在的程序目录必须登记。规则表：{:?}，期望 prefix={:?}",
+                    rules
+                        .iter()
+                        .map(|r| (&r.prefix, &r.label))
+                        .collect::<Vec<_>>(),
+                    app_norm
+                )
+            });
+        assert_eq!(hit.access, Access::Read, "程序目录只读，不给写");
+        assert!(hit.label.contains("程序目录"));
+
+        let data_hit = rules
+            .iter()
+            .find(|r| r.prefix == data_norm)
+            .expect("数据目录必须登记");
+        assert_eq!(data_hit.access, Access::Full, "数据目录完全控制");
+
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&app);
     }
 }
