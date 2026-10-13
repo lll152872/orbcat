@@ -1918,26 +1918,134 @@ mod autostart {
         crate::win32::read_hkcu_sz(RUN_KEY, VALUE_NAME).is_some()
     }
 
-    /// 启动时校准：若注册表里的自启项指向 debug exe，而 release exe 已存在，
-    /// 就改写指向 release —— 否则开机永远弹黑框（debug 构建带控制台）。
+    /// 启动时校准自启项，让它指向**当前正在运行的这只 exe**。
+    ///
+    /// ## 为什么要做「指向当前 exe」而不是只做 debug→release
+    ///
+    /// 历史上这里只处理「注册表指向 debug」一种情况，于是踩了个很坑的坑：
+    /// 自启项一旦指向 `...\orbcat\src-tauri\target\release\orbcat.exe`，
+    /// **就再也不会被纠正** —— 那个路径里没有 "debug" 字样，函数直接 return。
+    ///
+    /// 后果不是"多启动一份"，而是**用户数据整个不见**：
+    /// exe 在**同级**找 `agent-data\`（见 `resolve_data_dir`），
+    /// 而 `target\release\` 旁边根本没有 agent-data，
+    /// 于是开机启动的是一个数据目录为空的白板 —— 面板显示
+    /// 「尚未初始化 / 数据目录 agent-data/ 还不存在」。
+    /// 真实数据还躺在运行态目录里，只是开机那次根本没去看它。
+    ///
+    /// ## 判定规则（保守，宁可不改也不改错）
+    ///
+    /// 只有同时满足下面两条才改写：
+    /// 1. 注册表里现有的 exe **同级没有 agent-data**（它一定是错的，指向白板）；
+    /// 2. **当前 exe 同级有 agent-data**（我们自己才是对的那个）。
+    ///
+    /// 这样"用户手动在别处装了一份"不会被我们覆盖 —— 那时条件 1 通常不成立
+    /// （对方也有 agent-data）。
+    ///
+    /// debug→release 那条保留（debug 构建带控制台窗口，
+    /// `windows_subsystem="windows"` 只在 release 生效），但**只在 release
+    /// 同级也有 agent-data 时**才替换 —— 否则等于用一个空数据目录换一个黑框。
     pub fn sync_to_release() {
         let Some(cur) = crate::win32::read_hkcu_sz(RUN_KEY, VALUE_NAME) else {
             return; // 没设自启，不用管
         };
-        if !cur.to_lowercase().contains("debug") {
-            return; // 已经指向别处（release / 安装版）
+        let Ok(exe) = std::env::current_exe() else { return };
+        let target = preferred_autostart_exe(&exe);
+
+        let cur_path = std::path::PathBuf::from(cur.trim().trim_matches('"'));
+        if paths_equal(&cur_path, &target) {
+            return; // 已经指向对的那个
         }
-        if release_sibling_path().is_none() {
-            return; // release 还没构建，等构建后再说
+        // 条件 1：现有自启项同级**没有真实数据** —— 它一定是错的（只会开出白板）
+        if is_real_data_dir(&cur_path) {
+            return;
         }
-        if set(true).is_ok() {
-            eprintln!("[orbcat] 开机自启已改指向 release exe（无控制台黑框）");
+        // 条件 2：当前 exe 同级**确实有真实数据** —— 我们才是对的那个
+        if !is_real_data_dir(&target) {
+            return;
+        }
+
+        if set_to(&target).is_ok() {
+            eprintln!(
+                "[orbcat] 开机自启已改指向 {}（原先 {} 旁边没有 agent-data，开机会启动空数据目录）",
+                target.display(),
+                cur_path.display()
+            );
         }
     }
 
-    fn release_sibling_path() -> Option<std::path::PathBuf> {
-        let exe = std::env::current_exe().ok()?;
-        release_sibling(&exe)
+    /// 「这个 exe 同级那份 agent-data 里有真实数据吗？」
+    ///
+    /// ## 为什么不能只看 `is_dir()`
+    ///
+    /// 坏自启已经造出一个 `target\release\agent-data\` 了，**里面躺着 5 个文件**：
+    /// `permissions.json`（默认规则）、`pmem.sqlite`（空库，24KB 只是 sqlite 的空页）、
+    /// `diag.log`、`sessions\current.txt`、还有一个 **143 字节的空会话**。
+    /// 只判 `is_dir()` 会把它当成"有数据"→ 我们的自动纠正永远不触发。
+    ///
+    /// ## 判据
+    ///
+    /// 每次启动都会自动生成的那几个文件不算数；剩下还要**超过 1KB**
+    /// 才算实质内容 —— 真实会话是 21KB~775KB，真实 settings/models/mcp 也是几百字节到几十 KB，
+    /// 而空壳里那些都是 0~24KB 的生成物。这样两条都判得开。
+    fn is_real_data_dir(exe: &std::path::Path) -> bool {
+        const MIN_REAL_BYTES: u64 = 1024;
+        /// 每次启动都会自动生成 / 与用户内容无关
+        const BOOTSTRAP: &[&str] = &[
+            "permissions.json",
+            "pmem.sqlite",
+            "diag.log",
+            "permissions.json.bak",
+            "current.txt",
+        ];
+        fn scan(dir: &std::path::Path, bootstrap: &[&str], min: u64) -> Option<bool> {
+            let mut it = std::fs::read_dir(dir).ok()?.flatten().peekable();
+            if it.peek().is_none() {
+                return Some(false); // 目录不存在或为空
+            }
+            for e in it {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().into_owned();
+                if p.is_dir() {
+                    if name == "sessions" && scan(&p, bootstrap, min) == Some(true) {
+                        return Some(true);
+                    }
+                    continue;
+                }
+                if bootstrap.contains(&name.as_str()) {
+                    continue;
+                }
+                if e.metadata().map(|m| m.len() > min).unwrap_or(false) {
+                    return Some(true);
+                }
+            }
+            Some(false)
+        }
+        let Some(dir) = crate::data_dir_beside_exe(exe) else {
+            return false;
+        };
+        scan(&dir, BOOTSTRAP, MIN_REAL_BYTES).unwrap_or(false)
+    }
+
+    /// Windows 路径不区分大小写，比较时统一一下。
+    fn paths_equal(a: &std::path::Path, b: &std::path::Path) -> bool {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    }
+
+    /// 该指向哪个 exe：debug 构建且 release 同级也有真实数据时用 release，否则当前 exe。
+    fn preferred_autostart_exe(exe: &std::path::Path) -> std::path::PathBuf {
+        if let Some(rel) = release_sibling(exe) {
+            if is_real_data_dir(&rel) {
+                return rel;
+            }
+        }
+        exe.to_path_buf()
+    }
+
+    /// 按给定路径写注册表（`set(true)` 的可复用内核）
+    fn set_to(exe: &std::path::Path) -> Result<(), String> {
+        let cmd = format!("\"{}\"", exe.display());
+        crate::win32::write_hkcu_sz(RUN_KEY, VALUE_NAME, &cmd)
     }
 
     /// 设置/取消开机自启。
