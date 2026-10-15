@@ -465,11 +465,202 @@ fn data_dir_beside_exe(exe: &Path) -> Option<PathBuf> {
 
 /// 计算目标窗口 bounds，返回**物理像素** `(x, y, w, h)`。
 #[cfg(windows)]
+/// 球被用户拖到的真实位置（左上角，**已含 pad 偏移**）。
+///
+/// `None` = 还没记录过（首启）→ 走默认摆位。
+///
+/// ## 为什么需要它（2026-10-14 用户报）
+///
+/// 用户原话：「我移动球不能影响打开面板的位置 / 打开逻辑应该是基于当前球的位置的」。
+///
+/// 拖动走的是前端的 `startDragging()`（OS 级移动窗口），**新位置从头到尾
+/// 没被读过一次**。而 `compute_bounds` 每次都把球**重新硬算**成
+/// 「贴右边 + 固定 40% 高度」，于是：
+/// - 球拖到哪儿都白拖，展开面板一律回到那个硬编码位置；
+/// - 收起时球还会被**弹回**默认摆位（orb 分支也用硬算值）。
+///
+/// 记一份真实位置，面板/菜单/回收都从它锚定，才对得上用户看到的球。
+///
+/// ## 只在「当前窗口确实是球」时更新
+///
+/// 展开成面板后窗口尺寸变了，此时 `outer_position()` 是**面板**的位置。
+/// 若无脑覆盖，面板一关球就被挪到面板位置 —— 比现在的 bug 更怪。
+/// 所以由调用方按**尺寸**判断当前是不是球态（见 `apply_mode`）。
+static ORB_ANCHOR: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
+/// 把球的位置写进 `settings.json`，让它**跨重启存活**。
+///
+/// 只在真的变了才写 —— 每次 `apply_mode` 都落盘会白白磨盘。
+fn save_orb_pos(data_dir: &Path, pos: (i32, i32)) {
+    let mut s = config::load_settings(data_dir);
+    if s.orb_pos == Some(config::OrbPos { x: pos.0, y: pos.1 }) {
+        return;
+    }
+    s.orb_pos = Some(config::OrbPos { x: pos.0, y: pos.1 });
+    // ⚠️ 位置不是用户"设置"，存盘失败**不该**让整次展开失败 ——
+    //    最坏结果只是下次重启球回到默认摆位。记日志就行。
+    if let Err(e) = config::save_settings(data_dir, &s) {
+        eprintln!("[orbcat] ⚠️ 记住球位置失败（下次重启会回到默认摆位）: {e}");
+    }
+}
+
+/// 安静期时长：拖动停下来这么多毫秒后才落盘。
+const ORB_SAVE_DEBOUNCE_MS: u64 = 600;
+
+/// 等着落盘的位置（`None` = 没有在等的）。
+///
+/// ## 为什么不是每次 `Moved` 直接写
+///
+/// 拖动时 `WindowEvent::Moved` 每帧都来（可达 60+/s），而 `on_window_event`
+/// 跑在**主线程**上 —— 每次同步写 `settings.json` 会在事件循环里制造 IO 抖动，
+/// 表现为"拖的时候发卡"。所以改成"只留最新值 + 安静期后由后台线程写一次"。
+static ORB_SAVE_PENDING: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
+/// 安排一次球位置落盘（自带防抖）。
+///
+/// 已有 worker 在等就只更新值；没有才起一个。worker 醒来后 `take()` 走最新的
+/// 那个值 —— 所以拖一整串事件，最终只写**最后那一个**位置。
+///
+/// worker 醒来与 `Moved` 撞上的次序也安全：
+/// - `take()` 之前来了新值 → worker 直接拿到新的；
+/// - `take()` 之后来了新值 → 此时 pending 已被清空，会**再起一个** worker。
+fn schedule_orb_pos_save(data_dir: &Path, pos: (i32, i32)) {
+    let spawn = match ORB_SAVE_PENDING.lock() {
+        Ok(mut g) => {
+            let spawn = g.is_none();
+            *g = Some(pos);
+            spawn
+        }
+        Err(e) => {
+            eprintln!("[orbcat] ⚠️ 球位置落盘排队失败（锁 poisoned）: {e}");
+            false
+        }
+    };
+    if !spawn {
+        return;
+    }
+    let dir = data_dir.to_path_buf();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(ORB_SAVE_DEBOUNCE_MS));
+        let latest = match ORB_SAVE_PENDING.lock() {
+            Ok(mut g) => g.take(),
+            Err(_) => None,
+        };
+        if let Some(p) = latest {
+            save_orb_pos(&dir, p);
+        }
+    });
+}
+
+/// 退出前把还等着的位置立刻写掉。
+///
+/// 不做这一步的话："拖完球 → 直接杀进程 / 关机"这一条路径上，防抖窗口里的
+/// 那个值就丢了，下次启动球回到更早一次的位置。
+fn flush_orb_pos_save(data_dir: &Path) {
+    let pending = match ORB_SAVE_PENDING.lock() {
+        Ok(mut g) => g.take(),
+        Err(_) => None,
+    };
+    if let Some(p) = pending {
+        save_orb_pos(data_dir, p);
+    }
+}
+
+/// 球被拖动时（`WindowEvent::Moved`）记住新位置并排一次防抖落盘。
+///
+/// 面板/菜单态移动时直接返回 —— 那不是球在动，记下来等于把面板位置
+/// 写进 `orbPos`（比不记更糟）。
+fn remember_orb_moved(win: &tauri::Window) {
+    let Ok(scale) = win.scale_factor() else {
+        return;
+    };
+    let Some(anchor) = read_orb_anchor(win, scale) else {
+        // 面板/菜单态移动，或读不到位置 —— 都不是"球被拖了"
+        return;
+    };
+    // 位置没变就别排队（鼠标抖动会连着来一串相同值）
+    if let Ok(mut g) = ORB_ANCHOR.lock() {
+        if *g == Some(anchor) {
+            return;
+        }
+        *g = Some(anchor);
+    }
+    let dir = win.app_handle().state::<AppState>().data_dir.clone();
+    schedule_orb_pos_save(&dir, anchor);
+}
+
+/// 「当前这组位置+尺寸是不是球态」→ 是的话返回球的左上角（含 pad 偏移）。
+///
+/// 判据是**尺寸**不是 mode：orb / panel / menu 是同一个窗口，只有球态的宽高
+/// 恰好等于 `ORB_LOGICAL + 2*pad`。展开成面板后尺寸就变了，返回 `None` ——
+/// 调用方据此**不会**把面板位置误记成球的位置。
+///
+/// ⚠️ 收的是**位置+尺寸**而不是窗口句柄：`on_window_event` 交来 `&Window`，
+/// `apply_mode` 手上是 `&WebviewWindow`，而 Tauri 没给 `WebviewWindow` 取
+/// `&Window` 的公开入口（`window` 是私有字段），两者也没 deref 关系。
+/// 既然两边都有 `outer_position()` / `outer_size()`，就让各自读了传进来。
+///
+/// `apply_mode` 与 `on_window_event(Moved)` 共用这一份判据，避免两处漂移。
+fn orb_anchor_if_orb(
+    pos: tauri::PhysicalPosition<i32>,
+    size: tauri::PhysicalSize<u32>,
+    scale: f64,
+) -> Option<(i32, i32)> {
+    let pad = (ORB_PAD_LOGICAL * scale).round() as i32;
+    let orb_win_px = (ORB_LOGICAL * scale).round() as i32 + pad * 2;
+    if size.width as i32 != orb_win_px || size.height as i32 != orb_win_px {
+        return None;
+    }
+    Some((pos.x + pad, pos.y + pad))
+}
+
+/// `orb_anchor_if_orb` 的读取版：读失败一律当"不是球态"（返回 `None`）。
+///
+/// ⚠️ **只用于「面板/菜单态移动」那条路径**（`Moved` 事件）。那里读失败就
+/// 跳过是对的 —— 不是球态就不该记。
+/// `apply_mode` 走自己那套，因为它要区分"读失败"与"不是球态"：
+/// 前者该打日志，后者是常态。
+fn read_orb_anchor(win: &impl OrbBounds, scale: f64) -> Option<(i32, i32)> {
+    match (win.outer_position(), win.outer_size()) {
+        (Ok(p), Ok(s)) => orb_anchor_if_orb(p, s, scale),
+        _ => None,
+    }
+}
+
+/// `outer_position` / `outer_size` 的最小公共面。
+///
+/// `tauri::Window` 与 `tauri::WebviewWindow` 都实现了它，但彼此**没有**
+/// deref / 继承关系（见 [`orb_anchor_if_orb`] 的说明），只能这样合起来。
+trait OrbBounds {
+    fn outer_position(&self) -> tauri::Result<tauri::PhysicalPosition<i32>>;
+    fn outer_size(&self) -> tauri::Result<tauri::PhysicalSize<u32>>;
+}
+
+impl OrbBounds for tauri::Window {
+    fn outer_position(&self) -> tauri::Result<tauri::PhysicalPosition<i32>> {
+        tauri::Window::outer_position(self)
+    }
+    fn outer_size(&self) -> tauri::Result<tauri::PhysicalSize<u32>> {
+        tauri::Window::outer_size(self)
+    }
+}
+
+impl OrbBounds for tauri::WebviewWindow {
+    fn outer_position(&self) -> tauri::Result<tauri::PhysicalPosition<i32>> {
+        tauri::WebviewWindow::outer_position(self)
+    }
+    fn outer_size(&self) -> tauri::Result<tauri::PhysicalSize<u32>> {
+        tauri::WebviewWindow::outer_size(self)
+    }
+}
+
 fn compute_bounds(
     mode: &str,
     monitor_pos: (i32, i32),
     monitor_size: (u32, u32),
     scale: f64,
+    // 球的真实位置（左上角，含 pad）；`None` = 用默认摆位。
+    orb_anchor: Option<(i32, i32)>,
 ) -> (i32, i32, i32, i32) {
     let (mx, my) = monitor_pos;
     let (mw, mh) = (monitor_size.0 as i32, monitor_size.1 as i32);
@@ -477,16 +668,25 @@ fn compute_bounds(
     let margin = (MARGIN_LOGICAL * scale).round() as i32;
     let orb_px = (ORB_LOGICAL * scale).round() as i32;
 
-    let orb_x = mx + mw - orb_px - margin;
-    let orb_y = my + (mh as f64 * ORB_Y_RATIO).round() as i32;
+    // ⚠️ 球的位置优先用**用户拖到的真实位置**；没有记录（首启）才回默认摆位。
+    //    下面每个分支都从这里取 `orb_x` / `orb_y`，所以一处改，全跟着对。
+    let (orb_x, orb_y) = orb_anchor.unwrap_or_else(|| {
+        (
+            mx + mw - orb_px - margin,
+            my + (mh as f64 * ORB_Y_RATIO).round() as i32,
+        )
+    });
 
     match mode {
         "panel" => {
             let pw = (PANEL_W_LOGICAL * scale).round() as i32;
             let ph = (PANEL_H_LOGICAL * scale).round() as i32;
-            let px = mx + mw - pw - margin;
-
+            // 右边缘与球的右边缘对齐（与旧默认的几何关系一致），但 x 跟着**实际的球**走。
+            let mut px = orb_x + orb_px - pw;
             let mut py = orb_y - ph / 3;
+            // ⚠️ 必须夹取：球被拖到屏幕**左半边**时，面板会往左溢出屏幕。
+            //   只夹 x 就够，y 的两个分支下面本来就夹了。
+            px = px.clamp(mx + margin, (mx + mw - pw - margin).max(mx + margin));
             if py + ph > my + mh - margin {
                 py = my + mh - ph - margin;
             }
@@ -499,8 +699,17 @@ fn compute_bounds(
         "menu" => {
             let mw_menu = (MENU_W_LOGICAL * scale).round() as i32;
             let mh_menu = (MENU_H_LOGICAL * scale).round() as i32;
-            let mx_menu = orb_x + orb_px - mw_menu;
-            let my_menu = orb_y;
+            let mut mx_menu = orb_x + orb_px - mw_menu;
+            let mut my_menu = orb_y;
+            // 同上：球在左半边时向左展开会出界，两个方向都夹。
+            mx_menu = mx_menu.clamp(
+                mx + margin,
+                (mx + mw - mw_menu - margin).max(mx + margin),
+            );
+            my_menu = my_menu.clamp(
+                my + margin,
+                (my + mh - mh_menu - margin).max(my + margin),
+            );
             (mx_menu, my_menu, mw_menu, mh_menu)
         }
         // 胶囊态：窗口比球**大一圈**（每边 ORB_PAD_LOGICAL）。
@@ -521,7 +730,11 @@ fn compute_bounds(
 
 /// 应用某个形态：设置 bounds + 切换窗口扩展样式。
 #[cfg(windows)]
-fn apply_mode(win: &tauri::WebviewWindow, mode: &str) -> Result<(), String> {
+fn apply_mode(
+    win: &tauri::WebviewWindow,
+    mode: &str,
+    data_dir: &Path,
+) -> Result<(), String> {
     // ---- 诊断开关 ----
     // 设了 ORBCAT_NO_WINDOW_MODE 就跳过所有窗口形态调整，
     // 用来把它与"渲染问题"隔离开做二分排查。
@@ -542,7 +755,69 @@ fn apply_mode(win: &tauri::WebviewWindow, mode: &str) -> Result<(), String> {
         _ => (0, 0, 1920, 1080),
     };
 
-    let (x, y, w, h) = compute_bounds(mode, (mx, my), (mw, mh), scale);
+    // ── 记住球被拖到哪儿 ────────────────────────────────────────
+    //
+    // 判据是**尺寸**不是 mode：orb / panel / menu 是同一个窗口，
+    // 只有球态的宽高恰好等于 `ORB_LOGICAL + 2*pad`。
+    // 展开成面板后此刻读到的是**面板**位置，绝不能拿去覆盖锚点
+    //（否则一关面板球就被挪到面板那儿）。
+    //
+    // 拖动是前端的 `startDragging()`（OS 级移动），Rust 这边此前**完全不知道**
+    // 球被挪过 —— `compute_bounds` 每次重新硬算，于是球拖了等于没拖。
+    //
+    // 尺寸判据在 `orb_anchor_if_orb`（`Moved` 事件那边也用同一份）。
+    // 这里**不**走防抖队列：切形态是低频事件，直接同步写一次，
+    // 顺带保证「展开前球的位置一定是已落盘的」。
+    let anchor = match (
+        win.outer_position(),
+        win.outer_size(),
+    ) {
+        (Ok(p), Ok(s)) => match orb_anchor_if_orb(p, s, scale) {
+            Some(a) => {
+                // 此刻窗口就是球 → 这就是用户拖到的位置
+                match ORB_ANCHOR.lock() {
+                    Ok(mut g) => *g = Some(a),
+                    Err(e) => eprintln!("[orbcat] ⚠️ 记录球位置失败（锁 poisoned）: {e}"),
+                }
+                save_orb_pos(data_dir, a);
+                Some(a)
+            }
+            // 当前是面板/菜单 → 用上一次记下的球位置，没有就回默认摆位
+            None => ORB_ANCHOR.lock().ok().and_then(|g| *g).or_else(|| {
+                let s = config::load_settings(data_dir);
+                s.orb_pos.map(|p| (p.x, p.y))
+            }),
+        },
+        // 读不到位置 → 打日志并回默认摆位（不能猜，猜错就球跑偏了）
+        (p, s) => {
+            let e = match (p, s) {
+                (Err(e), _) => e,
+                (_, Err(e)) => e,
+                _ => unreachable!(),
+            };
+            eprintln!("[orbcat] ⚠️ 读窗口位置失败，按默认摆位: {e}");
+            None
+        }
+    };
+    // 存档可能是上次那块屏的坐标（拔了扩展屏 / 改了分辨率）→ 落屏外就丢弃，
+    // 回默认摆位。否则球会出现在用户够不到的地方，连拖回来都费劲。
+    let anchor = anchor.filter(|&(ax, ay)| {
+        let orb_px = (ORB_LOGICAL * scale).round() as i32;
+        let (Ok(x0), Ok(y0), Ok(x1), Ok(y1)) = (
+            u32::try_from(ax),
+            u32::try_from(ay),
+            u32::try_from(ax + orb_px),
+            u32::try_from(ay + orb_px),
+        ) else {
+            return false;
+        };
+        // 与当前显示器**有交集**就算还在屏上
+        let overlap_x = (x0 < mw as u32) && (x1 > mx.max(0) as u32);
+        let overlap_y = (y0 < mh as u32) && (y1 > my.max(0) as u32);
+        overlap_x && overlap_y
+    });
+
+    let (x, y, w, h) = compute_bounds(mode, (mx, my), (mw, mh), scale, anchor);
 
     // 关键：用 SetWindowPos 而非 Tauri 的 set_size —— 见 win32::set_bounds 注释
     win32::set_bounds(ptr, x, y, w, h);
@@ -1311,6 +1586,7 @@ fn mem_files(state: State<'_, AppState>) -> MemoryFiles {
 
 /// 项目记忆清单（设置 › 记忆 展示懒检测状态）
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ProjectMemoryView {
     name: String,
     source: String,
@@ -1875,6 +2151,9 @@ pub(crate) fn web_search_ready_for(data_dir: &std::path::Path) -> bool {
 #[tauri::command]
 fn app_quit(app: tauri::AppHandle) {
     eprintln!("[orbcat] 用户要求退出");
+    // 退出前把还排在防抖窗口里的球位置写掉 —— 否则「刚拖完就退出」会丢
+    let dir = app.state::<AppState>().data_dir.clone();
+    flush_orb_pos_save(&dir);
     app.exit(0);
 }
 
@@ -1985,46 +2264,14 @@ mod autostart {
     ///
     /// ## 判据
     ///
-    /// 每次启动都会自动生成的那几个文件不算数；剩下还要**超过 1KB**
-    /// 才算实质内容 —— 真实会话是 21KB~775KB，真实 settings/models/mcp 也是几百字节到几十 KB，
-    /// 而空壳里那些都是 0~24KB 的生成物。这样两条都判得开。
+    /// 判据本体在 [`crate::bootstrap::data_dir_has_real_content`]（跳过每次启动
+    /// 都会自动生成的那几个文件，剩下还要超过 1KB 才算实质内容）。
+    /// **这里刻意复用、不再自己抄一份** —— `boot_state` 判「老数据 vs 新装」
+    /// 用的是同一套判据，抄两份迟早会漂成两个答案。
     fn is_real_data_dir(exe: &std::path::Path) -> bool {
-        const MIN_REAL_BYTES: u64 = 1024;
-        /// 每次启动都会自动生成 / 与用户内容无关
-        const BOOTSTRAP: &[&str] = &[
-            "permissions.json",
-            "pmem.sqlite",
-            "diag.log",
-            "permissions.json.bak",
-            "current.txt",
-        ];
-        fn scan(dir: &std::path::Path, bootstrap: &[&str], min: u64) -> Option<bool> {
-            let mut it = std::fs::read_dir(dir).ok()?.flatten().peekable();
-            if it.peek().is_none() {
-                return Some(false); // 目录不存在或为空
-            }
-            for e in it {
-                let p = e.path();
-                let name = e.file_name().to_string_lossy().into_owned();
-                if p.is_dir() {
-                    if name == "sessions" && scan(&p, bootstrap, min) == Some(true) {
-                        return Some(true);
-                    }
-                    continue;
-                }
-                if bootstrap.contains(&name.as_str()) {
-                    continue;
-                }
-                if e.metadata().map(|m| m.len() > min).unwrap_or(false) {
-                    return Some(true);
-                }
-            }
-            Some(false)
-        }
-        let Some(dir) = crate::data_dir_beside_exe(exe) else {
-            return false;
-        };
-        scan(&dir, BOOTSTRAP, MIN_REAL_BYTES).unwrap_or(false)
+        crate::data_dir_beside_exe(exe)
+            .map(|d| crate::bootstrap::data_dir_has_real_content(&d))
+            .unwrap_or(false)
     }
 
     /// Windows 路径不区分大小写，比较时统一一下。
@@ -3146,7 +3393,18 @@ async fn chat(
     //   2. **失败无害**：只打日志，蒸馏挂了不影响对话；
     //   3. **省调用**：中断轮、太短的轮（合计 < 60 字，寒暄）不蒸馏。
     // Err 分支（本轮失败）不蒸馏 —— 半截产物提不出可靠记忆。
-    if !run.interrupted {
+    //
+    // ⚠️ **蒸馏会话必须豁免**（2026-10-15 加，实证）：
+    // 蒸馏会话的输入是**开场白**（「把每条分流到 USER.md / SOUL.md / …」），
+    // 输出是**收尾小结**（「① … ② … 已写入 USER.md ## 学习」）。
+    // 拿这两段去提取「值得跨会话长期记住的事实」，提出来的必然是：
+    //   ① 蒸馏指令本身（「条目分流至 USER/SOUL/IDENTITY」）—— 纯污染，
+    //      system prompt 已经每轮写着，写进长期记忆只会多一份会过期的副本；
+    //   ② 刚被 distill_move 迁走的条目的**改写版** —— 迁移动作被当成新记忆
+    //      又提交回候选队列，用户刚点完「✓ 记住」又看到它。
+    // 实证：2026-10-15 17:55 那次蒸馏跑完后，候选队列里凭空多出 3 条，
+    // 全是这次蒸馏的开场白与小结里的话。
+    if !run.interrupted && !sessions::is_distill(&state.data_dir, &session_id) {
         let merged_chars = input.chars().count() + run.answer.chars().count();
         if merged_chars >= memory::AUTO_DISTILL_MIN_CHARS {
             let dd = state.data_dir.clone();
@@ -3393,23 +3651,15 @@ fn session_state(state: State<'_, AppState>) -> serde_json::Value {
 /// 目录在 = 用户有数据（哪怕某人删空了配置文件，那也是他的选择，不该被当成新装）。
 #[tauri::command]
 fn boot_state(state: State<'_, AppState>) -> serde_json::Value {
-    // ⚠️ 不能只看 `data_dir` 目录在不在 —— 那是 `needsInit` 最初的写法，
-    //    2026-10-12 被用户抓出：**发布版永远等不到「初始化」按钮**。
+    // ⚠️ 判据**不在这里写**，全在 `bootstrap::needs_init`：
+    //   - 最老的一版是 `!state.data_dir.exists()`，发布版**永远等不到按钮**
+    //     （data_dir 第一次启动就被 diag.log / permissions.json 建出来了，
+    //      骨架却一个没铺 → `!exists()` 恒为 false）。
+    //   - 第二版只看 `.skeleton-state.json`，又太严：**老用户被判成新装**，
+    //     明明有 60 个会话却弹出「agent-data 还不存在」（2026-10-14 实测）。
     //
-    //    原因：`data_dir` 是 `%APPDATA%\com.orbcat.desktop`，程序一启动就会
-    //    往里面写 `diag.log` / `permissions.json` / `settings.json` /
-    //    `pmem.sqlite` —— **目录在第一次启动时就被创建了**，而骨架目录
-    //    （memory / pending / projects / skills）和 manifest.json 一个都没铺。
-    //    于是 `!exists()` 恒为 false，「建出目录结构」按钮永远不出现。
-    //
-    //    改成查骨架完成标志：`.skeleton-state.json` 是 bootstrap 铺完时写的状态文件，
-    //    它在 = 初始化完成；不在 = 需要初始化。这个判据与「目录里碰巧有
-    //    别的文件」完全无关。
-    //
-    //    ⚠️ 刻意**不**引用 `bootstrap::SKELETON_DIRS`：那个常量由 build.rs
-    //    在 OUT_DIR 生成（include!），在 lib.rs 里引不到；而且骨架清单会随
-    //    版本增删，硬编码一份必然漂移。manifest.json 是唯一完成标志，最稳。
-    let needs_init = !state.data_dir.join(".skeleton-state.json").is_file();
+    // 两版的坑都记在 `bootstrap::needs_init` 的文档里，别再改回去。
+    let needs_init = bootstrap::needs_init(&state.data_dir);
     // 没模型不等于没初始化 —— 先去设置里把模型加上，这里照样放行
     let has_models = config::load_models(&state.data_dir)
         .map(|m| !m.is_empty())
@@ -3418,6 +3668,11 @@ fn boot_state(state: State<'_, AppState>) -> serde_json::Value {
         "needsInit": needs_init,
         "hasModels": has_models,
         "dataDir": state.data_dir.display().to_string(),
+        // ⚠️ 前端那句「agent-data 还不存在」**曾经是假的**：目录由
+        //    `resolve_data_dir` 在启动时就建出来了。文案跟着判据走，
+        //    所以把「到底存不存在」如实报给前端，由它决定说「还不存在」
+        //    还是「还是空的」。
+        "dataDirExists": state.data_dir.is_dir(),
     })
 }
 
@@ -3887,13 +4142,17 @@ fn capture_screen() -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-fn set_window_mode(window: tauri::WebviewWindow, mode: String) -> Result<(), String> {
+fn set_window_mode(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    mode: String,
+) -> Result<(), String> {
     if mode != "orb" && mode != "panel" && mode != "menu" {
         return Err(format!("未知模式「{mode}」，应为 orb / panel / menu"));
     }
 
     #[cfg(windows)]
-    apply_mode(&window, &mode)?;
+    apply_mode(&window, &mode, &state.data_dir)?;
 
     #[cfg(not(windows))]
     {
@@ -4180,7 +4439,7 @@ fn wake_and_open_panel(app: &tauri::AppHandle) {
 
     #[cfg(windows)]
     {
-        if let Err(e) = apply_mode(&win, "panel") {
+        if let Err(e) = apply_mode(&win, "panel", &resolve_data_dir(app)) {
             eprintln!("[orbcat] ⚠️ 第二实例展开面板失败: {e}");
         }
     }
@@ -4216,7 +4475,8 @@ fn wake_and_open_panel(app: &tauri::AppHandle) {
                 };
                 #[cfg(windows)]
                 {
-                    if let Err(e) = apply_mode(&w, "orb") {
+                    let dd = resolve_data_dir(&h2);
+                    if let Err(e) = apply_mode(&w, "orb", &dd) {
                         eprintln!("[orbcat] ⚠️ 前端未就绪，退回球态失败: {e}");
                     }
                 }
@@ -4548,7 +4808,11 @@ pub fn run() {
             // --- 窗口初始形态 ---
             #[cfg(windows)]
             if let Some(win) = app.get_webview_window("orb") {
-                if let Err(e) = apply_mode(&win, "orb") {
+                // ⚠️ 这次调用是**首启摆位**的判定点：锚点若存在（用户拖过球，
+                //    位置存在 settings.json）就用它，没有才回默认摆位。
+                //    `data_dir` 上面已经 move 进 AppState 了，这里从 AppState 借。
+                let dir = app.state::<AppState>().data_dir.clone();
+                if let Err(e) = apply_mode(&win, "orb", &dir) {
                     eprintln!("[orbcat] 初始化窗口形态失败: {e}");
                 }
             }
@@ -4774,7 +5038,24 @@ pub fn run() {
                     }
                 }
             }
+
+            // 球被拖动 -> 记住位置 + 防抖落盘。
+            //
+            // 为什么要这条：pply_mode 只在**切形态**时才知道位置，于是
+            // 「拖完球直接杀进程/关机」这条路上防抖窗口里的值会丢，
+            // 下次启动球回到更早一次的位置。挂上 Moved 才真正做到
+            // 「拖到哪，下次启动就在哪」。
+            if window.label() == "orb" {
+                if matches!(event, tauri::WindowEvent::Moved(_)) {
+                    remember_orb_moved(window);
+                }
+            }
         })
         .run(context)
         .expect("error while running tauri application");
 }
+
+// 视图结构的字段名契约（纯 serde 测试，见模块文档）。
+#[cfg(test)]
+#[path = "view_contract.rs"]
+mod view_contract;

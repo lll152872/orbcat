@@ -109,3 +109,67 @@ describe("有目录但没模型时引导去加模型（不是再去初始化）"
     expect(btn.textContent).not.toContain("建出目录结构");
   });
 });
+
+/**
+ * 文案不许说假话（2026-10-14 用户实测）
+ *
+ * `agent-data/` 由 `resolve_data_dir` 在**启动时就已经建出来了**，
+ * 而判据是骨架标记 `.skeleton-state.json` 在不在。两者不是一回事，
+ * 于是这屏长期喊着一句假话「数据目录 agent-data/ 还不存在」——
+ * 而用户那份数据（60 个会话、2.5MB 审计日志）明明就在那儿躺着。
+ *
+ * 这里锁住「文案跟着判据走」：目录存在就该说"是空的"，不是"不存在"。
+ */
+describe("初始化文案跟着判据走，不喊「agent-data 不存在」", () => {
+  it("dataDirExists=true → 说「里还是空的」", async () => {
+    setMock("boot_state", {
+      needsInit: true,
+      hasModels: false,
+      dataDir: "C:\\Users\\someone\\AppData\\Roaming\\com.orbcat.desktop",
+      dataDirExists: true,
+    });
+    await bootApp();
+    await openPanel();
+    await waitFor(() => !!document.getElementById("init-go"), 3000, "init button");
+
+    const body = document.querySelector(".init-body")?.textContent ?? "";
+    expect(body).toContain("里还是空的");
+    expect(body).not.toContain("还不存在");
+  });
+
+  it("dataDirExists=false → 才允许说「还不存在」", async () => {
+    setMock("boot_state", {
+      needsInit: true,
+      hasModels: false,
+      dataDir: "D:\\nowhere\\agent-data",
+      dataDirExists: false,
+    });
+    await bootApp();
+    await openPanel();
+    await waitFor(() => !!document.getElementById("init-go"), 3000, "init button");
+
+    expect(document.querySelector(".init-body")?.textContent ?? "").toContain("还不存在");
+  });
+
+  it("老后端没有 dataDirExists 字段时也别崩、也不说「不存在」", async () => {
+    mockNotInitialized();
+    await bootApp();
+    await openPanel();
+    await waitFor(() => !!document.getElementById("init-go"), 3000, "init button");
+
+    const body = document.querySelector(".init-body")?.textContent ?? "";
+    expect(body).not.toContain("还不存在");
+  });
+
+  it("按钮旁必须保证「不覆盖已有文件」", async () => {
+    mockNotInitialized();
+    await bootApp();
+    await openPanel();
+    await waitFor(() => !!document.getElementById("init-go"), 3000, "init button");
+
+    // 用户被吓到不敢点，多半是因为不知道会不会毁掉自己的数据
+    expect(document.querySelector(".init-hint")?.textContent ?? "").toContain(
+      "不会被覆盖",
+    );
+  });
+});

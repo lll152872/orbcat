@@ -314,10 +314,15 @@ body {
 }
 
 /* 等权限 → 琥珀锁；记忆候选 → 紫脑标；错误 → 红叹号。
-   三者由状态机互斥（error > pending > mem），同一时刻最多亮一颗。
-   锁/叹号/脑三种图形 + 三种色相，构成"角标"这个第二通道（色盲兜底） */
+   三者互斥（error > pending > mem），同一时刻最多亮一颗。
+   锁/叹号/脑三种图形 + 三种色相，构成"角标"这个第二通道（色盲兜底）。
+
+   ⚠️ 记忆角标刻意**不绑** `.orb--mem`，改绑 `.orb--has-mem`：
+   2026-10-14 用户拍板"运行时 > 记忆 > 常态"之后，thinking 帧会盖过 mem 帧；
+   角标若跟着帧走，agent 一忙紫脑标就消失 —— 而"有记忆等你审"恰恰最该在
+   它忙着的时候被看见。角标是提醒通道，帧是状态通道，两者不该绑死。 */
 .orb--pending .orb-badge-perm,
-.orb--mem .orb-badge-mem,
+.orb--has-mem .orb-badge-mem,
 .orb--error .orb-badge-error {
   opacity: 1;
   animation: orb-badge-pulse 1.6s ease-in-out infinite;
@@ -1452,6 +1457,53 @@ body {
   flex-shrink: 0;
 }
 
+/* ---------------- 「↓ 回到底部」 ----------------
+
+   只有翻上去时才出现（`syncJumpButton` 控制 hidden），贴在右下角。
+
+   ⚠️ 半透明起步、hover 才实心：面板只有 984×501，这个钮必然压住最后一条
+   消息的一角，全天守着会碍眼。
+
+   ⚠️ `pointer-events: auto` 必须显式写 —— 父级 `.panel-body` 在滚动时可能
+   带 `pointer-events: none` 之类的状态，钮就点不到了。 */
+.jump-btn {
+  position: absolute;
+  right: 14px;
+  /* 贴输入区上沿：输入区实测高 ~56px，再留 10px 呼吸 */
+  bottom: 66px;
+  min-width: 34px;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: 17px;
+  border: 1px solid rgba(168, 230, 207, 0.28);
+  background: rgba(18, 23, 26, 0.72);
+  backdrop-filter: blur(6px);
+  color: #d4e4dc;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  pointer-events: auto;
+  opacity: 0.72;
+  transition: opacity 0.15s ease, background 0.15s ease, transform 0.15s ease;
+  z-index: 20;
+}
+
+.jump-btn:hover {
+  opacity: 1;
+  background: rgba(168, 230, 207, 0.22);
+  transform: translateY(-1px);
+}
+
+.jump-btn:active {
+  transform: translateY(0);
+}
+
+/* hidden 是 JS 控的显隐；`display:none` 必须显式给 ——
+   .jump-btn 设了 position:absolute，不写这条 `hidden` 在部分引擎下不生效 */
+.jump-btn[hidden] {
+  display: none !important;
+}
+
 /* ---------------- 会话页（主聊天 + 任务会话） ---------------- */
 
 /* 主聊天卡片：置顶、无删除按钮、视觉上比任务行更重 */
@@ -1741,6 +1793,7 @@ body {
   font-size: 10.5px;
   color: #8E8E94;
 }
+
 
 .mem-actions {
   margin-top: 7px;

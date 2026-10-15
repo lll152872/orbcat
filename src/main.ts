@@ -412,6 +412,16 @@ function sessionToEntries(s: Session): ChatEntry[] {
   return out;
 }
 
+/**
+ * `agent-data/` 到底存不存在（Rust `boot_state` 告知）。
+ *
+ * ⚠️ 别再拿它反推别的结论。这屏的判据是**骨架标记**（`.skeleton-state.json`），
+ * 而目录本身在启动时就被 `resolve_data_dir` 建出来了 —— 所以
+ * 「目录不存在」这句话在这屏里**曾经是假的**（2026-10-14 用户实测）。
+ * 这个字段只用来让文案说实话用。
+ */
+let dataDirExists = true;
+
 /** 启动自检：agent-data 不存在 / 没有模型 → 标记需要引导 */
 async function checkBoot(): Promise<void> {
   try {
@@ -419,11 +429,14 @@ async function checkBoot(): Promise<void> {
       needsInit: boolean;
       hasModels: boolean;
       dataDir: string;
+      dataDirExists?: boolean;
     }>("boot_state");
     needsInit = st.needsInit;
     hasModels = st.hasModels;
+    // 老版本后端没这个字段 → 保守当成"存在"，宁可不说"不存在"也不说假话
+    dataDirExists = st.dataDirExists ?? true;
     if (needsInit) {
-      console.warn("[orbcat] 数据目录不存在，需要初始化:", st.dataDir);
+      console.warn("[orbcat] 数据目录还没有骨架，需要初始化:", st.dataDir);
     } else if (!hasModels) {
       console.warn("[orbcat] 还没有配置任何模型");
     }
@@ -497,7 +510,20 @@ async function switchSession(id: string): Promise<void> {
   // ⚠️ 不再用 `busy` 拦住切换（切走、后台继续跑）。
   //    落盘路径自带开跑时的 session_id，回答不会写错会话；前端进度监听也按
   //    `runningSessionId !== currentSessionId` 丢掉旧会话的事件（不会污染当前视图）。
-  if (id === currentSessionId) return; // 点自己：别白重载一次（会冲掉正在流式的气泡）
+  if (id === currentSessionId) {
+    // 点自己：**不重载消息**（会冲掉正在流式的气泡），
+    // 但**必须把视图切回对话** ——
+    // 2026-10-14 用户报：会话历史页里点当前那条会话**完全没反应**，
+    // 像是进不去。早退原本只该拦"重载"，却把 `view = "chat"` 一起拦掉了，
+    // 于是停在会话历史页出不来。会话管理入口加进设置后这条路径更容易撞上。
+    if (view !== "chat") {
+      view = "chat";
+      renderBody();
+      syncBusyUi();
+      syncJumpButton();
+    }
+    return;
+  }
   try {
     const s = await invoke<Session>("session_switch", { id });
     currentSessionId = s.id;
@@ -523,9 +549,13 @@ async function switchSession(id: string): Promise<void> {
         : (projects.find((p) => p.name === meta?.projectName)?.id ?? null);
     activeProjectId = wantPid;
     await invoke("pmem_set_active", { id: wantPid }).catch(() => {});
+    // 计数是**按当前视图**的 —— 换会话就清零，别把上一条的"漏看 N 条"
+    // 挂到这一条上（用户看到按钮上的 3 会以为这条有 3 条没看）
+    chatMissed = 0;
     view = "chat";
     renderBody();
     syncBusyUi(); // 切换了会话 → busy / 停止按钮 / 提示条都要跟着这个会话走
+    syncJumpButton();
   } catch (e) {
     pushEntry("error", `切换会话失败：${e}`);
   }
@@ -933,8 +963,7 @@ async function resendPrompt(text: string, imgs: string[]): Promise<void> {
   const runSid = runningSessionId;
   const b0 = document.getElementById("panel-body");
   if (b0) {
-    paintMessages(b0);
-    b0.scrollTop = b0.scrollHeight;
+    repaintChatToBottom();
   }
 
   markRunStart(runSid);
@@ -1780,6 +1809,8 @@ function markRunStart(runSid: string): void {
 function markRunEnd(runSid: string): void {
   runningSessions.delete(runSid);
   if (runningSessionId === runSid) runningSessionId = "";
+  // 下一轮重新计一次「↓」（一轮只加一次，见 paintRunningNow）
+  chatMissedCountedForRun = false;
   setThinking(runningSessions.size > 0); // 还有别的会话在跑 → 球继续转
   syncBusyUi();
 }
@@ -1794,9 +1825,13 @@ function markRunEnd(runSid: string): void {
 let draftInput = "";
 
 /**
- * 胶囊态五态机。优先级 **error > pending > mem > thinking > idle** ——
- * 出事了最要紧，其次是"被挡住等你批"的权限申请，再次是"可选、不催"的记忆候选，
- * 再其次正在干活。
+ * 胶囊态五态机。优先级 **error > pending > thinking > mem > idle** ——
+ * 出事了最要紧，其次是"被挡住等你批"的权限申请，再次是"正在干活"，
+ * 然后才是"可选、不催"的记忆候选。
+ *
+ * ⚠️ 2026-10-14 用户拍板调整过一次：`thinking` 从 `mem` **下面**提到了上面。
+ *    原顺序下，只要待审记忆 ≥ 1 条，球就永远是绿壳 peek，agent 干活时的
+ *    蓝猫摇尾巴一次都露不出来 —— 用户看着像卡住了。运行时是当下最该被看见的事。
  *
  * ⚠️ pending（权限）与 mem（记忆）**必须分开**：两者语义不同。
  *    权限申请 = 被挡住了、动不了，急；记忆候选 = 有东西待你顺手审，不急。
@@ -1848,8 +1883,13 @@ let orbSleeping = false;
 function currentOrbState(): OrbState {
   if (unseenError) return "error";
   if (pendingPermCount > 0) return "pending"; // 权限=被挡住，最急
-  if (pendingMem > 0) return "mem"; // 记忆=可选，不催
+  // ⚠️ `thinking` 必须排在 `mem` **前面**（2026-10-14 用户拍板：运行时 > 记忆 > 常态）。
+  //
+  //    原先 `mem` 在前，于是只要待审记忆 ≥ 1 条，球就**永远**是绿壳 peek，
+  //    agent 干活时的蓝猫摇尾巴一次都露不出来 —— 从用户角度看就是「怎么一直
+  //    不动」。记忆是可选的（不催），运行时才是当下最该被看见的那件事。
   if (thinking) return "thinking";
+  if (pendingMem > 0) return "mem";
   return "idle";
 }
 
@@ -2287,9 +2327,14 @@ function renderOrb(): void {
   // 帧序 = 层级：idle/pending/error 三张睡猫在最底，awake 在中间（待命→工作是
   // "醒猫淡入盖上来"），mem(peek) 放最上（绿球盖住底下的睡猫/醒猫）。
   // 角标放最后，保证盖在球上面。
+  //
+  // ⚠️ `orb--has-mem` 不是状态，是**独立于帧态**的提醒标记：
+  //    思考时帧是蓝猫（thinking 压过 mem），但紫脑标照亮 —— 见 `applyOrbState`。
   const s = currentOrbState();
   app.innerHTML = `
-    <div class="orb orb--${s}${orbSleeping ? " orb--sleeping" : ""}" id="orb" title="${orbSleeping ? ORB_SLEEP_TITLE : ORB_TITLE[s]}">
+    <div class="orb orb--${s}${orbSleeping ? " orb--sleeping" : ""}${
+      pendingMem > 0 ? " orb--has-mem" : ""
+    }" id="orb" title="${orbSleeping ? ORB_SLEEP_TITLE : ORB_TITLE[s]}">
       <img class="orb-frame orb-frame-idle"    src="orb/orb-state-green.png"  alt="" draggable="false" />
       <img class="orb-frame orb-frame-pending" src="orb/orb-state-yellow.png" alt="" draggable="false" />
       <img class="orb-frame orb-frame-error"   src="orb/orb-state-red.png"    alt="" draggable="false" />
@@ -2325,6 +2370,10 @@ function applyOrbState(): void {
   const s = currentOrbState();
   el.classList.remove("orb--idle", "orb--thinking", "orb--pending", "orb--mem", "orb--error");
   el.classList.add(`orb--${s}`);
+  // 紫脑标跟**帧态解耦**：thinking 压过 mem 之后，若角标还绑在 `.orb--mem` 上，
+  // agent 一忙起来提醒就跟着消失 —— 正好在最该提醒"有记忆等你审"的时候没了。
+  // 这里直接由 pendingMem 驱动，与球在演哪一帧无关。
+  el.classList.toggle("orb--has-mem", pendingMem > 0);
   el.classList.toggle("orb--sleeping", orbSleeping);
   el.title = orbSleeping ? ORB_SLEEP_TITLE : ORB_TITLE[s];
 }
@@ -3457,7 +3506,19 @@ function paintRunningNow(): void {
     return;
   }
   // 用户没往上翻时才自动跟到底部
-  if (atBottom) b.scrollTop = b.scrollHeight;
+  if (atBottom) {
+    b.scrollTop = b.scrollHeight;
+  } else {
+    // 用户翻上去之后这一轮还在跑 → 「↓」该冒出来了。
+    //
+    // ⚠️ **一轮只加一次**：流式每个 token 都会走到这里，逐帧加会让数字
+    //    一路狂跳，看着像来了一堆新消息。`chatMissedCountedForRun` 认当前 run。
+    if (!chatMissedCountedForRun) {
+      chatMissedCountedForRun = true;
+      chatMissed += 1;
+    }
+    syncJumpButton();
+  }
 }
 
 /** 绑定申请卡上的按钮（渲染后调用；每次重绘都会重新绑一批新的） */
@@ -3585,15 +3646,18 @@ function renderMessagesInner(): string {
     // 未初始化时，空态要给出**可操作的下一步**，而不是通用引导语。
     // 用户不知道"agent-data 不存在"是什么意思，得直接把话说明白。
     if (needsInit) {
+      // ⚠️ 文案跟着判据走：判据是**骨架标记缺失**，不是"目录不存在"。
+      //    目录早被 `resolve_data_dir` 建出来了，说它"还不存在"是假的 ——
+      //    用户看到这句会以为数据没了（2026-10-14 实测）。
       return `<div class="empty init-prompt">
         <div class="init-title">尚未初始化</div>
         <div class="init-body">
-          数据目录 <code>agent-data/</code> 还不存在 ——<br>
+          数据目录 <code>agent-data/</code> ${dataDirExists ? "里还是空的" : "还不存在"} ——<br>
           没有人格文件、行为红线、用户画像、长期记忆。
         </div>
         <button class="init-go" id="init-go">建出目录结构</button>
         <div class="init-hint">
-          点一下就行，这一步<b>不需要模型</b>。<br>
+          点一下就行，这一步<b>不需要模型</b>；<b>已有的文件一个都不会被覆盖</b>。<br>
           建完再去 <b>设置</b> 里添加一个模型，就能开始对话了。
         </div>
       </div>`;
@@ -4030,16 +4094,19 @@ function refreshPermCards(): void {
   const b = document.getElementById("panel-body");
   if (!b) return;
   const host = b.querySelector<HTMLElement>(".perm-cards");
+  // ⚠️ `atBottom` 必须在**重绘之前**问：真浏览器里 `innerHTML=` 会把 scrollTop
+  //    清 0，重绘之后再问恒为 false，「在底部就跟随」这个闸门就成了摆设
+  //    （2026-10-14 复查时发现的）。
+  const wasAtBottom = isChatAtBottom();
   if (host) {
     host.innerHTML = renderPermCards();
     bindPermButtons(host);
   } else {
     // 老布局：卡片区可能嵌在消息流里 —— 兜底整绘
-    paintMessages(b);
+    repaintChatKeepScroll();
   }
   // 权限卡出现/消失时若用户在底部，跟一下；否则别抢滚动
-  const atBottom = b.scrollHeight - b.scrollTop - b.clientHeight < 60;
-  if (atBottom) b.scrollTop = b.scrollHeight;
+  if (wasAtBottom) b.scrollTop = b.scrollHeight;
 }
 
 /** 提交用户的决定。失败不吞 —— 明确报出来，否则用户以为点了没反应 */
@@ -4429,11 +4496,26 @@ function renderPanel(): void {
       <!-- 轻提示层：非对话页（设置/记忆/会话）里的临时信息走这里，
            绝不塞进对话流。见 pushEntry 里的说明。 -->
       <div class="toast-wrap" id="toast-wrap"></div>
+
+      <!-- 「↓ 回到底部」：只有翻上去时才出现（由 syncJumpButton 控制 hidden）。
+           ⚠️ 放在输入区外面：panel-input 是 flex 容器，塞进去会被拉伸布局挤变形。
+           绝对定位贴右下角，压在消息区底部一点 —— 半透明，不遮内容，hover 才实心。 -->
+      <button class="jump-btn" id="jump-btn" hidden title="回到最新消息">↓</button>
     </div>
   `;
 
   attachDrag(document.getElementById("panel-header")!, () => {
     /* 标题栏只拖动 */
+  });
+  // 滚动记账要在 innerHTML 落地**之后**才挂得上（此时才拿得到 #panel-body）。
+  // `renderBody` 会把它整个换掉，所以这里每次都调；函数内部有重复挂防护。
+  installScrollMemo();
+
+  // 「↓ 回到底部」：点了就贴底并清零计数
+  document.getElementById("jump-btn")?.addEventListener("click", () => {
+    scrollToBottom();
+    chatMissed = 0;
+    syncJumpButton();
   });
 
   document.getElementById("btn-close")!.addEventListener("click", () => void collapse());
@@ -4764,6 +4846,127 @@ function scheduleFgCtx(): void {
   }, 3000);
 }
 
+/**
+ * 每个会话记住的对话滚动位置。
+ *
+ * ## 用户原话（2026-10-14）
+ *
+ * 「我看最上面那一条下一次也要是那一条，不要每次开球都看最下面」。
+ *
+ * 收起面板再展开、切去设置再回来、切会话再切回来 —— `renderBody` 的
+ * chat 分支每次都无条件 `scrollToBottom()`，于是**每次开球都落在最后一条**。
+ * 长会话里这意味着每次都要重新往上滚半天才能接上上次读的进度。
+ *
+ * ## 为什么用 scroll 事件而不是"离开时存一次"
+ *
+ * 离开面板的路径太多（收起 / 切 view / 切会话 / 失焦收起 / 托盘…），
+ * 逐个挂钩迟早漏一条，漏了就是"这条路径不记忆"。
+ * 监听滚动则**永远**是当前值，且顺带把会话切换前的位置也存对了。
+ *
+ * ## 键是会话 id
+ *
+ * 每条会话各自记。切会话时读的是**目标**会话记的位置，不是上一条的。
+ *
+ * 不落盘：只是"这次开着 app 期间回到原位"，跨重启无意义
+ * （消息列表长度都可能变了）。
+ */
+const chatScrollMemo = new Map<string, number>();
+
+/**
+ * 用户翻上去之后「新到的消息」条数 —— 显示在「↓ 回到底部」按钮上。
+ *
+ * ## 计数口径
+ *
+ * 只有**用户已经在往上翻**时新到的非用户消息才计数。
+ * 贴着底部时来的消息不计数（本来就看得见，数了是噪音）。
+ * 一路滚到底 / 点 ↓ / 发出消息 → 清零。
+ *
+ * 不数流式过程中的每个 token：那是同一条消息在长高，
+ * 一边长一边跳数字会让人以为来了一堆新消息。
+ */
+let chatMissed = 0;
+
+/**
+ * 「这一轮已经给「↓」记过数了没」—— 防止流式每个 token 都 +1。
+ * 标记跟着**当前 run**，一轮结束（`markRunEnd`）或发新消息时清掉。
+ */
+let chatMissedCountedForRun = false;
+
+/**
+ * 「↓ 回到底部」按钮的显隐与计数。
+ *
+ * 贴在底部时**隐藏**（没有要回去的地方），否则常驻一个按钮
+ * 只会让人以为是别的功能。滚动到底 / 点它 / 发消息时清零。
+ */
+function syncJumpButton(): void {
+  const btn = document.getElementById("jump-btn");
+  if (!btn) return;
+  if (view !== "chat") {
+    btn.hidden = true;
+    return;
+  }
+  const atBottom = isChatAtBottom();
+  btn.hidden = atBottom;
+  if (atBottom) chatMissed = 0;
+  btn.textContent = chatMissed > 0 ? `↓ ${chatMissed > 99 ? "99+" : chatMissed}` : "↓";
+}
+
+/** 恢复滚动位置：记过就回原处，没记过（或原处已越界）才贴底。 */
+function restoreChatScroll(): void {
+  const b = document.getElementById("panel-body");
+  if (!b) return;
+  const memo = chatScrollMemo.get(currentSessionId);
+  if (memo === undefined) {
+    scrollToBottom();
+    return;
+  }
+  // ⚠️ 上限夹取：会话可能被截断/分叉变短，原来那个 scrollTop 会超出，
+  //    直接赋值会停在空白处（看着像"消息丢了"）。
+  const max = Math.max(0, b.scrollHeight - b.clientHeight);
+  b.scrollTop = Math.min(memo, max);
+}
+
+/**
+ * 重绘对话区并**保持**当前滚动位置（用户正在往上翻历史时用）。
+ *
+ * ## 为什么必须显式写回
+ *
+ * 真浏览器里 `innerHTML = ...` 会把 `scrollTop` 清成 0，并**随后**抛一次
+ * `scroll` 事件。两个后果：
+ * 1. 用户的视线被拽回顶部；
+ * 2. `chatScrollMemo` 被这条事件写成 0 —— 下次开面板直接回到顶部，
+ *    滚动记忆等于白做。
+ *
+ * 同步写回就够：scroll 事件是**异步**抛的，等它触发时读到的已经是写回后的值。
+ */
+function repaintChatKeepScroll(): void {
+  const b = document.getElementById("panel-body");
+  if (!b) return;
+  const keep = b.scrollTop;
+  paintMessages(b);
+  b.scrollTop = keep;
+}
+
+/** 重绘对话区并**贴底**（发消息、跑完一轮、来了新候选）。 */
+function repaintChatToBottom(): void {
+  const b = document.getElementById("panel-body");
+  if (!b) return;
+  paintMessages(b);
+  b.scrollTop = b.scrollHeight;
+}
+
+/**
+ * 此刻是不是贴在底部。
+ *
+ * ⚠️ **必须在重绘之前问**：真浏览器里 `innerHTML=` 刚把 `scrollTop` 清 0，
+ *    这时再问永远是 false（`main.ts` 权限卡那处就是这么错的 —— 闸门形同虚设）。
+ */
+function isChatAtBottom(): boolean {
+  const b = document.getElementById("panel-body");
+  if (!b) return true;
+  return b.scrollHeight - b.scrollTop - b.clientHeight < 60;
+}
+
 function scrollToBottom(): void {
   const b = document.getElementById("panel-body");
   if (b) b.scrollTop = b.scrollHeight;
@@ -4811,16 +5014,24 @@ function renderBody(): void {
   }
 
   if (view === "sessions") {
+    // ⚠️ 必须保 scrollTop（2026-10-14 用户报）：删掉一条会话后列表要重渲染，
+    //    `innerHTML = ...` 会把 scrollTop 归零 → 视线被拽回列表顶部。
+    //    长列表里删一条中间的就更烦 —— 删完还得重新滚回原来的位置。
+    //    （mem 页 / 设置页早就这么做了，只有会话页漏了。）
+    const keep = b.scrollTop;
+    const paint = () => {
+      b.innerHTML = renderSessionsView();
+      bindSessionsView(b);
+      // ⚠️ 两轮重渲染都要还回去。删掉末条之后内容变矮，浏览器会自动夹到
+      //    可滚动范围内，不需要（也不该）自己再夹一次。
+      b.scrollTop = keep;
+    };
     b.innerHTML = `<div class="mem-head">会话历史</div>`;
     void refreshSessionList().then(() => {
       if (view !== "sessions") return;
-      b.innerHTML = renderSessionsView();
-      bindSessionsView(b);
+      paint();
       void refreshSessionProjectTags().then(() => {
-        if (view === "sessions") {
-          b.innerHTML = renderSessionsView();
-          bindSessionsView(b);
-        }
+        if (view === "sessions") paint();
       });
     });
     return;
@@ -5041,7 +5252,9 @@ function renderBody(): void {
 
   paintMessages(b);
   renderPreview(); // 回到对话时恢复缩略图区
-  scrollToBottom();
+  // ⚠️ 不再无条件贴底：记过位置就回原处（2026-10-14 用户报「每次开球都看最下面」）
+  restoreChatScroll();
+  syncJumpButton(); // 回到原处就意味着"不在底部" → ↓ 按钮要冒出来
   bindInitPrompt(b);
 }
 
@@ -5056,6 +5269,28 @@ function renderBody(): void {
  * 形态二（目录已建、没模型）：直接打开设置面板让用户加模型。
  *   加模型只有这一条路（id / url / apiKey 三样，得用户自己填）。
  */
+/**
+ * 把当前滚动位置记进 [`chatScrollMemo`]。**每次滚动都调**，见那里的说明。
+ *
+ * 只在 `view === "chat"` 时记 —— 设置/记忆页的滚动不该污染对话的位置。
+ */
+function memoizeChatScroll(): void {
+  if (view !== "chat") return;
+  const b = document.getElementById("panel-body");
+  if (!b || !currentSessionId) return;
+  chatScrollMemo.set(currentSessionId, b.scrollTop);
+}
+
+/** 在面板容器上挂滚动记账。`renderPanel` 每次重建 DOM，所以要防重复挂。 */
+function installScrollMemo(): void {
+  const b = document.getElementById("panel-body");
+  if (!b || b.dataset.scrollMemo === "1") return;
+  b.dataset.scrollMemo = "1";
+  b.addEventListener("scroll", memoizeChatScroll, { passive: true });
+  // 显隐也要跟着滚动走：滚下去藏起来、滚上来冒出来
+  b.addEventListener("scroll", syncJumpButton, { passive: true });
+}
+
 function bindInitPrompt(root: HTMLElement): void {
   const btn = root.querySelector<HTMLButtonElement>("#init-go");
   if (!btn) return;
@@ -5340,9 +5575,9 @@ async function distillStart(): Promise<void> {
 
     const kickoff =
       "开始蒸馏：先读 agent-data/memory/MEMORY.md（中转站），把每条分流到 " +
-      "USER.md（只写「人」）/ SOUL.md（语气人格）/ IDENTITY.md（称呼）。" +
-      "逐条引用原文把建议摆出来给我看；拿不准的条目直接问我，我答复后你再用 distill_move 落盘。" +
-      "项目记忆（agent-data/projects/）这轮不碰。";
+      "USER.md（只写「人」）/ SOUL.md（语气人格）/ IDENTITY.md（称呼）/ " +
+      "projects/<名>/MEMORY.md（只在本项目内成立的事实，用 distill_move 的 project 参数指定项目名，留空 = 顶栏激活的项目）。" +
+      "逐条引用原文把建议摆出来给我看；拿不准的条目直接问我，我答复后你再用 distill_move 落盘。";
     const input = document.getElementById("input") as HTMLTextAreaElement | null;
     if (input) {
       input.value = kickoff;
@@ -5446,6 +5681,9 @@ const ICONS: Record<string, string> = {
   cmdpolicy: '<rect x="2.5" y="4.5" width="19" height="15" rx="2.2"/><path d="M6.5 9.5l2.4 2.5-2.4 2.5"/><path d="M12.5 14.5h5"/>',
   // 记忆：灯泡
   mem: '<path d="M12 3a6 6 0 0 0-3.4 10.9V17h6.8v-3.1A6 6 0 0 0 12 3z"/><path d="M10 20.2h4"/>',
+  // 会话管理：带尾巴的气泡 + 两行横线（会话列表的通用隐喻）
+  sessions:
+    '<path d="M4 5h16v11H9.5L4 20.5z"/><path d="M8 9.5h8"/><path d="M8 13h5"/>',
   // 行为：滑杆
   behavior:
     '<path d="M3.5 8.5h9"/><path d="M17.5 8.5h3"/><circle cx="15" cy="8.5" r="2.2"/><path d="M3.5 15.5h3"/><path d="M11.5 15.5h9"/><circle cx="9" cy="15.5" r="2.2"/>',
@@ -5467,6 +5705,27 @@ function memSummaryText(pendingCount: number): string {
   const n = skillsCache.length;
   const parts = [`技能 ${n} 个`, "记忆文件", "项目绑定"];
   if (pendingCount > 0) parts.unshift(`待审批 ${pendingCount}`);
+  return parts.join(" · ");
+}
+
+/**
+ * 「会话管理」入口摘要。
+ *
+ * ## 为什么必须有这个入口（2026-10-14 用户报）
+ *
+ * 用户原话：「这个没有会话管理啊」。设置页里模型 / 搜索 / Token / 备份 / MCP /
+ * 安全闸门 / 记忆一应俱全，唯独没有会话 —— 于是想找个会话只能先知道「顶栏那颗
+ * 史按钮」或「切换左上角项目下拉会顺带跳到会话页」这两条隐藏路径。
+ *
+ * 顶栏和项目下拉**都还在**（它们是快捷方式），但「设置里找不到会话」这件事本身
+ * 就让人以为功能不存在。入口页的定位就是"这有什么、都在哪"，漏一行等于说没有。
+ */
+function sessionsSummaryText(): string {
+  const n = sessionList.length;
+  if (n === 0) return "还没有会话";
+  const cur = sessionList.find((s) => s.current);
+  const parts = [`共 ${n} 个会话`, "按项目分组"];
+  if (cur?.title) parts.push(`当前：${cur.title.slice(0, 12)}`);
   return parts.join(" · ");
 }
 
@@ -5524,6 +5783,7 @@ function renderSettingsMenu(
   // 都原地保留，功能恢复时把那两处的 `true` 去掉即可，不用重写任何东西。
   return `
     ${item("models", "models", "模型", `当前 ${curModelName} · 共 ${models.length} 个（独立窗口管理）`)}
+    ${item("sessions", "sessions", "会话管理", sessionsSummaryText())}
     ${item("search", "search", "搜索 web_search", searchSummary)}
     ${item("usage", "usage", "Token 用量", usageSummary)}
     ${item("recovery", "recovery", "备份与回收站", recoverySummary)}
@@ -7269,10 +7529,19 @@ function pushEntry(
   } else {
     entries.push(entry);
   }
-  const b = document.getElementById("panel-body");
-  if (b) {
-    paintMessages(b);
-    scrollToBottom();
+  if (document.getElementById("panel-body")) {
+    // ⚠️ **不抢滚动**（2026-10-14 用户要「给用户选择」）：
+    //    用户正在往上翻历史时，新消息一律不把他拽回底部 ——
+    //    改由右下角的「↓ 回到底部」按钮（带新消息计数）让他自己决定。
+    //    在底部时照旧跟随。
+    if (isChatAtBottom()) {
+      repaintChatToBottom();
+    } else {
+      repaintChatKeepScroll();
+      // 用户自己发的那条不算"漏看的" —— `send()` 随后会显式贴底
+      if (role !== "user") chatMissed += 1;
+    }
+    syncJumpButton();
   }
 
   // 胶囊态收到错误 → 球变红。
@@ -7844,8 +8113,12 @@ async function send(): Promise<void> {
   const runSid = runningSessionId;
   const b0 = document.getElementById("panel-body");
   if (b0) {
-    paintMessages(b0);
-    b0.scrollTop = b0.scrollHeight;
+    // ⚠️ 发消息**无条件**贴底，不看当前滚到哪 —— 用户主动发了新问题，
+    //    意图明确是「从这儿继续」。pushEntry 那边不抢滚动，这里是刻意的例外。
+    repaintChatToBottom();
+    chatMissed = 0;
+    chatMissedCountedForRun = false; // 新的一轮，重新计
+    syncJumpButton();
   }
 
   markRunStart(runSid);
@@ -7956,12 +8229,11 @@ async function send(): Promise<void> {
   );
   if (pendingAfter.length > pendingBefore.length) {
     const n = pendingAfter.length - pendingBefore.length;
-    const bd = document.getElementById("panel-body");
+    // ⚠️ 这里**不**再自己贴底：`pushEntry` 内部已经按"用户在底部才跟随"的规矩
+    //    处理过了（会保住位置 + 给「↓」加计数）。在外面再无条件
+    //    `repaintChatToBottom()` 就等于把「不抢滚动」这个约定又破了 ——
+    //    用户正翻历史，看到的却是"被拽到底 + 数字在跳"。
     pushEntry("system", `有 ${n} 条记忆候选待审批（设置 › 记忆，批了才会进长期记忆）`);
-    if (bd) {
-      paintMessages(bd);
-      bd.scrollTop = bd.scrollHeight;
-    }
   }
 }
 
@@ -8086,7 +8358,7 @@ function refillInput(text: string): void {
  */
 async function reloadSessionKeepScroll(expect = 0): Promise<void> {
   const bd = document.getElementById("panel-body");
-  const atBottom = bd ? bd.scrollHeight - bd.scrollTop - bd.clientHeight < 60 : true;
+  const atBottom = isChatAtBottom();
   try {
     const st = await invoke<SessionState>("session_state");
     const fresh = sessionToEntries(st.session);
@@ -8102,8 +8374,19 @@ async function reloadSessionKeepScroll(expect = 0): Promise<void> {
     // ⚠️ 只有停在对话页才重绘：一轮跑完时用户可能正开着设置页，
     //    这里不设防就会把设置页整块换成聊天记录（输入框还是隐藏的，页面像坏了）
     if (bd && view === "chat") {
-      paintMessages(bd);
-      if (atBottom) bd.scrollTop = bd.scrollHeight;
+      // ⚠️ 不在底部时**必须保位置**，不能只是"不滚"：
+      //    `innerHTML=` 会把 scrollTop 清 0（还会把 `chatScrollMemo` 写成 0），
+      //    于是"往上翻历史"在一轮跑完后会变成"被拽回顶部 + 下次也回顶部"。
+      if (atBottom) {
+        repaintChatToBottom();
+      } else {
+        // 这一轮刚跑完 = 用户翻着的这段历史**后面**多了一条回答。
+        // 这是「新消息到达」最常见的形态，计数要在这儿加 —— pushEntry 那条
+        // 路只覆盖系统提示类消息，覆盖不到助手回答本身。
+        repaintChatKeepScroll();
+        chatMissed += 1;
+        syncJumpButton();
+      }
     }
   } catch (e) {
     console.warn(`[orbcat] 重载会话失败：${e}`);

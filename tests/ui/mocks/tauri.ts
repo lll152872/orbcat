@@ -416,6 +416,23 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
     case "session_fork":
     case "session_truncate":
       return sessionPayload() as T;
+    case "session_delete": {
+      // ⚠️ 必须**真的**从 sessionList 里删掉：之前这里挂的是静态 override
+      // （恒返回 null），于是任何"删完列表要刷新"的用例都测不出来 ——
+      // 行不会消失，看起来像前端没刷新。
+      // 后端语义：主会话（kind === "main"）不可删；删掉当前会话时会切到别的。
+      const id = typeof args?.id === "string" ? args.id : "";
+      const victim = state.sessionList.find((s) => s.id === id);
+      if (victim?.kind === "main") {
+        throw new Error("主会话不可删除");
+      }
+      state.sessionList = state.sessionList.filter((s) => s.id !== id);
+      if (state.currentSessionId === id) {
+        const next = state.sessionList.find((s) => s.kind === "main") ?? state.sessionList[0];
+        if (next) state.currentSessionId = next.id;
+      }
+      return null as T;
+    }
     case "mem_pending":
       return state.memPending as T;
     case "perm_requests_list":
