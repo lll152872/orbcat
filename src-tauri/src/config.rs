@@ -706,6 +706,30 @@ pub struct AgentSettings {
     /// 取第一条。旧 settings.json 没有这个字段 → None（回落裸 id 查找）。
     #[serde(default)]
     pub selected_model_url: Option<String>,
+    /// 悬浮球被拖到的位置（左上角，**物理像素**，不含 pad）。
+    ///
+    /// `None` = 用户没拖过 → 走默认摆位（贴右边 + 40% 屏高）。
+    ///
+    /// ## 为什么必须持久化（2026-10-14 用户报）
+    ///
+    /// 用户原话：「这个锚点能保存，就是下次重启也这样」。
+    /// 只记在内存里的话，**每次重启球都弹回默认摆位** —— 那等于拖了也白拖，
+    /// 只是把「展开面板位置不对」换成了「重启后位置丢失」，用户照样恼火。
+    ///
+    /// ## 换屏/改分辨率后会失效吗
+    ///
+    /// 会。所以读取侧**必须校验**：见 `lib.rs::apply_mode` 里按当前显示器
+    /// 范围做的夹取 —— 落在屏外的存档直接丢弃并回默认摆位。
+    /// 存的是物理像素，跨不同 DPI 显示器时也由那道校验兜住。
+    #[serde(default)]
+    pub orb_pos: Option<OrbPos>,
+}
+
+/// 悬浮球位置（物理像素，左上角、不含 pad）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct OrbPos {
+    pub x: i32,
+    pub y: i32,
 }
 
 /// ⚠️ 「当前 agent 模式」**不在 settings.json 里**。
@@ -750,6 +774,7 @@ impl Default for AgentSettings {
             models_window: Default::default(),
             active_bundle: None,
             selected_model_url: None,
+            orb_pos: None,
         }
     }
 }
@@ -1022,6 +1047,67 @@ mod tests {
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// 球的位置必须**跨重启存活**（2026-10-14 用户报：「这个锚点能保存，
+    /// 就是下次重启也这样」）。只记在内存里的话，每次重启球都弹回默认摆位，
+    /// 等于把「展开面板位置不对」换成了「重启后位置丢失」。
+    #[test]
+    fn orb_pos_round_trips_through_settings_json() {
+        let d = tmp_dir("orb_pos");
+
+        // 首启：没有这个字段 → None → 走默认摆位
+        assert_eq!(load_settings(&d).orb_pos, None);
+
+        let mut s = load_settings(&d);
+        s.orb_pos = Some(OrbPos { x: 300, y: 512 });
+        save_settings(&d, &s).expect("保存应成功");
+
+        let back = load_settings(&d);
+        assert_eq!(
+            back.orb_pos,
+            Some(OrbPos { x: 300, y: 512 }),
+            "球的位置必须写进 settings.json 并能读回来"
+        );
+
+        // 落盘键名是驼峰 `orbPos`（AgentSettings 带 rename_all）
+        let raw = std::fs::read_to_string(d.join("settings.json")).unwrap();
+        assert!(raw.contains("\"orbPos\""), "落盘键名应为 orbPos：{raw}");
+
+        // 旧 settings.json（没有 orbPos）不能解析失败 —— 有 `default`
+        std::fs::write(
+            d.join("settings.json"),
+            r#"{"selectedModel":null,"blurCollapse":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_settings(&d).orb_pos,
+            None,
+            "老 settings.json 没有 orbPos 时必须回落 None，不能炸"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 存了别的字段不能把 `orbPos` 抹掉（`load → 改一项 → save` 是常规路径）。
+    #[test]
+    fn saving_another_field_keeps_orb_pos() {
+        let d = tmp_dir("orb_pos_keep");
+        let mut s = load_settings(&d);
+        s.orb_pos = Some(OrbPos { x: 10, y: 20 });
+        save_settings(&d, &s).unwrap();
+
+        // 模拟「用户顺手改了失焦收起」：load → 改 → save
+        let mut s2 = load_settings(&d);
+        s2.blur_collapse = !s2.blur_collapse;
+        save_settings(&d, &s2).unwrap();
+
+        assert_eq!(
+            load_settings(&d).orb_pos,
+            Some(OrbPos { x: 10, y: 20 }),
+            "改别的设置不该把球的位置冲掉"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// **stdio server 不能因为没有 url 就被丢掉**。
