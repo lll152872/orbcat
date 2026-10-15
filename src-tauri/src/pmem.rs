@@ -38,6 +38,29 @@ fn now_ts() -> String {
     )
 }
 
+/// 项目名必须是**目录名的单段**：不能带路径分隔符、不能是 `.` / `..`。
+///
+/// 为什么这是硬校验：项目名会直接拼进 `projects/<名>/MEMORY.md`（本文件多处，
+/// 外加 `distill::project_memory_path` 与 `memory::match_project_memory`）。
+/// 名字一旦能带分隔符，`projects/../../evil/MEMORY.md` 就会写到
+/// `agent-data` **外面**去 —— 而项目名是用户/模型给的字符串。
+///
+/// `distill::resolve_project` 只允许名字**精确等于已登记项目**，是第二道闸；
+/// 这里是第一道 —— 闸门要设在数据入口，不设在读出口。
+fn check_name(name: &str) -> Result<&str, String> {
+    let n = name.trim();
+    if n.is_empty() {
+        return Err("项目名不能为空".into());
+    }
+    if n == "." || n == ".." || n.contains('/') || n.contains('\\') || n.contains('\0') {
+        return Err(format!(
+            "项目名「{n}」不合法：它会变成 projects/ 下的一个目录，不能包含路径分隔符 \
+             （/ \\）、不能是 . 或 .."
+        ));
+    }
+    Ok(n)
+}
+
 fn open(data_dir: &Path) -> Result<rusqlite::Connection, String> {
     std::fs::create_dir_all(data_dir).map_err(|e| format!("建数据目录失败: {e}"))?;
     let conn = rusqlite::Connection::open(db_path(data_dir))
@@ -81,10 +104,7 @@ pub fn list_projects(data_dir: &Path) -> Result<Vec<ProjectRow>, String> {
 }
 
 pub fn create_project(data_dir: &Path, name: &str, root_path: &str) -> Result<ProjectRow, String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("项目名不能为空".into());
-    }
+    let name = check_name(name)?;
     let conn = open(data_dir)?;
     let ts = now_ts();
     conn.execute(
@@ -191,10 +211,8 @@ pub fn session_map(
 
 /// 重命名项目（显示名唯一）
 pub fn rename_project(data_dir: &Path, id: i64, new_name: &str) -> Result<(), String> {
-    let new_name = new_name.trim();
-    if new_name.is_empty() {
-        return Err("项目名不能为空".into());
-    }
+    // 与 create_project 同一条闸：重命名会 `fs::rename` 整个目录
+    let new_name = check_name(new_name)?;
     let conn = open(data_dir)?;
     let old: String = conn
         .query_row("SELECT name FROM projects WHERE id = ?1", [id], |r| r.get(0))
@@ -305,6 +323,38 @@ mod tests {
         append_project_memory(&d, "论文", "Fig.2 是任务表", "model").unwrap();
         let t = project_memory_md(&d, "论文").unwrap();
         assert!(t.contains("Fig.2 是任务表"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 项目名会直接拼进 `projects/<名>/MEMORY.md`，而它是**外部给的字符串**
+    /// （用户在 UI 里输入、模型在 distill_move 里传）。带分隔符就必须挡住，
+    /// 否则一行调用就能把文件写到 data_dir 外面。
+    #[test]
+    fn project_name_cannot_contain_path_separators() {
+        let d = tmp("evil");
+        for bad in ["..", ".", "../evil", "a/b", "a\\b", "  "] {
+            assert!(
+                create_project(&d, bad, "").is_err(),
+                "「{bad}」必须被拒绝"
+            );
+        }
+        assert!(
+            !d.parent().unwrap().join("evil").exists(),
+            "不能在 projects/ 外面造目录"
+        );
+        // 正常名仍然能建
+        let p = create_project(&d, "M3FM 论文", "C:\\work").unwrap();
+        assert_eq!(p.name, "M3FM 论文", "首尾空格要去掉，中间的要保留");
+        assert!(d.join("projects/M3FM 论文/MEMORY.md").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn rename_rejects_path_separators_too() {
+        let d = tmp("evil2");
+        let p = create_project(&d, "论文", "").unwrap();
+        assert!(rename_project(&d, p.id, "../跑了").is_err());
+        assert_eq!(list_projects(&d).unwrap()[0].name, "论文", "拒绝后不该改名");
         let _ = std::fs::remove_dir_all(&d);
     }
 }
