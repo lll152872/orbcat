@@ -98,6 +98,7 @@ pub struct StoredStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StoredMessage {
     /// `user` | `assistant`
     pub role: String,
@@ -135,7 +136,7 @@ pub struct StoredMessage {
     /// 执行中插话的 id。有值时 UI **不在对话流铺气泡**，
     /// 而是在 assistant.steps 的 `kind=steer` 时间线里按位置画（真实交错）。
     /// 历史回灌仍按 user 角色进模型上下文。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "steer_id", skip_serializing_if = "Option::is_none")]
     pub steer_id: Option<String>,
     /// 生成本条回答的模型 id（供「每天每模型」用量统计）。老数据没有 → None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1547,6 +1548,153 @@ pub fn usage_report(data_dir: &Path) -> Vec<UsageRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 落盘消息的字段名必须驼峰 —— 前端 `StoredMsg` 按 `steerId` 读。
+    ///
+    /// 2026-10-14：`StoredMessage` 漏了 `rename_all`，落盘成 `steer_id`，
+    /// 前端读 `m.steerId` 恒为 `undefined`。后果是 `sessionToEntries` 里
+    ///   - `if (m.steerId) return;` 恒不成立 → 每条「插话」重载后都被当成
+    ///     普通用户气泡画出来，而设计是它只该出现在 steps 时间线的 `kind=steer`；
+    ///   - 收集插话图片的那圈同样恒不成立 → **插话里带的图永远看不到**。
+    #[test]
+    fn stored_message_serializes_steer_id_as_camel_case() {
+        let m = StoredMessage {
+            role: "user".into(),
+            text: "插话".into(),
+            images: vec![],
+            steps: vec![],
+            reasoning: None,
+            interrupted: false,
+            partial: false,
+            steer_id: Some("steer-9".into()),
+            model: None,
+            usage: None,
+            at: 1790000000000,
+        };
+        let v = serde_json::to_value(&m).expect("应可序列化");
+        assert_eq!(
+            v.get("steerId").and_then(|x| x.as_str()),
+            Some("steer-9"),
+            "前端按 `steerId` 读，落盘必须是驼峰"
+        );
+        assert!(
+            v.get("steer_id").is_none(),
+            "还在写 `steer_id`：{:?}",
+            v
+        );
+    }
+
+    /// **反向**契约：老会话文件里的 `steer_id` 必须照样读得进来。
+    ///
+    /// 这条比上一条更要紧 —— 实证有 **12 个**真实会话文件是蛇形写的
+    /// （`D:\orbcat\agent-data\sessions\*.json`）。光加 `rename_all` 而不加
+    /// `alias`，这些老文件的插话标记会在重载时静默变成 `None`，
+    /// 插话又变成普通气泡 —— 修了新数据、毁了老数据。
+    #[test]
+    fn legacy_snake_case_steer_id_still_deserializes() {
+        let legacy = r#"{
+            "role": "user",
+            "text": "插话",
+            "images": [],
+            "steps": [],
+            "steer_id": "steer-legacy-1",
+            "at": 1790000000000
+        }"#;
+        let m: StoredMessage = serde_json::from_str(legacy).expect("老格式必须能读");
+        assert_eq!(
+            m.steer_id.as_deref(),
+            Some("steer-legacy-1"),
+            "老文件的 `steer_id` 不能被丢掉（实证 12 个真实会话是蛇形）"
+        );
+    }
+
+    /// 两条合起来 = 一次真实的读写往返：老文件读进来，原样再写出去仍是驼峰。
+    #[test]
+    fn legacy_session_round_trips_into_camel_case() {
+        let legacy = r#"{
+            "id": "s1-0",
+            "title": "老会话",
+            "createdAt": 1790000000000,
+            "updatedAt": 1790000000000,
+            "kind": "task",
+            "mode": "chat",
+            "messages": [{
+                "role": "user", "text": "插话", "images": [],
+                "steps": [], "steer_id": "st-1", "at": 1790000000001
+            }]
+        }"#;
+        let s: Session = serde_json::from_str(legacy).expect("老会话必须能读");
+        assert_eq!(
+            s.messages[0].steer_id.as_deref(),
+            Some("st-1"),
+            "老会话里的插话标记必须保住"
+        );
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(
+            out.contains("\"steerId\""),
+            "再写出去必须是驼峰：{}",
+            &out[..out.len().min(200)]
+        );
+        assert!(!out.contains("\"steer_id\""), "不该再写蛇形");
+    }
+
+    /// 真机烟测：拿**真实**会话目录跑一遍，确认老文件的插话标记没丢。
+    ///
+    /// 单元测试喂的是手写 JSON；本机有 12 个蛇��� `steer_id` 的真实文件，
+    /// 这是"加了 alias 到底救没救回来"唯一的实证。
+    ///
+    /// 用法（**只读**）：
+    /// ```text
+    ///   $env:ORBCAT_SESS_SMOKE = 'D:\orbcat\agent-data\sessions'
+    ///   cargo test --lib real_sessions_keep_steer_id -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn real_sessions_keep_steer_id() {
+        let Ok(arg) = std::env::var("ORBCAT_SESS_SMOKE") else {
+            println!("跳过：未设 ORBCAT_SESS_SMOKE");
+            return;
+        };
+        let dir = PathBuf::from(arg);
+        assert!(dir.is_dir(), "{} 不是目录", dir.display());
+
+        let mut files = 0usize;
+        let mut legacy = 0usize;
+        let mut recovered = 0usize;
+        let mut broken = Vec::new();
+
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") || is_grants_file(&p) {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let Some(s) = read_session(&p) else {
+                continue;
+            };
+            files += 1;
+            let had_legacy = raw.contains("\"steer_id\"");
+            let got = s.messages.iter().filter(|m| m.steer_id.is_some()).count();
+            if had_legacy {
+                legacy += 1;
+                if got > 0 {
+                    recovered += 1;
+                } else {
+                    broken.push(p.file_name().unwrap_or_default().to_string_lossy().into_owned());
+                }
+            }
+            println!("  {}  snake={}  steerId 读出 {} 条", p.file_name().unwrap_or_default().to_string_lossy(), had_legacy, got);
+        }
+
+        println!("会话文件 {} 个，其中蛇形 legacy {} 个，成功救回 {} 个", files, legacy, recovered);
+        assert!(
+            broken.is_empty(),
+            "这些老文件的插话标记丢了（alias 没生效）：{:?}",
+            broken
+        );
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("orbcat_sess_{tag}"));
