@@ -128,8 +128,86 @@ struct AppliedState {
     applied_files: Vec<String>,
 }
 
-const STATE_FILE: &str = ".skeleton-state.json";
+/// 骨架完成标志。`boot_state` 拿它当「初始化过了没有」的判据，
+/// 所以这里必须是**唯一**的字面量来源 —— 前后端、两处判据都从这里取。
+pub(crate) const STATE_FILE: &str = ".skeleton-state.json";
 const MIGRATIONS_DIR: &str = "migrations";
+
+/// 「自动生成物」白名单 —— 每次启动都会自己写、与用户内容无关的文件。
+///
+/// `pmem.sqlite` 是必须列进来的那个：空库也有 24KB（sqlite 的空页），
+/// 光按大小判会把空壳目录误判成「有数据」。
+const BOOTSTRAP_FILES: &[&str] = &[
+    "permissions.json",
+    "pmem.sqlite",
+    "diag.log",
+    "permissions.json.bak",
+    "current.txt",
+];
+
+/// 「实质内容」门槛：超过这个字节数才算用户真的用过。
+const MIN_REAL_BYTES: u64 = 1024;
+
+/// 这份 `agent-data/` 里有没有**实质内容**。
+///
+/// 判据：跳过 [`BOOTSTRAP_FILES`] 里的自动生成物，剩下的文件还要**超过**
+/// [`MIN_REAL_BYTES`] 才算数 —— 真实会话 21KB~775KB，真实 `RULES.md` /
+/// `SOUL.md` / `USER.md` 也在 1.8KB~20KB 量级；而空壳目录里剩下的都是
+/// 0~24KB 的生成物，两条判得开。
+///
+/// `None` = 目录根本读不到（不存在 / 无权限），调用方按「没有内容」处理。
+fn scan_real_content(dir: &Path, min: u64) -> Option<bool> {
+    let mut it = std::fs::read_dir(dir).ok()?.flatten().peekable();
+    if it.peek().is_none() {
+        return Some(false); // 目录不存在或为空
+    }
+    for e in it {
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
+        if p.is_dir() {
+            // `sessions/` 单独下钻：好会话和自动生成的 `current.txt` 同目录，
+            // 不下钻就永远只看见 current.txt。
+            if name == "sessions" && scan_real_content(&p, min) == Some(true) {
+                return Some(true);
+            }
+            continue;
+        }
+        if BOOTSTRAP_FILES.contains(&name.as_str()) {
+            continue;
+        }
+        if e.metadata().map(|m| m.len() > min).unwrap_or(false) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// [`scan_real_content`] 的 bool 版；读不到目录一律算「没有内容」。
+pub(crate) fn data_dir_has_real_content(data_dir: &Path) -> bool {
+    scan_real_content(data_dir, MIN_REAL_BYTES).unwrap_or(false)
+}
+
+/// **这份数据目录需不需要走初始化引导？**（`boot_state` 的唯一判据）
+///
+/// ## 两个条件，缺一不可
+///
+/// 1. **没有 [`STATE_FILE`] 标记** —— 说明 bootstrap 没在这儿铺过骨架。
+/// 2. **也没有实质内容** —— 说明它确实是个新装/空目录，而不是老数据。
+///
+/// ## 为什么第 2 条不能省（2026-10-14 用户实测）
+///
+/// 判据换成标记文件之后，**老用户反而被误判成新装**：标记文件是
+/// [`bootstrap_agent_data`] 才会写的，而换判据之前的那些目录已经带着
+/// 60 个会话、2.5MB 审计日志、一整套人格文件，却**从没有过**这个标记
+/// （那时还没有这个文件）。于是 `needsInit` 永远为 true，每次开空会话
+/// 都弹出「尚未初始化 / 数据目录 agent-data/ 还不存在」——
+/// 而那份数据明明就在那儿躺着。
+///
+/// 老数据 ≠ 待初始化。补上第 2 条之后：那台机器立刻恢复成正常态，
+/// 一个文件都不用动。
+pub(crate) fn needs_init(data_dir: &Path) -> bool {
+    !data_dir.join(STATE_FILE).is_file() && !data_dir_has_real_content(data_dir)
+}
 
 /// 建目录骨架 + 最小配置文件。**不碰 `models.json` 之外的任何密钥**。
 ///
@@ -679,19 +757,85 @@ mod tests {
         );
 
         // 判据必须说"需要初始化"
-        let needs_init = !d.join(STATE_FILE).is_file();
+        // ⚠️ 这里调的是**出厂那个函数**，不是把判据抄一遍 ——
+        //    抄一遍的话，改判据就改不动这里，测试会变成摆设。
         assert!(
-            needs_init,
-            "目录存在但骨架没铺 → 必须判定为「需要初始化」，\
+            needs_init(&d),
+            "只有自动生成物 → 必须判定为「需要初始化」，\
              否则用户看不到「建出目录结构」按钮（2026-10-12 实际发生）"
         );
 
         // 补跑一次 bootstrap 之后才该变成 false
         bootstrap_agent_data(&d).expect("初始化应成功");
+        assert!(!needs_init(&d), "bootstrap 跑完就必须算已初始化");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// **老数据目录不算待初始化**（2026-10-14 用户实测）。
+    ///
+    /// 这台机器上的 `agent-data/` 带着 60 个会话、2.5MB 审计日志、一整套
+    /// 人格文件，**唯独没有** `.skeleton-state.json` —— 因为它建于判据换版
+    /// 之前，那时还没有这个文件、也从没跑过 bootstrap。
+    ///
+    /// 只判标记文件的话，每次开空会话都会弹出「尚未初始化 /
+    /// 数据目录 agent-data/ 还不存在」，而那份数据明明就在那儿躺着。
+    #[test]
+    fn legacy_dir_with_real_data_needs_no_init() {
+        let d = tmp("legacy");
+        std::fs::create_dir_all(d.join("sessions")).unwrap();
+        std::fs::write(d.join("diag.log"), "启动正常\n").unwrap();
+        std::fs::write(d.join("permissions.json"), "{\"rules\":[]}").unwrap();
+        // 真实人格文件 20KB + 一个真实量级的会话
+        std::fs::write(d.join("RULES.md"), "行为红线".repeat(2000)).unwrap();
+        std::fs::write(
+            d.join("sessions/s1-0.json"),
+            format!("{{\"messages\":[{}]}}", "0,".repeat(900)),
+        )
+        .unwrap();
+
         assert!(
-            !(!d.join(STATE_FILE).is_file()),
-            "bootstrap 跑完就必须算已初始化"
+            !d.join(STATE_FILE).is_file(),
+            "测试前提失效：老目录本来就没有标记文件"
         );
+        assert!(
+            !needs_init(&d),
+            "有真实会话 + 人格文件的老目录**不是待初始化**，\
+             否则用户每次开新会话都看到假告警（2026-10-14 实际发生）"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 老数据**只存在于 `sessions/` 里**时也要认出来。
+    ///
+    /// `sessions/` 下面同时躺着自动生成的 `current.txt` 和好会话文件；
+    /// 不单独下钻这一层，就永远只看见 `current.txt`，老数据会被误判成空目录。
+    #[test]
+    fn real_content_is_found_inside_sessions_dir() {
+        let d = tmp("sessions-only");
+        std::fs::create_dir_all(d.join("sessions")).unwrap();
+        std::fs::write(d.join("sessions/current.txt"), "s1-0\n").unwrap();
+        std::fs::write(d.join("sessions/s1-0.json"), "x".repeat(4096)).unwrap();
+
+        assert!(
+            data_dir_has_real_content(&d),
+            "sessions/ 下有 4KB 会话文件就该算实质内容"
+        );
+        assert!(!needs_init(&d), "有真会话就不该要初始化");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 净空目录仍然要初始化 —— 新用户必须能看见那个按钮。
+    #[test]
+    fn empty_dir_needs_init() {
+        let d = tmp("brand-new");
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(!data_dir_has_real_content(&d), "空目录不该有实质内容");
+        assert!(needs_init(&d), "空目录必须判定为「需要初始化」");
+
+        // 目录压根不存在也不能崩，按「没有内容」处理
+        let gone = d.join("does-not-exist");
+        assert!(!data_dir_has_real_content(&gone));
+        assert!(needs_init(&gone), "目录不存在 = 新装，必须判为需要初始化");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1127,5 +1271,53 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 真机烟测：拿**真实**的 `agent-data/` 跑一遍 `needs_init`。
+    ///
+    /// 单元测试喂的是自己造的目录；本机这份是「换判据之前就建好、
+    /// 因此没有标记文件」的老数据 —— 单元测试造不出这个状态组合。
+    ///
+    /// 用法（**只读**，绝不碰真实数据）：
+    /// ```text
+    ///   $env:ORBCAT_BOOT_SMOKE = 'D:\orbcat\agent-data'
+    ///   cargo test --lib real_data_needs_init -- --ignored --nocapture
+    /// ```
+    /// 打印出来的 `标记文件` / `最大实质文件` 两行是排查依据 ——
+    /// 判据一旦在这台机器上判错，先看这两行，别猜。
+    #[test]
+    #[ignore]
+    fn real_data_needs_init() {
+        let Ok(arg) = std::env::var("ORBCAT_BOOT_SMOKE") else {
+            println!("跳过：未设 ORBCAT_BOOT_SMOKE");
+            return;
+        };
+        let d = PathBuf::from(arg);
+        assert!(d.is_dir(), "{} 不是目录", d.display());
+
+        // 报告「是哪个文件让它被判成有数据」—— 判错时一眼定位
+        let mut biggest = (String::new(), 0u64);
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() || BOOTSTRAP_FILES.contains(&e.file_name().to_string_lossy().as_ref())
+            {
+                continue;
+            }
+            let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+            if len > biggest.1 {
+                biggest = (e.file_name().to_string_lossy().into_owned(), len);
+            }
+        }
+        println!("目录            = {}", d.display());
+        println!("标记文件        = {}", d.join(STATE_FILE).is_file());
+        println!("最大实质文件    = {} ({} B)", biggest.0, biggest.1);
+        println!("有实质内容      = {}", data_dir_has_real_content(&d));
+        println!("needs_init      = {}", needs_init(&d));
+
+        assert!(
+            !needs_init(&d),
+            "真实数据目录不该被判成「待初始化」—— \
+             这正是 2026-10-14 用户看到假告警「agent-data 还不存在」的原因"
+        );
     }
 }
