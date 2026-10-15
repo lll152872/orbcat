@@ -1,5 +1,19 @@
 //! 记忆蒸馏的**搬运层**：解析 `memory/MEMORY.md`（中转站）+ 把条目迁到目标文件
 //!
+//! ## 四个落点（2026-10-15 起）
+//!
+//! | target | 落点 | 装什么 |
+//! |---|---|---|
+//! | `user` | `agent-data/USER.md` | **只写「人」**：身份、能力、性格、习惯、雷区、设备 |
+//! | `soul` | `agent-data/SOUL.md` | 人格、语气、表达纪律 |
+//! | `identity` | `agent-data/IDENTITY.md` | 名字、互相怎么称呼 |
+//! | `project` | `agent-data/projects/<名>/MEMORY.md` | **只在本项目成立**：路径、术语、进展、未决项 |
+//!
+//! 加 `project` 之前没有第四个落点，于是「只在本项目成立」的事实只有两条路：
+//! 硬塞进 `USER.md`（被它的边界自锁明令禁止）或留在中转站 —— 每次蒸馏都只能 `stay`。
+//! 项目记忆本来就在 `agent-data/projects/` 下、`remember(scope:"project")` 也一直在写它，
+//! 蒸馏却够不着：这是搬运层少了一个去向，不是数据没地方放。
+//!
 //! ## 定位（2026-10-03 定稿）
 //!
 //! 谁来做判断：**agent 本身**，在一条普通的「记忆蒸馏」会话里 —— 它读中转站、
@@ -23,7 +37,19 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// 合法去向（`duplicate` = 目标已有同文，只从中转站删）
-pub const TARGETS: [&str; 5] = ["user", "soul", "identity", "stay", "duplicate"];
+///
+/// ⚠️ `project`（2026-10-15 加）：项目级事实的落点。此前蒸馏只往三份全局
+/// persona 文件搬，于是「只在本项目成立」的事实只能被硬塞进 USER.md 或
+/// 留在中转站 —— 而 `USER.md` 的边界自锁明令禁止写项目内容，于是这类条目
+/// 每次蒸馏都只能 `stay`。现在有正经落点了。
+pub const TARGETS: [&str; 6] = [
+    "user",
+    "soul",
+    "identity",
+    "project",
+    "stay",
+    "duplicate",
+];
 
 /// 一次迁移的请求（agent 调 `distill_move` 时的参数）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,11 +57,18 @@ pub const TARGETS: [&str; 5] = ["user", "soul", "identity", "stay", "duplicate"]
 pub struct DistillProposal {
     /// 条目正文（不含行首 `- `）。从中转站移除时按它匹配
     pub text: String,
-    /// user | soul | identity | duplicate（stay = 什么都不做）
+    /// user | soul | identity | project | duplicate（stay = 什么都不做）
     pub target: String,
     /// 归到目标文件的哪个小节（如 `## 基本`）；空 = 追加到末尾
     #[serde(default)]
     pub section: String,
+    /// `target="project"` 时指定项目名；留空 = 用顶栏当前激活的项目。
+    ///
+    /// 留空是**有意的**：与 `remember(scope:"project")` 同一条规则 ——
+    /// 用户已经用顶栏表达了"我现在在哪个项目里"，不该再让模型复述一遍名字。
+    /// 两者都没有时 [`resolve_project`] 会报错并列出可选项目。
+    #[serde(default)]
+    pub project: String,
     /// 迁移理由（回显给用户看，便于 agent 在正文里交代）
     #[serde(default)]
     pub reason: String,
@@ -51,6 +84,12 @@ pub struct DistillReport {
     pub removed: usize,
     /// 备份文件名（`memory/` 下）
     pub backup: String,
+    /// 实际写入的文件（相对 data_dir）；空 = 没写任何文件
+    ///
+    /// 为什么加这个字段：`target="project"` 时"目标文件"不是 `<TARGET>.md`
+    /// 而是 `projects/<名>/MEMORY.md`，工具返回值要**逐字说清改的是哪个文件**
+    /// —— 模型会把它原样转述给用户，说含糊了用户就不知道自己的记忆去哪了。
+    pub written: String,
     /// 跳过的条目（目标已有同文等原因）
     pub skipped: Vec<String>,
 }
@@ -153,6 +192,61 @@ fn long_term_path(root: &Path) -> PathBuf {
 
 fn target_path(root: &Path, target: &str) -> PathBuf {
     root.join(format!("{}.md", target.to_uppercase()))
+}
+
+/// `target="project"` 的落点：`projects/<名>/MEMORY.md`。
+///
+/// ⚠️ 必须与 `pmem::project_memory_md` / `pmem::append_project_memory` /
+/// `memory::MemoryStore::match_project_memory` **同一条路径** —— 那几处是
+/// 项目记忆的真源，这里若自己拼一套，蒸馏写进去的东西模型永远读不到。
+fn project_memory_path(root: &Path, name: &str) -> PathBuf {
+    root.join("projects").join(name).join("MEMORY.md")
+}
+
+/// 解析 `target="project"` 的项目名，返回**已登记**的项目名。
+///
+/// ## 为什么必须查 `pmem.sqlite` 而不是直接拿名字拼路径
+///
+/// 项目名是**模型给的字符串**，而落点是 `data_dir/projects/<名>/MEMORY.md`。
+/// 不校验就等于把路径拼装权交给模型：`project: "../../evil"` 会在
+/// `agent-data` 外面凭空造出目录并往里写文件。名字只允许**精确等于某个已登记
+/// 的项目**，从根上堵死穿越（顺带挡掉 `"a/b"`、`".."`、`""`）。
+///
+/// 校验过不了就报错并**列出可选项目** —— 模型拿到清单后能直接改对，不必再来回试。
+fn resolve_project(root: &Path, want: &str) -> Result<String, String> {
+    let known = crate::pmem::list_projects(root).unwrap_or_default();
+    let list = if known.is_empty() {
+        "（一个都没有 —— 用户还没建过项目）".to_string()
+    } else {
+        known
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>()
+            .join("、")
+    };
+
+    let want = want.trim();
+    if want.is_empty() {
+        // 留空 = 用顶栏激活的项目，与 `remember(scope:"project")` 同一条规则
+        let active = crate::config::load_settings(root)
+            .active_project_id
+            .and_then(|pid| known.iter().find(|p| p.id == pid).map(|p| p.name.clone()));
+        return active.ok_or_else(|| {
+            format!(
+                "target=\"project\" 但没有指定项目名，顶栏也没有激活项目。\n\
+                 二选一：\n\
+                 1. 传 project=\"<项目名>\" 指明落到哪个项目\n\
+                 2. 让用户在顶栏「项目 ▾」里切到目标项目，再调一次（不带 project）\n\
+                 现有项目：{list}"
+            )
+        });
+    }
+
+    known
+        .iter()
+        .find(|p| p.name == want)
+        .map(|p| p.name.clone())
+        .ok_or_else(|| format!("没有名为「{want}」的项目。现有项目：{list}"))
 }
 
 /// 条目 → 目标文件里的块（首行带 `- `，续行缩进两格）
@@ -261,9 +355,13 @@ fn rewrite_memory(md: &str, remove: &[Entry]) -> String {
 
 /// 迁移**一条**（`distill_move` 工具的实现体）。
 ///
-/// 流程：备份（按天）→ 写目标文件（user/soul/identity）→ 从中转站移除。
+/// 流程：解析去向 → 备份（按天）→ 写目标文件 → 从中转站移除。
 /// `target = duplicate` 表示「目标已有同文」：不写文件，只从中转站删。
 /// `target = stay`：什么都不做（agent 用它表达「这条留在中转站」）。
+/// `target = project`：写 `projects/<名>/MEMORY.md`（名字见 [`resolve_project`]）。
+///
+/// ⚠️ **项目名必须先解析成功再动任何文件** —— 报错时磁盘保持原样，
+/// 与「传错正文一个字都不动」的纪律一致。
 pub fn apply_entry(root: &Path, p: &DistillProposal) -> Result<DistillReport, String> {
     let text = p.text.trim();
     if text.is_empty() {
@@ -271,7 +369,7 @@ pub fn apply_entry(root: &Path, p: &DistillProposal) -> Result<DistillReport, St
     }
     if !TARGETS.contains(&p.target.as_str()) {
         return Err(format!(
-            "未知去向 {}（只能是 user / soul / identity / stay / duplicate）",
+            "未知去向 {}（只能是 user / soul / identity / project / stay / duplicate）",
             p.target
         ));
     }
@@ -279,12 +377,20 @@ pub fn apply_entry(root: &Path, p: &DistillProposal) -> Result<DistillReport, St
         moved: 0,
         removed: 0,
         backup,
+        written: String::new(),
         skipped: Vec::new(),
     };
 
     if p.target == "stay" {
         return Ok(empty(String::new()));
     }
+
+    // 项目名先解析（可能报错）—— 放在备份之前，保证失败时磁盘零改动
+    let project = if p.target == "project" {
+        Some(resolve_project(root, &p.project)?)
+    } else {
+        None
+    };
 
     let mem_path = long_term_path(root);
     let md = std::fs::read_to_string(&mem_path).map_err(|e| format!("读 MEMORY.md 失败: {e}"))?;
@@ -305,14 +411,33 @@ pub fn apply_entry(root: &Path, p: &DistillProposal) -> Result<DistillReport, St
 
     // 2) 写目标文件（duplicate 跳过写）
     let mut moved = 0usize;
+    let mut written = String::new();
     let mut skipped: Vec<String> = Vec::new();
-    if matches!(p.target.as_str(), "user" | "soul" | "identity") {
+    if let Some(name) = &project {
+        // 项目侧也要能反悔：落盘前先把它自己按天备份一份
+        let path = project_memory_path(root, name);
+        let cur = std::fs::read_to_string(&path).unwrap_or_default();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let pbak = path.with_file_name(format!("MEMORY.md.bak-{}", today_compact()));
+        std::fs::write(&pbak, &cur).map_err(|e| format!("写项目记忆备份失败: {e}"))?;
+        match insert_into_target(&cur, &p.section, text) {
+            Some(next) => {
+                std::fs::write(&path, next).map_err(|e| format!("写项目记忆失败: {e}"))?;
+                moved = 1;
+                written = format!("projects/{name}/MEMORY.md");
+            }
+            None => skipped.push(format!("项目「{name}」的记忆已有同文：{}", clip(text, 60))),
+        }
+    } else if matches!(p.target.as_str(), "user" | "soul" | "identity") {
         let file = std::fs::read_to_string(target_path(root, &p.target)).unwrap_or_default();
         match insert_into_target(&file, &p.section, text) {
             Some(next) => {
                 std::fs::write(target_path(root, &p.target), next)
                     .map_err(|e| format!("写 {} 失败: {e}", p.target))?;
                 moved = 1;
+                written = format!("{}.md", p.target.to_uppercase());
             }
             None => skipped.push(format!("目标文件已有同文：{}", clip(text, 60))),
         }
@@ -326,6 +451,7 @@ pub fn apply_entry(root: &Path, p: &DistillProposal) -> Result<DistillReport, St
         moved,
         removed: 1,
         backup: backup_name,
+        written,
         skipped,
     })
 }
@@ -371,6 +497,7 @@ pub fn delete_entry(root: &Path, text: &str) -> Result<DistillReport, String> {
         moved: 0,
         removed: 1,
         backup: backup_name,
+        written: String::new(),
         skipped: Vec::new(),
     })
 }
@@ -380,12 +507,16 @@ fn apply_batch(root: &Path, approved: &[DistillProposal]) -> Result<DistillRepor
     let mut moved = 0;
     let mut removed = 0;
     let mut backup = String::new();
+    let mut written = Vec::new();
     let mut skipped = Vec::new();
     for p in approved {
         let r = apply_entry(root, p)?;
         moved += r.moved;
         removed += r.removed;
         skipped.extend(r.skipped);
+        if !r.written.is_empty() && !written.contains(&r.written) {
+            written.push(r.written);
+        }
         if !r.backup.is_empty() {
             backup = r.backup;
         }
@@ -394,6 +525,7 @@ fn apply_batch(root: &Path, approved: &[DistillProposal]) -> Result<DistillRepor
         moved,
         removed,
         backup,
+        written: written.join("、"),
         skipped,
     })
 }
@@ -421,7 +553,16 @@ mod tests {
             text: text.into(),
             target: target.into(),
             section: section.into(),
+            project: String::new(),
             reason: String::new(),
+        }
+    }
+
+    /// 带项目名的 `distill_move` 参数（`target="project"` 专用）
+    fn prop_proj(text: &str, project: &str, section: &str) -> DistillProposal {
+        DistillProposal {
+            project: project.into(),
+            ..prop(text, "project", section)
         }
     }
 
@@ -615,6 +756,165 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
             .collect();
         assert!(baks.is_empty(), "报错时不该写备份");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------- project 去向（2026-10-15） ----------------
+
+    const TS3: &str = "洛谷代码放 D:\\allc++\\luogu\\，文件名 P<题号>.cpp。（ts3）";
+
+    /// 核心行为：条目写进 `projects/<名>/MEMORY.md`，并从中转站消失。
+    ///
+    /// 落点必须与 `pmem::project_memory_md` **同一条路径** —— 蒸馏写进去的
+    /// 东西，主对话得能在 system prompt 里读出来才算数。
+    #[test]
+    fn project_target_writes_into_projects_memory_md() {
+        let dir = seed("proj");
+        crate::pmem::create_project(&dir, "M3FM", "").unwrap();
+
+        let r = apply_entry(&dir, &prop_proj(TS3, "M3FM", "")).unwrap();
+        assert_eq!((r.moved, r.removed), (1, 1));
+        assert_eq!(r.written, "projects/M3FM/MEMORY.md", "要逐字说清改的是哪个文件");
+
+        let pm = std::fs::read_to_string(dir.join("projects/M3FM/MEMORY.md")).unwrap();
+        assert!(pm.contains(TS3), "条目应进项目记忆: {pm}");
+        // 中转站那边必须少掉这条
+        let mem = std::fs::read_to_string(dir.join("memory").join("MEMORY.md")).unwrap();
+        assert!(!mem.contains("洛谷"), "中转站不该留着: {mem}");
+        assert!(mem.contains("称呼约定"), "别的条目不动");
+        // 也不能凭空写进 USER.md
+        assert!(
+            !dir.join("USER.md").exists(),
+            "project 去向不碰三份 persona 文件"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 项目记忆是**另一个文件** → 它自己也得有一份备份，
+    /// 否则动错了只能从中转站那份备份里捞，而那份里根本没有项目内容。
+    #[test]
+    fn project_target_backs_up_the_project_file_too() {
+        let dir = seed("proj-bak");
+        crate::pmem::create_project(&dir, "论文", "").unwrap();
+        let r = apply_entry(&dir, &prop_proj(TS3, "论文", "")).unwrap();
+        assert_eq!(r.written, "projects/论文/MEMORY.md");
+
+        let baks: Vec<_> = std::fs::read_dir(dir.join("projects/论文"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
+            .collect();
+        assert_eq!(baks.len(), 1, "项目侧按天备份，实际 {}", baks.len());
+        let bak = std::fs::read_to_string(baks[0].path()).expect("备份应可读");
+        assert!(!bak.contains("洛谷"), "备份是**写入前**的内容: {bak}");
+        assert!(bak.contains("项目记忆"), "备份里是原文件全文: {bak}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 项目名写错 → 报错 + 列出可选项目 + **磁盘零改动**。
+    ///
+    /// 报错必须带清单：模型拿到名字才能一次改对，不用来回试。
+    #[test]
+    fn unknown_project_name_is_rejected_and_lists_options() {
+        let dir = seed("proj-err");
+        crate::pmem::create_project(&dir, "M3FM", "").unwrap();
+        crate::pmem::create_project(&dir, "论文", "").unwrap();
+        let before = std::fs::read_to_string(dir.join("memory").join("MEMORY.md")).unwrap();
+
+        let r = apply_entry(&dir, &prop_proj(TS3, "不存在的项目", ""));
+        let e = r.unwrap_err();
+        assert!(e.contains("M3FM") && e.contains("论文"), "报错要列出可选项目: {e}");
+        assert!(e.contains("不存在的项目"), "报错要点名收到的名字: {e}");
+
+        assert_eq!(
+            before,
+            std::fs::read_to_string(dir.join("memory").join("MEMORY.md")).unwrap(),
+            "报错时中转站不能动"
+        );
+        assert!(!dir.join("projects/不存在的项目").exists(), "不能凭空造目录");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **路径穿越必须被挡住**：项目名会拼进 `projects/<名>/MEMORY.md`，
+    /// 而它是模型给的字符串。`../..` 那种名字若被接受，一行 `distill_move`
+    /// 就能把文件写到 agent-data 外面去。
+    #[test]
+    fn project_name_cannot_escape_the_projects_dir() {
+        for evil in ["..", "../evil", "..\\..\\evil", "a/b", "."] {
+            let dir = seed("proj-evil");
+            crate::pmem::create_project(&dir, "正常项目", "").unwrap();
+            let r = apply_entry(&dir, &prop_proj(TS3, evil, ""));
+            assert!(r.is_err(), "项目名「{evil}」必须被拒绝");
+            assert!(
+                !dir.parent().unwrap().join("evil").exists(),
+                "不能写到 projects/ 外面去（{evil}）"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// `project` 留空 = 用顶栏激活的项目（与 `remember(scope:"project")` 同规则）。
+    ///
+    /// 用户已经用顶栏表达了"我现在在哪个项目里"，不该再逼模型复述一遍名字。
+    #[test]
+    fn empty_project_falls_back_to_the_active_project() {
+        let dir = seed("proj-active");
+        let a = crate::pmem::create_project(&dir, "激活的", "").unwrap();
+        let b = crate::pmem::create_project(&dir, "没激活的", "").unwrap();
+
+        let mut s = crate::config::load_settings(&dir);
+        s.active_project_id = Some(a.id);
+        crate::config::save_settings(&dir, &s).unwrap();
+
+        let r = apply_entry(&dir, &prop_proj(TS3, "", "")).unwrap();
+        assert_eq!(r.written, format!("projects/{}/MEMORY.md", a.name));
+        assert!(
+            std::fs::read_to_string(dir.join("projects").join(&b.name).join("MEMORY.md"))
+                .unwrap()
+                .contains("# 项目记忆"),
+            "没激活的项目不该被写"
+        );
+        assert!(std::fs::read_to_string(dir.join("projects").join(&a.name).join("MEMORY.md"))
+            .unwrap()
+            .contains(TS3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 两个都没有时，报错要说清**两条出路**（指定项目名 / 先切顶栏），
+    /// 而不是只丢一句"没有项目"。
+    #[test]
+    fn no_project_at_all_reports_both_ways_out() {
+        let dir = seed("proj-none");
+        let r = apply_entry(&dir, &prop_proj(TS3, "", ""));
+        let e = r.unwrap_err();
+        assert!(e.contains("project="), "要告诉模型可以指定名字: {e}");
+        assert!(e.contains("顶栏"), "要告诉用户可以切顶栏: {e}");
+        assert!(e.contains("一个都没有"), "要说清现状: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 判重：同一条迁两次，第二次必须报错（中转站已无此条），
+    /// 且项目记忆里**不能**出现两份。
+    #[test]
+    fn project_target_dedupes_against_existing_project_memory() {
+        let dir = seed("proj-dup");
+        crate::pmem::create_project(&dir, "M3FM", "").unwrap();
+        // 先用 remember 通道写一条同文的（append_project_memory 会加时间戳后缀，
+        // 所以这里直接手写同文 bullet，模拟"已经记过了"）
+        let pm = dir.join("projects/M3FM/MEMORY.md");
+        let cur = std::fs::read_to_string(&pm).unwrap();
+        std::fs::write(&pm, format!("{cur}\n- {TS3}\n")).unwrap();
+
+        let r = apply_entry(&dir, &prop_proj(TS3, "M3FM", "")).unwrap();
+        assert_eq!((r.moved, r.removed), (0, 1), "不该重写，但要从中转站摘掉");
+        assert!(!r.skipped.is_empty(), "要报告跳过了: {:?}", r.skipped);
+        let after = std::fs::read_to_string(&pm).unwrap();
+        assert_eq!(
+            after.matches("洛谷").count(),
+            1,
+            "项目记忆里只能有一份: {after}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

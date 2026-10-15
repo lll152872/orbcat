@@ -88,6 +88,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "foreground_context",
     "current_time",
     "remember",
+    "read_project_memory",
     "distill_move",
     "life_items",
     "ask_user",
@@ -425,6 +426,7 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
                 "required": ["content"]
             }),
         ),
+        READ_PROJECT_MEMORY_SPEC(),
         ToolSpec::new(
             "life_items",
             "读取本机**数据源**的明细（生活/学习信号：学习通作业、教务、邮件、\
@@ -1249,6 +1251,7 @@ async fn execute_inner(
         "life_items" => life_items(args, ctx).await,
         "ask_user" => ask_user(args, ctx).await,
         "recall_turns" => recall_turns(args, ctx),
+        "read_project_memory" => read_project_memory(args, ctx),
         "load_skill" => {
             let name = get_str(args, "name")?;
             // 技能正文可能带命令示例，但那是「模型照着敲」的，不经过这里；
@@ -1496,6 +1499,163 @@ async fn life_items(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Strin
 /// 所以走同一个出口（同 `load_skill` 的纪律）。理由不只是"守规矩"：
 /// 用户可能在设置里把 `agent-data` 从权限规则里删掉（比如把数据目录挪到别处），
 /// 那时**所有**文件工具都该一致地拒绝，而不是这里留一个不检查的裸读后门。
+// ---------------------------------------------------------------------------
+// read_project_memory（2026-10-15）
+// ---------------------------------------------------------------------------
+
+/// 读项目记忆**正文**的返回上限（字符）。
+///
+/// ## 为什么必须有这个闸
+///
+/// 项目记忆是**唯一一种由 agent 自己不断追加**的记忆文件 ——
+/// `remember(scope:"project")` 与 `distill_move(target="project")` 都往里写，
+/// 而 system prompt 还在教它「每得出可复用结论就记，不要攒到最后」。
+/// 没有上限的话它会退化成日志：实测 `projects/test/MEMORY.md` 已经 29,001 字
+/// （≈14.5k token），`projects/论文/MEMORY.md` 11,589 字。
+///
+/// 截断**必须在工具层**做，不能只靠 system prompt 说「别读太多」——
+/// 模型说了不算，文件读进来就已经烧完 token 了。截断时必须**说清还剩多少**，
+/// 让模型能决定是自己调大 `limit`、还是引导用户去整理那个文件。
+const PROJECT_MEMORY_CHARS: usize = 6000;
+
+/// `read_project_memory` 的 schema。
+const READ_PROJECT_MEMORY_SPEC: fn() -> ToolSpec = read_project_memory_spec;
+
+fn read_project_memory_spec() -> ToolSpec {
+    ToolSpec::new(
+        "read_project_memory",
+        "读某个项目的记忆正文（`projects/<名>/MEMORY.md`）。\n\
+         项目记忆**不在你的系统提示里**（它随时在变，整份注入会让每轮对话的缓存全失效）—— \
+         需要时才调这里。\n\
+         `project`：留空 = 顶栏当前激活的项目。\n\
+         `query`：只返回含这个词的条目（字面量子串，不支持正则）。留空 = 返回开头若干条。\n\
+         `limit`：最多返回几条，默认 20，上限 100。\n\
+         返回里会写明「共 N 条，本次给了 K 条」—— 还有没拿到的就调大 limit 或用 query 精确捞。",
+        json!({
+            "type": "object",
+            "properties": {
+                "project": { "type": "string", "description": "项目名；留空 = 顶栏激活的项目。必须是已存在的项目，写错会报错并列出可选项目" },
+                "query": { "type": "string", "description": "字面量子串过滤，只回含它的条目；留空 = 返回开头若干条" },
+                "limit": { "type": "integer", "description": "最多返回几条（默认 20，上限 100）" }
+            }
+        }),
+    )
+}
+
+/// 读项目记忆正文（带条目数上限 + 字符上限）。
+fn read_project_memory(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
+    // 项目名必须**精确命中已登记项目** —— 它会拼进 projects/<名>/MEMORY.md，
+    // 而名字是外部字符串。与 distill::resolve_project 同一条纪律。
+    let known = crate::pmem::list_projects(ctx.data_dir).unwrap_or_default();
+    let list = if known.is_empty() {
+        "（一个都没有 —— 用户还没建过项目）".to_string()
+    } else {
+        known
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>()
+            .join("、")
+    };
+    let want = args
+        .get("project")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let name = if want.is_empty() {
+        let active = crate::config::load_settings(ctx.data_dir)
+            .active_project_id
+            .and_then(|pid| known.iter().find(|p| p.id == pid).map(|p| p.name.clone()));
+        active.ok_or_else(|| {
+            format!(
+                "没指定 project，顶栏也没有激活项目。传 project=\"<项目名>\" 指明，\
+                 或让用户切顶栏。现有项目：{list}"
+            )
+        })?
+    } else {
+        known
+            .iter()
+            .find(|p| p.name == want)
+            .map(|p| p.name.clone())
+            .ok_or_else(|| format!("没有名为「{want}」的项目。现有项目：{list}"))?
+    };
+
+    let dir = ctx.data_dir.join("projects").join(&name);
+    // 走权限网关，与 load_skill 同纪律：agent-data 可能被用户从规则里删掉
+    if let Err(e) = authorize(ctx, &dir, Access::Read) {
+        return Err(format!("项目「{name}」的记忆目录无读取权限：{e}"));
+    }
+    let raw = std::fs::read_to_string(dir.join("MEMORY.md")).unwrap_or_default();
+
+    // 逐条切（缩进续行归并），对标 distill::split_entries
+    let all = crate::memory::split_bullets_pub(&raw);
+    if all.is_empty() {
+        return Ok(ToolOutput::text(format!(
+            "项目「{name}」的项目记忆是空的。\n\
+             要沉淀项目级事实（路径/术语/进展/未决项）就用 `remember`（scope=\"project\"）。"
+        )));
+    }
+
+    let query = args.get("query").and_then(Value::as_str).unwrap_or("").trim();
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| n.clamp(1, 100) as usize)
+        .unwrap_or(20);
+    let hit: Vec<&String> = all
+        .iter()
+        .filter(|e| query.is_empty() || e.contains(query))
+        .collect();
+
+    // 字符上限：条目逐条加，超了就停并如实说明截断
+    let mut out = String::new();
+    let mut used = 0usize;
+    let mut shown = 0usize;
+    let mut char_capped = false;
+    for e in hit.iter().take(limit) {
+        let need = e.chars().count() + 1;
+        if used + need > PROJECT_MEMORY_CHARS && shown > 0 {
+            char_capped = true;
+            break;
+        }
+        out.push_str(&format!("- {}\n", e.replace('\n', " ")));
+        used += need;
+        shown += 1;
+    }
+
+    let mut msg = format!("项目「{name}」的项目记忆（projects/{name}/MEMORY.md）\n");
+    if query.is_empty() {
+        msg.push_str(&format!("共 {} 条，本次给出前 {shown} 条", all.len()));
+    } else {
+        msg.push_str(&format!(
+            "共 {} 条，其中含「{query}」的 {n} 条，本次给出 {shown} 条",
+            all.len(),
+            n = hit.len()
+        ));
+    }
+    if shown < hit.len() {
+        msg.push_str(&format!(
+            "（还有 {} 条没给：调大 limit，或用更精确的 query 捞）",
+            hit.len() - shown
+        ));
+    }
+    // ⚠️ 判据是「**因为字数被迫截断**」，不是「used 恰好 ≥ 上限」——
+    // 后者只在正好卡在边界时才为真（实测 18 条 × 330 字 = 5940 < 6000 就漏报了）。
+    if char_capped {
+        msg.push_str(&format!(
+            "（已到单次返回上限约 {PROJECT_MEMORY_CHARS} 字；这个项目的记忆已经很长，\
+             如果大部分都不相干，建议引导用户在 设置 › 记忆 里整理或归档它）"
+        ));
+    }
+    if shown == 0 {
+        msg.push_str("\n（没有匹配的条目）");
+    } else {
+        msg.push('\n');
+        msg.push_str(&out);
+    }
+    Ok(ToolOutput::text(msg))
+}
+
 fn recall_turns(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     if ctx.session_id.is_empty() {
         return Ok(ToolOutput::text("当前没有会话上下文，无法查找历史。"));
@@ -1799,14 +1959,20 @@ fn distill_move_spec() -> ToolSpec {
         "distill_move",
         "把长期记忆中转站（MEMORY.md）里的**一条**迁移到目标文件，并在成功后从中转站移除。\
          仅在「记忆蒸馏」会话里可用。执行前会自动备份 MEMORY.md（按天）。\
-         `target`：user（用户画像）/ soul（人格语气）/ identity（称呼）/ duplicate（目标已有同文，只从中转站删）/ stay（保持不动）。\
+         `target`：user（用户画像）/ soul（人格语气）/ identity（称呼）/ project（项目记忆）/ duplicate（目标已有同文，只从中转站删）/ stay（保持不动）。\
+         `project`：**只在 target=\"project\" 时有意义** —— 写进哪个项目的记忆（`projects/<名>/MEMORY.md`）。\
+         留空 = 写顶栏当前激活的项目；两者都没有会报错并列出可选项目名，按名字重试即可。\
+         选落点的判据：这条是否**只在本项目内**成立（路径、术语、进展、未决项）→ project；\
+         跨项目通用（用户偏好、雷区、通用教训）→ user / soul / identity。\
+         ⚠️ USER.md 有边界自锁、只写「人」，项目内容写进去算记忆污染。\
          `text` 必须与 MEMORY.md 里的条目正文一致（不含行首 \"- \"），否则报错。\
          一次只迁一条；多条请多次调用（每条都会单独返回结果）。",
         json!({
             "type": "object",
             "properties": {
                 "text": { "type": "string", "description": "条目正文（与 MEMORY.md 逐字一致，不含行首 \"- \"）" },
-                "target": { "type": "string", "enum": ["user", "soul", "identity", "duplicate", "stay"], "description": "迁往哪：user 用户画像 / soul 人格语气 / identity 称呼 / duplicate 已有同文只删中转 / stay 不动" },
+                "target": { "type": "string", "enum": ["user", "soul", "identity", "project", "duplicate", "stay"], "description": "迁往哪：user 用户画像 / soul 人格语气 / identity 称呼 / project 项目记忆 / duplicate 已有同文只删中转 / stay 不动" },
+                "project": { "type": "string", "description": "target=\"project\" 时指定项目名（留空 = 顶栏激活的项目）。必须是已存在的项目名，写错会报错并列出可选项目" },
                 "section": { "type": "string", "description": "目标文件里的小节标题（如 \"## 偏好\"）；留空则追加到文件末尾" },
                 "reason": { "type": "string", "description": "迁移理由（会在结果里回显，便于你向用户交代）" }
             },
@@ -1828,6 +1994,12 @@ fn distill_move(args: &Value, data_dir: &Path) -> Result<ToolOutput, String> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        project: args
+            .get("project")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
         reason: args
             .get("reason")
             .and_then(|v| v.as_str())
@@ -1835,10 +2007,15 @@ fn distill_move(args: &Value, data_dir: &Path) -> Result<ToolOutput, String> {
             .to_string(),
     };
     let r = crate::distill::apply_entry(data_dir, &p)?;
-    let where_ = if p.section.trim().is_empty() {
-        format!("{}.md 末尾", p.target.to_uppercase())
+    // 落点一律取 `r.written`（相对 data_dir 的真实路径）。project 去向没法用
+    // `<TARGET>.md` 拼出来，而「到底改的是哪个文件」必须逐字准确 ——
+    // 模型会把这句原样转述给用户。
+    let where_ = if r.written.is_empty() {
+        p.target.clone()
+    } else if p.section.trim().is_empty() {
+        format!("{} 末尾", r.written)
     } else {
-        format!("{}.md {}", p.target.to_uppercase(), p.section.trim())
+        format!("{} {}", r.written, p.section.trim())
     };
     let head = if !p.reason.trim().is_empty() {
         format!("{}（理由：{}）", clip(&p.text, 60), p.reason.trim())
@@ -1865,6 +2042,18 @@ fn distill_move(args: &Value, data_dir: &Path) -> Result<ToolOutput, String> {
     };
     if r.removed == 0 {
         msg.push_str("（未从中转站移除）");
+    }
+    // 项目记忆另有一份自己的备份：动的是**另一个**文件，备份在中转站那份
+    // 捞不回来，不说清楚用户会以为回不了头。
+    if p.target == "project" && r.moved == 1 {
+        let dir = r
+            .written
+            .rsplit_once('/')
+            .map(|(d, _)| d.to_string())
+            .unwrap_or_default();
+        msg.push_str(&format!(
+            "\n项目记忆自己也按天备份了一份：{dir}/MEMORY.md.bak-<日期>（改错了从那儿捞）。"
+        ));
     }
     Ok(ToolOutput::text(msg))
 }
@@ -5617,6 +5806,137 @@ Write-Output "ARG=[$msg]"
         assert!(err.contains("只读") || err.contains("run_command"), "{}", err);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---------------- read_project_memory（2026-10-15） ----------------
+
+    /// 项目记忆**正文不得进 system prompt** —— 这是成本正确性断言。
+    ///
+    /// 回归本体：激活项目与前台命中的项目记忆原来都是 `stable.push(整份正文)`。
+    /// system prompt 是 `messages[0]`、历史挂在它下面，所以那份正文每被写一次，
+    /// 它下面**整段对话**都要按未命中价重付；而 agent 被明确要求
+    /// 「每得出可复用结论就记」—— 它自己就是个掉缓存引擎。
+    /// 实证体积：`projects/test/MEMORY.md` 29,001 字（≈14.5k tok）。
+    #[test]
+    fn project_memory_body_is_not_injected_into_system_prompt() {
+        let d = mem_tmp("pminject");
+        let p = crate::pmem::create_project(&d, "论文", "").unwrap();
+        let marker = "PROJECT_MEMORY_SECRET_MARKER_ZZ";
+        crate::pmem::append_project_memory(&d, &p.name, &marker, "test").unwrap();
+
+        let mut s = crate::config::load_settings(&d);
+        s.active_project_id = Some(p.id);
+        crate::config::save_settings(&d, &s).unwrap();
+
+        let prompt = crate::agent::build_system_prompt_full(&d, "", None, None);
+        assert!(
+            !prompt.contains(marker),
+            "项目记忆正文混进了 system prompt —— 每轮掉缓存的源头就是它"
+        );
+        // 但「有一行索引」必须在，否则模型根本不知道要去读
+        assert!(
+            prompt.contains(&p.name) && prompt.contains("read_project_memory"),
+            "改成按需读之后，必须在 prompt 里点名项目 + 指向工具"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 工具返回：条目正文 + 「共 N 条 / 给出 K 条」的如实说明。
+    #[test]
+    fn read_project_memory_returns_entries_with_counts() {
+        let d = mem_tmp("pmread");
+        let p = crate::pmem::create_project(&d, "论文", "").unwrap();
+        for t in ["Fig.1b = CTViT", "单位是 cm 不是 mm", "待办：补图 3a"] {
+            crate::pmem::append_project_memory(&d, &p.name, t, "test").unwrap();
+        }
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        // 工具走权限网关（与 load_skill 同纪律）→ 测试里得先授 Read
+        let mut gate = PermissionGate::new();
+        gate.add_rule(&d, Access::Read, "test");
+        let out = read_project_memory(&json!({"project": "论文"}), &ctx_for!(gate, &d, mcp)).unwrap();
+        let t = out.text;
+        assert!(t.contains("共 3 条"), "{t}");
+        assert!(t.contains("Fig.1b = CTViT"), "{t}");
+        assert!(t.contains("待办：补图 3a"), "{t}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// **体积闸**：项目记忆会退化成日志（实测 test 项目 29k 字），
+    /// 所以必须在**工具层**截断 —— 只在 prompt 里写「别读太多」不算数，
+    /// 文件读进来就已经烧完 token 了。且截断必须**说清还剩多少**，
+    /// 模型才知道该调大 limit 还是引导用户去整理。
+    #[test]
+    fn read_project_memory_truncates_and_reports_the_rest() {
+        let d = mem_tmp("pmcap");
+        let p = crate::pmem::create_project(&d, "大项目", "").unwrap();
+        // 每条 300 字，写 60 条 = 18,000 字，远超 6000 上限
+        let filler = "内".repeat(300);
+        for _ in 0..60 {
+            crate::pmem::append_project_memory(&d, &p.name, &filler, "test").unwrap();
+        }
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        // 工具走权限网关（与 load_skill 同纪律）→ 测试里得先授 Read
+        let mut gate = PermissionGate::new();
+        gate.add_rule(&d, Access::Read, "test");
+        let out =
+            read_project_memory(&json!({"project": "大项目", "limit": 100}), &ctx_for!(gate, &d, mcp))
+                .unwrap();
+        let t = out.text;
+        assert!(t.contains("共 60 条"), "{t}");
+        assert!(
+            t.chars().count() < 9000,
+            "返回必须有硬上限，实际 {} 字",
+            t.chars().count()
+        );
+        assert!(t.contains("还有"), "截断时必须说清还有多少没给: {t}");
+        assert!(t.contains("上限"), "触顶时必须提示该整理了: {t}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 限流：`limit` 生效；`query` 只回命中的条目。
+    #[test]
+    fn read_project_memory_respects_limit_and_query() {
+        let d = mem_tmp("pmfilt");
+        let p = crate::pmem::create_project(&d, "X", "").unwrap();
+        for t in ["苹果一条", "香蕉一条", "樱桃一条", "杏子一条"] {
+            crate::pmem::append_project_memory(&d, &p.name, t, "test").unwrap();
+        }
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        // 工具走权限网关（与 load_skill 同纪律）→ 测试里得先授 Read
+        let mut gate = PermissionGate::new();
+        gate.add_rule(&d, Access::Read, "test");
+
+        let one = read_project_memory(&json!({"project": "X", "limit": 1}), &ctx_for!(gate, &d, mcp))
+            .unwrap();
+        assert!(one.text.contains("本次给出前 1 条"), "{}", one.text);
+        assert!(!one.text.contains("香蕉"), "limit=1 不该给第二条");
+
+        let q = read_project_memory(
+            &json!({"project": "X", "query": "香蕉"}),
+            &ctx_for!(gate, &d, mcp),
+        )
+        .unwrap();
+        assert!(q.text.contains("香蕉"), "{}", q.text);
+        assert!(!q.text.contains("苹果"), "query 过滤要生效");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 路径穿越必须挡住 —— 项目名会拼进 `projects/<名>/MEMORY.md`，
+    /// 而它是模型给的字符串。
+    #[test]
+    fn read_project_memory_rejects_unknown_and_traversal_names() {
+        let d = mem_tmp("pmsec");
+        crate::pmem::create_project(&d, "正常", "").unwrap();
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        // 工具走权限网关（与 load_skill 同纪律）→ 测试里得先授 Read
+        let mut gate = PermissionGate::new();
+        gate.add_rule(&d, Access::Read, "test");
+        for bad in ["../evil", "..", "不存在"] {
+            let r = read_project_memory(&json!({ "project": bad }), &ctx_for!(gate, &d, mcp));
+            assert!(r.is_err(), "「{bad}」必须被拒绝");
+        }
+        assert!(!d.parent().unwrap().join("evil").exists(), "不能写到 projects/ 外面");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     // ---------------- remember 的 scope 落点 ----------------

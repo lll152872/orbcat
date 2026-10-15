@@ -1794,6 +1794,34 @@ body {
   color: #8E8E94;
 }
 
+/* 驳回理由输入框：挂在 meta 行尾部，悬停/聚焦才显形 ——
+   平时不占视觉预算，但「丢弃」那一刻它就在那儿，不用另开弹窗 */
+.mem-reason {
+  margin-left: 8px;
+  width: 190px;
+  max-width: 55%;
+  padding: 1px 6px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font-size: 10.5px;
+  font-family: inherit;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.mem-item:hover .mem-reason,
+.mem-reason:focus {
+  opacity: 1;
+  /* 对比度：占位文字要过 AA（4.5:1），见 CHANGELOG 的低对比度整改批次 */
+  border-color: var(--line, rgba(128, 128, 128, 0.35));
+  background: var(--panel-2, rgba(128, 128, 128, 0.08));
+}
+
+.mem-reason::placeholder {
+  color: #9A9AA0;
+}
 
 .mem-actions {
   margin-top: 7px;

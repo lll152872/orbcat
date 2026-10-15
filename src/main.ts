@@ -5420,7 +5420,8 @@ function renderMemView(
             (c) => `
       <div class="mem-item">
         <div class="mem-text">${esc(c.content)}</div>
-        <div class="mem-meta">${esc(c.source)} · ${esc(c.created_at)}</div>
+        <div class="mem-meta">${esc(c.source)} · ${esc(c.created_at)}
+          <input class="mem-reason" data-for="${esc(c.id)}" placeholder="驳回理由（可留空，写进 rejected.jsonl）" spellcheck="false" /></div>
         <div class="mem-actions">
           <button class="mem-btn ok" data-id="${esc(c.id)}" title="写入长期记忆">✓ 记住</button>
           <button class="mem-btn no" data-id="${esc(c.id)}" title="驳回（留档）">✗ 丢弃</button>
@@ -5513,7 +5514,12 @@ function bindMemButtons(root: HTMLElement): void {
   );
   root.querySelectorAll<HTMLButtonElement>(".mem-btn.no[data-id]").forEach((btn) =>
     btn.addEventListener("click", async () => {
-      await invoke("mem_reject", { id: btn.dataset.id }).catch((e) =>
+      // 驳回理由跟着一起留档（2026-05-15）：rejected.jsonl 是留档，
+      // 只留内容不��理由，过几天只能问人「这条当初为什么被打回」。
+      const id = btn.dataset.id ?? "";
+      const box = root.querySelector<HTMLInputElement>(`.mem-reason[data-for="${CSS.escape(id)}"]`);
+      const reason = box?.value.trim() ?? "";
+      await invoke("mem_reject", { id, reason }).catch((e) =>
         pushEntry("error", `驳回失败：${e}`),
       );
       renderBody();

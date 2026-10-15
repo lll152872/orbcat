@@ -1100,20 +1100,26 @@ pub async fn run(
         system_prompt.push_str(
             "\n\n---\n\n# 你的角色：记忆蒸馏助手（本会话专用）\n\n\
              长期记忆有一个**中转站** `agent-data/memory/MEMORY.md`：审批通过的记忆先进那里，\
-             由你逐条分流到三个归属文件，之后中转站只留真正「无处可去」的条目。\n\n\
-             ## 三个目标文件与边界\n\
+             由你逐条分流到四个归属文件，之后中转站只留真正「无处可去」的条目。\n\n\
+             ## 四个落点与边界\n\
              - `USER.md`（用户画像）：**只写「人」** —— 身份、能力、性格、习惯、偏好、雷区、设备、\
              沟通与授权习惯。项目名、项目路径、项目进展、代码细节**禁止**入内。\n\
              - `SOUL.md`（人格/语气）：你应表现出的人格、语气、表达纪律。\n\
              - `IDENTITY.md`（称呼）：名字、互相怎么称呼、身份定位。\n\
+             - `projects/<名>/MEMORY.md`（项目记忆，**project** 去向）：**只在本项目内成立**的事实 ——\
+             工作目录与命名约定、术语、本项目进展、未决问题。\
+             跨项目通用的内容放这里等于污染别的项目；反过来，只属于某个项目的事实\
+             放 USER.md 同样算污染（USER.md 有边界自锁）。\
+             项目名用 `distill_move` 的 `project` 参数指定；留空 = 顶栏当前激活的项目。\
+             名字写错会报错并列出可选项目 —— 照着报错里的名字重试，别猜。\n\
              - 与目标文件现有内容重复 → `duplicate`（不写文件，只从中转站删）。\n\
-             - 项目/环境/工具事实、无处可放 → `stay`（**保持不动**，别硬塞进上面三个）。\n\
+             - 项目/环境/工具事实、无处可放 → `stay`（**保持不动**，别硬塞进上面几个）。\n\
              - **这条已经过时，或当初就记错了** → `memory_delete`（把这条从中转站删掉，\n\
              不写任何文件；执行前自动按天备份，可反悔）。\n\
              记忆是**滚动累积**的：光加不减，错的条目会一直影响以后每一次回答。\n\
              但删比加危险 —— **拿不准该不该删，先问用户**，别自己判。\n\n\
              ## 工作方式（重要）\n\
-             1. 先用 `read_file` 读 `agent-data/memory/MEMORY.md`（必要时也读三个目标文件，避免重复搬运）。\n\
+             1. 先用 `read_file` 读 `agent-data/memory/MEMORY.md`（必要时也读目标文件，避免重复搬运）。\n\
              2. **先给结论、再动手**：把逐条建议（每条引用原文）摆出来，让用户过目。\n\
              3. **拿不准就问**，一次最多问 3 条，问清再动；用户答复后再改判。\
                          别为了「显得有进展」而硬判。\n\
@@ -1125,7 +1131,9 @@ pub async fn run(
              - 未经用户明确同意，不要迁移「拿不准」的条目。\n\
              - **删除一律先问**：把「要删哪条 + 为什么删」摆给用户，拿到明确同意再动
                `memory_delete`。\n\
-             - 项目记忆（`agent-data/projects/`）**不在这轮范围内**，除非用户要求。",
+             - `target=\"project\"` 会**直接写** `projects/<名>/MEMORY.md`（该项目的记忆真源，\
+             跨会话生效）。动手前先确认项目名对不对 —— 写错项目等于把记忆塞到\
+             另一个项目里，用户很难自己发现。",
         );
     }
 
@@ -1158,20 +1166,26 @@ pub async fn run(
             fg.summary()
         ));
 
-        // 项目记忆：前台目录/文件命中 projects/*/source.ref 时附上（最长前缀）
+        // 项目记忆：前台目录/文件命中 projects/*/source.ref 时**只提名字**（2026-10-15 改）
+        //
+        // 原来这里附上整份正文。改掉的理由同上（激活项目那一段）：
+        // 前台每轮都在变，这段本来就在 system prompt 最尾，再叠一份几 k token
+        // 的项目记忆 = 每轮多付一遍缓存价，而且项目记忆一变就再失效一次。
+        // 正文交给 `read_project_memory`。
         let candidates: Vec<&Path> = [fg.dir.as_deref(), fg.file.as_deref()]
             .into_iter()
             .flatten()
             .map(Path::new)
             .collect();
-        if let Some((name, mem)) =
+        if let Some((name, _)) =
             crate::memory::MemoryStore::new(data_dir).match_project_memory(&candidates)
         {
             system_prompt.push_str(&format!(
-                "\n\n---\n\n# 项目记忆（{name}）\n\n\
-                 当前前台路径命中该项目。下列约定只在本项目内成立，优先遵守：\n\n{mem}\n\n\
-                 若要沉淀新的项目级事实，用 `remember` 提交候选（或引导用户写进 \
-                 `agent-data/projects/{name}/MEMORY.md`）。"
+                "\n\n---\n\n# 前台命中项目：{name}\n\n\
+                 当前前台路径命中项目「{name}」。它的项目记忆在 \
+                 `projects/{name}/MEMORY.md`，**正文不在这里** —— \
+                 需要时调 `read_project_memory(project=\"{name}\")` 读。\n\
+                 若要沉淀新的项目级事实，用 `remember` 写入（或引导用户直接改那个文件）。"
             ));
         }
     }
@@ -2358,6 +2372,21 @@ pub fn build_system_prompt(data_dir: &Path) -> String {
     build_system_prompt_full(data_dir, "", None, None)
 }
 
+/// 项目记忆的 `(条目数, 字数)` —— 只给 system prompt 写一行索引用。
+///
+/// 刻意**不读全文再数**：这里每轮都要跑一次，读进来数完就丢纯属浪费。
+/// `pmem::project_memory_stat` 那份是给 UI 用的，这里只管元信息。
+fn project_memory_stat(data_dir: &Path, name: &str) -> (usize, usize) {
+    let p = data_dir.join("projects").join(name).join("MEMORY.md");
+    match std::fs::read_to_string(&p) {
+        Ok(s) => {
+            let n = s.lines().filter(|l| l.trim_start().starts_with("- ")).count();
+            (n, s.chars().count())
+        }
+        Err(_) => (0, 0),
+    }
+}
+
 /// 组装 system prompt；`user_message` 的关键词会**自动加载**命中的技能正文，
 /// `ptc_sdk` 是 PTC 模式下的**程序内工具声明**（`None` = 非 PTC / 不需要）。
 ///
@@ -2484,32 +2513,42 @@ pub fn build_system_prompt_full(
         }
     }
 
-    // 激活项目（顶栏切换）→ 注入项目 MEMORY.md（跳脱主对话）
+    // 激活项目（顶栏切换）→ **只给一行索引，不给正文**（2026-10-15 改）
+    //
+    // ⚠️ 为什么不再整份注入（这是成本正确性问题，不是风格问题）：
+    //
+    // 实测 `D:\orbcat\agent-data\projects\` 各项目 MEMORY.md 的体积：
+    // `test` 29,001 字（≈14.5k tok）、`论文` 11,589 字（≈5.8k tok）——
+    // 整份塞进 system prompt 就是**每轮**（哪怕缓存命中）都要按缓存价付一遍。
+    //
+    // 更糟的是**缓存**：system prompt 是 `messages[0]`，历史挂在它下面。
+    // 项目记忆每被 `remember(scope:"project")` / `distill_move(project)` 写一次，
+    // 它下面**整段对话**都要按未命中价重付。而 agent 被明确要求
+    // 「每得出可复用结论就记，不要攒到最后」—— 于是它自己是个掉缓存引擎。
+    //
+    // 改成与「外部工具索引」同款纪律：**只给名字 + 一句话，正文要用工具读**。
     {
         let s = crate::config::load_settings(data_dir);
         if let Some(pid) = s.active_project_id {
             if let Ok(list) = crate::pmem::list_projects(data_dir) {
                 if let Some(p) = list.into_iter().find(|x| x.id == pid) {
-                    if let Some(pm) = crate::pmem::project_memory_md(data_dir, &p.name) {
-                        stable.push(format!(
-                            "# 项目记忆（{name}）\n\n{pm}\n\n\
-                             当前处于项目「{name}」。\n\
-                             **你必须主动维护这份项目记忆**：\n\
-                             1. 结论、路径、术语、未决问题 → 本轮用 `remember` 写入（直接落盘）\n\
-                             2. 发现过时/错误条目 → `remember` 写「更正：…」并点明作废哪条\n\
-                             3. 项目事实写项目；**跨项目偏好与通用教训仍要用 `remember(scope:\"global\")`**\n\
-                             —— 别因为当前在项目里，就把通用经验全丢进项目层\n\
-                             4. 每得出可复用结论就记，不要攒到最后",
-                            name = p.name
-                        ));
-                    } else {
-                        stable.push(format!(
-                            "# 项目（{name}）\n\n\
-                             当前处于项目「{name}」，项目记忆为空。\n\
-                             **必须用 `remember` 维护**（结论/路径/未决问题 → projects/{name}/MEMORY.md）。",
-                            name = p.name
-                        ));
-                    }
+                    let (entries, chars) = project_memory_stat(data_dir, &p.name);
+                    stable.push(format!(
+                        "# 当前项目（{name}）\n\n\
+                         顶栏切到了项目「{name}」，它的项目记忆在 \
+                         `projects/{name}/MEMORY.md`（{entries} 条 / 约 {chars} 字）。\n\n\
+                         **正文不在这里**（项目记忆随时在变，整份注入会让每轮对话的缓存全失效）—— \
+                         需要时调 `read_project_memory(project=\"{name}\")` 读，读完只取你要的那几条。\n\n\
+                         **你必须主动维护这份项目记忆**：\n\
+                         1. 结论、路径、术语、未决问题 → 本轮用 `remember` 写入（直接落盘）\n\
+                         2. 发现过时/错误条目 → `remember` 写「更正：…」并点明作废哪条\n\
+                         3. 项目事实写项目；**跨项目偏好与通用教训仍要用 `remember(scope:\"global\")`**\n\
+                         —— 别因为当前在项目里，就把通用经验全丢进项目层\n\
+                         4. 每得出可复用结论就记，不要攒到最后",
+                        name = p.name,
+                        entries = entries,
+                        chars = chars,
+                    ));
                 }
             }
         }
@@ -2523,8 +2562,13 @@ pub fn build_system_prompt_full(
          - `scope:\"global\"` → 提交全局候选 → 用户在 设置 › 记忆 批准后进 `memory/MEMORY.md`（跨项目长期记忆）\n\
          - `scope:\"project\"` → 直写 `projects/<名>/MEMORY.md`（只在本项目成立的事实；当前没有激活项目时工具会报错）\n\
          - `USER.md` / `SOUL.md` / `IDENTITY.md` **不是** `remember` 的落点 —— 那是记忆蒸馏会话的活，别自己往里写\n\
-         - **过时/记错的条目要删** → 你这里没有删除工具；把「哪条过时、为什么」告诉用户，
+         - **过时/记错的条目要删** → 你这里没有删除工具；把「哪条过时、为什么」告诉用户，\
            由记忆蒸馏会话的 `memory_delete` 处理（会先按天备份）\n\n\
+         # 读记忆：项目记忆**不在你的提示里**，要用工具读\n\n\
+         `USER.md` / `SOUL.md` / `memory/MEMORY.md` 的内容已注入上方，**直接引用**。\n\
+         但**项目记忆没有** —— prompt 里只有一行「项目 X 有 N 条记忆在 projects/X/MEMORY.md」。\
+         原因：项目记忆随时在被你自己追加，整份注入会让**每一轮**对话的缓存全部失效。\
+         需要项目约定、项目路径、项目历史结论时，调 `read_project_memory(project, query?)`。\n         **别凭印象猜项目里已经定了什么** —— 先查。\n\n\
          # When to write（MUST follow —— 不是「等用户开口才记」）\n\n\
          命中下面任一条，**当场就调 `remember`，不要攒**：\n\
          - 用户**纠正你**或否定你的做法 → 记「错因 + 正确做法」\n\
@@ -2543,8 +2587,8 @@ pub fn build_system_prompt_full(
          或请用户切顶栏，**不要自己偷偷换落点**。另有轮末自动蒸馏在后台兜底，但它**不替代**你当场判断。\n\n\
          # 不该记\n\n\
          临时状态、一次路径的临时拼接、编造的猜测、尚未确认的推断、闲聊 —— 这些只会污染明天的上下文。\n\n\
-         记不清某事时：先查上方已注入的长期记忆段与项目记忆，再调 `recall_turns`，\
-         仍没有再问用户 —— 不要瞎编。\n\
+         记不清某事时：先查上方已注入的长期记忆段，再按需调 `read_project_memory` 查项目记忆、\
+         调 `recall_turns` 查更早的对话原文，仍没有再问用户 —— 不要瞎编。\n\
          </memory_system>"
             .to_string(),
     );

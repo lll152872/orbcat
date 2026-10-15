@@ -44,10 +44,20 @@ pub struct Candidate {
     pub id: String,
     /// 记忆内容
     pub content: String,
-    /// 来源：`model`（模型主动提交）| `user`（用户手写）
+    /// 来源：`model`（模型主动提交）| `auto`（轮末自动蒸馏）| `user`（用户手写）
     pub source: String,
     /// 提交时间（本地时区，ISO 风格）
     pub created_at: String,
+    /// **驳回理由**（只写进 `rejected.jsonl`，不进 `candidates.jsonl`）。
+    ///
+    /// 2026-10-15 加：以前驳回只把条目搬走、不留理由，于是过几天问
+    /// 「这条当初为什么被打回」只能靠翻聊天记录 —— 而 rejected.jsonl
+    /// 本来就是**留档**，留内容不��理由等于留一半。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_reason: Option<String>,
+    /// 驳回时间（同上格式），用来分清「提交于何时 / 否于何时」
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_at: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +228,8 @@ impl MemoryStore {
             content,
             source: source.to_string(),
             created_at: now_string(),
+            rejected_reason: None,
+            rejected_at: None,
         };
 
         std::fs::create_dir_all(self.pending_dir())
@@ -293,13 +305,20 @@ impl MemoryStore {
         Self::rewrite_jsonl(&self.candidates_path(), &all)
     }
 
-    /// 驳回一条：移到 rejected.jsonl 留档
-    pub fn reject(&self, id: &str) -> Result<(), String> {
+    /// 驳回一条：移到 rejected.jsonl 留档（**连理由一起**）
+    ///
+    /// `reason` 为空串 = 用户没填 / 老调用方。仍然照常留档，只是没有理由可看。
+    pub fn reject(&self, id: &str, reason: &str) -> Result<(), String> {
         let mut all = Self::read_jsonl::<Candidate>(&self.candidates_path())?;
         let Some(pos) = all.iter().position(|c| c.id == id) else {
             return Err(format!("找不到候选 {id}"));
         };
-        let c = all.remove(pos);
+        let mut c = all.remove(pos);
+        let reason = reason.trim();
+        if !reason.is_empty() {
+            c.rejected_reason = Some(reason.to_string());
+        }
+        c.rejected_at = Some(now_string());
 
         std::fs::create_dir_all(self.pending_dir())
             .map_err(|e| format!("建 pending 目录失败: {e}"))?;
@@ -611,10 +630,137 @@ pub async fn auto_distill(
     store_auto_entries(data_dir, &items)
 }
 
+/// 条目归一化：剥掉时间戳尾注与首部的「XX：」标签，压掉空白与常见标点。
+///
+/// ## 为什么需要
+///
+/// 自动蒸馏产出的条目是**改写版**，不是原文照抄：
+/// 候选写「论文笔记产出结构：论文笔记存放在 D:\myword\文章\论文\」，
+/// 而 MEMORY.md 里的原文是「用户的论文/笔记产出统一放在 D:\myword\文章\ 下的
+/// Obsidian 库，论文类笔记固定在 D:\myword\文章\论文\……（ts1791981574T12:39:34Z）」。
+/// 原来的 `lt.contains(it)` 是**子串**匹配，这种改写根本挡不住
+/// —— 实证：2026-10-15 蒸馏把 4 条刚迁走的记忆又原样提交回候选队列。
+fn norm_for_dedup(s: &str) -> String {
+    // 去掉行尾的（ts...）/（... · user）/（2026-09-23 ... 验证）这类来源标注
+    let mut t = s.to_string();
+    while let Some(p) = t.rfind('（') {
+        let tail = &t[p..];
+        let inner = tail.trim_start_matches('（');
+        let looks_like_stamp = inner.starts_with("ts")
+            || inner.starts_with("20")
+            || inner.contains("·")
+            || inner.contains("验证")
+            || inner.contains("建立")
+            || inner.contains("跑通");
+        if tail.ends_with('）') && looks_like_stamp {
+            t.truncate(p);
+        } else {
+            break;
+        }
+    }
+    // 去掉首部「XX：」式标签（候选常带，原文不带）
+    //
+    // ⚠️ 必须用 `len_utf8()` 而不是 `p + 1`：全角冒号 `：` 是 U+FF1A，
+    //    UTF-8 下占 **3 字节**，`p+1` 会落在字符内部 → panic（char boundary）。
+    //    这条是 `norm_strips_stamp_prefix_and_punctuation` 当场抓出来的。
+    if let Some(p) = t.find('：') {
+        if p <= 12 {
+            t = t[p + '：'.len_utf8()..].to_string();
+        }
+    }
+    // 只留实义字符：小写化 + 去掉空白与中英文标点
+    t.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// 两条内容是否算「同一条」。
+///
+/// 双向子串 + 长度门槛：门槛挡掉「都在讲工具」这种泛泛的撞词
+/// （8 个字以下的共性片段谁都命中，那会把真条目也误杀）。
+fn same_memory(a: &str, b: &str) -> bool {
+    let (na, nb) = (norm_for_dedup(a), norm_for_dedup(b));
+    if na.is_empty() || nb.is_empty() {
+        return false;
+    }
+    if na == nb {
+        return true;
+    }
+    let (short, long) = if na.len() <= nb.len() { (&na, &nb) } else { (&nb, &na) };
+    short.chars().count() >= 8 && long.contains(short)
+}
+
+/// 把记忆的**全部落点**读成一个比对语料：逐条 bullet 切开。
+///
+/// ## 为什么不能只比 `memory/MEMORY.md`
+///
+/// 记忆有五个落点（USER / SOUL / IDENTITY / 中转站 / projects/*）。
+/// 查重只扫中转站的话，一条**刚被蒸馏迁进 USER.md** 的记忆就从基准里消失了，
+/// 下一轮自动蒸馏会把它原样再提一遍 —— 2026-10-15 的实证：候选队列里
+/// 5 条有 4 条是刚迁走的同义内容。
+fn dedup_corpus(store: &MemoryStore) -> Vec<String> {
+    let mut corpus: Vec<String> = Vec::new();
+
+    for name in ["USER.md", "SOUL.md", "IDENTITY.md", "memory/MEMORY.md"] {
+        if let Ok(t) = std::fs::read_to_string(store.root().join(name)) {
+            corpus.extend(split_bullets(&t));
+        }
+    }
+    // projects/*/MEMORY.md —— 项目记忆也是正式落点
+    if let Ok(rd) = std::fs::read_dir(store.root().join("projects")) {
+        for e in rd.flatten() {
+            if !e.path().is_dir() {
+                continue;
+            }
+            if let Ok(t) = std::fs::read_to_string(e.path().join("MEMORY.md")) {
+                corpus.extend(split_bullets(&t));
+            }
+        }
+    }
+    corpus
+}
+
+/// md 文本 → 逐条 bullet（`- ` 开头，缩进续行归并），对标 `distill::split_entries`。
+///
+/// 给 `tools::read_project_memory` 复用（项目记忆要能按条目读、不能只给一大坨）。
+pub fn split_bullets_pub(md: &str) -> Vec<String> {
+    split_bullets(md)
+}
+
+/// md 文本 → 逐条 bullet（`- ` 开头，缩进续行归并），对标 `distill::split_entries`。
+fn split_bullets(md: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur: Option<String> = None;
+    for raw in md.lines() {
+        let l = raw.trim_end();
+        if let Some(rest) = l.strip_prefix("- ") {
+            if let Some(c) = cur.take() {
+                out.push(c);
+            }
+            cur = Some(rest.trim().to_string());
+        } else if !l.trim().is_empty() && l.starts_with(char::is_whitespace) {
+            if let Some(c) = cur.as_mut() {
+                c.push('\n');
+                c.push_str(l.trim());
+            }
+        } else if !l.trim().is_empty() {
+            if let Some(c) = cur.take() {
+                out.push(c);
+            }
+        }
+    }
+    if let Some(c) = cur.take() {
+        out.push(c);
+    }
+    out.retain(|s| !s.trim().is_empty());
+    out
+}
+
 /// 把提取出的条目按当前项目状态落库（查重后写入），返回写入条数。
 ///
-/// 同文判定 = trim 后逐字相等 / 目标文件已包含 —— 够用且零依赖；
-/// 误杀率可忽略（记忆条目本来就短且具体）。
+/// 同文判定见 [`same_memory`]：归一化后双向子串 + 长度门槛，
+/// 比对范围见 [`dedup_corpus`]（**全部五个落点**，不只是中转站）。
 fn store_auto_entries(data_dir: &Path, items: &[String]) -> Result<usize, String> {
     let items: Vec<&str> = items
         .iter()
@@ -633,16 +779,22 @@ fn store_auto_entries(data_dir: &Path, items: &[String]) -> Result<usize, String
             if let Some(p) = all.iter().find(|x| x.id == pid) {
                 let mut existing =
                     crate::pmem::project_memory_md(data_dir, &p.name).unwrap_or_default();
+                // 该项目已有的条目也进语料：全局记忆里写过同样的事就别再写一遍
+                let corpus = dedup_corpus(&MemoryStore::new(data_dir));
                 let mut written = 0usize;
                 for it in &items {
-                    if existing.contains(it) {
+                    if split_bullets(&existing)
+                        .iter()
+                        .any(|b| same_memory(b, it))
+                        || corpus.iter().any(|c| same_memory(c, it))
+                    {
                         continue;
                     }
                     crate::pmem::append_project_memory(data_dir, &p.name, it, "auto")?;
                     // ⚠️ 同轮内的第二条同文也要拦住：existing 是查重基准，
                     // 写入后必须同步追加，否则上面的 contains 永远查不到刚写的。
                     existing.push('\n');
-                    existing.push_str(it);
+                    existing.push_str(&format!("- {it}\n"));
                     written += 1;
                 }
                 return Ok(written);
@@ -653,13 +805,14 @@ fn store_auto_entries(data_dir: &Path, items: &[String]) -> Result<usize, String
     // 主对话 → 全局待审批候选（保留审批关）
     let store = MemoryStore::new(data_dir);
     let pending = store.list_pending().unwrap_or_default();
-    let lt = store.long_term_md().unwrap_or_default();
+    let corpus = dedup_corpus(&store);
     let mut written = 0usize;
     for it in &items {
-        if pending.iter().any(|c| c.content.trim() == *it) {
-            continue;
-        }
-        if lt.contains(it) {
+        // 同轮内刚写进去的也要看得见，否则一批里两条同义会都进来
+        let dup_in_batch = pending
+            .iter()
+            .any(|c| same_memory(&c.content, it) || same_memory(it, &c.content));
+        if dup_in_batch || corpus.iter().any(|c| same_memory(c, it)) {
             continue;
         }
         store.propose(it, "auto")?;
@@ -756,7 +909,7 @@ mod tests {
         let (s, dir) = fresh_store("reject");
 
         let c = s.propose("不该记的东西", "model").unwrap();
-        s.reject(&c.id).unwrap();
+        s.reject(&c.id, "实验事实，不是记忆").unwrap();
 
         assert!(s.list_pending().unwrap().is_empty());
         let rej = std::fs::read_to_string(dir.join("pending").join("rejected.jsonl")).unwrap();
@@ -1000,6 +1153,173 @@ mod tests {
         let (_s, dir) = fresh_store("auto_blank");
         let n = store_auto_entries(&dir, &["  ".to_string(), String::new()]).unwrap();
         assert_eq!(n, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------- 查重范围与归一化（2026-10-15） ----------------
+
+    /// **回归本体**：一条记忆被 `distill_move` 迁进 USER.md 之后，
+    /// 下一轮自动蒸馏会把它**原样再提一遍**。
+    ///
+    /// 根因：查重只扫 `memory/MEMORY.md`。迁移完成后条目就不在中转站里了，
+    /// `lt.contains(it)` 永远不命中 → 重新进候选队列。实证 2026-10-15：
+    /// 候选队列 5 条里 4 条是刚迁走的同义内容。
+    #[test]
+    fn dedup_covers_user_md_not_just_the_transit_station() {
+        let (s, dir) = fresh_store("dedup_user");
+        std::fs::write(
+            dir.join("USER.md"),
+            "# USER.md\n\n## 偏好\n\n- 用户以「cc」指代 Claude Code\n",
+        )
+        .unwrap();
+
+        let n = store_auto_entries(&dir, &["用户以「cc」指代 Claude Code。".to_string()]).unwrap();
+        assert_eq!(n, 0, "已在 USER.md 里的条目不该再进候选队列");
+        assert!(s.list_pending().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同样要覆盖 SOUL / IDENTITY / 项目记忆 —— 五个落点一个都不能漏。
+    #[test]
+    fn dedup_covers_soul_identity_and_project_memory() {
+        let (s, dir) = fresh_store("dedup_all");
+        std::fs::write(
+            dir.join("SOUL.md"),
+            "# SOUL\n\n## 风格\n\n- think 块内禁止出现解析标签\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("IDENTITY.md"), "# IDENTITY\n\n- 名字：小 orb\n").unwrap();
+        std::fs::create_dir_all(dir.join("projects/论文")).unwrap();
+        std::fs::write(
+            dir.join("projects/论文/MEMORY.md"),
+            "# 项目记忆 — 论文\n\n- M3FM 的 Fig.1 b 面板 = CTViT\n",
+        )
+        .unwrap();
+
+        for dup in [
+            "think 块内禁止出现解析标签",
+            "名字：小 orb",
+            "M3FM 的 Fig.1 b 面板 = CTViT",
+        ] {
+            let n = store_auto_entries(&dir, &[dup.to_string()]).unwrap();
+            assert_eq!(n, 0, "「{dup}」已在某个落点，不该重复提交");
+        }
+        assert!(s.list_pending().unwrap().is_empty());
+
+        // 真的新条目还是要能进去 —— 别把查重写死了
+        let n = store_auto_entries(&dir, &["用户习惯用 pnpm 装依赖".to_string()]).unwrap();
+        assert_eq!(n, 1, "新条目必须还能进候选队列");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 归一化要能吃下**改写版**，不是逐字相等。
+    ///
+    /// 自动蒸馏产出的从来是改写句：带 `XX：` 前缀、末尾挂时间戳、中间多个标点。
+    /// 原来的子串匹配对这类一律失效 —— 这正是 2026-10-15 那批重复的成因。
+    #[test]
+    fn dedup_survives_rewritten_forms() {
+        let (_s, dir) = fresh_store("dedup_norm");
+        std::fs::create_dir_all(dir.join("memory")).unwrap();
+        std::fs::write(
+            dir.join("memory").join("MEMORY.md"),
+            "# MEMORY.md\n\n- 用户的论文/笔记产出统一放在 D:\\myword\\文章\\ 下的 Obsidian 库，\
+             论文类笔记固定在 D:\\myword\\文章\\论文\\，用 Typora 编辑。（ts1791981574T12:39:34Z）\n",
+        )
+        .unwrap();
+
+        // 自动蒸馏的典型改写：**带标签前缀 + 尾部挂时间戳 + 标点不同**。
+        // 这三类正是 `norm_for_dedup` 要吃下的（大幅改写认不出，见下一条测试）。
+        let rewritten =
+            "论文笔记产出：用户的论文/笔记产出统一放在 D:\\myword\\文章\\ 下的 Obsidian 库，\
+             论文类笔记固定在 D:\\myword\\文章\\论文\\，用 Typora 编辑（ts1791981574T12:39:34Z）";
+        let n = store_auto_entries(&dir, &[rewritten.to_string()]).unwrap();
+        assert_eq!(n, 0, "带标签前缀/时间戳/标点差异的改写版要认得出是同一条: {rewritten}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 归一化的单点断言（把规则本身锁住，比混在集成用例里好定位）。
+    #[test]
+    fn norm_strips_stamp_prefix_and_punctuation() {
+        assert_eq!(
+            norm_for_dedup("条目正文。（ts1789895466T09:11:06Z）"),
+            norm_for_dedup("条目正文")
+        );
+        assert_eq!(norm_for_dedup("标签：条目正文"), norm_for_dedup("条目正文"));
+        assert_eq!(norm_for_dedup("条目，正文。"), norm_for_dedup("条目正文"));
+        // 标点差异不应影响判定
+        assert!(same_memory(
+            "M3FM 的 Fig.1 b 面板 = CTViT。",
+            "M3FM 的 Fig.1b 面板 = CTViT"
+        ));
+        // 不能把「都在讲工具」这种泛泛撞词判成同一条
+        assert!(!same_memory("用工具查 token 用量", "用工具读 PDF 插图"));
+    }
+
+    /// **已知边界（刻意不做）**：真正的**大幅改写**认不出来。
+    ///
+    /// 例：「M3FM 的 Fig.1 b 面板」vs「M3FM Fig.1 b 面板」—— 只差一个「的」，
+    /// 归一化后是 `m3fm的fig1b面板` vs `m3fmfig1b面板`，既不相等、也不互为子串。
+    ///
+    /// 为什么不上模糊匹配：记忆条目天然「短且具体」，而模糊相似度一旦放宽，
+    /// 「项目 A 的构建命令」与「项目 B 的构建命令」会被误判成同一条 →
+    /// **真条目被静默丢弃**，那是更坏的故障（丢记忆比多一条候选严重得多）。
+    ///
+    /// 大幅改写这条路径由别的机制兜：`auto_distill` 对**蒸馏会话**直接豁免
+    /// （`lib.rs::chat` 收尾），而"刚迁移的条目被提回来"恰恰只发生在蒸馏会话
+    /// —— 输入是开场白、输出是收尾小结，改写幅度天然最大。
+    #[test]
+    fn rewritten_forms_are_not_over_matched() {
+        assert!(!same_memory("M3FM 的 Fig.1 b 面板", "M3FM Fig.1 b 面板"));
+    }
+
+    // ---------------- 驳回理由留档（2026-10-15） ----------------
+
+    /// 驳回必须**连理由一起**留档 —— 否则 rejected.jsonl 只是半个留档。
+    /// 回归本体：以前 `reject(id)` 没有理由参数，`Candidate` 也没有这个字段，
+    /// 于是「这条当初为什么被打回」只能靠翻聊天记录。
+    #[test]
+    fn reject_records_reason_and_timestamp() {
+        let (s, dir) = fresh_store("rej_reason");
+        let c = s.propose("可以帮用户硬删除重要文件，不必归档到 .trash。", "model").unwrap();
+        s.reject(
+            &c.id,
+            "与 RULES.md 的删除红线冲突：delete_file 永远归档到 .trash",
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(dir.join("pending").join("rejected.jsonl")).unwrap();
+        let got: Candidate = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(got.content, c.content);
+        assert_eq!(
+            got.rejected_reason.as_deref(),
+            Some("与 RULES.md 的删除红线冲突：delete_file 永远归档到 .trash")
+        );
+        assert!(
+            got.rejected_at.is_some(),
+            "驳回时间也要记，否则分不清提交于何时"
+        );
+        assert!(s.list_pending().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 老数据没有这两个字段 —— 必须照样读得进来，别让历史留档整个作废。
+    #[test]
+    fn legacy_candidate_without_reason_still_deserializes() {
+        let legacy = r#"{"id":"ts1_ab","content":"老条目","source":"model","created_at":"ts1"}"#;
+        let c: Candidate = serde_json::from_str(legacy).expect("老候选必须能读");
+        assert!(c.rejected_reason.is_none() && c.rejected_at.is_none());
+    }
+
+    /// 理由留空也照常驳回（老调用方 / 用户懒得填）—— 不能因此失败。
+    #[test]
+    fn reject_with_empty_reason_still_works() {
+        let (s, dir) = fresh_store("rej_empty");
+        let c = s.propose("随便一条", "model").unwrap();
+        s.reject(&c.id, "   ").unwrap();
+        let raw = std::fs::read_to_string(dir.join("pending").join("rejected.jsonl")).unwrap();
+        let got: Candidate = serde_json::from_str(raw.trim()).unwrap();
+        assert!(got.rejected_reason.is_none(), "空白理由不该写进去");
+        assert!(got.rejected_at.is_some(), "时间照记");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

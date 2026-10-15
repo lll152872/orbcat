@@ -3957,9 +3957,17 @@ fn mem_approve(state: State<'_, AppState>, id: String) -> Result<(), String> {
     state.memory.approve(&id)
 }
 
+/// 驳回一条候选。`reason` 可空 —— 空也照常留档，只是没有理由可看。
+///
+/// 为什么要理由（2026-10-15 加）：`rejected.jsonl` 本来就是**留档**，
+/// 以前只留内容不留理由，于是过几天只能问人「这条当初为什么被打回」。
 #[tauri::command]
-fn mem_reject(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    state.memory.reject(&id)
+fn mem_reject(
+    state: State<'_, AppState>,
+    id: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    state.memory.reject(&id, reason.as_deref().unwrap_or(""))
 }
 
 /// 用户手写一条记忆候选（和模型提交走同一审批通道）
