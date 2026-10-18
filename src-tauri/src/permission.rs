@@ -501,7 +501,20 @@ pub const SELF_DATA_DIR_LABEL: &str = "agent 数据目录（程序自身）";
 /// - 指向对的地方但**被降级**成只读 → 留着会在设置页出现同 label 的两条，
 ///   而其中那条死规则只会让人以为"这条规则不生效"。
 pub fn ensure_self_data_dir_rule(gate: &mut PermissionGate, data_dir: &Path) -> bool {
-    let want = data_dir.to_path_buf();
+    // ⚠️ **必须规范化后再比**（2026-10-18 CI 才暴露出来）：
+    // `add_rule` 存进去的是 `best_effort_canonicalize` 之后的路径，而
+    // `data_dir` 是调用方给的原始形态。两者在**同一台机器**上也可能不同形 ——
+    // Windows 上 `C:\Users\RUNNER~1\AppData\Local\Temp` 会被展开成
+    // `C:\Users\runneradmin\AppData\Local\Temp`（8.3 短名 / 联接点）。
+    //
+    // 不规范化的话：`want` 永远匹配不上已存的那条 → 每次启动都判定"要修" →
+    // 每次启动都重写 permissions.json 并打一条"数据目录已迁移"的日志。
+    // 而实际什么都没迁移。
+    //
+    // 同一文件里 `load_gate` 那条用例的注释已经写过这个坑（"可能被解析成 8.3
+    // 短名或展开联接 —— 所以要拿同样规范化后的路径去比"），这里是被它提醒过
+    // 却仍然踩了的地方。
+    let want = best_effort_canonicalize(data_dir);
     if gate
         .export_rules()
         .iter()
@@ -510,6 +523,8 @@ pub fn ensure_self_data_dir_rule(gate: &mut PermissionGate, data_dir: &Path) -> 
         return false; // 已经是全权限且指对了
     }
     gate.retain_rules(|r| r.label != SELF_DATA_DIR_LABEL);
+    // 传 `want` 而不是 `data_dir`：`add_rule` 内部还会再规范化一次，
+    // 传规范化过的值是幂等的（规范化一个已规范化的路径 = 它本身）。
     gate.add_rule(&want, Access::Full, SELF_DATA_DIR_LABEL);
     true
 }
@@ -1004,12 +1019,18 @@ mod tests {
         // 重新加载（模拟重启）
         let g2 = load_gate(&new_dir, &new_dir.join("app"));
         let rules = g2.export_rules();
+        // ⚠️ 比的是**规范化后**的路径：`add_rule` / `load_gate` 存的都是规范化形态，
+        //    而 `new_dir` / `old_dir` 是原始形态。Windows 上两者可能不同形
+        //    （8.3 短名、联接点展开），本机恰好同形就会把这个 bug 藏起来 ——
+        //    CI（`RUNNER~1` → `runneradmin`）才炸出来。2026-10-18。
+        let new_norm = best_effort_canonicalize(&new_dir);
+        let old_norm = best_effort_canonicalize(&old_dir);
         assert!(
-            rules.iter().any(|r| r.prefix == new_dir && r.access == Access::Full),
+            rules.iter().any(|r| r.prefix == new_norm && r.access == Access::Full),
             "数据目录搬家后那条 full 必须被校正回真地方"
         );
         assert!(
-            !rules.iter().any(|r| r.prefix == old_dir && r.label == SELF_DATA_DIR_LABEL),
+            !rules.iter().any(|r| r.prefix == old_norm && r.label == SELF_DATA_DIR_LABEL),
             "指向旧地方的残骸不该留着 —— 那是一条够得着的幽灵授权"
         );
         let _ = std::fs::remove_dir_all(&d);
@@ -1059,8 +1080,10 @@ mod tests {
         gate.add_rule(&d, Access::Read, SELF_DATA_DIR_LABEL);
         assert!(ensure_self_data_dir_rule(&mut gate, &d));
         let rules = gate.export_rules();
+        // 比规范化形态 —— 理由同 `self_data_dir_rule_is_repaired_after_data_dir_moved`
+        let d_norm = best_effort_canonicalize(&d);
         assert!(
-            rules.iter().any(|r| r.prefix == d && r.access == Access::Full),
+            rules.iter().any(|r| r.prefix == d_norm && r.access == Access::Full),
             "程序自己的数据目录必须是 Full"
         );
         assert_eq!(

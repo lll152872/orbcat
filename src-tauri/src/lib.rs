@@ -463,8 +463,20 @@ fn data_dir_beside_exe(exe: &Path) -> Option<PathBuf> {
 // 窗口几何计算
 // ---------------------------------------------------------------------------
 
-/// 计算目标窗口 bounds，返回**物理像素** `(x, y, w, h)`。
-#[cfg(windows)]
+// ⚠️ 这里**不要**加 `#[cfg(windows)]`（2026-10-18 CI 才炸出来）。
+//
+// 下面这一整段（`ORB_ANCHOR` / `save_orb_pos` / `remember_orb_moved` /
+// `compute_bounds` …）是**跨平台**的：它们的调用方 `on_window_event`（记位置）
+// 与 `app_quit`（落盘）都**没有**平台 gate，而 `apply_mode` 才是 Windows 专有的。
+//
+// 之前这行 `#[cfg(windows)]` 写在 `ORB_ANCHOR` 上（属性只作用于**下一个 item**，
+// 不是作用于"后面这一段"）——于是 macOS 构建里 `ORB_ANCHOR` 被编掉，
+// 而没被编掉的 `remember_orb_moved` 照样引用它：
+//
+//     error[E0425]: cannot find value `ORB_ANCHOR` in this scope
+//       --> src/lib.rs:582
+//
+// 本机（Windows）永远发现不了 —— 这就是它能一直躺着的原因。
 /// 球被用户拖到的真实位置（左上角，**已含 pad 偏移**）。
 ///
 /// `None` = 还没记录过（首启）→ 走默认摆位。
@@ -654,6 +666,7 @@ impl OrbBounds for tauri::WebviewWindow {
     }
 }
 
+/// 计算目标窗口 bounds，返回**物理像素** `(x, y, w, h)`。
 fn compute_bounds(
     mode: &str,
     monitor_pos: (i32, i32),

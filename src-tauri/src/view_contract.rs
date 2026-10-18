@@ -166,14 +166,26 @@ fn debounced_orb_pos_save_writes_only_the_last_position() {
         schedule_orb_pos_save(&dir, (i * 100, i * 10));
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
-    // 等安静期过去
-    std::thread::sleep(std::time::Duration::from_millis(
-        ORB_SAVE_DEBOUNCE_MS + 400,
-    ));
+
+    // ⚠️ **轮询**而不是「睡够安静期 + 400ms」（2026-10-18）：
+    // 原来那版在 587 条用例**并行**跑时偶发失败（本机单跑 3/3 通过、
+    // 全量跑偶发挂）—— 固定睡眠等于假定 worker 线程拿得到 CPU。机器一忙，
+    // worker 被推迟到断言之后才落盘，于是读到的是**中间某个**位置。
+    //
+    // 这里等的是**真正要等的那件事**（落盘成最后那个值），而不是"睡够这么久
+    // 应该落完了"。慢机器上只是多等几轮，不会误判成失败。
+    let want = Some(config::OrbPos { x: 600, y: 60 });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5_000);
+    let got = loop {
+        let cur = config::load_settings(&dir).orb_pos;
+        if cur == want || std::time::Instant::now() > deadline {
+            break cur;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
 
     assert_eq!(
-        config::load_settings(&dir).orb_pos,
-        Some(config::OrbPos { x: 600, y: 60 }),
+        got, want,
         "拖一串事件后必须落盘**最后一个**位置，不是第一个也不是中间某个"
     );
     let _ = std::fs::remove_dir_all(&dir);
