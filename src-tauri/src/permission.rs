@@ -465,10 +465,60 @@ pub fn bootstrap_gate(agent_data_dir: impl AsRef<Path>, app_dir: impl AsRef<Path
     gate
 }
 
-/// 加载权限规则。
+/// 「程序自己正在用的数据目录」这条规则的 label。
 ///
-/// - 文件存在 → **完全以文件为准**（用户的配置说了算）
-/// - 不存在 → 用自举规则，并**立刻写入文件**（让用户看得见、改得动）
+/// 与 [`PROJECT_DIR_LABEL_PREFIX`] 的**动态**规则不同：这条**要落盘、也要在设置页
+/// 看得见** —— 用户打开设置看到「程序数据目录（自有）」才知道 agent 能写哪。
+/// 代价是它会跟着目录搬家而失效，所以 [`load_gate`] 每次启动都校正它。
+pub const SELF_DATA_DIR_LABEL: &str = "agent 数据目录（程序自身）";
+
+/// 确保「程序自己正在用的数据目录」有一条 [`Access::Full`] 规则。
+///
+/// 返回 `true` = 规则表被改过（调用方要落盘）。
+///
+/// ## 为什么必须每次启动都校正（2026-10-15 用户机器上实测）
+///
+/// 自举规则只在 `permissions.json` **不存在**时写一次（[`load_gate`] 的老规矩：
+/// 「文件存在就完全以文件为准」）。于是数据目录一旦搬家 ——
+/// 本机就是从 `D:\workplace\悬浮小agent\orbcat\agent-data` 搬到 `D:\orbcat\agent-data`
+/// —— 文件里那条 `full` 就永远指向**旧地方**，而真数据目录只剩 `D:\` 的 read 兜底。
+///
+/// 后果比"多一条旧规则"严重得多：
+/// - agent 用常规 `write_file` / `edit_file` **写不了自己的记忆与会话**；
+/// - 而且**没有任何提示** —— `remember` 那条路直连 `pmem::`，本就绕过文件闸门，
+///   所以只有它还能写。同一份文件两条路权限不一致，出问题时极难定位。
+///
+/// ## 为什么不按"动态规则"处理
+///
+/// 动态规则不落盘、不进设置页列表（见 [`PROJECT_DIR_LABEL_PREFIX`] 的三条硬约束）。
+/// 那套是为「激活项目目录」设计的 —— 那条授权会随项目切换而变，不该留痕。
+/// 数据目录规则性质不同：它固定、用户看得见、也改得动，就该留在文件里。
+///
+/// ## 只修这一条，不动用户的其它规则
+///
+/// 同 [`SELF_DATA_DIR_LABEL`] 的**全摘掉**再补一条对的。两种情况都要摘：
+/// - 指向旧地方（目录搬家）→ 留着就是一条够得着的幽灵授权；
+/// - 指向对的地方但**被降级**成只读 → 留着会在设置页出现同 label 的两条，
+///   而其中那条死规则只会让人以为"这条规则不生效"。
+pub fn ensure_self_data_dir_rule(gate: &mut PermissionGate, data_dir: &Path) -> bool {
+    let want = data_dir.to_path_buf();
+    if gate
+        .export_rules()
+        .iter()
+        .any(|r| r.prefix == want && r.access == Access::Full)
+    {
+        return false; // 已经是全权限且指对了
+    }
+    gate.retain_rules(|r| r.label != SELF_DATA_DIR_LABEL);
+    gate.add_rule(&want, Access::Full, SELF_DATA_DIR_LABEL);
+    true
+}
+
+/// 加载规则文件 + 组装闸门。
+///
+/// - 文件存在 → **以文件为准**，但**唯一例外**是 [`ensure_self_data_dir_rule`]：
+///   程序正在用的数据目录必须可写，详见那里的说明。
+/// - 文件不存在 → 用自举规则，并**立刻写入文件**（让用户看得见、改得动）。
 pub fn load_gate(agent_data_dir: impl AsRef<Path>, app_dir: impl AsRef<Path>) -> PermissionGate {
     let data_dir = agent_data_dir.as_ref();
     let path = rules_path(data_dir);
@@ -479,6 +529,14 @@ pub fn load_gate(agent_data_dir: impl AsRef<Path>, app_dir: impl AsRef<Path>) ->
                 Ok(f) => {
                     let mut gate = PermissionGate::new();
                     gate.replace_rules(&f.rules);
+                    // ⚠️ 文件为准，但数据目录那条必须校正 —— 目录搬家后它会指错地方，
+                    //    导致 agent 写不动自己的记忆（详见函数文档）。
+                    if ensure_self_data_dir_rule(&mut gate, data_dir) {
+                        match save_gate(data_dir, &gate) {
+                            Ok(p) => eprintln!("[orbcat] 已修正 {} 里的数据目录规则（数据目录已迁移）", p.display()),
+                            Err(e) => eprintln!("[orbcat] ⚠️ 修正数据目录规则后写盘失败: {e}"),
+                        }
+                    }
                     return gate;
                 }
                 Err(e) => {
@@ -916,6 +974,104 @@ mod tests {
         g.add_rule(r"D:\myword", Access::ReadWrite, "D:\\myword");
         g.add_rule(r"D:\myword\agent-data", Access::Full, "agent 数据");
         g
+    }
+
+    /// 数据目录规则必须指向**程序正在用的那个**目录 —— 复刻用户机器上的真实故障。
+    ///
+    /// `permissions.json` 是**搬家之前**生成的，那条 `full` 指着旧地方；
+    /// 真数据目录只剩一条盘级 `read` 兜底。后果是 agent 用常规
+    /// `write_file`/`edit_file` 写不了自己的记忆与会话，而且**没有任何提示**
+    /// （`remember` 直连 `pmem::` 绕过闸门，所以只有它还能写 —— 两条路权限不一致）。
+    #[test]
+    fn self_data_dir_rule_is_repaired_after_data_dir_moved() {
+        let d = std::env::temp_dir().join(format!(
+            "fa_perm_moved_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let old_dir = d.join("old");
+        let new_dir = d.join("new");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+
+        // 写一份"搬家前"的 permissions.json
+        let mut gate = PermissionGate::new();
+        gate.add_rule(&old_dir, Access::Full, SELF_DATA_DIR_LABEL);
+        save_gate(&new_dir, &gate).expect("写旧规则");
+
+        // 重新加载（模拟重启）
+        let g2 = load_gate(&new_dir, &new_dir.join("app"));
+        let rules = g2.export_rules();
+        assert!(
+            rules.iter().any(|r| r.prefix == new_dir && r.access == Access::Full),
+            "数据目录搬家后那条 full 必须被校正回真地方"
+        );
+        assert!(
+            !rules.iter().any(|r| r.prefix == old_dir && r.label == SELF_DATA_DIR_LABEL),
+            "指向旧地方的残骸不该留着 —— 那是一条够得着的幽灵授权"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn self_data_dir_rule_is_idempotent() {
+        let d = std::env::temp_dir().join(format!(
+            "fa_perm_idem_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let mut gate = PermissionGate::new();
+        assert!(ensure_self_data_dir_rule(&mut gate, &d), "第一次应当补上");
+        assert!(
+            !ensure_self_data_dir_rule(&mut gate, &d),
+            "已经对上了就不该再改（否则每次启动都白写一次盘）"
+        );
+        assert_eq!(
+            gate.export_rules()
+                .iter()
+                .filter(|r| r.label == SELF_DATA_DIR_LABEL)
+                .count(),
+            1,
+            "同一条规则不能重复堆"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 反向对照：用户把这条**降级**了也要抬回 Full。
+    ///
+    /// 那是程序自己的记忆/会话目录，写不进去等于坏了 —— 不该当成授权意图。
+    #[test]
+    fn self_data_dir_rule_is_lifted_back_to_full() {
+        let d = std::env::temp_dir().join(format!(
+            "fa_perm_down_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let mut gate = PermissionGate::new();
+        gate.add_rule(&d, Access::Read, SELF_DATA_DIR_LABEL);
+        assert!(ensure_self_data_dir_rule(&mut gate, &d));
+        let rules = gate.export_rules();
+        assert!(
+            rules.iter().any(|r| r.prefix == d && r.access == Access::Full),
+            "程序自己的数据目录必须是 Full"
+        );
+        assert_eq!(
+            rules
+                .iter()
+                .filter(|r| r.label == SELF_DATA_DIR_LABEL)
+                .count(),
+            1,
+            "降级那条要被替换掉，不是再加一条"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[cfg(windows)]

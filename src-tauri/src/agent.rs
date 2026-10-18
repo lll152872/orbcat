@@ -1185,7 +1185,8 @@ pub async fn run(
                  当前前台路径命中项目「{name}」。它的项目记忆在 \
                  `projects/{name}/MEMORY.md`，**正文不在这里** —— \
                  需要时调 `read_project_memory(project=\"{name}\")` 读。\n\
-                 若要沉淀新的项目级事实，用 `remember` 写入（或引导用户直接改那个文件）。"
+                 若要沉淀新的项目级事实，用 `remember` 写入；\
+                 要改/删已有条目，用常规的 `read_file` + `edit_file` 操作那个文件即可。"
             ));
         }
     }
@@ -2539,12 +2540,15 @@ pub fn build_system_prompt_full(
                          `projects/{name}/MEMORY.md`（{entries} 条 / 约 {chars} 字）。\n\n\
                          **正文不在这里**（项目记忆随时在变，整份注入会让每轮对话的缓存全失效）—— \
                          需要时调 `read_project_memory(project=\"{name}\")` 读，读完只取你要的那几条。\n\n\
-                         **你必须主动维护这份项目记忆**：\n\
-                         1. 结论、路径、术语、未决问题 → 本轮用 `remember` 写入（直接落盘）\n\
-                         2. 发现过时/错误条目 → `remember` 写「更正：…」并点明作废哪条\n\
-                         3. 项目事实写项目；**跨项目偏好与通用教训仍要用 `remember(scope:\"global\")`**\n\
-                         —— 别因为当前在项目里，就把通用经验全丢进项目层\n\
-                         4. 每得出可复用结论就记，不要攒到最后",
+                         **这份文件由你维护**（增删改都随你，但有一条纪律：**改用常规工具，别新造**）：\n\
+                         - **追加一条** → `remember(content, scope:\"project\")`（直接落盘，无需用户审批）\n\
+                         - **改一条 / 删一条** → `read_file` 读 `projects/{name}/MEMORY.md`，\
+                         然后用 `edit_file` 精确替换，或 `delete_file` 归档掉。\n\
+                         别为了删一条去写专用工具 —— `edit_file` 就够。\n\
+                         - **跨项目的用户偏好/通用教训不要写这里** → 那些走 \
+                         `remember(scope:\"global\")`（有审批关）。\n\
+                         - 改之前先 `read_file` 看当前内容，**别凭印象改**。\n\
+                         - 每得出可复用结论就记，不要攒到最后",
                         name = p.name,
                         entries = entries,
                         chars = chars,
@@ -2560,7 +2564,8 @@ pub fn build_system_prompt_full(
          # 记忆：三个落点，写哪一层由你选\n\n\
          工具是 `remember(content, scope)`。**scope 决定落点，不要默认全写当前项目**：\n\n\
          - `scope:\"global\"` → 提交全局候选 → 用户在 设置 › 记忆 批准后进 `memory/MEMORY.md`（跨项目长期记忆）\n\
-         - `scope:\"project\"` → 直写 `projects/<名>/MEMORY.md`（只在本项目成立的事实；当前没有激活项目时工具会报错）\n\
+         - `scope:\"project\"` → 追加一条到 `projects/<名>/MEMORY.md`（只在本项目成立的事实）。\
+         **只能追加** —— 要改/删已有条目，用常规的 `read_file` + `edit_file` 操作那个文件，别造专用工具。\n\
          - `USER.md` / `SOUL.md` / `IDENTITY.md` **不是** `remember` 的落点 —— 那是记忆蒸馏会话的活，别自己往里写\n\
          - **过时/记错的条目要删** → 你这里没有删除工具；把「哪条过时、为什么」告诉用户，\
            由记忆蒸馏会话的 `memory_delete` 处理（会先按天备份）\n\n\
@@ -2582,7 +2587,7 @@ pub fn build_system_prompt_full(
          - 跨项目通用（用户偏好 / 雷区 / 通用教训 / 关于用户本人的事实）→ `scope:\"global\"`\n\
          - 只在本项目成立（路径、术语、目录与命名约定、本项目进展与未决项）→ `scope:\"project\"`\n\
          - 拿不准 → `global`：候选有审批把关，提错会被驳；漏记的永远丢了\n\n\
-         全局侧**有审批关，宁多勿漏**；项目侧**无审批，必须准**：只写确认过的事实，不写猜测。\
+         全局侧**有审批关，宁多勿漏**；项目侧**无审批、直接落盘**，所以项目侧更要准：只写确认过的事实。\
          选了 `project` 而当前没有激活项目时，工具会报错并给你项目清单 —— 改口成 `global`，\
          或请用户切顶栏，**不要自己偷偷换落点**。另有轮末自动蒸馏在后台兜底，但它**不替代**你当场判断。\n\n\
          # 不该记\n\n\

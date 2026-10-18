@@ -263,6 +263,16 @@ pub fn project_memory_md(data_dir: &Path, name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// 项目名 → `projects/<名>/MEMORY.md`。
+///
+/// ⚠️ **名字必须先过 `valid_project_name`** —— 项目名来自 UI 与工具调用，
+/// 会被拼进路径，空/隐藏/含分隔符/含 `..` 的一律拒绝。
+fn project_memory_path(data_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let name = name.trim();
+    valid_project_name(name)?;
+    Ok(data_dir.join("projects").join(name).join("MEMORY.md"))
+}
+
 /// 追加一条项目记忆到 md（有项目时 `remember` 可直接写，不进全局 pending）
 pub fn append_project_memory(
     data_dir: &Path,
@@ -274,11 +284,12 @@ pub fn append_project_memory(
     if content.is_empty() {
         return Err("记忆内容不能为空".into());
     }
-    let dir = data_dir.join("projects").join(name);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("建项目目录失败: {e}"))?;
-    let p = dir.join("MEMORY.md");
+    let p = project_memory_path(data_dir, name)?;
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("建项目目录失败: {e}"))?;
+    }
     if !p.exists() {
-        std::fs::write(&p, format!("# 项目记忆 — {name}\n\n"))
+        std::fs::write(&p, format!("# 项目记忆 — {}\n\n", name.trim()))
             .map_err(|e| format!("写 MEMORY.md 失败: {e}"))?;
     }
     let mut f = std::fs::OpenOptions::new()
@@ -289,6 +300,72 @@ pub fn append_project_memory(
     writeln!(f, "- {content}（{} · {source}）", now_ts())
         .map_err(|e| format!("追加记忆失败: {e}"))?;
     Ok(())
+}
+
+/// 项目名合法性（UI 与工具共用的唯一口径）。
+pub fn valid_project_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.starts_with('.')
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+    {
+        return Err("非法项目名".into());
+    }
+    Ok(())
+}
+
+/// 读项目 MEMORY.md 全文（UI 编辑器 / 工具校对用）。不存在当空串。
+pub fn read_project_memory_file(data_dir: &Path, name: &str) -> Result<String, String> {
+    let p = project_memory_path(data_dir, name)?;
+    match std::fs::read_to_string(&p) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("读项目记忆失败: {e}")),
+    }
+}
+
+/// 改项目记忆前按天备份（同 [`crate::distill`] 的 `MEMORY.md.bak-<日期>` 命名），
+/// 返回备份文件名。同一天再改会覆盖它 —— 想回到更早得自己另存。
+fn backup_project_memory(p: &Path) -> Result<String, String> {
+    let stamp = crate::distill::ts_compact_pub();
+    let name = format!("MEMORY.md.bak-{stamp}");
+    let bak = p.with_file_name(&name);
+    let prev = std::fs::read_to_string(p).unwrap_or_default();
+    std::fs::write(&bak, prev).map_err(|e| format!("备份项目记忆失败: {e}"))?;
+    Ok(name)
+}
+
+/// **用户手工编辑**项目 MEMORY.md（整份覆盖）。
+///
+/// 返回备份文件名 —— 按天覆盖，所以同一天改多次只能回到当天第一次的状态。
+/// 要更稳就自己拷一份 `MEMORY.md.bak-<日期>`。
+pub fn write_project_memory_file(
+    data_dir: &Path,
+    name: &str,
+    text: &str,
+) -> Result<String, String> {
+    let p = project_memory_path(data_dir, name)?;
+    let bak = if p.exists() {
+        Some(backup_project_memory(&p)?)
+    } else {
+        None
+    };
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("建项目目录失败: {e}"))?;
+    }
+    let body = if text.trim().is_empty() {
+        format!("# 项目记忆 — {}\n\n", name.trim())
+    } else {
+        let t = text.trim_end();
+        if t.ends_with('\n') {
+            t.to_string()
+        } else {
+            format!("{t}\n")
+        }
+    };
+    std::fs::write(&p, body).map_err(|e| format!("写项目记忆失败: {e}"))?;
+    Ok(bak.unwrap_or_default())
 }
 
 #[cfg(test)]

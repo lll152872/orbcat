@@ -169,6 +169,15 @@ fn clip(s: &str, max: usize) -> String {
 
 /// 今天的日期串（`YYYYMMDD`）—— 备份按天命名
 fn today_compact() -> String {
+    ts_compact_pub()
+}
+
+/// [`today_compact`] 的跨模块可见版本（`pmem` 的备份命名要用同一套）。
+pub(crate) fn ts_compact_pub() -> String {
+    ts_compact()
+}
+
+fn ts_compact() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

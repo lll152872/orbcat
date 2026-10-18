@@ -4129,6 +4129,26 @@ fn pmem_clear_memory(state: State<'_, AppState>, name: String) -> Result<(), Str
     pmem::clear_project_memory(&state.data_dir, &name)
 }
 
+/// 读项目 MEMORY.md 全文（设置 › 记忆 的手改编辑器）。
+///
+/// ⚠️ **不走文件权限网关** —— 这是**用户自己**在设置页改自己的项目记忆，
+/// 不是 agent 的工具调用。agent 想读/改这个文件走 `read_project_memory` /
+/// `read_file`+`edit_file`（那条路要过闸门，见 `permission::ensure_self_data_dir_rule`）。
+#[tauri::command]
+fn pmem_memory_read(state: State<'_, AppState>, name: String) -> Result<String, String> {
+    pmem::read_project_memory_file(&state.data_dir, &name)
+}
+
+/// 整份覆盖项目 MEMORY.md（用户手改）。返回备份文件名（空 = 原来没有文件）。
+#[tauri::command]
+fn pmem_memory_write(
+    state: State<'_, AppState>,
+    name: String,
+    text: String,
+) -> Result<String, String> {
+    pmem::write_project_memory_file(&state.data_dir, &name, &text)
+}
+
 /// 改会话标题
 #[tauri::command]
 fn session_set_title(
@@ -4956,6 +4976,8 @@ pub fn run() {
             pmem_session_map,
             pmem_rename,
             pmem_clear_memory,
+        pmem_memory_read,
+        pmem_memory_write,
             mem_read,
             mem_files,
             mem_projects,
