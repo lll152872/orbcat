@@ -1572,14 +1572,63 @@ body {
   color: #dce2da;
 }
 
-/* 主聊天与任务列表之间的分隔标题 */
+/* 组标题（无任务空间 / 📁 项目名）—— 可点收起/展开，右键仍能重命名项目
+   ⚠️ 它是 `<button>`：浏览器默认 button 样式（灰底、居中、系统字体）会
+      整块盖掉这里的深色面板，所以必须显式清干净。 */
 .sess-sep {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
   margin: 12px 0 7px;
+  padding: 3px 0 5px;
+  font-family: inherit;
   font-size: 10.5px;
   letter-spacing: 0.04em;
+  text-align: left;
   color: #85858B;
+  background: transparent;
+  border: none;
   border-bottom: 1px solid rgba(168, 230, 207, 0.07);
-  padding-bottom: 5px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.sess-sep:hover {
+  color: #a8a8ae;
+}
+
+.sess-sep:focus-visible {
+  outline: 1px solid rgba(168, 230, 207, 0.45);
+  outline-offset: 2px;
+}
+
+/* 折叠态：标题留着（不然没法再点开），只把下面那组藏起来。
+   ⚠️ 色值不能一味压暗：浏览器实测 #6b6b72 在面板底色 rgb(20,18,15) 上只有
+      **3.54:1**，低于 WCAG AA 的 4.5:1；#7e7e86 是 4.64:1 —— 既还看得出
+      「这一组收着」，又真的读得出来。 */
+.sess-sep.folded {
+  color: #7e7e86;
+}
+
+.sess-caret {
+  flex: 0 0 auto;
+  font-size: 9px;
+  color: #8e8e94;
+}
+
+.sess-sep-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 计数 / 「当前项目」角标：与 `.lm-count`（#8E8E94）同档，取低一档以示次要 */
+.sess-sep-n {
+  flex: 0 0 auto;
+  color: #7e7e86;
 }
 
 .sess-item {
@@ -3014,6 +3063,13 @@ body {
   padding-left: 6px;
 }
 
+/* ⚠️ 必须显式写：`.sess-group` 是 `display:flex`，优先级高于 UA 样式表里的
+   `[hidden]{display:none}` —— 不写这一条，「折叠」在真浏览器里**根本不生效**
+   （元素带着 hidden 属性却照样显示）。happy-dom 不做样式计算，测不出来。 */
+.sess-group[hidden] {
+  display: none;
+}
+
 /* 表单字段：小标签 + 输入，和面板深色一致（不要系统白框） */
 .fld {
   display: flex;
@@ -3462,6 +3518,45 @@ button.fetch-id {
 .proj-editor:focus {
   outline: none;
   border-color: rgba(168, 230, 207, 0.5);
+}
+
+/* 项目 MEMORY.md 手改编辑器（设置 › 记忆 › 项目记忆 › 「编辑记忆」）
+   样式照 `.proj-editor` 那套走 —— 同一种东西（等宽正文、可纵向拉伸）。 */
+.proj-mem-editor {
+  width: 100%;
+  min-height: 180px;
+  box-sizing: border-box;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  padding: 8px;
+  border-radius: 6px;
+  resize: vertical;
+  color: inherit;
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid rgba(168, 230, 207, 0.14);
+}
+.proj-mem-editor:focus {
+  outline: none;
+  border-color: rgba(168, 230, 207, 0.5);
+}
+
+.proj-mem-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* ⚠️ 这行必须写清"备份按天只留一份" —— 用户以为有历史版本，
+   结果手滑覆盖后回不去，比一开始就没备份更气。 */
+.proj-mem-hint {
+  margin-top: 4px;
+  font-size: 10.5px;
+  color: #85858B;
+}
+.proj-mem-hint code {
+  font-size: 10px;
+  color: #7c8479;
 }
 
 /* MCP「添加 HTTP 网关 / 添加 stdio 脚本」表单：一行内横向排布，放不下才换行。

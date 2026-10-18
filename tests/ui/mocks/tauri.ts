@@ -359,6 +359,10 @@ const emptyOk: Record<string, unknown> = {  set_window_mode: null,
   pmem_list: [],
   pmem_get_active: null,
   pmem_session_map: {},
+  /** 项目名 → MEMORY.md 全文（`pmem_memory_read` / `_write` 共用一份真存储） */
+  projectMemory: {} as Record<string, string>,
+  /** `_write` 返回的备份名（按天），测试用来断言"保存前有备份" */
+  projectMemoryBackup: "MEMORY.md.bak-20261015",
 };
 
 /**
@@ -412,7 +416,26 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
       state.sessionMode = m;
       return sessionPayload(m) as T;
     }
-    case "session_switch":
+    case "session_switch": {
+      // ⚠️ 必须**真的切**：之前这里直接 `sessionPayload()`，而它是拿
+      // `state.currentSessionId` 拼的 —— 于是 `session_switch` 切了会话、
+      // 返回的却还是原来那条。前端 `currentSessionId` 永远不变，
+      // 「切了会话但顶栏/标题没跟着变」这类真 bug 会被 mock 悄悄抹平
+      // （2026-10-17 顶栏项目与当前会话不匹配就是这么测不出来的）。
+      const id = String(args?.id ?? "");
+      const target = state.sessionList.find((s) => s.id === id);
+      if (!target) throw new Error(`会话不存在：${id}`);
+      state.currentSessionId = id;
+      return {
+        id,
+        title: target.title,
+        kind: target.kind,
+        createdAt: target.createdAt ?? Date.now() - 1000,
+        updatedAt: target.updatedAt ?? Date.now(),
+        messages: state.messages.map((m) => ({ ...m })),
+        mode: state.sessionMode,
+      } as T;
+    }
     case "session_fork":
     case "session_truncate":
       return sessionPayload() as T;
@@ -435,6 +458,18 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
     }
     case "mem_pending":
       return state.memPending as T;
+    // ---- 项目 MEMORY.md 的用户手改通道 ----
+    // ⚠️ 必须**真的存取**：之前没映射，编辑器一保存就报"未映射命令"，
+    //   而"改完内存里有变化"这件事根本测不到。
+    case "pmem_memory_read":
+      return (state.projectMemory[String(args?.name ?? "") ?? ""] ?? "") as T;
+    case "pmem_memory_write": {
+      const name = String(args?.name ?? "");
+      const prev = state.projectMemory[name];
+      if (prev === undefined) return "" as T; // 原来没有文件 → 没备份
+      state.projectMemory[name] = String(args?.text ?? "");
+      return state.projectMemoryBackup as T;
+    }
     case "perm_requests_list":
       return state.permPending as T;
     // 数据源：默认返回 state.lifeStatus（测试可以塞一个"已接学习通"的形态）。

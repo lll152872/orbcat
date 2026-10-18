@@ -541,14 +541,10 @@ async function switchSession(id: string): Promise<void> {
     await loadModes(id);
     await loadProjects();
     await refreshSessionProjectTags();
-    const meta = sessionList.find((x) => x.id === id);
-    // 主聊天永不挂项目 → 记忆回主对话
-    const wantPid =
-      meta?.kind === "main"
-        ? null
-        : (projects.find((p) => p.name === meta?.projectName)?.id ?? null);
-    activeProjectId = wantPid;
-    await invoke("pmem_set_active", { id: wantPid }).catch(() => {});
+    // 顶栏跟着**会话**走：主聊天永不挂项目 → 记忆回主对话
+    activeProjectId = sessionProjectId(sessionList.find((x) => x.id === id));
+    await invoke("pmem_set_active", { id: activeProjectId }).catch(() => {});
+    paintProjectSelect();
     // 计数是**按当前视图**的 —— 换会话就清零，别把上一条的"漏看 N 条"
     // 挂到这一条上（用户看到按钮上的 3 会以为这条有 3 条没看）
     chatMissed = 0;
@@ -1062,8 +1058,47 @@ async function refreshSessionList(): Promise<void> {
 }
 
 
-/** 会话页：**上方主聊天（唯一、不可删）**，下方任务会话列表 */
-/** 会话页：按**项目**分组；📁 标签独立、不被标题省略吃掉 */
+/**
+ * 会话页：按**任务空间**分组（`📁 项目名`），没挂靠任何项目的那一组叫「无任务空间」。
+ * 📁 标签独立、不被标题省略吃掉。
+ *
+ * ## 组标题可折叠 + 默认收起（2026-10-17 / 18 用户两次提）
+ *
+ * `.sess-sep` 从纯 div 改成 `<button>`：点一下收/放本组会话。
+ *
+ * **默认只展开「当前会话所在的那一组」，其余全收起。**
+ * 第一版做成全展开，等于折叠功能存在但默认没人用 —— 用户原话
+ * 「默认应该是折叠的吧，为啥全是展开的」。
+ * 为什么不全收：全收的话打开会话页一屏只剩标题，**连自己现在在哪条会话里都看不见**，
+ * 得先展开一次才找得到（而「找一条旧会话」正是要做这个功能的原因）。
+ *
+ * ## 状态：内存 Map，且**默认是算出来的**不是存出来的
+ *
+ * `sessFoldOverride` 只记**用户点过**的组；没点过的走上面那条默认规则。
+ * 于是「切到别的会话 → 刚才那组自动收起、新那组自动展开」是白送的，
+ * 不必在 `switchSession` 里手动搬状态（那种写法漏一处就错）。
+ *
+ * 不落盘：这是「看一眼就想改」的临时视图偏好，跟 `blur_collapse` 那种
+ * 「设了就想一直生效」的开关不同级。要落盘得给 `AgentSettings` 加字段并
+ * **重编 Rust**，为一个临时偏好付那个代价不划算。
+ *
+ * 键用项目名本身（`null` 组用 `""`）—— 项目改名后旧键自动失效，
+ * 比留一个指向旧名的孤儿键诚实。
+ */
+const sessFoldOverride = new Map<string, boolean>();
+
+/**
+ * 这一组收不收。
+ *
+ * @param hasCurrent 这一组里有没有**当前会话**（只用来算默认值）
+ *
+ * 显式点过的不吃默认 —— 用户说收就收，哪怕那正是他正在聊的那一组。
+ */
+function isSessGroupFolded(key: string, hasCurrent: boolean): boolean {
+  const explicit = sessFoldOverride.get(key);
+  return explicit ?? !hasCurrent;
+}
+
 function renderSessionsView(): string {
   const projTag = (name?: string | null): string =>
     name ? `<span class="sess-proj" title="项目：${esc(name)}">📁 ${esc(name)}</span>` : "";
@@ -1120,25 +1155,34 @@ function renderSessionsView(): string {
   const sections = keys
     .map((k) => {
       const list = groups.get(k)!;
-      const head =
-        k === null
-          ? `主对话 / 未挂靠 · ${list.length}`
-          : `📁 ${esc(k)} · ${list.length}${k === activeName ? " · 当前项目" : ""}`;
+      // 「当前会话」按 **id** 判，不靠后端那个 `current` 字段 ——
+      // 那是另一条线（`session_switch` 前后端都靠 current.txt），
+      // 而这里要的只是"这一组要不要默认展开"，用前端自己的 `currentSessionId` 更直接。
+      const hasCurrent = list.some((s) => s.id === currentSessionId);
+      const folded = isSessGroupFolded(k ?? "", hasCurrent);
+      // 标题：项目名太长就靠 CSS 省略（`.sess-sep-name`），计数与「当前项目」另起一颗 span
+      const name = k === null ? "无任务空间" : `📁 ${esc(k)}`;
+      const badge = `${list.length}${k === activeName ? " · 当前项目" : ""}`;
       const rows = list.map(itemRow).join("");
       const sepAttrs =
         k === null
           ? ""
           : ` data-pname="${esc(k)}" data-pid="${projects.find((p) => p.name === k)?.id ?? ""}"`;
       return `
-    <div class="sess-sep"${sepAttrs}>${head}</div>
-    <div class="sess-group${k === activeName ? " cur-proj" : ""}">${rows}</div>`;
+    <button type="button" class="sess-sep${folded ? " folded" : ""}" aria-expanded="${!folded}"
+            data-fold="${esc(k ?? "")}" title="点一下收起/展开这组会话"${sepAttrs}>
+      <span class="sess-caret">${folded ? "▸" : "▾"}</span>
+      <span class="sess-sep-name">${name}</span>
+      <span class="sess-sep-n">${badge}</span>
+    </button>
+    <div class="sess-group${k === activeName ? " cur-proj" : ""}"${folded ? " hidden" : ""}>${rows}</div>`;
     })
     .join("");
 
   return `
     <div class="mem-head">会话<button class="mem-back" id="sess-new">＋ 新建</button></div>
     <div class="set-hint" style="margin-bottom:8px">
-      <b>按项目分组</b> · 右键会话挂靠/改挂靠 · 点一条进入对话
+      <b>按项目分组</b> · 点组标题收起/展开 · 右键会话挂靠/改挂靠 · 点一条进入对话
     </div>
     ${sections || '<div class="mem-empty">还没有会话。</div>'}
     <div style="margin:8px 0">
@@ -1159,6 +1203,28 @@ function bindSessionsView(root: HTMLElement): void {
       void deleteSession(btn.dataset.id ?? "");
     }),
   );
+  // 组标题 → 收/放本组
+  //
+  // ⚠️ **直接改 DOM，不走 renderBody()**：重渲染要重新拉 `session_state`
+  // + `pmem_session_map`（会话页每次进来都拉两轮），点一下折叠等 200ms
+  // 还带一次闪烁；而这里要做的只是「藏一个 div + 翻一个箭头」。
+  // 真要重画也没错，只是这里的收益全是负的。
+  root.querySelectorAll<HTMLButtonElement>(".sess-sep").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.fold ?? "";
+      // 当前收/放状态从 DOM 读（`aria-expanded` 就是刚渲染出来的那份），
+      // 不重算 `isSessGroupFolded` —— 那里要 `hasCurrent`，这里没必要再找一遍。
+      const folded = btn.getAttribute("aria-expanded") === "true";
+      sessFoldOverride.set(key, folded);
+      btn.classList.toggle("folded", folded);
+      btn.setAttribute("aria-expanded", String(!folded));
+      const caret = btn.querySelector(".sess-caret");
+      if (caret) caret.textContent = folded ? "▸" : "▾";
+      // 标题的下一个兄弟就是本组容器（`.sess-sep` 与 `.sess-group` 成对出现）
+      const body = btn.nextElementSibling as HTMLElement | null;
+      if (body?.classList.contains("sess-group")) body.hidden = folded;
+    });
+  });
   document.getElementById("sess-new")?.addEventListener("click", () => void newSession());
   document.getElementById("sess-compact")?.addEventListener("click", () => void compactCurrent());
 
@@ -1483,6 +1549,85 @@ async function refreshSessionProjectTags(): Promise<void> {
   } catch {
     /* 库未建时静默 */
   }
+}
+
+/**
+ * 这条会话挂着的项目 id。
+ *
+ * `SessionMeta.projectName`（项目名）是前端从 `pmem_session_map` 补的，
+ * 要 id 得回 `projects` 里按名反查 —— 反查不到 = 没挂靠（项目被删/改名留了残名）。
+ * 主聊天永不挂项目（`pmem_bind_session` 那边也拒），恒 null。
+ */
+function sessionProjectId(meta?: SessionMeta): number | null {
+  if (!meta || meta.kind === "main") return null;
+  return projects.find((p) => p.name === meta.projectName)?.id ?? null;
+}
+
+/**
+ * 这个项目里**最近动过**的那条会话（没有则 undefined）。
+ *
+ * 选项目后要落到的那一条：按 `updatedAt` 倒序取首个。
+ * 主聊天恒不挂项目，所以天然不在任何项目里（`projectName === null` 过滤掉了）。
+ */
+function latestSessionIn(projectId: number | null): SessionMeta | undefined {
+  if (projectId == null) return undefined;
+  const name = projects.find((p) => p.id === projectId)?.name;
+  if (!name) return undefined;
+  return sessionList
+    .filter((s) => s.projectName === name)
+    .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+}
+
+/** 把顶栏那颗 `<select>` 的值/提示刷成当前激活项目（`renderBody` 不重画标题条） */
+function paintProjectSelect(): void {
+  const psel = document.getElementById("project-select") as HTMLSelectElement | null;
+  if (!psel) return;
+  psel.value = activeProjectId == null ? "" : String(activeProjectId);
+  const name = projects.find((p) => p.id === activeProjectId)?.name;
+  psel.title = `当前：${name ?? "主对话"} —— 跟**当前会话**走（选它会跳到该项目的会话）`;
+}
+
+/**
+ * 进对话时把顶栏项目**拉回当前会话所在的项目**。
+ *
+ * ## 这不是洁癖，是修串味
+ *
+ * 顶栏项目（后端 `active_project_id`）不是装饰，它决定三件事：
+ * ① 这一轮注入哪份项目记忆（`agent.rs` 的「当前项目」索引）；
+ * ② 蒸馏出来的条目往哪个项目落（`memory.rs::auto_distill`）；
+ * ③ 执行期给**哪个目录**开读写授权（`lib.rs::active_project_dir`）。
+ * 所以它必须与「你正在聊的那条会话」一致 —— `config.rs` 里那句话就是这个意思：
+ * 「决定注入哪份 MEMORY.md，**随会话走**」。
+ *
+ * ## 2026-10-17 用户报的现场
+ *
+ * 顶栏选「写作业」→ 那一步只改了激活项目（并跳去会话页）→ 用户**没点任何会话**，
+ * 直接「返回对话」→ 回到的还是那条 test 会话，顶栏却还挂着「写作业」。
+ * 于是这条 test 会话下一轮就被告知「顶栏切到了项目『写作业』」，
+ * 还顺手拿到了那个目录的读写授权 —— 看着只是标题不对，**上下文和权限都串了**。
+ *
+ * ## 为什么挂在 `renderBody` 的对话分支上
+ *
+ * 这是「进入对话」的唯一必经之处：点球展开、`‹ 返回对话`、`switchSession`、发完消息
+ * 重画……全走它。挂在别处（点返回时才补）会漏掉「启动时 settings.json 里就存着
+ * 上次那个项目」这条冷启动路径。
+ *
+ * ## 拿不到就不动
+ *
+ * `renderBody()` 每条消息都会跑一遍，这里必须**零副作用**：
+ * - `sessionList` 里找不到当前会话（还没拉）→ 不动；
+ * - `projectName === undefined`（`refreshSessionProjectTags` 还没跑，挂靠未知）→ 不动。
+ * 否则每次开面板都会把上次记住的项目误清成「主对话」。
+ */
+function alignProjectToSession(): void {
+  const meta = sessionList.find((s) => s.id === currentSessionId);
+  if (!meta || meta.projectName === undefined) return;
+  const want = sessionProjectId(meta);
+  if (want !== activeProjectId) {
+    activeProjectId = want;
+    void invoke("pmem_set_active", { id: want }).catch(() => {});
+  }
+  paintProjectSelect();
 }
 
 function installSessionBindHandler(root: HTMLElement): void {
@@ -4566,6 +4711,18 @@ function renderPanel(): void {
     } catch (e) {
       showToast(`切换项目失败：${e}`, "error");
     }
+    // 选项目 = "去那个项目干活"。项目里已有会话就直接落到**最新那条**。
+    //
+    // 为什么不能只停在会话页让用户自己点（2026-10-17 用户报）：
+    // 他选了项目没点会话就「返回对话」→ 回到的还是**别的项目**的会话，
+    // 顶栏却写着刚选的项目 —— 记忆与目录授权一起串到别的项目上。
+    // `alignProjectToSession()` 只能在回对话时把顶栏拉回来（那是兜底），
+    // 这里直接把他送到对的地方，才是"选项目"这个动作本来的意思。
+    const target = latestSessionIn(id);
+    if (target && target.id !== currentSessionId) {
+      await switchSession(target.id);
+      return;
+    }
     view = "sessions";
     renderBody();
   });
@@ -5250,6 +5407,7 @@ function renderBody(): void {
     return;
   }
 
+  alignProjectToSession(); // 顶栏项目必须与当前会话一致（别让「标题写 A、聊着 B」）
   paintMessages(b);
   renderPreview(); // 回到对话时恢复缩略图区
   // ⚠️ 不再无条件贴底：记过位置就回原处（2026-10-14 用户报「每次开球都看最下面」）
@@ -5458,14 +5616,15 @@ function renderMemView(
       <div class="skill-item">
         <div class="skill-name">📁 ${esc(p.name)} ${badge}</div>
         <div class="skill-desc"><code>${esc(p.source || "（无 source.ref）")}</code></div>
-        ${
-          canFix
-            ? `<div class="proj-fix">
-                 <button type="button" class="mem-btn proj-set-src" data-proj="${esc(p.name)}" title="把 source.ref 指到新路径（留空 = 解绑）">改路径</button>
-                 <button type="button" class="mem-btn no proj-archive" data-proj="${esc(p.name)}" title="整个目录挪进 agent-data/.trash/（不硬删，可手工还原）">归档</button>
-               </div>`
-            : ""
-        }
+        <div class="proj-fix">
+          <button type="button" class="mem-btn proj-edit-mem" data-proj="${esc(p.name)}" title="直接改这个项目的 MEMORY.md（agent 平时自己维护，你偶尔手改）">编辑记忆</button>
+          ${
+            canFix
+              ? `<button type="button" class="mem-btn proj-set-src" data-proj="${esc(p.name)}" title="把 source.ref 指到新路径（留空 = 解绑）">改路径</button>
+                 <button type="button" class="mem-btn no proj-archive" data-proj="${esc(p.name)}" title="整个目录挪进 agent-data/.trash/（不硬删，可手工还原）">归档</button>`
+              : ""
+          }
+        </div>
       </div>`;
           })
           .join("");
@@ -5531,7 +5690,11 @@ function bindMemButtons(root: HTMLElement): void {
     void distillStart();
   });
 
-  // ---- 项目记忆维护：改路径 / 归档 ----
+  // ---- 项目记忆维护：编辑正文 / 改路径 / 归档 ----
+  root.querySelectorAll<HTMLButtonElement>(".proj-edit-mem").forEach((btn) =>
+    btn.addEventListener("click", () => void startProjMemoryEdit(btn.dataset.proj ?? "")),
+  );
+
   root.querySelectorAll<HTMLButtonElement>(".proj-set-src").forEach((btn) =>
     btn.addEventListener("click", () => startProjEdit(btn.dataset.proj ?? "")),
   );
@@ -5597,6 +5760,85 @@ async function distillStart(): Promise<void> {
   } catch (e) {
     showToast(`开蒸馏会话失败：${e}`, "error");
   }
+}
+
+/**
+ * 就地编辑项目 MEMORY.md（用户手改通道）。
+ *
+ * ## 分工（2026-10-15 用户拍板）
+ *
+ * agent 是项目记忆的**维护者** —— 追加走 `remember(scope:"project")`，
+ * 改删走常规 `read_file`/`edit_file`。这个编辑器是给用户的**特殊场合**：
+ * 想亲手改一条、或者 agent 把整份写乱了要收拾。
+ *
+ * ## 为什么就地展开而不是弹窗
+ *
+ * 同「改路径」的交互（`startProjEdit`）：记忆页是长列表，弹窗会把上下文
+ * 弹走，改完还要重新找回到哪一条。
+ *
+ * ## 保存语义
+ *
+ * 整份覆盖，后端先按天备份成 `MEMORY.md.bak-<日期>`。⚠️ 同一天改多次只回到
+ * 当天第一次的状态 —— 提示里写明，别让用户以为有历史版本。
+ */
+async function startProjMemoryEdit(name: string): Promise<void> {
+  const item = [...document.querySelectorAll(".skill-item")].find(
+    (el) => el.querySelector(".proj-edit-mem")?.getAttribute("data-proj") === name,
+  );
+  const desc = item?.querySelector<HTMLElement>(".skill-desc");
+  if (!desc) return;
+
+  let text = "";
+  try {
+    text = await invoke<string>("pmem_memory_read", { name });
+  } catch (e) {
+    showToast(`读取项目记忆失败：${e}`, "error");
+    return;
+  }
+
+  const stat = item?.querySelector<HTMLElement>(".skill-name")?.textContent ?? "";
+  desc.innerHTML = `
+    <textarea class="proj-mem-editor" rows="10" spellcheck="false"
+      placeholder="项目的路径、术语、目录与命名约定、进展与未决项…"></textarea>
+    <div class="proj-mem-actions">
+      <button type="button" class="mem-btn ok proj-mem-save">保存</button>
+      <button type="button" class="mem-btn no proj-mem-cancel">取消</button>
+    </div>
+    <div class="proj-mem-hint">${esc(
+      text.trim() ? `${stat.trim()}` : "（这个项目还没有记忆）",
+    )} · 整份覆盖，保存前自动备份到 <code>MEMORY.md.bak-&lt;日期&gt;</code>（同一天只留一份）</div>`;
+  const ta = desc.querySelector<HTMLTextAreaElement>(".proj-mem-editor");
+  if (!ta) return;
+  ta.value = text;
+  ta.focus();
+
+  const save = async (): Promise<void> => {
+    const btn = desc.querySelector<HTMLButtonElement>(".proj-mem-save");
+    if (btn) btn.disabled = true;
+    try {
+      const bak = await invoke<string>("pmem_memory_write", { name, text: ta.value });
+      showToast(bak ? `已保存「${name}」的项目记忆（备份 ${bak}）` : `已保存「${name}」的项目记忆`, "ok");
+      renderBody();
+    } catch (e) {
+      if (btn) btn.disabled = false;
+      showToast(`保存失败：${e}`, "error");
+    }
+  };
+  desc.querySelector<HTMLButtonElement>(".proj-mem-save")?.addEventListener("click", () => {
+    void save();
+  });
+  desc.querySelector<HTMLButtonElement>(".proj-mem-cancel")?.addEventListener("click", () => {
+    renderBody();
+  });
+  ta.addEventListener("keydown", (ev) => {
+    // ⚠️ Ctrl/Cmd+S = 保存（编辑器里的肌肉记忆）；**普通 Enter 必须照常换行**，
+    //    不能像「改路径」那个单行输入那样 Enter 即存 —— 这里是多行正文。
+    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") {
+      ev.preventDefault();
+      void save();
+    }
+    if (ev.key === "Escape") renderBody();
+  });
 }
 
 function startProjEdit(name: string): void {
