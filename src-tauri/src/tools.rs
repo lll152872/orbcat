@@ -4021,6 +4021,7 @@ async fn gate_command(
         CmdVerdict::HardBlock { reason } => {
             audit_cmd(
                 ctx, cmd, &norm, cwd, "blocked", "hard-block", command_policy::Risk::High, None,
+                "pwsh",
             );
             Err(format!(
                 "命令被**硬性阻断**（不可申请）：{reason}\n\
@@ -4030,7 +4031,7 @@ async fn gate_command(
         }
         CmdVerdict::Allow { reason } => {
             let risk = command_policy::Risk::Low;
-            audit_cmd(ctx, cmd, &norm, cwd, "allowed", "whitelist", risk, None);
+            audit_cmd(ctx, cmd, &norm, cwd, "allowed", "whitelist", risk, None, "pwsh");
             Ok(CmdGate::Allowed {
                 source: format!("白名单（{reason}）"),
                 risk,
@@ -4055,7 +4056,7 @@ async fn gate_command(
             };
 
             if hit {
-                audit_cmd(ctx, cmd, &norm, cwd, "allowed", "grant", risk, None);
+                audit_cmd(ctx, cmd, &norm, cwd, "allowed", "grant", risk, None, "pwsh");
                 return Ok(CmdGate::Allowed {
                     source: "已授权（临时授权生效）".into(),
                     risk,
@@ -4090,7 +4091,7 @@ async fn gate_command(
                         _ => "完全访问",
                     }
                 );
-                audit_cmd(ctx, cmd, &norm, cwd, "allowed", "trust-auto", risk, None);
+                audit_cmd(ctx, cmd, &norm, cwd, "allowed", "trust-auto", risk, None, "pwsh");
                 return Ok(CmdGate::Allowed { source, risk, norm });
             }
 
@@ -4111,7 +4112,7 @@ async fn gate_command(
                 .await?;
 
             if !verdict.is_approved() {
-                audit_cmd(ctx, cmd, &norm, cwd, "rejected", "user-denied", risk, None);
+                audit_cmd(ctx, cmd, &norm, cwd, "rejected", "user-denied", risk, None, "pwsh");
                 return Ok(CmdGate::Refused(ToolOutput::text(verdict.to_model_message())));
             }
 
@@ -4126,7 +4127,7 @@ async fn gate_command(
                 CmdScope::Full => "记住完整命令",
             };
             let source = format!("用户已批准（{scope_label}）");
-            audit_cmd(ctx, cmd, &norm, cwd, "approved", "user-approved", risk, None);
+            audit_cmd(ctx, cmd, &norm, cwd, "approved", "user-approved", risk, None, "pwsh");
             Ok(CmdGate::Allowed { source, risk, norm })
         }
     }
@@ -4183,7 +4184,7 @@ async fn run_command(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Stri
         match crate::shell::run_on_desktop(&cmd, &cwd, timeout_secs).await {
             Ok(o) => o,
             Err(e) => {
-                audit_cmd(ctx, &cmd, &norm, &cwd, "error", &source, risk, None);
+                audit_cmd(ctx, &cmd, &norm, &cwd, "error", &source, risk, None, "pwsh");
                 return Err(format!("后台桌面执行失败：{e}"));
             }
         }
@@ -4193,7 +4194,7 @@ async fn run_command(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Stri
         match crate::shell::run_powershell_tick(&cmd, &cwd, timeout_secs, tick, cancel).await {
             Ok(o) => o,
             Err(e) => {
-                audit_cmd(ctx, &cmd, &norm, &cwd, "error", &source, risk, None);
+                audit_cmd(ctx, &cmd, &norm, &cwd, "error", &source, risk, None, "pwsh");
                 return Err(format!("执行失败：{e}"));
             }
         }
@@ -4206,7 +4207,7 @@ async fn run_command(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Stri
     } else {
         "executed"
     };
-    audit_cmd(ctx, &cmd, &norm, &cwd, event, &source, risk, out.exit_code);
+    audit_cmd(ctx, &cmd, &norm, &cwd, event, &source, risk, out.exit_code, "pwsh");
 
     Ok(ToolOutput::text(format_command_output(
         &cmd,
@@ -4231,6 +4232,10 @@ fn resolve_command_cwd(args: &Value, ctx: &ToolCtx<'_>) -> Result<PathBuf, Strin
 }
 
 /// 写一条命令审计（自动补哈希链）。失败只记日志，不影响命令执行。
+///
+/// `shell` = **实际执行这条命令的解释器**（`"pwsh"` / `"bash"`）。
+/// 命令文本一样、在不同 shell 下语义不同（`rm -rf /` 在 pwsh 下是无效参数、
+/// 在 bash 下是整机报废），不记这一条事后复盘就断了线。
 #[allow(clippy::too_many_arguments)]
 fn audit_cmd(
     ctx: &ToolCtx<'_>,
@@ -4241,6 +4246,7 @@ fn audit_cmd(
     source: &str,
     risk: command_policy::Risk,
     exit_code: Option<i32>,
+    shell: &str,
 ) {
     let rec = command_policy::AuditRecord {
         ts: crate::permission::now_ms(),
@@ -4254,6 +4260,7 @@ fn audit_cmd(
         cwd: cwd.to_string_lossy().into_owned(),
         session_id: ctx.session_id.to_string(),
         risk: risk.as_str().to_string(),
+        shell: shell.to_string(),
         exit_code,
     };
     if let Err(e) = command_policy::audit_append(ctx.data_dir, rec) {
