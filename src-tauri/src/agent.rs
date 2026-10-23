@@ -2504,6 +2504,67 @@ pub fn build_system_prompt_full(
     ptc_sdk: Option<&str>,
     session_id: Option<&str>,
 ) -> String {
+    let (persona, context) = build_prompt_segments(data_dir, user_message, ptc_sdk, session_id);
+    let mut all = persona;
+    all.extend(context);
+    all.join("\n\n---\n\n")
+}
+
+/// system prompt 的**两份**（pi 内核路径用）。
+///
+/// ## 为什么要拆
+///
+/// pi 的 system prompt 是**分段构造**的（上游 `buildSystemPromptSections`）：
+/// `preamble`（默认是 coding agent 人格）+ `tools` + `rules` + `docs` +
+/// `project_context` + `skills` + 各 extension 写进 `sections` 的段。
+///
+/// 我们以前整段替换（`{ systemPrompt: p }` ⇒ 上游设 `forceSystemPrompt`）
+/// ⇒ **pi 原生那些段全丢**（工具说明、规则、cwd、项目上下文…）。
+///
+/// 现在改成：
+/// - `persona` → pi 的 **`customPrompt`**（替换掉 coding agent 人格 ⇒ 我们的占主导）；
+/// - `context` → pi 的 **`systemPromptOptions.sections["orbcat_context"]`**（追加段）；
+/// - pi 原生的 tools / rules / docs / project_context / MCP 清单 **全部保留**
+///   ⇒ 它们自然变成「工具用法 / 环境信息」的补充资料。
+///
+/// ⚠️ 段名必须匹配上游 `/^[a-z][a-z0-9_-]*$/`，否则上游直接 throw。
+#[derive(Debug, Clone, Default)]
+pub struct PromptParts {
+    /// 人格 / 红线 / 身份 / 用户 —— 放 pi 的 `customPrompt`
+    pub persona: String,
+    /// 长期记忆 / 项目 / 模式 / 技能 / 执行位置 —— 放 pi 的 `sections`
+    pub context: String,
+}
+
+/// 把 prompt 拆成「人格」与「上下文」两份（**pi 内核路径用**）。
+///
+/// `persona` → pi 的 `customPrompt`（替换 pi 的 coding agent 人格 ⇒ 我们的占主导）
+/// `context` → pi 的 `systemPromptOptions.sections["orbcat_context"]`（追加段）
+///
+/// ⚠️ **自研内核那条路仍然用整段**（`build_system_prompt_full`）⇒ 行为逐字不变。
+pub fn build_system_prompt_parts(
+    data_dir: &Path,
+    user_message: &str,
+    ptc_sdk: Option<&str>,
+    session_id: Option<&str>,
+) -> PromptParts {
+    let (persona, context) = build_prompt_segments(data_dir, user_message, ptc_sdk, session_id);
+    PromptParts {
+        persona: persona.join("\n\n---\n\n"),
+        context: context.join("\n\n---\n\n"),
+    }
+}
+
+/// 把 prompt 拆成「人格」与「上下文」两份。
+///
+/// ⚠️ **自研内核那条路仍然用整段**（`build_system_prompt_full`）⇒ 行为逐字不变。
+/// 这里只是把同一批段**按边界切成两份**，拼接顺序与原来完全一致。
+fn build_prompt_segments(
+    data_dir: &Path,
+    user_message: &str,
+    ptc_sdk: Option<&str>,
+    session_id: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
     let mut stable: Vec<String> = Vec::new();
     let mut dynamic: Vec<String> = Vec::new();
 
@@ -2529,6 +2590,20 @@ pub fn build_system_prompt_full(
     if let Some(u) = read("USER.md") {
         stable.push(format!("# 关于用户\n\n{u}"));
     }
+    // ── 分界：上面是「人格 / 红线 / 身份 / 用户」，下面是「记忆 / 项目 / 模式 / 技能」──
+    //
+    // pi 路径要把人格塞进 `customPrompt`（替换 pi 的 coding agent 人格），
+    // 其余塞进 `sections` ⇒ 这里标一下分界。
+    let persona_end = stable.len();
+
+    // ── 当前执行位置（**两种内核都要有**）──
+    //
+    // 模型不知道宿主在哪种 shell 里 ⇒ 会照旧写 `Get-ChildItem`
+    // （在 bash 里 command not found）或照旧写 `ls`（在 pwsh 里是别名，行为不同）。
+    //
+    // 数据来自 settings 的 `execShell`（后端 `config::ExecShell`）+ 后台桌面开关。
+    stable.push(exec_location_note(data_dir));
+
     if let Some(m) = read("memory/MEMORY.md") {
         stable.push(format!("# 长期记忆\n\n{m}"));
     }
@@ -3095,8 +3170,55 @@ pub fn build_system_prompt_full(
         }
     }
 
-    stable.extend(dynamic);
-    stable.join("\n\n---\n\n")
+    // 顺序与原来完全一致：persona ++ (stable 的其余 ++ dynamic)
+    let mut context: Vec<String> = stable.split_off(persona_end);
+    context.extend(dynamic);
+    let persona: Vec<String> = stable;
+    (persona, context)
+}
+
+/// **当前执行位置**说明段（模型要知道自己在哪种 shell 里）。
+///
+/// ## 为什么必须写
+///
+/// 模型写命令时通常不知道宿主跑在哪种 shell 上：
+/// - `ls` 在 pwsh 里是 `Get-ChildItem` 的别名（语义相近但参数不同）；
+/// - `rm -rf` 在 pwsh 里**根本不是这个意思**（`rm` 是 `Remove-Item` 的别名，
+///   `-rf` 不是合法参数）⇒ 会报错或做错事；
+/// - `find`/`grep` 在 pwsh 里是 `Select-String` 的别名，行为差异更大。
+///
+/// ⇒ 把它做成**宿主侧事实**告诉模型，比让模型自己猜或让执行器做「方言自纠」稳。
+///
+/// ⚠️ 「后台桌面 vs 本机」与「用哪种 shell」是**两个正交维度**：
+/// 前者决定**在哪儿跑**，后者决定**用哪种解释器**。
+fn exec_location_note(data_dir: &Path) -> String {
+    let shell = crate::config::load_settings(data_dir).exec_shell;
+    let on_bg_desk = crate::win32desk::is_enabled();
+    let place = if on_bg_desk {
+        "**后台桌面**（一个独立的隐藏 Windows 桌面会话，不是用户当前正在看的桌面）"
+    } else {
+        "**本机**（用户当前使用的桌面）"
+    };
+    let (shell_name, syntax) = match shell {
+        crate::config::ExecShell::Gitbash => (
+            "**Git Bash**（`bash.exe`，GNU 语法）",
+            "用 GNU 语法：`ls` / `cat` / `rm -rf` / `find` / `grep` / `chmod`。\n\
+             多条命令用 `&&` / `||` / `;` 串联。**不要**用 PowerShell 的 \
+             `Get-ChildItem` / `Select-String` / `Remove-Item`。",
+        ),
+        crate::config::ExecShell::Pwsh => (
+            "**PowerShell**（`pwsh`，Windows 语法）",
+            "用 PowerShell 语法：`Get-ChildItem` / `Select-String` / `Remove-Item -Recurse -Force`。\n\
+             **不要**用 GNU 的 `ls` / `grep` / `rm -rf` / `find`。",
+        ),
+    };
+    format!(
+        "# 当前执行位置\n\n\
+         你在 {place} 上执行命令，shell 是 {shell_name}。\n\n\
+         {syntax}\n\n\
+         ⚠️ 写命令前先按上面的 shell 选语法 —— 语法不对的命令会直接失败，\
+         或在另一种 shell 下产生**完全不同的效果**。"
+    )
 }
 
 /// 当前 epoch 毫秒。会话与历史模块共用同一口径。
