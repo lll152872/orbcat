@@ -106,6 +106,24 @@ jobs:
       - name: Rust tests
         run: cargo test --lib --manifest-path src-tauri/Cargo.toml
 
+      # ⚠️ 这一步以前**从来没有过**（2026-10-23 守门实测：ci.yml 全文只有两处
+      #   `cargo test --lib`，build-windows / build-macos 各一处，
+      #   `cargo test --tests` 一次都没跑过）⇒
+      #   `src-tauri/tests/` 下的集成测试（pi_integration / pi_mcp_e2e /
+      #   pi_mock_e2e / pi_l1_project_e2e / pi_security_e2e …）**在 CI 里一条都不执行**，
+      #   集成层回归只能靠人本地跑。
+      #
+      #   为什么用 `--tests` 而不是逐个 `--test pi_xxx`：
+      #   cargo 的 `--tests` = 所有 test=true 的目标，**包含 lib 单测**，
+      #   所以上面那条 `--lib` 会再跑一遍（652 个 ≈ 4s，可接受）。
+      #   换来的是：**新增的集成测试文件自动进 CI**，不用改这里 ——
+      #   逐个枚举的写法一旦漏了新文件，就会静悄悄不执行，正是本条要修的病。
+      #
+      #   位置必须在上面 "Frontend build" 之后 —— tauri-build 递归 Walk dist/，
+      #   目录不存在直接 exit 101（那条踩坑注释别动）。
+      - name: Rust integration tests (src-tauri/tests)
+        run: cargo test --tests --manifest-path src-tauri/Cargo.toml
+
       # ── 出包 ──────────────────────────────────────────────
       # 放在测试之后：测试红了就没必要编，编了也是白编。
       #
