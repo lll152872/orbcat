@@ -39,8 +39,8 @@ const ONE_BUNDLE = {
 
 async function openProject(): Promise<HTMLElement> {
   document.getElementById("btn-gear")!.click();
-  await waitFor(() => !!document.querySelector(".set-entry"), 3000, "设置入口页");
-  const entry = Array.from(document.querySelectorAll<HTMLElement>(".set-entry")).find(
+  await waitFor(() => !!document.querySelector(".set-row"), 3000, "设置入口页");
+  const entry = Array.from(document.querySelectorAll<HTMLElement>(".set-row")).find(
     (b) => b.dataset.act === "project",
   );
   if (!entry) throw new Error("设置里找不到「项目」入口");
@@ -52,7 +52,7 @@ async function openProject(): Promise<HTMLElement> {
 /** 只打开设置入口页，不进项目页 */
 async function openSettingsMenu(): Promise<void> {
   document.getElementById("btn-gear")!.click();
-  await waitFor(() => !!document.querySelector(".set-entry"), 3000, "设置入口页");
+  await waitFor(() => !!document.querySelector(".set-row"), 3000, "设置入口页");
 }
 
 describe("设置 › 项目", () => {
@@ -68,7 +68,7 @@ describe("设置 › 项目", () => {
     await openPanel();
     await openSettingsMenu();
 
-    const entry = Array.from(document.querySelectorAll<HTMLElement>(".set-entry")).find(
+    const entry = Array.from(document.querySelectorAll<HTMLElement>(".set-row")).find(
       (b) => b.dataset.act === "project",
     );
     // 行还在 DOM 里（页面代码与摘要函数都没删），只是不可见 ——
@@ -78,7 +78,7 @@ describe("设置 › 项目", () => {
 
     // 相邻的入口不能被连带打掉
     expect(
-      Array.from(document.querySelectorAll<HTMLElement>(".set-entry")).some(
+      Array.from(document.querySelectorAll<HTMLElement>(".set-row")).some(
         (b) => b.dataset.act === "mcp" && !b.hasAttribute("hidden"),
       ),
       "「MCP 外部工具」必须照常显示",

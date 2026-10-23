@@ -7,6 +7,61 @@
 
 ---
 
+## [未发布]
+
+### 增强
+
+**模型导入能解析 OpenRouter 风格的模型描述** —— 窗口大小与能力都认
+
+现在不少网关的 `/models` 返回的是 OpenRouter 那种带 `capabilities` 的描述，
+以前只能认出 `id`，窗口和能力全丢。解析器现在认：
+
+- 上下文窗口：`context_length` / `max_context_length` / `max_input_tokens`（也会退回 `top_provider`）
+- 最大输出：`max_completion_tokens` / `max_output_tokens` / `max_output_length`
+- 工具能力：`capabilities.tools` / `supports_tools` / `supports_tool_call`
+- 视觉能力：`capabilities.vision` / `supports_vision`；没声明时从 `architecture.input_modalities`
+  里有没有 `image` 推断
+
+能力是**逐模型**的（一批里有的支持工具、有的不支持），导入时按模型分别落库，
+不再一刀切按表单勾选。
+
+**「粘贴模型 JSON 导入」** —— 直接把模型描述贴进添加表单
+
+添加模型表单里新增「粘贴模型 JSON 导入」：粘一段模型描述，点「解析并填入」，
+模型 ID、上下文窗口、最大输出、工具/视觉勾选一起填好。解析走的是**后端同一个
+解析器**（`models_parse_spec`），所以「拉得到、粘进来就丢字段」不会发生。
+Base URL 仍以表单里那一栏为准（可以改）。
+
+**组菜单新增「修改 Base URL」** —— 整组换网关不用逐个点编辑
+
+以前组菜单能改组名、能改 Key，却改不了 Base URL：想把一整组模型切到另一个
+网关只能逐个点编辑改 URL。现在可以一次改完，Key、窗口、能力都跟着走；
+目标组里已经有同 id 的**不覆盖**（那条留在原组）。
+
+### 修复
+
+**添加模型时 API Key 没有继承，「获取 ID」永远拉不到列表**
+
+添加模型的表单里 API Key 留空是常态（提示词明说「云端留空自动继承同组 Key」），
+但「获取 ID」以前**直接把空 Key 发出去** → 云端网关回 401 → 拉列表永远失败。
+现在留空时会先在**同 Base URL** 的已配置模型里找一把 Key 用上（额外请求头同理，
+OpenCode Zen 少了 `x-opencode-session` 会直接 400）；批量导入也是同一条口径。
+表单里还会实时提示「这个 Base URL 下已有 N 个模型配了 Key —— 留空即自动继承」。
+
+**`grep_files` 支持正则** —— pattern 含正则语法（`a|b`、`.*`、`\d`、`^x`、`[abc]`）时
+**自动按正则匹配**，并可在返回标题里看到「已自动按正则匹配」
+
+此前 `grep_files` 只做字面子串，遇到正则一律报错。实测 543 次调用里有 32 次模型
+习惯性直接写正则，报错把它逼去 `run_command` 跑 `rg` —— 绕开权限网关、撞 24KB 结果截断。
+
+- 默认「自动」：普通词仍走 `contains` 快路径（不编译、不回溯，`.` `(` 也不会被当元符号）
+- `regex: true/false` 可强制口径；`regex: true` 下语法错会报错并说明怎么改
+- 自动模式下正则编译不过（如 Windows 路径 `D:\workplace` 里的 `\w`）**回落字面搜索**并在结果里说明
+- 正则同样默认大小写不敏感（Rust regex 语法，不支持反向引用与前后瞻）
+- 字面模式零命中时，提示「加 `regex: true` 再搜一次」
+
+---
+
 ## [1.1.0] — 2026-10-18 — 记忆手改通道 + 顶栏/会话一致性 + 分组折叠
 
 从 v1.0.0 起，第一次把「记忆 / 项目 / 会话」三条线各自收口的一次。

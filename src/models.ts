@@ -38,8 +38,16 @@ interface ModelView {
 interface RemoteModelInfo {
   id: string;
   ownedBy?: string;
-  contextLength?: number;
-  maxOutputLength?: number;
+  contextLength?: number | null;
+  maxOutputLength?: number | null;
+  /**
+   * 提供商自报的工具调用能力。
+   * `null` / `undefined` = 对方**没声明** → 沿用表单里的勾选；
+   * `false` = 明确不支持（要覆盖掉表单勾选）。
+   */
+  supportsToolCall?: boolean | null;
+  /** 提供商自报的看图能力（同上：`null` = 没声明） */
+  supportsImages?: boolean | null;
 }
 
 /** 编辑表单回填（不含完整 Key） */
@@ -71,6 +79,8 @@ interface ModelFormState {
   headersText: string;
   maxIn: string;
   maxOut: string;
+  /** 「粘贴模型 JSON」框里的原文（重绘时保住） */
+  jsonText: string;
   error?: string;
   preset: string;
 }
@@ -141,6 +151,7 @@ function emptyModelForm(): ModelFormState {
     headersText: "",
     maxIn: "",
     maxOut: "",
+    jsonText: "",
     preset: "custom",
   };
 }
@@ -166,6 +177,25 @@ function shortHost(url: string): string {
   }
 }
 
+/**
+ * 是不是**本机**跑的模型（设计稿 07:2:1081「本地 · 无工具」）。
+ *
+ * 本机模型的能力与云端不同（常常没有工具调用），标出来用户才知道
+ * 为什么这个模型在工具行里没有「工具」。
+ */
+function isLocalUrl(url: string): boolean {
+  const u = (url ?? "").toLowerCase();
+  return (
+    u.includes("localhost") ||
+    u.includes("127.0.0.1") ||
+    u.includes("0.0.0.0") ||
+    u.includes("::1") ||
+    u.includes("192.168.") ||
+    u.includes("10.") ||
+    u.startsWith("http://[")
+  );
+}
+
 /** 模型身份键 = `url::id`（同 model 不同 Base URL 是两条独立配置） */
 function identityUrl(id: string, url: string): string {
   return `${url.trim().replace(/\/+$/, "").toLowerCase()}::${id}`;
@@ -182,6 +212,28 @@ function sameUrl(a: string, b: string): boolean {
 
 function modelsEndpointPreview(baseUrl: string): string {
   return `${baseUrl.replace(/\/+$/, "")}/models`;
+}
+
+/**
+ * API Key 输入框下方那行提示。
+ *
+ * 用户心智是「一个提供商一个 Key」：往已有组里加模型时，Key 留空就会
+ * **自动继承**同组已配置的那把（后端 `models_add` / `models_fetch_remote`
+ * 都是这条口径）。但表单上光写一句"云端留空自动继承同组 Key"，用户照样会
+ * 再去粘一遍 —— 这里明确告诉他"这个 Base URL 下已经有 Key 了，留空即可"。
+ */
+function keyHintText(url: string, editing: boolean): string {
+  if (editing) return "留空 = 保持原来的 Key 不变。";
+  const u = url.trim();
+  const fallback = "本地 / Ollama 可留空；云端留空自动继承同组 Key。";
+  if (!u) return fallback;
+  const same = models.filter((m) => sameUrl(m.url, u));
+  if (same.length === 0) return fallback;
+  const withKey = same.filter((m) => m.hasKey).length;
+  if (withKey > 0) {
+    return `这个 Base URL 下已有 ${withKey} 个模型配了 Key —— 留空即自动继承，不用再粘一遍。`;
+  }
+  return `这个 Base URL 下已有 ${same.length} 个模型（都没配 Key）—— 留空即不鉴权。`;
 }
 
 /** token 数：支持 `128000` / `128k` / `1m` */
@@ -388,6 +440,15 @@ function bindResize(): void {
   });
 }
 
+/** 当前搜索命中的模型数（底部状态栏「匹配 / 总数」用） */
+let modelFilteredCount = 0;
+
+/** 有几个分组（= 几个不同的 Base URL）—— 标题条「N 个模型 · M 组」 */
+function modelGroupCount(): number {
+  const urls = new Set(models.map((m) => m.url.trim().replace(/\/+$/, "").toLowerCase()));
+  return urls.size;
+}
+
 function renderModelsBody(): string {
   const q = (modelSearch || "").trim().toLowerCase();
   const filtered = q
@@ -397,6 +458,7 @@ function renderModelsBody(): string {
           m.url.toLowerCase().includes(q),
       )
     : models;
+  modelFilteredCount = filtered.length;
 
   // 按 Base URL 分组：模型身份 = (Base URL, 接口 id)，分组键就是 URL 本身。
   const groups = new Map<string, ModelView[]>();
@@ -418,9 +480,13 @@ function renderModelsBody(): string {
         .map((m) => {
           const cur = isCurrent(m);
           const ctx = m.maxInputTokens ? `${Math.round(m.maxInputTokens / 1000)}K` : "—";
-          const tags = `${m.supportsToolCall ? '<span class="lm-tag">工具</span>' : ""}${
-            m.supportsImages ? '<span class="lm-tag">视觉</span>' : ""
-          }`;
+          // 能力列（设计稿 07:2:1068「工具 · 视觉」/ 2:1073「工具」/ 2:1081「本地 · 无工具」）
+          // —— 拼成**一段文字**，不是两颗 chip。
+          const caps: string[] = [];
+          if (isLocalUrl(m.url)) caps.push("本地");
+          if (m.supportsToolCall) caps.push("工具");
+          if (m.supportsImages) caps.push("视觉");
+          const cap = caps.length ? caps.join(" · ") : "无工具";
           return `
       <div class="lm-row${cur ? " cur" : ""}" data-id="${esc(m.id)}" data-url="${esc(m.url)}">
         <div class="lm-name">
@@ -428,10 +494,11 @@ function renderModelsBody(): string {
             cur ? "当前使用中" : "设为当前模型"
           }">◎</button>
           <span class="lm-label" title="${esc(m.id)}">${esc(m.id)}</span>
+          ${cur ? '<span class="lm-cur">当前</span>' : ""}
           ${m.hasKey === false ? '<span class="lm-nokey">无Key</span>' : ""}
         </div>
         <div class="lm-ctx">${esc(ctx)}</div>
-        <div class="lm-tags">${tags}</div>
+        <div class="lm-tags">${esc(cap)}</div>
         <div class="lm-ops">
           <button class="set-btn edit" data-id="${esc(m.id)}" data-url="${esc(m.url)}">编辑</button>
           <button class="set-btn test" data-id="${esc(m.id)}" data-url="${esc(m.url)}">测</button>
@@ -450,34 +517,36 @@ function renderModelsBody(): string {
         <button class="lm-mi" data-act="rename-group" data-url="${esc(url)}">重命名组</button>
         <button class="lm-mi" data-act="group-key" data-url="${esc(url)}">更新 API 密钥</button>
         <button class="lm-mi" data-act="add-into" data-url="${esc(url)}">在此添加模型</button>
+        <button class="lm-mi" data-act="change-url" data-url="${esc(url)}">修改 Base URL</button>
         <div class="lm-sep"></div>
         <button class="lm-mi danger" data-act="del-group" data-url="${esc(url)}">删除组</button>
       </div>`;
 
+      // 组块（设计稿 07:2:1034）：组头 = 折叠指示 + 组名 + 弹性空隙 + 组齿轮
       return `
       <div class="lm-group${curInside ? " cur" : ""}">
         <div class="lm-head-wrap">
           <button class="lm-head" data-url="${esc(url)}" title="${esc(url)}">
             <span class="lm-chev">${closed ? "▸" : "▾"}</span>
             <span class="lm-title">${esc(groupTitle(url))}</span>
-            <span class="lm-count">${list.length}</span>
           </button>
           <button class="lm-gear${menuOpen ? " on" : ""}" data-url="${esc(url)}" title="组操作">⚙</button>
           ${menu}
         </div>
-        ${
-          closed
-            ? ""
-            : `<div class="lm-body">
-                <div class="lm-th">
-                  <span>名称</span><span>上下文大小</span><span>功能</span><span>操作</span>
-                </div>
-                ${items}
-              </div>`
-        }
+        ${closed ? "" : `<div class="lm-body">${items}</div>`}
       </div>`;
     })
     .join("");
+
+  // 表头（设计稿 07:2:1033）：**整表一行**，不是每组一行 ——
+  // 列的含义跟组无关，重复画在每组头上只会让人以为列会变。
+  const tableHead = `
+    <div class="lm-th">
+      <span>模型</span>
+      <span>上下文</span>
+      <span>能力</span>
+      <span></span>
+    </div>`;
 
   const f = modelForm;
   const editing = f.editId !== null;
@@ -507,7 +576,11 @@ function renderModelsBody(): string {
     ? `
     <div class="id-picker">
       <div class="id-picker-head">
-        <span>从 <code>${esc(remoteFetch.lastEndpoint ?? remoteFetch.sourceUrl)}</code> 选择模型 ID</span>
+        <span>${
+          remoteFetch.source === "json"
+            ? "从粘贴的 JSON 里选择模型 ID"
+            : `从 <code>${esc(remoteFetch.lastEndpoint ?? remoteFetch.sourceUrl)}</code> 选择模型 ID`
+        }</span>
         <button type="button" class="set-btn" id="picker-close">关闭</button>
       </div>
       ${remoteFetch.error ? `<div class="form-err">${esc(remoteFetch.error)}</div>` : ""}
@@ -520,10 +593,29 @@ function renderModelsBody(): string {
                   const already = remoteFetch!.localIds.has(
                     identityUrl(it.id, remoteFetch!.sourceUrl),
                   );
+                  // 能力标签：只显示**对方明确声明**的（没声明就别显示，
+                  // 否则会让人以为"不支持"）。ctx 同理。
+                  const tags = [
+                    it.supportsToolCall === true ? "工具" : "",
+                    it.supportsImages === true ? "视觉" : "",
+                  ]
+                    .filter(Boolean)
+                    .map((t) => `<span class="lm-tag">${t}</span>`)
+                    .join("");
+                  const ctx =
+                    typeof it.contextLength === "number" && it.contextLength > 0
+                      ? `${Math.round(it.contextLength / 1000)}K`
+                      : "";
                   return `<button type="button" class="id-pick${already ? " already" : ""}" data-id="${esc(
                     it.id,
-                  )}" data-ctx="${it.contextLength ?? ""}">
+                  )}" data-ctx="${it.contextLength ?? ""}" data-out="${it.maxOutputLength ?? ""}" data-tool="${
+                    it.supportsToolCall === true ? "1" : it.supportsToolCall === false ? "0" : ""
+                  }" data-img="${
+                    it.supportsImages === true ? "1" : it.supportsImages === false ? "0" : ""
+                  }">
                     <span class="remote-id">${esc(it.id)}</span>
+                    <span class="lm-tags">${tags}</span>
+                    ${ctx ? `<span class="remote-meta">${ctx}</span>` : ""}
                     <span class="remote-meta">${already ? "已配置" : it.ownedBy ? esc(it.ownedBy) : ""}</span>
                   </button>`;
                 })
@@ -532,7 +624,7 @@ function renderModelsBody(): string {
       </div>
       <div class="remote-actions">
         <button type="button" class="set-btn add" id="picker-batch">批量导入未配置的全部</button>
-        <div class="set-hint">点一行 = 填入「接口模型 ID」；批量导入会共用当前 URL / Key。</div>
+        <div class="set-hint">点一行 = 填入「接口模型 ID」（窗口/能力也会一并带入）；批量导入会共用当前 URL / Key。</div>
       </div>
     </div>`
     : "";
@@ -572,6 +664,10 @@ function renderModelsBody(): string {
             : "本地 / Ollama 可留空；云端留空自动继承同组 Key"
         }" value="${esc(f.clearKey ? "" : f.apiKey)}" />
       </label>
+      <!-- 同组 Key 继承提示：Base URL 命中已有组时提示"留空即可用同组 Key"，
+           否则用户会以为必须再粘一遍（其实后端已经会继承，但用户不知道）。
+           实时更新走 JS（#f-key-hint），不整块重绘 —— 重绘会打断输入焦点。 -->
+      <div class="set-hint" id="f-key-hint">${esc(keyHintText(f.url, editing))}</div>
       ${
         editing
           ? `<label class="set-check"><input type="checkbox" id="f-clear-key"${
@@ -605,6 +701,14 @@ function renderModelsBody(): string {
         <textarea id="f-headers" rows="3" placeholder="每行一个 Key: Value">${esc(f.headersText)}</textarea>
         <div class="set-hint">OpenCode Zen 的 <code>x-opencode-session</code> 会自动补，不用手填。</div>
       </details>
+      <details class="adv-box"${f.jsonText ? " open" : ""}>
+        <summary>粘贴模型 JSON 导入（可选）</summary>
+        <textarea id="f-json" rows="4" spellcheck="false" placeholder='{"id":"nemotron-3.5-lightning-free","context_length":262144,"max_completion_tokens":262144,"capabilities":{"tools":true,"vision":false}}'>${esc(f.jsonText)}</textarea>
+        <div class="form-row-2" style="margin-top:6px">
+          <button type="button" class="set-btn" id="f-parse-json">解析并填入</button>
+        </div>
+        <div class="set-hint">支持 OpenRouter / OpenAI 兼容的模型描述：<code>id</code>、<code>context_length</code>、<code>max_completion_tokens</code>、<code>capabilities.tools/vision</code> 都会被认出来。<b>Base URL 仍以上面那一栏为准</b>（可以改）。</div>
+      </details>
       <div class="set-hint">Key 只存本地 <code>agent-data/models.json</code>（已 gitignore）。本地模型可不填 Key。</div>
       ${picker}
         </div>
@@ -620,10 +724,10 @@ function renderModelsBody(): string {
       <div class="set-form lm-tools">
         <input id="model-search" placeholder="键入以搜索…（名称 / 模型 ID / Base URL）" value="${esc(modelSearch)}"
           autocomplete="off" autocorrect="off" spellcheck="false" />
-        <button type="button" class="set-btn add" id="model-add-open">添加模型</button>
       </div>
+      ${tableHead}
       <div class="lm-list">${
-        rows || '<div class="mem-empty">还没有模型，点右上「添加模型」。</div>'
+        rows || '<div class="mem-empty">还没有模型，点右上「添加自定义模型」。</div>'
       }</div>
     </div>
     ${typePicker}
@@ -646,12 +750,29 @@ function renderApp(): void {
 
   app.innerHTML = `
     <div class="mw-window">
+      <!-- 标题条（设计稿 07:2:1024）：左组 = 应用图标 + 标题 + 统计，
+           右组 = 「添加自定义模型」（猫白实心）+ 关闭。 -->
       <div class="mw-titlebar">
-        <span class="mw-title">模型管理</span>
-        <span class="mw-count">${models.length} 个模型 · 点卡片◎切当前 · Esc 关闭</span>
-        <button class="mw-close" id="mw-close" title="关闭（Esc）">✕</button>
+        <div class="mw-tb-left">
+          <span class="mw-app-ico" title="orbcat"></span>
+          <span class="mw-title">模型管理</span>
+          <span class="mw-count">${models.length} 个模型 · ${modelGroupCount()} 组</span>
+        </div>
+        <div class="mw-tb-right">
+          <button type="button" class="mm-add-btn" id="model-add-open" title="添加一个 OpenAI 兼容接口">＋ 添加自定义模型</button>
+          <button class="mw-close" id="mw-close" title="关闭（Esc）">✕</button>
+        </div>
       </div>
       ${renderModelsBody()}
+      <!-- 底部状态栏（设计稿 07:2:1026） -->
+      <div class="mw-status">
+        <span>身份键 = Base URL + 接口 id</span>
+        <span class="mono">${
+          modelFilteredCount === models.length
+            ? `${models.length} 个模型`
+            : `${modelFilteredCount} / ${models.length} 个模型`
+        }</span>
+      </div>
     </div>
     ${RESIZE_HANDLES.map((h) => `<div class="mw-rz mw-rz-${h.dir}" data-dir="${h.dir}"></div>`).join("")}`;
 
@@ -733,6 +854,7 @@ function readModelForm(): void {
   f.headersText = val("#f-headers");
   f.maxIn = val("#f-max-in");
   f.maxOut = val("#f-max-out");
+  f.jsonText = val("#f-json");
 }
 
 function setModelFormError(msg: string | undefined): void {
@@ -848,6 +970,40 @@ function bindApp(): void {
         return;
       }
 
+      if (act === "change-url") {
+        // 整组换 Base URL：以前只能逐个模型点编辑改 URL
+        const n = models.filter((m) => sameUrl(m.url, url)).length;
+        const next = await askInput(
+          "修改 Base URL",
+          `把「${shortHost(url)}」下的 ${n} 个模型挪到新的 Base URL（Key、窗口、能力都跟着走）`,
+          url,
+        );
+        if (next === null) {
+          renderApp();
+          return;
+        }
+        if (!next.trim()) {
+          showToast("Base URL 不能为空", "error");
+          renderApp();
+          return;
+        }
+        try {
+          const res = await invoke<{ moved: number; skipped: string[]; newUrl: string }>(
+            "models_change_group_url",
+            { url, newUrl: next.trim() },
+          );
+          await reloadModels();
+          showToast(
+            `已改到 ${res.newUrl}（${res.moved} 个模型）` +
+              (res.skipped.length ? `，跳过 ${res.skipped.length} 个重名` : ""),
+          );
+        } catch (err) {
+          showToast(`修改失败：${err}`, "error");
+        }
+        renderApp();
+        return;
+      }
+
       if (act === "del-group") {
         const n = models.filter((m) => m.url === url).length;
         const ok = await askConfirm("删除组", `确定删除「${shortHost(url)}」下的全部 ${n} 个模型？`);
@@ -900,6 +1056,9 @@ function bindApp(): void {
       setModelFormError("先填 Base URL，再获取模型 ID");
       return;
     }
+    // Key 留空时后端会**继承同组 Key**（用户心智：一个提供商一个 Key）。
+    // 这里先记下"这次是不是走的继承"，拉完告诉用户一声 —— 否则他以为是自己填的。
+    const inherited = !key && models.some((m) => sameUrl(m.url, url) && m.hasKey);
     try {
       const list = await invoke<RemoteModelInfo[]>("models_fetch_remote", {
         url,
@@ -922,6 +1081,8 @@ function bindApp(): void {
       f.error = undefined;
       if (list.length === 0) {
         f.error = "提供商返回 0 个模型（接口可能不支持 /models）";
+      } else if (inherited) {
+        showToast(`已用同组 Key 拉到 ${list.length} 个模型`, "info");
       }
     } catch (e) {
       remoteFetch = {
@@ -941,6 +1102,52 @@ function bindApp(): void {
     renderApp();
   });
 
+  // —— Base URL 改一改 → 实时刷新「同组 Key 继承」提示 ——
+  // 只改那行文字，**不整块重绘**（重绘会把输入焦点打断，用户正在打字就废了）。
+  document.getElementById("f-url")?.addEventListener("input", (e) => {
+    const val = (e.target as HTMLInputElement).value;
+    modelForm.url = val;
+    const hint = document.getElementById("f-key-hint");
+    if (hint) hint.textContent = keyHintText(val, modelForm.editId !== null);
+  });
+
+  // —— 粘贴模型 JSON → 解析并填入 ——
+  // 解析在后端做（`models_parse_spec` → 跟「从提供商拉列表」**同一个**解析器），
+  // 所以"拉得到、粘进来就丢字段"这种事不会发生。
+  document.getElementById("f-parse-json")?.addEventListener("click", async () => {
+    readModelForm();
+    const txt = modelForm.jsonText.trim();
+    if (!txt) {
+      setModelFormError("先粘贴一段模型 JSON");
+      return;
+    }
+    try {
+      const list = await invoke<RemoteModelInfo[]>("models_parse_spec", { payload: txt });
+      if (!list.length) {
+        setModelFormError("这段 JSON 里没解析出模型");
+        return;
+      }
+      remoteFetch = {
+        items: list,
+        source: "json",
+        sourceUrl: modelForm.url.trim(),
+        apiKey: modelForm.apiKey,
+        headersText: modelForm.headersText,
+        tool: modelForm.tool,
+        img: modelForm.img,
+        localIds: configuredKeys(),
+        checked: new Set(),
+        lastEndpoint: "粘贴的 JSON",
+        error: undefined,
+      };
+      modelForm.error = undefined;
+      renderApp();
+      showToast(`解析出 ${list.length} 个模型，点一行填入`, "ok");
+    } catch (e) {
+      setModelFormError(`解析失败：${e}`);
+    }
+  });
+
   document.getElementById("picker-close")?.addEventListener("click", () => {
     readModelForm();
     remoteFetch = null;
@@ -952,6 +1159,10 @@ function bindApp(): void {
       readModelForm();
       const id = b.dataset.id ?? "";
       const ctx = Number(b.dataset.ctx || 0);
+      const out = Number(b.dataset.out || 0);
+      // 能力："" = 对方没声明（沿用表单勾选）；"1"/"0" = 明确支持/不支持
+      const tool = b.dataset.tool ?? "";
+      const img = b.dataset.img ?? "";
       const url0 = remoteFetch?.sourceUrl ?? modelForm.url;
       remoteFetch = null;
       // 同源同 id 已配置 → 直接进编辑（身份 = URL + id）
@@ -971,6 +1182,7 @@ function bindApp(): void {
             headersText: ev.headersText,
             maxIn: ev.maxInputTokens != null ? String(ev.maxInputTokens) : "",
             maxOut: ev.maxOutputTokens != null ? String(ev.maxOutputTokens) : "",
+            jsonText: modelForm.jsonText,
             preset: "custom",
             error: undefined,
           };
@@ -983,6 +1195,11 @@ function bindApp(): void {
       }
       modelForm.id = id;
       if (ctx > 0) modelForm.maxIn = String(ctx);
+      if (out > 0) modelForm.maxOut = String(out);
+      if (tool === "1") modelForm.tool = true;
+      else if (tool === "0") modelForm.tool = false;
+      if (img === "1") modelForm.img = true;
+      else if (img === "0") modelForm.img = false;
       modelForm.error = undefined;
       renderApp();
       showToast(`已填入模型 ID：${id}`, "ok");
@@ -1001,11 +1218,22 @@ function bindApp(): void {
       showToast("没有可导入的模型（都已配置）", "info");
       return;
     }
+    // 逐模型的元信息：OpenRouter 风格的返回里，窗口大小和能力都是**每个模型**
+    // 各自一份的（`context_length` / `max_completion_tokens` / `capabilities`），
+    // 一刀切按表单勾选会把能力标错。
     const contextLengths: Record<string, number> = {};
+    const maxOutputTokens: Record<string, number> = {};
+    const toolFlags: Record<string, boolean> = {};
+    const imageFlags: Record<string, boolean> = {};
     for (const it of rf.items) {
       if (typeof it.contextLength === "number" && it.contextLength > 0) {
         contextLengths[it.id] = it.contextLength;
       }
+      if (typeof it.maxOutputLength === "number" && it.maxOutputLength > 0) {
+        maxOutputTokens[it.id] = it.maxOutputLength;
+      }
+      if (typeof it.supportsToolCall === "boolean") toolFlags[it.id] = it.supportsToolCall;
+      if (typeof it.supportsImages === "boolean") imageFlags[it.id] = it.supportsImages;
     }
     try {
       const result = await invoke<{ added: string[]; skipped: string[] }>("models_import_remote", {
@@ -1017,6 +1245,9 @@ function bindApp(): void {
         supportsToolCall: f.tool,
         supportsImages: f.img,
         contextLengths,
+        maxOutputTokens,
+        toolFlags,
+        imageFlags,
       });
       await reloadModels();
       remoteFetch = null;
@@ -1093,6 +1324,7 @@ function bindApp(): void {
           headersText: ev.headersText,
           maxIn: ev.maxInputTokens != null ? String(ev.maxInputTokens) : "",
           maxOut: ev.maxOutputTokens != null ? String(ev.maxOutputTokens) : "",
+          jsonText: "",
           preset: "custom",
           error: undefined,
         };

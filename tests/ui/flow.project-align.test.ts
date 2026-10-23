@@ -36,11 +36,19 @@ function select(): HTMLSelectElement {
   return el;
 }
 
-/** 顶栏那颗 select 当前显示的项目名（`""` = 主对话） */
+/**
+ * 顶栏那颗 select 当前显示的项目名（`""` = 无任务空间）。
+ *
+ * 选项文案带会话数（`📁 论文 · 12`），所以要把尾巴的「 · N」去掉。
+ * ⚠️ 去掉的是**最后一个**「 · 数字」：项目名本身也可能带「·」
+ * （用户起名很随意），正则贪心匹配到最后一个才对。
+ */
 function shownProject(): string {
   const s = select();
   const opt = s.options[s.selectedIndex];
-  return (opt?.textContent ?? "").replace(/^📁\s*/, "");
+  return (opt?.textContent ?? "")
+    .replace(/^📁\s*/, "")
+    .replace(/\s*·\s*\d+$/, "");
 }
 
 /** 当前对话页（不是会话/设置页） */
@@ -79,7 +87,7 @@ describe("选项目 → 落到那个项目的会话（2026-10-17 不匹配）", 
   it("选「写作业」→ 直接切到它那条会话，顶栏与内容一致", async () => {
     await bootApp();
     await openPanel();
-    expect(shownProject(), "起点应是主对话（当前会话没挂项目）").toBe("主对话");
+    expect(shownProject(), "起点应是无任务空间（当前会话没挂项目）").toBe("无任务空间");
 
     await pickProject("写作业");
     await waitFor(() => inChat(), 3000, "back in chat with 写作业's session");
@@ -131,7 +139,7 @@ describe("兜底：任何一次进对话，顶栏都回到当前会话的项目"
     (document.getElementById("sub-back") as HTMLButtonElement).click();
     await waitFor(() => inChat(), 3000, "back to chat");
 
-    expect(shownProject(), "顶栏必须与当前会话一致（当前会话没挂项目）").toBe("主对话");
+    expect(shownProject(), "顶栏必须与当前会话一致（当前会话没挂项目）").toBe("无任务空间");
     // 后端也被拉回来了 —— 否则下一轮仍会注入那个项目的记忆与目录授权
     const sets = callsOf("pmem_set_active");
     expect(sets.length, "应补写一次激活项目").toBeGreaterThan(0);
@@ -143,7 +151,7 @@ describe("兜底：任何一次进对话，顶栏都回到当前会话的项目"
     setMock("pmem_get_active", { id: 1, name: "写作业" });
     await bootApp();
     await openPanel();
-    await waitFor(() => shownProject() === "主对话", 3000, "aligned on open");
+    await waitFor(() => shownProject() === "无任务空间", 3000, "aligned on open");
     const sets = callsOf("pmem_set_active");
     expect(sets[sets.length - 1].args?.id).toBeNull();
   });
@@ -167,6 +175,6 @@ describe("兜底：任何一次进对话，顶栏都回到当前会话的项目"
     await bootApp();
     await openPanel();
     await waitFor(() => inChat(), 2000, "chat still fine");
-    expect(shownProject()).toBe("主对话");
+    expect(shownProject()).toBe("无任务空间");
   });
 });

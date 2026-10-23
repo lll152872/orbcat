@@ -49,7 +49,7 @@ import {
   statSync,
 } from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 /**
  * 运行时硬契约 —— 与 `compute_dist_dir()` 的第 1 条规则逐字对应。
@@ -63,6 +63,23 @@ import { pathToFileURL } from "node:url";
  */
 export const DIST_SUBDIR = "dist";
 export const DIST_ENTRY = "index.html";
+
+/**
+ * 内置运行时的目录名 —— 与 `pi::runtime_dir()` 逐字对应。
+ *
+ * ⚠️ 改这里必须同步改 `src-tauri/src/pi.rs::runtime_dir()`。
+ * 目录名写错 = pi 内核静默不可用（启动日志会打「未找到内置 runtime/」）。
+ */
+export const RUNTIME_SUBDIR = "runtime";
+
+/** 目录存在？ */
+function isDir(p) {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
 
 function isFile(p) {
   try {
@@ -141,6 +158,7 @@ export function stageWindowsRelease({
   outDir,
   skeletonDir = null,
   files = [],
+  runtimeDir = null,
 }) {
   if (!isFile(exePath)) {
     throw new Error(`exe 不存在：${exePath}`);
@@ -160,6 +178,24 @@ export function stageWindowsRelease({
 
   // ⚠️ 关键一行：dist 是 **子目录**。这里写错就是 2026-10-12 那个事故。
   copyTree(distDir, path.join(outDir, DIST_SUBDIR));
+
+  // ── 内置运行时（node / python / git+bash / pi 内核）──
+  //
+  // 位置契约：`pi::runtime_dir(exe)` 找的是 **`<exe 同目录>/runtime/`**。
+  // ⚠️ 目录名写错 = pi 内核静默不可用（启动日志会打「未找到内置 runtime/」）。
+  //
+  // **可选**：runtime/ 不存在时不报错 —— 开发态（cargo build）本来就没有，
+  // 那时 pi 内核不可用，orbcat 继续用自研内核（AppState 里 pi 字段是 None）。
+  if (runtimeDir) {
+    if (isDir(runtimeDir)) {
+      copyTree(runtimeDir, path.join(outDir, RUNTIME_SUBDIR));
+    } else {
+      console.warn(
+        `[package] ⚠️ runtime 目录不存在，跳过内置运行时：${runtimeDir}\n` +
+          `          （pi 内核将不可用 —— 构建它：node tools/build-runtime-assets.mjs）`
+      );
+    }
+  }
 
   // 三合一：空骨架也进 zip（不含 models.json，见 stageSkeleton 的说明）
   if (skeletonDir) {
@@ -314,6 +350,17 @@ function parseArgs(argv) {
   return out;
 }
 
+/**
+ * 内置运行时的默认位置：仓库根的 `runtime/`。
+ *
+ * 找不到就返回 null —— `stageWindowsRelease` 会打警告并跳过
+ * （开发态本来就没有 runtime/，那不是错误）。
+ */
+export function defaultRuntimeDir() {
+  const p = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "runtime");
+  return isDir(p) ? p : null;
+}
+
 function main() {
   const args = parseArgs(process.argv.slice(2));
 
@@ -330,8 +377,11 @@ function main() {
       "用法：\n" +
         "  node tools/package.mjs --exe <exe> --dist <dist> --out <dir>\n" +
         "                         [--skeleton src-tauri/skeleton] [--file <f> ...]\n" +
+        "                         [--runtime <dir>]\n" +
         "  node tools/package.mjs --verify <dir> [--exe-name <name>]\n" +
         "\n" +
+        "  --runtime   内置运行时目录（node / python / git+bash / pi 内核），\n" +
+        "              拷成 <out>/runtime/。缺省找仓库根的 runtime/。\n" +
         "  --skeleton  把空骨架铺进 <out>/agent-data/（三合一分发）。\n" +
         "              只能指向 src-tauri/skeleton —— 铺真实 agent-data/ 会被\n" +
         "              verifyNoUserData 拦下，那等于把 API key 打进发布包。"
@@ -345,6 +395,9 @@ function main() {
     outDir: args.out,
     skeletonDir: args.skeleton ?? null,
     files: args.file ?? [],
+    // 内置运行时（node / python / git+bash / pi 内核）——
+    // 缺省就找仓库根的 runtime/（`node tools/build-runtime-assets.mjs` 的产物）。
+    runtimeDir: args.runtime ?? defaultRuntimeDir(),
   });
   const { notes } = verifyReleaseLayout(args.out, {
     exeName,

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { bootApp, openPanel, waitFor } from "./helpers";
+import { bootApp, openPanel, runCommandByName, waitFor } from "./helpers";
 import { callsOf, state } from "./mocks/tauri";
 
 /**
@@ -16,7 +16,8 @@ import { callsOf, state } from "./mocks/tauri";
  */
 
 async function openNewMenu(): Promise<HTMLElement> {
-  document.getElementById("btn-new")!.click();
+  // ⚠️ 2026-10-23：「＋」按钮按设计稿 03 从输入行删了，入口改走命令面板的 /new
+  await runCommandByName("new");
   // 菜单要等一次 `loadModes` 往返（打开前会重拉模式表），所以必须 waitFor
   await waitFor(() => !!document.getElementById("new-ctx"), 3000, "「＋」菜单");
   return document.getElementById("new-ctx")!;

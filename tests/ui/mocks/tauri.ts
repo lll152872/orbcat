@@ -40,6 +40,8 @@ type MockState = {
     url: string;
     supportsToolCall: boolean;
     supportsImages: boolean;
+    /** 是否已配置 Key（真实后端会回这个字段；同组继承提示靠它） */
+    hasKey?: boolean;
   }[];
   messages: MockStoredMsg[];
   sessionList: {
@@ -237,10 +239,37 @@ const emptyOk: Record<string, unknown> = {  set_window_mode: null,
     { id: "remote-a", ownedBy: "mock" },
     { id: "remote-b", ownedBy: "mock" },
   ],
+  /** 粘 JSON 导入的解析结果（默认给一条 OpenRouter 风格的） */
+  models_parse_spec: [
+    {
+      id: "nemotron-3.5-lightning-free",
+      ownedBy: "",
+      contextLength: 262144,
+      maxOutputLength: 262144,
+      supportsToolCall: true,
+      supportsImages: false,
+    },
+  ],
   models_import_remote: { added: ["remote-a"], skipped: [] },
+  /** 整组改 Base URL 的返回 */
+  models_change_group_url: { moved: 1, skipped: [], newUrl: "http://127.0.0.1:9/v2" },
   mem_approve: null,
   mem_reject: null,
   mem_propose: null,
+  /** 改写候选内容（仍留在待批队列） */
+  mem_rewrite: null,
+  /** 一次性批准全部候选 → 返回写入条数 */
+  mem_approve_all: 0,
+  /** 审批页底部状态栏统计：{ pending, handled } */
+  mem_stats: { pending: 0, handled: 0 },
+  /** 内置工具清单（设计稿 09「内置工具」组） */
+  builtin_tools: [],
+  /** 内置工具总闸 */
+  set_builtin_tools: null,
+  /** MCP server 列表（工具页 09 的「MCP 外部工具」组） */
+  mcp_servers_list: [],
+  /** MCP 永久授权清单 */
+  mcp_grants_list: [],
   // 记忆蒸馏：现在就是一条普通会话（后端按 sessions/<id>.distill 标记换角色 + 注入 distill_move）
   distill_session_open: null,
   mem_project_set_source: null,

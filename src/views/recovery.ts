@@ -105,7 +105,8 @@ export function renderRecoveryView(st: RecoveryState, headerHtml: string): strin
               ${where}
             </div>
             <span class="rec-meta">${fmtWhen(b.at)} · ${fmtBytes(b.size)}</span>
-            <button class="set-btn rec-restore" data-id="${esc(b.id)}">还原</button>
+            <button class="rec-restore" data-id="${esc(b.id)}">还原</button>
+            <button class="rec-delete" data-del="${esc(b.id)}" title="永久删除这一份备份（不可还原）">删除</button>
           </div>`;
         })
         .join("")
@@ -126,7 +127,8 @@ export function renderRecoveryView(st: RecoveryState, headerHtml: string): strin
               }</i>
             </div>
             <span class="rec-meta">${fmtWhen(t.at)} · ${fmtBytes(t.size)}</span>
-            <button class="set-btn rec-untrash" data-trashed="${esc(t.trashed)}"${dis}>还原</button>
+            <button class="rec-untrash" data-trashed="${esc(t.trashed)}"${dis}>还原</button>
+            <button class="rec-delete" data-del-trash="${esc(t.trashed)}" title="永久删除这一项归档（不可还原）">删除</button>
           </div>`;
         })
         .join("")
@@ -175,7 +177,18 @@ export function renderRecoveryView(st: RecoveryState, headerHtml: string): strin
     </div>`;
 }
 
-export function bindRecoveryView(root: HTMLElement, onReload: () => void): void {
+export function bindRecoveryView(
+  root: HTMLElement,
+  onReload: () => void,
+  /**
+   * 不可逆操作的二次确认（注入，不反向 import main.ts —— 会循环依赖）。
+   * 返回 true = 用户确认了。
+   *
+   * `hint` = **第三级提示行**（设计稿 11:2:1594）：给用户一条**更安全的替代路径**，
+   * 别只说「不能撤」—— 那会把人推向「算了全删」。
+   */
+  confirmDestructive: (title: string, body: string, hint?: string) => Promise<boolean>,
+): void {
   // 返回按钮已挪到滚动区之外的 `#sub-bar`，绑定统一在 main 的 `renderSubBar` 里做。
   // ⚠️ 这里**曾经**再绑一次 `onBack` → 那正是「点『设置』直接跳回对话」的根因：
   //    `#sub-back` 已被 `renderSubBar` 绑成 `switchView("settings")`，这里再绑一个
@@ -224,6 +237,50 @@ export function bindRecoveryView(root: HTMLElement, onReload: () => void): void 
       } catch (e) {
         // 典型失败：目标已存在（拒绝覆盖）—— 把原因原样告诉用户，别吞掉
         setMsg(`还原失败：${e}`, false);
+      }
+      reload();
+    }),
+  );
+
+  root.querySelectorAll<HTMLButtonElement>(".rec-delete[data-del]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const id = b.dataset.del!;
+      // 不可逆 —— 二次确认写明「永久删除，不可还原」（设计稿 10 / §7）
+      // ⚠️ 第三级提示行照抄设计稿 11:2:1594：给一条**更安全的替代路径**。
+      const ok = await confirmDestructive(
+        "永久删除这一份备份？",
+        `${id} 会被永久删除，不可还原，也不再计入保留策略的自动清理。`,
+        "如果只是想让它别再占地方，用「保留策略」批量清理即可 —— 那是可预期、可撤销的。",
+      );
+      if (!ok) return;
+      b.disabled = true;
+      try {
+        const msg = await invoke<string>("recovery_delete_backup", { id });
+        setMsg(msg, true);
+      } catch (e) {
+        setMsg(`删除失败：${e}`, false);
+        b.disabled = false;
+      }
+      reload();
+    }),
+  );
+
+  root.querySelectorAll<HTMLButtonElement>(".rec-delete[data-del-trash]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const trashed = b.dataset.delTrash!;
+      const ok = await confirmDestructive(
+        "永久删除这一项归档？",
+        "这一项归档会被永久删除，不可还原。",
+        "想留个底就先「还原」回原位 —— 还原是安全的：目标已存在时它会拒绝覆盖。",
+      );
+      if (!ok) return;
+      b.disabled = true;
+      try {
+        const msg = await invoke<string>("recovery_delete_trash", { trashed });
+        setMsg(msg, true);
+      } catch (e) {
+        setMsg(`删除失败：${e}`, false);
+        b.disabled = false;
       }
       reload();
     }),

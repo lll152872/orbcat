@@ -103,6 +103,26 @@ if [ "$SRC_EXE" != "$REL/orbcat.exe" ]; then
   cp -f "$SRC_EXE" "$REL/orbcat.exe"
 fi
 
+# ---- 内置运行时（node / python / git+bash / pi 内核）----
+#
+# 为什么要这一段：orbcat 依赖 node（PTC 的 run_code）、python、git+bash。
+# 不内置的话，用户机器上缺一个就残一条功能。构建产物 179.1 MB
+# （node 83 / python 21.4 / git+bash 64.2 / pi 10.5）。
+#
+# 位置契约：`pi::runtime_dir(exe)` 找 **`<exe 同目录>/runtime/`**。
+# ⚠️ 目录名写错 = pi 内核静默不可用。
+#
+# 没有 runtime/ 也不阻断构建 —— 开发态本来就可能没构建过，
+# 那时 orbcat 继续用自研内核（AppState.pi = None）。
+if [ ! -d "$REL/runtime" ] && [ -d runtime ]; then
+  echo "==> 拷贝内置运行时到 $REL/runtime（node / python / git+bash / pi）"
+  # 先清掉上一轮 —— runtime/ 有 700+ 文件，cp -rf 只增不减会攒垃圾
+  rm -rf "$REL/runtime" 2>/dev/null || true
+  mkdir -p "$REL/runtime"
+  cp -rf runtime/. "$REL/runtime/"
+  echo "  $(du -sh "$REL/runtime" 2>/dev/null | cut -f1)"
+fi
+
 echo "==> 拷贝前端资源到 $REL/dist（外置：exe 必须与 dist/ 同目录分发）"
 mkdir -p "$REL/dist"
 # 先清掉上一轮的 hash 产物：`cp -rf` 只增不减，dist/assets 会攒下十几次
@@ -137,6 +157,15 @@ cp -f "$REL/orbcat.exe" "$RUNTIME/orbcat.exe"
 rm -rf "$RUNTIME/dist/assets" 2>/dev/null || true
 mkdir -p "$RUNTIME/dist"
 cp -rf "$REL/dist/." "$RUNTIME/dist/"
+
+# 内置运行时同样部署到运行态 —— 位置契约同上（<exe 同目录>/runtime/）
+if [ -d "$REL/runtime" ]; then
+  echo "==> 部署内置运行时到 $RUNTIME/runtime"
+  rm -rf "$RUNTIME/runtime" 2>/dev/null || true
+  mkdir -p "$RUNTIME/runtime"
+  cp -rf "$REL/runtime/." "$RUNTIME/runtime/"
+  echo "  $(du -sh "$RUNTIME/runtime" 2>/dev/null | cut -f1)"
+fi
 
 echo "==> 同步 agent-data（运行态的 init 指引，不覆盖已有内容）"
 # ⚠️ 只从**骨架目录**取，绝不从仓库根的 agent-data/ 取 ——

@@ -26,11 +26,13 @@ import {
   sleep,
   sendText,
   assistantBubbles,
+  runCommandByName,
 } from "./helpers";
 
 /** 顶栏「史」按钮 → 进入会话历史页 */
 async function openSessionsViaHistoryButton(): Promise<void> {
-  (document.getElementById("btn-sess") as HTMLButtonElement).click();
+  // ⚠️ 2026-10-23：「史」按钮按设计稿 03 从输入行删了，入口改走命令面板的 /sessions
+  await runCommandByName("sessions");
   await waitFor(
     () => !!document.getElementById("sess-new"),
     3000,
@@ -48,7 +50,7 @@ async function openSessionsViaSettings(): Promise<void> {
     3000,
     "settings menu with 会话管理",
   );
-  const entry = Array.from(document.querySelectorAll(".set-entry")).find((el) =>
+  const entry = Array.from(document.querySelectorAll(".set-row")).find((el) =>
     (el.textContent ?? "").includes("会话管理"),
   ) as HTMLButtonElement | undefined;
   if (!entry) throw new Error("设置页里找不到「会话管理」入口");
@@ -70,7 +72,7 @@ describe("设置页有「会话管理」入口", () => {
       3000,
       "settings menu",
     );
-    const entry = Array.from(document.querySelectorAll(".set-entry")).find((el) =>
+    const entry = Array.from(document.querySelectorAll(".set-row")).find((el) =>
       (el.textContent ?? "").includes("会话管理"),
     ) as HTMLButtonElement | undefined;
     expect(entry, "设置页必须列出「会话管理」，否则用户以为这个功能不存在").toBeTruthy();
@@ -79,7 +81,9 @@ describe("设置页有「会话管理」入口", () => {
 
   it("点「会话管理」真的进会话历史页（不是死入口）", async () => {
     await openSessionsViaSettings();
-    expect(document.body.textContent ?? "").toContain("会话历史");
+    // 设计稿 05:2:920 —— 标题条上就写「会话」（不是「会话历史」）；
+    // 断言**标题条**而不是 body：body 里到处是「会话管理」「会话」这类字样。
+    expect(document.querySelector(".sub-bar-title")?.textContent ?? "").toBe("会话");
     expect(panelExists()).toBe(true); // 仍是面板形态，只是换页
   });
 
@@ -88,7 +92,9 @@ describe("设置页有「会话管理」入口", () => {
     await bootApp();
     await openPanel();
     await openSessionsViaHistoryButton();
-    expect(document.body.textContent ?? "").toContain("会话历史");
+    // 设计稿 05:2:920 —— 标题条上就写「会话」（不是「会话历史」）；
+    // 断言**标题条**而不是 body：body 里到处是「会话管理」「会话」这类字样。
+    expect(document.querySelector(".sub-bar-title")?.textContent ?? "").toBe("会话");
   });
 });
 
@@ -100,7 +106,9 @@ describe("在会话页点当前会话能回到对话（死键回归）", () => {
     expect(curId, "mock 应给出当前会话 id").toBeTruthy();
 
     await openSessionsViaHistoryButton();
-    expect(document.body.textContent ?? "").toContain("会话历史");
+    // 设计稿 05:2:920 —— 标题条上就写「会话」（不是「会话历史」）；
+    // 断言**标题条**而不是 body：body 里到处是「会话管理」「会话」这类字样。
+    expect(document.querySelector(".sub-bar-title")?.textContent ?? "").toBe("会话");
 
     const row = sessionRow(curId!);
     expect(row, "当前会话那行应该在列表里").toBeTruthy();

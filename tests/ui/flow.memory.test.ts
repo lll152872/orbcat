@@ -20,9 +20,9 @@ async function openSettingsThenMemory(): Promise<void> {
   // 设置入口页异步渲染，等菜单出现
   await waitFor(() => document.body.textContent?.includes("记忆") ?? false, 3000, "settings menu");
   // 点「记忆」入口（设置菜单项）
-  const memEntry = Array.from(document.querySelectorAll("button, .set-entry, [data-view]")).find(
-    (el) => (el.textContent ?? "").includes("记忆"),
-  ) as HTMLElement | undefined;
+  // ⚠️ 2026-10-23：设置页按设计稿 04 改成 4 组手风琴后，**不能按文案找「记忆」** ——
+  //    会先命中组头「记忆与数据」（那是折叠头，不是入口）。按 data-act 定位。
+  const memEntry = document.querySelector<HTMLElement>('.set-row[data-act="mem"]');
   if (!memEntry) throw new Error("设置菜单里找不到记忆入口");
   memEntry.click();
 }
@@ -32,7 +32,7 @@ describe("记忆审批 UI", () => {
     state.memPending = [];
     await openSettingsThenMemory();
     await waitFor(
-      () => document.body.textContent?.includes("没有待审批") ?? false,
+      () => document.body.textContent?.includes("全部处理完了") ?? false,
       3000,
       "empty pending",
     );
@@ -61,12 +61,25 @@ describe("记忆审批 UI", () => {
       "pending content",
     );
 
-    const okBtn = document.querySelector<HTMLButtonElement>('.mem-btn.ok[data-id="cand_1"]');
-    const noBtn = document.querySelector<HTMLButtonElement>('.mem-btn.no[data-id="cand_2"]');
+    // 设计稿 06:2:1004~2:1006 —— 候选卡的操作行是「驳回 / 改写 / 批准」三颗
+    const okBtn = document.querySelector<HTMLButtonElement>(
+      '.mem-cand-btn.approve[data-id="cand_1"]',
+    );
+    const noBtn = document.querySelector<HTMLButtonElement>(
+      '.mem-cand-btn.reject[data-id="cand_2"]',
+    );
     expect(okBtn).toBeTruthy();
     expect(noBtn).toBeTruthy();
 
     okBtn!.click();
+    // 驳回是**两步**：第一次只展开理由输入框（设计稿的卡里没有那个框，
+    // 但 rejected.jsonl 的「留理由」功能不能丢），第二次才真的驳回。
+    noBtn!.click();
+    await waitFor(
+      () => !!document.querySelector('.mem-reason[data-for="cand_2"]:not([hidden])'),
+      2000,
+      "reason box shown",
+    );
     noBtn!.click();
 
     await waitFor(() => callsOf("mem_approve").length >= 1, 2000, "mem_approve invoked");
@@ -74,6 +87,66 @@ describe("记忆审批 UI", () => {
 
     expect(callsOf("mem_approve")[0]?.args?.id).toBe("cand_1");
     expect(callsOf("mem_reject")[0]?.args?.id).toBe("cand_2");
+  });
+
+  it("「改写」把卡片变成编辑器，保存时只改内容不批准", async () => {
+    state.memPending = [
+      {
+        id: "cand_3",
+        content: "回答前先给结论，可能大概也许",
+        source: "model",
+        created_at: "ts0000000003T00:00:00Z",
+      },
+    ];
+    await openSettingsThenMemory();
+    await waitFor(
+      () => document.body.textContent?.includes("回答前先给结论") ?? false,
+      3000,
+      "pending content",
+    );
+
+    document.querySelector<HTMLButtonElement>('.mem-cand-btn.edit[data-id="cand_3"]')!.click();
+    await waitFor(
+      () => !!document.querySelector(".cand-edit-box:not([hidden])"),
+      2000,
+      "edit editor opened",
+    );
+    const ta = document.querySelector<HTMLTextAreaElement>(".cand-edit-box")!;
+    expect(ta.value).toContain("可能大概也许");
+
+    ta!.value = "回答前先给结论。";
+    document.querySelector<HTMLButtonElement>(".mem-cand-btn.save-edit")!.click();
+
+    await waitFor(() => callsOf("mem_rewrite").length >= 1, 2000, "mem_rewrite invoked");
+    expect(callsOf("mem_rewrite")[0]?.args?.id).toBe("cand_3");
+    expect(callsOf("mem_rewrite")[0]?.args?.content).toBe("回答前先给结论。");
+    // 改写**不等于**批准 —— 还得用户自己点「批准」
+    expect(callsOf("mem_approve").length, "改写不该顺带批准").toBe(0);
+  });
+
+  it("标题条有「全部批准」，点了要二次确认", async () => {
+    state.memPending = [
+      {
+        id: "cand_4",
+        content: "一条候选",
+        source: "model",
+        created_at: "ts0000000004T00:00:00Z",
+      },
+    ];
+    await openSettingsThenMemory();
+    await waitFor(
+      () => !!document.querySelector("#mem-approve-all"),
+      2000,
+      "approve-all button",
+    );
+
+    document.querySelector<HTMLButtonElement>("#mem-approve-all")!.click();
+    // 二次确认：先出现确认框，取消就不该调后端
+    await waitFor(() => !!document.querySelector(".confirm-card"), 2000, "confirm shown");
+    expect(callsOf("mem_approve_all").length, "取消前不该调后端").toBe(0);
+
+    document.querySelector<HTMLButtonElement>('.confirm-actions [data-k="yes"]')!.click();
+    await waitFor(() => callsOf("mem_approve_all").length >= 1, 2000, "mem_approve_all invoked");
   });
 });
 
@@ -96,7 +169,7 @@ describe("项目记忆的手改编辑器", () => {
       3000,
       "settings menu",
     );
-    const entry = Array.from(document.querySelectorAll(".set-entry")).find((el) =>
+    const entry = Array.from(document.querySelectorAll(".set-row")).find((el) =>
       (el.textContent ?? "").includes("记忆"),
     ) as HTMLButtonElement | undefined;
     if (!entry) throw new Error("设置菜单里找不到记忆入口");

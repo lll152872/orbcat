@@ -24,7 +24,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { bootApp, openPanel, sendText, waitFor, orbExists, clickOrb, sleep } from "./helpers";
+import { bootApp, openPanel, sendText, waitFor, orbExists, clickOrb } from "./helpers";
 import { state } from "./mocks/tauri";
 
 function orb(): HTMLElement {
@@ -60,12 +60,18 @@ describe("胶囊态：帧态优先级 error > pending > thinking > mem > idle", 
     await bootApp();
     await waitFor(() => has("orb--idle"), 3000, "idle");
 
-    state.chatDelayMs = 600; // 让这一轮还挂在"进行中"
+    // ⚠️ 延迟要给**足量余量**：从发消息到断言，中间隔着 waitFor 轮询 + 收起面板
+    //    + 状态落定，机器一慢（GC / 杀毒扫描）就可能超过这个数 —— 一旦 chat 返回，
+    //    这一轮就结束了，thinking 帧被摘掉，断言炸。
+    //    拉长**不增加测试耗时**：afterEach 的 clearAllTimers 会把那个 pending 的
+    //    setTimeout 直接取消，测试在断言后立刻结束。
+    state.chatDelayMs = 3000; // 让这一轮还挂在"进行中"
     await openPanel();
     await sendText("跑一会儿");
     await waitFor(() => !!document.querySelector(".msg.running"), 2000, "running");
 
     await collapseToOrb();
+    await waitFor(() => has("orb--thinking"), 2000, "thinking frame");
     expect(has("orb--thinking"), "干活中必须是 thinking 帧（蓝猫）").toBe(true);
     expect(has("orb--idle")).toBe(false);
   });
@@ -76,12 +82,13 @@ describe("胶囊态：帧态优先级 error > pending > thinking > mem > idle", 
     await bootApp();
     await waitFor(() => has("orb--mem"), 3000, "mem frame");
 
-    state.chatDelayMs = 600;
+    state.chatDelayMs = 3000; // 同上：余量要够，机器慢时不能翻车
     await openPanel();
     await sendText("一边有记忆待审，一边让它干活");
     await waitFor(() => !!document.querySelector(".msg.running"), 2000, "running");
 
     await collapseToOrb();
+    await waitFor(() => has("orb--thinking"), 2000, "thinking frame");
     expect(
       has("orb--thinking"),
       "有待审记忆时干活中仍要露蓝猫摇尾巴 —— 这正是 2026-10-14 用户报的回归",
@@ -110,13 +117,13 @@ describe("紫脑标与帧态解耦：提醒不能随帧消失", () => {
     await bootApp();
     await waitFor(() => has("orb--mem"), 3000, "mem frame");
 
-    state.chatDelayMs = 600;
+    state.chatDelayMs = 3000; // 同上
     await openPanel();
     await sendText("忙起来也别忘了提醒我审记忆");
     await waitFor(() => !!document.querySelector(".msg.running"), 2000, "running");
 
     await collapseToOrb();
-    await sleep(30); // 让 renderOrb / applyOrbState 都落定
+    await waitFor(() => has("orb--thinking"), 2000, "thinking frame");
     expect(has("orb--thinking")).toBe(true);
     expect(
       has("orb--has-mem"),

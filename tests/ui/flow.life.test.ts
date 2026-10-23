@@ -51,8 +51,8 @@ function withXuexitong(over: Partial<(typeof state)["lifeStatus"]["sources"][num
 
 async function openLife(): Promise<HTMLElement> {
   document.getElementById("btn-gear")!.click();
-  await waitFor(() => !!document.querySelector(".set-entry"), 3000, "设置入口页");
-  const entry = Array.from(document.querySelectorAll<HTMLElement>(".set-entry")).find(
+  await waitFor(() => !!document.querySelector(".set-row"), 3000, "设置入口页");
+  const entry = Array.from(document.querySelectorAll<HTMLElement>(".set-row")).find(
     (b) => b.dataset.act === "life",
   );
   if (!entry) throw new Error("设置里找不到「数据源」入口");
@@ -66,8 +66,8 @@ describe("设置 › 数据源", () => {
     await bootApp();
     await openPanel();
     document.getElementById("btn-gear")!.click();
-    await waitFor(() => !!document.querySelector(".set-entry"), 3000, "设置入口页");
-    const entry = Array.from(document.querySelectorAll<HTMLElement>(".set-entry")).find(
+    await waitFor(() => !!document.querySelector(".set-row"), 3000, "设置入口页");
+    const entry = Array.from(document.querySelectorAll<HTMLElement>(".set-row")).find(
       (b) => b.dataset.act === "life",
     )!;
     // 行保留在 DOM 里 —— 页面代码与后面 10 个用例都还依赖它，用户看不见而已
@@ -194,6 +194,6 @@ describe("设置 › 数据源", () => {
     const back = bar!.querySelector<HTMLElement>("#sub-back");
     expect(back, "返回按钮应在 #sub-bar 内").toBeTruthy();
     back!.click();
-    await waitFor(() => !!document.querySelector(".set-entry"), 3000, "回到设置入口");
+    await waitFor(() => !!document.querySelector(".set-row"), 3000, "回到设置入口");
   });
 });

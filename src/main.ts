@@ -17,6 +17,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { mdToHtml, splitStable } from "./markdown";
 import { MAX_BUBBLES, splitBubbles } from "./bubble";
+import { clipLines } from "./truncate";
 // 纯格式化/工具函数已抽到 format.ts（拆模块，见该文件头部说明）。
 // 这里集中 re-import，避免散落各处 import 语句。
 import {
@@ -32,6 +33,14 @@ import {
   renderRecoveryView,
   type RecoveryState,
 } from "./views/recovery";
+import {
+  closeCommandPanel,
+  currentCommand,
+  moveActive,
+  newPanelState,
+  openCommandPanel,
+  type CommandPanelState,
+} from "./commands";
 import {
   capAppend,
   esc,
@@ -95,6 +104,14 @@ interface AgentStep {
    * 混进心跳文本会把摘要搅掉。
    */
   tick?: string;
+  /**
+   * **工具耗时（毫秒）** —— 只对 tool_call / tool_result / tool_error 有意义。
+   *
+   * 为什么单开字段：耗时是**元信息**，不是结果内容。混进 `detail` 会污染
+   * 结果预览（detail 要原样展示给用户，还要过 summarizeArgs）。
+   * 后端 pi 路径取 `tool_execution_end.durationMs`，自研内核自己掐表。
+   */
+  durationMs?: number;
   /**
    * 插话（kind === "steer"）附带的图片**文件路径**。
    *
@@ -319,6 +336,33 @@ let sessionList: SessionMeta[] = [];
 let sessionLoaded: Promise<void> | null = null;
 
 /**
+ * 记忆页的**待批条数**（标题条徽标 + 底部状态栏用）。
+ *
+ * 为什么缓存而不是每次现拉：标题条在 `#panel-body` 之外，
+ * 渲染顺序是「先 body 后 sub-bar」，body 拿到数据时标题条已经画完了 ——
+ * 缓存一份给标题条用，同一份数据不用拉第二次。
+ */
+let memPendingCount = 0;
+/** 记忆页统计（底部状态栏「N / M」） */
+let memStatsCache: MemStats | null = null;
+/** 设置页「搜索设置」是否展开（设计稿 04 右组 🔍 + 底栏「/ 搜索设置」） */
+let settingsSearchOpen = false;
+/** 设置页搜索关键词 */
+let settingsSearchQ = "";
+/** 设置页统计（底部状态栏「N 组 · M 项」）—— 设置页渲染完从 DOM 数出来 */
+let settingsStatCache = { groups: 0, items: 0 };
+/** 工具页统计（底部状态栏「N 组 · M 个工具」） */
+let toolsStatCache = { groups: 0, tools: 0 };
+/** MCP 组的工具数（底部状态栏要用 —— DOM 里数不到，那是折叠组） */
+let mcpToolsCount = 0;
+/**
+ * **内置工具总闸**（settings.builtinToolsEnabled）—— 设计稿 09「内置工具」组的开关。
+ *
+ * 关掉 = 模型工具表里一个内置工具都没有（只剩 MCP 外部工具与项目脚本工具）。
+ */
+let builtinToolsEnabled = true;
+
+/**
  * 是否需要初始化（Rust `boot_state` 告知）。
  *
  * 为 true 表示 `agent-data/` 目录不存在 = 全新克隆的仓库。
@@ -467,7 +511,7 @@ function ensureSessionLoaded(): Promise<void> {
 }
 
 /**
- * 开新会话 → 挂到**当前激活项目**（主对话则不绑）。
+ * 开新会话 → 挂到**当前激活项目**（「无任务空间」则不绑）。
  *
  * `mode` = 这条会话的模式 id（模式跟会话走）。不传就用
  * `defaultModeId` —— 它是**编译期常量级别的"标准模式"**，不是用户可配项
@@ -505,7 +549,7 @@ async function newSession(mode?: string): Promise<void> {
   }
 }
 
-/** 进入会话：顶栏项目跟着会话走（主聊天 → 主对话） */
+/** 进入会话：顶栏项目跟着会话走（主聊天 → 无任务空间） */
 async function switchSession(id: string): Promise<void> {
   // ⚠️ 不再用 `busy` 拦住切换（切走、后台继续跑）。
   //    落盘路径自带开跑时的 session_id，回答不会写错会话；前端进度监听也按
@@ -541,7 +585,7 @@ async function switchSession(id: string): Promise<void> {
     await loadModes(id);
     await loadProjects();
     await refreshSessionProjectTags();
-    // 顶栏跟着**会话**走：主聊天永不挂项目 → 记忆回主对话
+    // 顶栏跟着**会话**走：主聊天永不挂项目 → 记忆回「无任务空间」
     activeProjectId = sessionProjectId(sessionList.find((x) => x.id === id));
     await invoke("pmem_set_active", { id: activeProjectId }).catch(() => {});
     paintProjectSelect();
@@ -709,6 +753,12 @@ function askConfirm(
   body: string,
   danger = "删除",
   dangerStyle = true,
+  /**
+   * 第三级提示行（设计稿 11:2:1594）。
+   * 「如果只是想让它别再占地方，用「保留策略」批量…」——
+   * 给用户一条**更安全的替代路径**，别只说「不能撤」。
+   */
+  hint = "",
 ): Promise<boolean> {
   return new Promise((resolve) => {
     const mask = document.createElement("div");
@@ -717,6 +767,7 @@ function askConfirm(
       <div class="confirm-card">
         <div class="confirm-title">${esc(title)}</div>
         <div class="confirm-body">${esc(body)}</div>
+        ${hint ? `<div class="confirm-hint">${esc(hint)}</div>` : ""}
         <div class="confirm-actions">
           <button type="button" class="set-btn" data-k="no">取消</button>
           <button type="button" class="set-btn${dangerStyle ? " danger" : ""}" data-k="yes">${esc(danger)}</button>
@@ -966,7 +1017,11 @@ async function resendPrompt(text: string, imgs: string[]): Promise<void> {
   permMuteThisTurn = false;
 
   try {
-    const run = await invoke<AgentRun>("chat", { input: text, images: imgs });
+    // 选内核：pi 可用就走 pi，否则走自研的。
+    // ⚠️ 两个命令的**参数名与返回结构完全一致**（PiRun 是 AgentRun 的同构体），
+    //    所以这里只有一行分流，渲染逻辑一行都不用改。
+    const cmd = usePiKernel && piKernelAvailable ? "chat_pi" : "chat";
+    const run = await invoke<AgentRun>(cmd, { input: text, images: imgs });
     // 用户可能在等的时候切走了 → 别动当前视图（结果后端已落回它自己的会话）
     if (runSid !== currentSessionId) return;
     const idx = entries.findIndex((x) => x.role === "running");
@@ -1104,23 +1159,36 @@ function renderSessionsView(): string {
     name ? `<span class="sess-proj" title="项目：${esc(name)}">📁 ${esc(name)}</span>` : "";
 
   /**
-   * 这条会话的 Agent 模式标记。
+   * 这条会话的 Agent 模式标记（行尾 chip）。
    *
-   * 为什么摆在一行 meta 的最后而不是标题行：标题行已经有 分支/项目/当前 三个标，
-   * 再塞一个会把标题挤没（`.sess-title` 是省略号截断的）。
+   * 设计稿 05（2:943 模式标记）：底 #26262B + 字 #71717A 的小 chip。
    * 默认模式**不标** —— 它是绝大多数会话的状态，每条都标等于纯噪声；
-   * 只有"跟默认不一样"的会话才值得一眼看出来。
+   * 只有「跟默认不一样」的会话才值得一眼看出来。
    */
   const modeTag = (id: string): string => {
     if (!id || id === defaultModeId) return "";
     const nm = modesCache.find((x) => x.id === id)?.name ?? id;
-    return ` · <span class="sess-mode" title="Agent 模式：${esc(nm)}（建会话时定，不能改）">${
-      MODE_ICON[id] ?? "🧩"
-    } ${esc(nm)}</span>`;
+    return `<span class="sess-mode-tag" title="Agent 模式：${esc(nm)}（建会话时定，不能改）">${esc(
+      nm,
+    )}</span>`;
+  };
+
+  /**
+   * 行首的**模式点**（设计稿 05：2:941/2:944/2:947/2:953）。
+   *
+   * 每条会话都有 —— 默认模式也画（它就是「标准=薄荷」那一个）。
+   * 远看只凭色点就能分辨这条是哪一档，不用读文字。
+   */
+  const modeDot = (id: string): string => {
+    const m = id || defaultModeId;
+    return `<span class="sess-mode-dot" data-mode="${esc(m)}" title="模式：${esc(
+      modesCache.find((x) => x.id === m)?.name ?? m,
+    )}"></span>`;
   };
 
   const itemRow = (s: SessionMeta): string => `
       <div class="sess-item${s.current ? " cur" : ""}" data-id="${esc(s.id)}" title="右键挂靠到项目">
+        ${modeDot(s.mode)}
         <button class="sess-open" data-id="${esc(s.id)}" title="切换到该会话">
           <span class="sess-title-row">
             <span class="sess-title">${esc(s.title || "（无标题）")}</span>
@@ -1128,14 +1196,15 @@ function renderSessionsView(): string {
             ${projTag(s.projectName)}
             ${s.current ? '<span class="sess-cur-tag">当前</span>' : ""}
           </span>
-          <span class="sess-meta">${fmtTime(s.updatedAt)} · ${s.count} 条${modeTag(s.mode)}</span>
+          <span class="sess-meta">${fmtTime(s.updatedAt)} · ${s.count} 条</span>
         </button>
+        ${modeTag(s.mode)}
         ${s.kind === "main" ? "" : `<button class="sess-del" data-id="${esc(s.id)}" title="删除该会话">✕</button>`}
       </div>`;
 
   const groups = new Map<string | null, SessionMeta[]>();
   for (const s of sessionList) {
-    // 主聊天永远进「主对话」组
+    // 主聊天永远进「无任务空间」组（它不挂任何项目）
     const k = s.kind === "main" ? null : (s.projectName ?? null);
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k)!.push(s);
@@ -1180,7 +1249,13 @@ function renderSessionsView(): string {
     .join("");
 
   return `
-    <div class="mem-head">会话<button class="mem-back" id="sess-new">＋ 新建</button></div>
+    <div class="mem-head">会话
+      <!-- 「＋ 新建」挪到**标题条右组**了（设计稿 05:2:922）——
+           这里留一个 hidden 的同 id 元素：现有 UI 测试拿它当「会话页已打开」的锚点
+           （tests/ui/flow.sessions-entry.test.ts），删了会连累那几条用例。
+           界面上不显示，功能入口在标题条那颗 ＋ 上。 -->
+      <button class="mem-back" id="sess-new" hidden>＋ 新建</button>
+    </div>
     <div class="set-hint" style="margin-bottom:8px">
       <b>按项目分组</b> · 点组标题收起/展开 · 右键会话挂靠/改挂靠 · 点一条进入对话
     </div>
@@ -1430,7 +1505,7 @@ function showSessionBindMenu(x: number, y: number, sid: string, kind: string): v
   menu.id = "sess-ctx";
   menu.className = "ctx-menu";
   const binds = [
-    `<div class="ctx-item" data-act="bind" data-pid="">主对话（不挂项目）</div>`,
+    `<div class="ctx-item" data-act="bind" data-pid="">无任务空间（不挂项目）</div>`,
     ...projects.map(
       (p) => `<div class="ctx-item" data-act="bind" data-pid="${p.id}">📁 ${esc(p.name)}</div>`,
     ),
@@ -1552,6 +1627,23 @@ async function refreshSessionProjectTags(): Promise<void> {
 }
 
 /**
+ * 每个空间里有多少条会话（键 = 项目名；无任务空间那组用 `null`）。
+ *
+ * 与会话页分组**同一套口径**：`kind === "main"` 的主聊天归「无任务空间」，
+ * 其余按 `projectName` 归。顶栏下拉显示的条数因此与会话页看到的一致 ——
+ * 两处用不同口径的话，顶栏说「论文 · 3」而会话页里只有 2 条，
+ * 用户会以为是数据错了。
+ */
+function sessionCountBySpace(): Map<string | null, number> {
+  const m = new Map<string | null, number>();
+  for (const s of sessionList) {
+    const k = s.kind === "main" ? null : (s.projectName ?? null);
+    m.set(k, (m.get(k) ?? 0) + 1);
+  }
+  return m;
+}
+
+/**
  * 这条会话挂着的项目 id。
  *
  * `SessionMeta.projectName`（项目名）是前端从 `pmem_session_map` 补的，
@@ -1582,9 +1674,54 @@ function latestSessionIn(projectId: number | null): SessionMeta | undefined {
 function paintProjectSelect(): void {
   const psel = document.getElementById("project-select") as HTMLSelectElement | null;
   if (!psel) return;
-  psel.value = activeProjectId == null ? "" : String(activeProjectId);
+  // ⚠️ 选项文案**也要重写**：条数会变（新建/删会话、切换挂靠），
+  // 只改 `value` 的话收起状态下那颗 chip 上还挂着旧数字
+  // （「论文 · 12」实际已经 13 条了）。
+  const counts = sessionCountBySpace();
+  const want = [
+    { id: "", label: `无任务空间 · ${counts.get(null) ?? 0}` },
+    ...projects.map((p) => ({
+      id: String(p.id),
+      label: `📁 ${p.name} · ${counts.get(p.name) ?? 0}`,
+    })),
+  ];
+  // 只在**真的不一样**时才重写 —— `renderBody` 每条消息都会走到这里，
+  // 每次都重建 <option> 是白做的功，还可能把用户正展开着的原生下拉弹回去。
+  const same =
+    psel.options.length === want.length &&
+    want.every(
+      (w, i) => psel.options[i].value === w.id && psel.options[i].textContent === w.label,
+    );
+  const wantVal = activeProjectId == null ? "" : String(activeProjectId);
+  if (!same) {
+    psel.innerHTML = want.map((w) => `<option value="${w.id}">${esc(w.label)}</option>`).join("");
+  }
+  // ⚠️ 选中状态**必须用 DOM 属性 `option.selected`**，不能只靠 HTML 的 `selected` 属性。
+  //
+  // 实测（jsdom 最小复现，四种写法都验过）：
+  //   A 直接 innerHTML 带 selected 属性  → selectedIndex = **-1**（属性没转成 selectedness）
+  //   B 空 select 再 innerHTML 带 selected → selectedIndex = **-1**
+  //   D select 嵌在 div.innerHTML 里       → selectedIndex = **-1**
+  //   C innerHTML 不带 selected + 赋值 value → selectedIndex = 0  ✅
+  //
+  // 根因：HTML 属性 `selected` 只是**初始选中标记**，解析完就不是 selectedness 了；
+  // 而 `psel.value = wantVal` 在「目标值恰好等于当前 value」时会被
+  // `if (psel.value !== wantVal)` 守卫跳过 —— 首项的 value 就是 ""，
+  // 于是「无任务空间」这条永远选不上，`selectedIndex` 停在 -1。
+  //
+  // 浏览器里靠「默认选中第一项」的隐式兜底侥幸看不出问题，但那是不可靠行为：
+  // 同一份代码换个 DOM 实现（jsdom / 测试环境）就崩。
+  //
+  // 正解：**无条件**把选中的那一项设成 `option.selected = true`。
+  // 这是 DOM 属性（IDL attribute），直接改 selectedness，与解析时机无关。
+  const idx = want.findIndex((w) => w.id === wantVal);
+  for (let i = 0; i < psel.options.length; i++) {
+    psel.options[i].selected = i === idx;
+  }
+  // value 兜底：有些环境对 selected 赋值不敏感，两手都做（无害）
+  if (psel.value !== wantVal) psel.value = wantVal;
   const name = projects.find((p) => p.id === activeProjectId)?.name;
-  psel.title = `当前：${name ?? "主对话"} —— 跟**当前会话**走（选它会跳到该项目的会话）`;
+  psel.title = `当前：${name ?? "无任务空间"} —— 跟当前会话走（选它会跳到那个空间的会话）`;
 }
 
 /**
@@ -1617,7 +1754,7 @@ function paintProjectSelect(): void {
  * `renderBody()` 每条消息都会跑一遍，这里必须**零副作用**：
  * - `sessionList` 里找不到当前会话（还没拉）→ 不动；
  * - `projectName === undefined`（`refreshSessionProjectTags` 还没跑，挂靠未知）→ 不动。
- * 否则每次开面板都会把上次记住的项目误清成「主对话」。
+ * 否则每次开面板都会把上次记住的项目误清成「无任务空间」。
  */
 function alignProjectToSession(): void {
   const meta = sessionList.find((s) => s.id === currentSessionId);
@@ -1759,6 +1896,11 @@ interface ProgressEvent {
   /** toolTick：长工具执行心跳（已运行秒数 + 输出尾巴） */
   elapsedSecs?: number;
   tail?: string;
+  /**
+   * 工具耗时（毫秒）—— pi 的 `tool_execution_end.durationMs`，
+   * 自研内核是后端掐的表。工具行后面显示「· 1.2s」。
+   */
+  durationMs?: number;
   /** discardStream */
   reason?: string;
   /** steer：被消费掉的那条插话的 id */
@@ -1772,6 +1914,16 @@ interface Candidate {
   content: string;
   source: string;
   created_at: string;
+  /** 触发轮次（用户原话，截断过）—— 后端可选，老数据没有 */
+  turn_ref?: string | null;
+}
+
+/** 审批页底部状态栏的统计（后端 `mem_stats`） */
+interface MemStats {
+  /** 当前待批数 */
+  pending: number;
+  /** 已处理数（已批准 + 已驳回） */
+  handled: number;
 }
 
 interface McpGroupView {
@@ -1868,31 +2020,6 @@ void projectInfo;
  * 记忆页渲染完顺手回填这里，两处共用一份。
  */
 let skillsCache: SkillInfo[] = [];
-
-/**
- * 🔶 幽灵函数 —— 「项目」（拼装包）功能整体暂缓。
- *
- * 定论：这个功能未来再说，本轮不发布。签名保留、调用点保留、
- * 返回 `null`（= 没有摘要文本）。设置入口页那一行同时带 `hidden`，用户看不见。
- *
- * 为什么留个空壳而不是整段删掉：这一页（`renderProjectView`）和它的整套 vitest
- * 都是**活的**，删掉入口会让这些测试一起红。留着幽灵函数，恢复功能时只需
- * ① 按下面注释里的原实现写回来 ② 去掉那行 `item()` 的 `true`。删代码更省事，
- * 但下次做的时候得从头重建一遍页面。
- */
-function projectSummaryText(): null {
-  return null;
-  /* ↓↓↓ 恢复功能时把这段实现放回来（暂缓前的原样） ----------
-  if (!projectInfo) return "读取中…";
-  const act = projectInfo.active;
-  if (!act) return `未激活 · 共 ${projectInfo.bundles.length} 个包`;
-  const b = projectInfo.bundles.find((x) => x.id === act);
-  const warn =
-    (projectInfo.permError ? " · ⚠️ 权限预设已丢弃" : "") +
-    (projectInfo.unresolved.length ? ` · ${projectInfo.unresolved.length} 项引用失效` : "");
-  return `已激活「${esc(b?.name ?? act)}」${warn}`;
-  -------------------------------------------------------------------- */
-}
 
 /** 这条配置实际用哪种传输（与 Rust `resolved_transport` 同规则） */
 function mcpTransportOf(s: McpServerCfg): "http" | "stdio" {
@@ -2086,7 +2213,7 @@ function modelGroupLabel(url: string | undefined): string {
   if (!url) return "";
   return modelGroupNames[url]?.trim() || shortHost(url);
 }
-/** 项目索引（pmem.sqlite）；activeProjectId=null = 主对话 */
+/** 项目索引（pmem.sqlite）；activeProjectId=null = 无任务空间（没有激活项目） */
 let projects: ProjectRow[] = [];
 let activeProjectId: number | null = null;
 let entries: ChatEntry[] = [];
@@ -2147,9 +2274,15 @@ interface PermRule {
 
 /** 开机自启是否已开启（设置页显示用） */
 let autostartOn = false;
-
 /** 失焦自动收起（防挡屏幕）。启动时从 Rust 读，设置页可改。 */
 let blurCollapse = true;
+/**
+ * **项目目录自动读写**（设计稿 04「行为与安全」组的行内开关）。
+ * 关掉 = 激活项目绑的目录不再自动给 ReadWrite，工具碰它一律走弹卡审批。
+ */
+let projectDirAutoread = true;
+/** 命令策略条数（白名单 / 硬阻断）—— 设置页行内摘要用 */
+let cmdPolicyCounts = { allow: 0, hard: 0 };
 
 /**
  * 执行权限档位（settings.execTrust）—— 管 run_command / MCP 弹卡频率。
@@ -2267,7 +2400,6 @@ let bgDeskWindows: { title: string; width: number; height: number; pid: number }
 let panelOpenedAt = 0;
 
 /** 权限规则条数（设置入口页摘要用） */
-let permCount = 0;
 let searchInfo: SearchStatus | null = null;
 
 /** 用于在重绘时解绑上一轮的 window 监听器 */
@@ -3118,7 +3250,7 @@ function pairToolSteps(items: AgentStep[] | undefined): AgentStep[] | undefined 
       (next.name ?? "") === (s.name ?? "") &&
       !isToolFailure(next.detail)
     ) {
-      out.push({ ...s, result: next.detail });
+      out.push({ ...s, result: next.detail, durationMs: next.durationMs ?? s.durationMs });
       i++; // 返回条目被吃掉，不再单独占一行
       continue;
     }
@@ -3222,16 +3354,28 @@ function renderItem(s: AgentStep, idx = -1, kp = ""): string {
       // 第二轮：**调用与返回并成一行**（`pairToolSteps` 已把返回塞进 `s.result`），
       // 所以一个工具只占一行 —— 前缀按有没有返回在 🔧 / ✅ 之间切，
       // 详情块里先参数后返回，点开一次两样都能看到。
+      //
+      // 第三轮（学 pi）：**加上耗时**（`Took 1.2s`）—— 工具跑了多久是用户很想知道的一件事，
+      // pi 用 monotonic clock 测，我们后端给 `durationMs`。
       const args = s.detail ? summarizeArgs(s.detail) : "";
-      const clip = (t: string) => (t.length > 8 * 1024 ? t.slice(0, 8 * 1024) + "\n…[截断]" : t);
       const body = [
-        s.detail ? `<pre class="tl-tool-pre">${esc(clip(s.detail))}</pre>` : "",
-        s.result ? `<pre class="tl-tool-pre tl-res-pre">返回：${esc(clip(s.result))}</pre>` : "",
+        s.detail
+          ? `<pre class="tl-tool-pre">${esc(clipLines(s.detail, s.name || ""))}</pre>`
+          : "",
+        s.result
+          ? `<pre class="tl-tool-pre tl-res-pre">返回：${esc(
+              clipLines(s.result, s.name || ""),
+            )}</pre>`
+          : "",
       ].join("");
+      const dur =
+        s.durationMs !== undefined
+          ? `<span class="tl-dur">· ${(s.durationMs / 1000).toFixed(1)}s</span>`
+          : "";
       return `<details class="tl-tool tl-call"${di} data-open-key="tc-${esc(kp)}-${esc(s.name || "")}-${idx}">
         <summary title="${esc(s.name || "?")}${args ? ` · ${esc(args)}` : ""}">${
           s.result ? "✅" : "🔧"
-        } ${esc(toolLabel(s.name))}${
+        } ${esc(toolLabel(s.name))}${dur}${
           s.tick ? `<span class="tl-tick">${esc(s.tick)}</span>` : ""
         }</summary>${body}</details>`;
     }
@@ -3241,10 +3385,14 @@ function renderItem(s: AgentStep, idx = -1, kp = ""): string {
       //    `tool_call`（合成一行）。这里只兜**孤立返回**：`cap_steps` 超限截断把一对拆开、
       //    或老会话数据里本来就是孤儿。照样折成一行，别让它消失。
       const full = s.detail || "";
-      const bodyFull = full.length > 8 * 1024 ? full.slice(0, 8 * 1024) + "\n…[截断]" : full;
+      const bodyFull = clipLines(full, s.name || "");
       const tip = full.split("\n")[0].slice(0, 90);
+      const dur =
+        s.durationMs !== undefined
+          ? `<span class="tl-dur">· ${(s.durationMs / 1000).toFixed(1)}s</span>`
+          : "";
       return `<details class="tl-tool tl-res"${di} data-open-key="tr-${esc(kp)}-${esc(s.name || "")}-${idx}">
-        <summary title="${esc(tip)}">✅ ${esc(toolLabel(s.name))}</summary>
+        <summary title="${esc(tip)}">✅ ${esc(toolLabel(s.name))}${dur}</summary>
         ${bodyFull ? `<pre class="tl-tool-pre">${esc(bodyFull)}</pre>` : ""}
       </details>`;
     }
@@ -4488,10 +4636,14 @@ function openModelsAdd(): void {
  * 增删改仍然只在独立「模型管理」窗口（设置 › 🧩 模型）。这里唯一多出来的
  * 是底部那颗 **＋ 添加自定义模型** —— 它分隔线以下单独一行，不参与"选择"这件事。
  */
-function paintModelsDropdown(): void {
+/**
+ * 模型下拉的绘制。锚点默认是顶栏的模型 chip；设置页那行用 `set-model-chip`
+ * （设计稿 04:2:806 的行内下拉）—— 同一套渲染，只是锚点不同。
+ */
+function paintModelsDropdown(anchorId = "model-chip"): void {
   document.getElementById("models-dropdown")?.remove();
   if (!modelsDropdownOpen) return;
-  const chip = document.getElementById("model-chip");
+  const chip = document.getElementById(anchorId);
   if (!chip) return;
   // 当前模型解析成**唯一一条**（提到 map 外面：它跟行无关，别每行算一次）
   const cur = currentModelRef();
@@ -4569,20 +4721,58 @@ function renderPanel(): void {
       <span class="mc-caret">▾</span>
     </button>`;
 
-  // 主对话 / 项目（新建走独立「项+」，select 只显示真实项目，永远选中当前）
+  // ── 内核切换 chip（pi ↔ 自研）────────────────────────────────
+  //
+  // 为什么要给用户看这个：两个内核的**行为**确实不同
+  // （pi 有自己的 compaction / codemode / 扩展生态；自研的那套是 orbcat 独有的
+  //  记忆蒸馏 / PTC / 时间线折叠规则）。用户有权知道自己在用哪个。
+  // 模式 chip（2026-10-23 新增）—— **常驻可见**。
+  //
+  // 为什么要它：模式是**会话级钉死不可改**的（项目铁律），但以前只在
+  // 「＋新建会话」菜单里选，选完界面上**看不出当前是什么模式** ——
+  // 不可见就等于不可控。模式 chip 补上这个缺口。
+  //
+  // 为什么**不是下拉**：模式不可改，给个下拉是骗人。点了只提示"建会话时定"。
+  // 想换模式 → 走「＋」新建一条会话。
+  //
+  // 状态点用**模式色**（见 styles.css 的 --mode-standard 等）：
+  // 薄荷=标准 / 沙金=闲聊 / 珊瑚=创作 / 靛蓝=PTC。远看只凭色点就能分辨。
+  const curModeId = currentModeId();
+  const curModeName = currentModeName();
+  const modeChip = `
+    <button class="mode-chip" id="mode-chip" data-mode="${esc(curModeId)}"
+      title="当前模式：${esc(curModeName)}（建会话时定，不能改）"><span class="mc-dot"></span><span class="mc-mode-name">${esc(
+      curModeName,
+    )}</span></button>`;
+
+  // 「无任务空间」/ 各项目（新建走独立「＋」菜单，select 只显示真实项目，永远选中当前）
+  //
+  // ⚠️ 第一项叫「**无任务空间**」而不是「主对话」（2026-10-21）：
+  // 它指的是「**当前没有激活任何项目**」这个状态，不是「主聊天那条会话」。
+  // 旧名把两件事混成一句 —— 而会话页那一组早就改叫「无任务空间」了，
+  // 同一个概念在两个地方两个名字，用户看到的和它实际指的是两回事。
+  //
+  // 每项后面带**会话数**（学习别家的空间管理做法，2026-10-21 用户给的参考图）：
+  // 那张参考图里下拉就是一列空间名，但**一个数都没有** —— 选之前你不知道
+  // 哪个空间里有东西、哪个是空的。补上条数之后，这个下拉从「一个下拉框」变成
+  // 「一张空间总览」：条数是 0 的空间一眼就知道是空的。
+  // 顺带一个好处：收起状态下那颗 chip 也就直接写着「论文 · 12」，不用展开就知道。
+  const spaceCounts = sessionCountBySpace();
   const projOpts = [
-    `<option value=""${activeProjectId == null ? " selected" : ""}>主对话</option>`,
+    `<option value=""${activeProjectId == null ? " selected" : ""}>无任务空间 · ${
+      spaceCounts.get(null) ?? 0
+    }</option>`,
     ...projects.map(
       (p) =>
         `<option value="${p.id}"${p.id === activeProjectId ? " selected" : ""}>📁 ${esc(
           p.name,
-        )}</option>`,
+        )} · ${spaceCounts.get(p.name) ?? 0}</option>`,
     ),
   ].join("");
   const projTitle =
     activeProjectId == null
-      ? "主对话"
-      : (projects.find((p) => p.id === activeProjectId)?.name ?? "主对话");
+      ? "无任务空间"
+      : (projects.find((p) => p.id === activeProjectId)?.name ?? "无任务空间");
 
   app.innerHTML = `
     <div class="panel">
@@ -4597,16 +4787,25 @@ function renderPanel(): void {
            "行内元素"不需要动任何 JS —— 它们本来就是各自 getElementById
            单独切 display 的。 -->
       <div class="panel-header" id="panel-header">
-        <select id="project-select" title="当前：${esc(projTitle)} · 切项目看该项目会话">
-          ${projOpts}
-        </select>
-        <button class="mini-btn" id="btn-grab" title="截取当前屏幕">截</button>
-        <button class="mini-btn" id="btn-new" title="新建会话 / 项目">＋</button>
-        <button class="mini-btn" id="btn-sess" title="会话（主聊天 / 任务）">史</button>
-        <span class="ph-flex"></span>
-        ${modelBtn}
-        <button class="panel-btn" id="btn-gear" title="设置 / 模型">⚙</button>
-        <button class="panel-btn" id="btn-close" title="收起">—</button>
+        <!-- 左组：空间 + 模式。**两件事都是"我在哪 / 我是谁"，必须挨着**。
+             旧的写法是 select + 三个按钮 + 一个 ph-flex 弹性占位，
+             结果空间和模式之间被撑出一个大洞 —— 视觉上像缺了什么。
+             现在改成左右两组，组内紧凑，组间才拉开。 -->
+        <div class="ph-left">
+          <select id="project-select" title="当前：${esc(projTitle)} —— 跟当前会话走；选别的会跳到那个空间的会话">
+            ${projOpts}
+          </select>
+          ${modeChip}
+        </div>
+        <!-- 右组：模型 + 设置 + 收起
+             设计稿 02（2:1595 右侧组）：**就这三件**。
+             内核 chip 不在设计稿里 → 挪进设置页「行为与安全」组，
+             不占标题条（真机实报：它把空间 chip 的文字都挤没了）。 -->
+        <div class="ph-right">
+          ${modelBtn}
+          <button class="panel-btn" id="btn-gear" title="设置 / 模型">⚙</button>
+          <button class="panel-btn" id="btn-close" title="收起">—</button>
+        </div>
       </div>
 
       <!-- 第二行：有内容才占高度。前台应用 / 子页标题 / 后台任务。 -->
@@ -4623,17 +4822,29 @@ function renderPanel(): void {
 
       <div class="panel-body" id="panel-body"></div>
 
+      <!-- 底部状态栏（设计稿 04/05/06/07/09）：内容区**之外**的一条固定窄带。
+           为什么固定不跟着内容滚：它是「这一页的仪表盘」（多少条 / 几组 / 搜什么），
+           滚走就看不见了 —— 与标题条同一条理由（返回按钮也是因此挪到 #sub-bar 的）。
+           没有状态栏的页面（对话 / 备份回收站）整条隐藏，不占高度。 -->
+      <div class="panel-status" id="panel-status" style="display:none"></div>
+
       <div class="thumbs" id="thumbs"></div>
       <div class="img-hint" id="img-hint" style="display:none"></div>
 
       <div class="panel-input">
-        <!-- 「行为」入口：**一颗**小 logo，不是三颗 chip。
-             定稿：执行位置/模式/权限是设置，不该占输入行；
-             但行为本身是高频入口，所以留一颗图标当门，点开进设置 › 行为页。
-             与之前"三颗 chip 挤掉输入框宽度"是两回事：一颗图标约 30px。 -->
-        <button id="btn-behavior" class="mini-btn behavior-btn" title="行为：执行位置 / Agent 模式 / 执行权限">${setIcon("behavior")}</button>
+        <!-- 「命令面板」入口：**一颗**小 logo。
+             定稿（2026-10-23）：这颗按钮从「行为」改成「命令面板」——
+             行为（执行位置/模式/权限）已经整块搬进设置 › 行为页，输入行不该占着它；
+             而命令面板是**高频入口**，点开就是菜单，**不用记任何快捷键**
+             （用户原话："用你个软件还要背这么多快捷方式"）。
+             打斜杠也能开同一个面板 —— 按钮是给不想记斜杠的人的。 -->
+        <button id="btn-commands" class="mini-btn commands-btn" title="命令面板（也可以在输入框打 /）">${setIcon("commands")}</button>
         <textarea id="input" rows="1" placeholder="问点什么…"
           title="Enter 发送 / Shift+Enter 换行 / Ctrl+V 贴图"></textarea>
+        <button class="mini-btn" id="btn-grab" title="截取当前屏幕">截</button>
+        <!-- 设计稿 03 的输入行就这 4 件：命令面板按钮 · 输入框 · 截图 · 发送。
+             「＋新建」「史会话」**不在这里** —— 它们在命令面板里
+             （/new 新建会话、/sessions 会话列表），点开即菜单，不用记快捷键。 -->
         <button id="btn-stop" title="停止生成" hidden>■</button>
         <button id="btn-send" title="发送">↵</button>
       </div>
@@ -4664,23 +4875,32 @@ function renderPanel(): void {
   });
 
   document.getElementById("btn-close")!.addEventListener("click", () => void collapse());
+  document.getElementById("kernel-chip")?.addEventListener("click", () => void toggleKernel());
   document.getElementById("btn-grab")!.addEventListener("click", () => void grabScreen());
   // 「测」「忆」的工具栏入口已删：
   //   测试连通性 → 模型管理窗口（设置 › 🧩 模型，每行一颗「测」）
   //   记忆审批   → 设置入口页「🧠 记忆」
-  document.getElementById("btn-new")!.addEventListener("click", (e) => {
-    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    void showNewMenu(r.left, r.bottom + 4);
-  });
-  document.getElementById("btn-sess")!.addEventListener("click", () => void switchView("sessions"));
+  //
+  // ⚠️ 「＋新建」「史会话」两颗也按设计稿 03 从输入行删了（输入行就 4 件）。
+  //    它们的入口在**命令面板**里：`/new` 新建会话、`/sessions` 会话列表。
+  //    所以这里没有按钮可绑 —— 下面 `runCommand("new")` 直接调 `showNewMenu`。
 
-  // 当前会话标题挂到「史」按钮的 tooltip 上，一眼知道在哪个会话/什么模式里
-  // （模式跟会话走后，这里成了"不打开列表也能确认当前模式"的唯一入口）
+  // 模式 chip：点了**不换模式**（会话级钉死不可改），只说明怎么换。
+  // 给个下拉是骗人 —— 用户点开发现改不了，比不显示更糟。
+  document.getElementById("mode-chip")?.addEventListener("click", () => {
+    showToast(
+      `当前模式「${currentModeName()}」在建会话时就定了，不能换。想换 → 命令面板里「新建会话」。`,
+      "info",
+      3200,
+    );
+  });
+
+  // 当前会话信息挂到**命令面板按钮**的 tooltip 上（输入行没有「史」了）。
   const curSess = sessionList.find((s) => s.id === currentSessionId);
-  const sessBtn = document.getElementById("btn-sess");
-  if (sessBtn && curSess) {
+  const cmdBtn = document.getElementById("btn-commands");
+  if (cmdBtn && curSess) {
     const tag = curSess.kind === "main" ? "主聊天" : curSess.kind === "fork" ? "分支" : "任务";
-    sessBtn.title = `会话（${tag}：${curSess.title}）· 模式：${currentModeName()}`;
+    cmdBtn.title = `命令面板（新建会话 / 会话列表都在里面）· 当前：${tag}「${curSess.title}」· 模式：${currentModeName()}`;
   }
   document.getElementById("btn-gear")!.addEventListener("click", () => void switchView("settings"));
 
@@ -4737,6 +4957,31 @@ function renderPanel(): void {
   }
 
   input?.addEventListener("keydown", (e) => {
+    // 面板打开时，↑↓ / Enter / Esc 归面板管 —— 不能让 ↑ 去移动光标、
+    // Enter 去把「/记」当消息发出去。
+    if (cmdPanel.el) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        moveActive(cmdPanel, 1);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        moveActive(cmdPanel, -1);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeCommandPanel(cmdPanel);
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        // 选中即**执行**（不是发消息）—— 命令是动作，runSelectedCommand 内部已 dispatch
+        runSelectedCommand(input);
+        return;
+      }
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void send();
@@ -4747,6 +4992,19 @@ function renderPanel(): void {
     input.style.height = Math.min(input.scrollHeight, 120) + "px";
     // 边打边同步草稿：这样无论面板因什么原因被重建，内容都不会丢
     draftInput = input.value;
+    // 同步命令面板：内容以 `/` 开头就开，改掉就关
+    syncCommandPanel(input);
+  });
+
+  // 失焦就关面板 —— 否则输入框里还带着 `/记`，面板却浮在别的窗口上
+  input?.addEventListener("blur", () => {
+    // 延迟一帧：点面板里的某一项时，blur 会先于 mousedown 触发，
+    // 直接关会把用户正在点的那次点击吃掉
+    setTimeout(() => {
+      if (cmdPanel.el && document.activeElement?.id !== "cmd-panel") {
+        closeCommandPanel(cmdPanel);
+      }
+    }, 120);
   });
 
   // 发送按钮**只负责发送**。忙碌时它变成「插话」——ENTER 永远把用户打的字送出去，
@@ -4756,10 +5014,17 @@ function renderPanel(): void {
 
   // 注：执行位置 / Agent 模式 / 执行权限三组控制**已移出输入行**（见 renderBehaviorView）。
   // 它们曾以 chip 形式占掉输入行 110~165px，把输入框压到放不下一行提示。
-  // 输入行左侧只留一颗 🎛 当门 —— 高频入口要一眼能找到，但不能占宽度。
-  document
-    .getElementById("btn-behavior")!
-    .addEventListener("click", () => void switchView("behavior"));
+  //
+  // 输入行左侧那颗按钮现在开的是**命令面板**（2026-10-23 改）：
+  // 点开就是命令清单，**不需要记任何快捷键**。打 `/` 开的是同一个面板。
+  document.getElementById("btn-commands")!.addEventListener("click", () => {
+    const input = document.getElementById("input") as HTMLTextAreaElement;
+    // 空查询 = 展示全部命令（按注册表顺序，高频在前）
+    openCommandPanel(cmdPanel, "", (act) => {
+      void runCommand(act);
+    });
+    input?.focus();
+  });
 
   renderPreview();
   renderBody();
@@ -5138,6 +5403,15 @@ function renderBody(): void {
 
   // 顶部标题条跟着 view 走（对话 → 前台应用条；其余 → 当前页标题 + 返回）
   renderSubBar();
+  // 底部状态栏（设计稿 04/05/06/07/09）—— 没有状态栏的页面整条隐藏
+  renderStatusBar();
+
+  // ⚠️ **子页只有一行标题条**（设计稿 04/05/06/09/10 都是）：
+  // 左组 = 返回 + 标题，右组 = 本页动作。原来的主面板标题条（空间/模式/模型/设置/收起）
+  // 在子页里**收起来** —— 两行标题条把 600px 高的面板吃掉一大截，
+  // 而且「设置」页顶上那行（空间·模式·模型）跟下面那行「‹ 设置」自相矛盾。
+  const hdr = document.getElementById("panel-header");
+  if (hdr) hdr.style.display = view === "chat" ? "flex" : "none";
 
   // 非对话视图下不需要输入区
   const inputArea = document.querySelector(".panel-input") as HTMLElement | null;
@@ -5156,11 +5430,15 @@ function renderBody(): void {
       invoke<MemoryFiles>("mem_files").catch(() => null),
       invoke<SkillInfo[]>("skills_list").catch(() => [] as SkillInfo[]),
       invoke<ProjectMemoryView[]>("mem_projects").catch(() => [] as ProjectMemoryView[]),
-    ]).then(([list, files, sk, projects]) => {
+      invoke<MemStats>("mem_stats").catch(() => null),
+    ]).then(([list, files, sk, projects, st]) => {
       if (view !== "mem") return;
-      b.innerHTML = renderMemView(list, files, sk, projects ?? []);
+      b.innerHTML = renderMemView(list, files, sk, projects ?? [], st);
       b.scrollTop = keepMem;
       bindMemButtons(b);
+      // 标题条徽标与底部状态栏都靠这份数（渲染顺序：body 先，标题条后）
+      renderSubBar();
+      renderStatusBar();
     })
     .catch((e) => {
       if (view !== "mem") return;
@@ -5204,8 +5482,8 @@ function renderBody(): void {
       bd(invoke<McpStatus>("mcp_status").catch(() => null), null),
       bd(invoke<Candidate[]>("mem_pending").catch(() => [] as Candidate[]), [] as Candidate[]),
       bd(invoke<boolean>("autostart_status").catch(() => false), false),
-      bd(invoke<PermRule[]>("perm_rules").catch(() => [] as PermRule[]), [] as PermRule[]),
-      bd(invoke<{ blurCollapse?: boolean }>("get_settings").catch(() => null), null),
+      
+      bd(invoke<{ blurCollapse?: boolean; projectDirAutoread?: boolean }>("get_settings").catch(() => null), null),
       bd(invoke<UsageRecord[]>("usage_report").catch(() => [] as UsageRecord[]), [] as UsageRecord[]),
       bd(invoke<SearchStatus | null>("search_status").catch(() => null), null),
       bd(invoke<RecoveryState>("recovery_state").catch(() => null), null),
@@ -5214,21 +5492,29 @@ function renderBody(): void {
       bd(invoke<LifeStatus>("life_status").catch(() => null), null),
       // 技能：同样只为摘要里的个数（skills_list 是热扫描目录，失败退化成空）
       bd(invoke<SkillInfo[]>("skills_list").catch(() => [] as SkillInfo[]), [] as SkillInfo[]),
+      // 命令策略：设置页「行为与安全」组要显示「N 条规则 · M 条硬阻断」
+      bd(invoke<{ allow?: string[]; hardBlock?: string[] }>("perm_cmd_policy").catch(() => null), null),
     ])
-      .then(([mcp, pending, autoOn, rules, settings, usage, search, recovery, proj, life, skills]) => {
+      .then(([mcp, pending, autoOn, settings, usage, search, recovery, proj, life, skills, cmdPolicy]) => {
         if (view !== "settings") return;
         autostartOn = autoOn;
         blurCollapse = settings?.blurCollapse ?? true;
-        permCount = rules.length;
+        projectDirAutoread = settings?.projectDirAutoread ?? true;
         searchInfo = search;
         projectInfo = proj;
         lifeInfo = life;
         skillsCache = skills;
+        cmdPolicyCounts = {
+          allow: cmdPolicy?.allow?.length ?? 0,
+          hard: cmdPolicy?.hardBlock?.length ?? 0,
+        };
         const tSum = todayTokenTotal(usage);
         const summary = usage.length ? `今日 ${fmtTokens(tSum)} · 共 ${usage.length} 次问答` : "暂无记录";
-        b.innerHTML = renderSettingsMenu(mcp, pending.length, summary, recoverySummaryText(recovery));
-        b.scrollTop = keep;
+        b.innerHTML = renderSettingsMenu(mcp, pending.length, summary, recoverySummaryText(recovery));        b.scrollTop = keep;
         bindSettingsMenu(b);
+        applySettingsSearch(b);
+        refreshSettingsStat(b);
+        renderStatusBar();
       })
       .catch((e) => {
         // 渲染链抛异常也必须显示出来 —— 之前没 catch，异常会让页面永远停在"加载中"
@@ -5331,24 +5617,34 @@ function renderBody(): void {
       invoke<McpServerCfg[]>("mcp_servers_list").catch(() => [] as McpServerCfg[]),
       invoke<string[]>("mcp_grants_list").catch(() => [] as string[]),
       invoke<Record<string, boolean>>("mcp_group_settings").catch(() => ({})),
+      invoke<BuiltinToolInfo[]>("builtin_tools").catch(() => [] as BuiltinToolInfo[]),
+      invoke<SkillInfo[]>("skills_list").catch(() => [] as SkillInfo[]),
+      invoke<{ builtinToolsEnabled?: boolean }>("get_settings").catch(() => null),
     ])
-      .then(([st, servers, grants, grpSettings]) => {
+      .then(([st, servers, grants, grpSettings, builtins, skills, stg]) => {
         if (view !== "mcp") return;
         // 全局"直接全给"开关（保留键 __all__），组开关本身由后端决定 g.active
         const gs: Record<string, boolean> = grpSettings ?? {};
         mcpAllGroups = gs["__all__"] ?? true;
+        builtinToolsEnabled = stg?.builtinToolsEnabled ?? true;
         // 数据源交给 `mcpServers`（DOM 只负责画）—— 见它的注释
         mcpServers = servers ?? [];
-        b.innerHTML = renderMcpView(st, mcpServers, grants ?? []);
+        mcpToolsCount = st?.groups.reduce((a, g) => a + g.toolCount, 0) ?? 0;
+        b.innerHTML = renderMcpView(st, mcpServers, grants ?? [], builtins ?? [], skills ?? []);
         b.scrollTop = keep;
         bindMcpView(b);
+        refreshToolsStat(b);
+        renderSubBar();
+        renderStatusBar();
       })
       .catch(() => {
         if (view !== "mcp") return;
         mcpServers = [];
-        b.innerHTML = renderMcpView(null, [], []);
+        b.innerHTML = renderMcpView(null, [], [], [], []);
         b.scrollTop = keep;
         bindMcpView(b);
+        refreshToolsStat(b);
+        renderStatusBar();
       });
     return;
   }
@@ -5379,7 +5675,12 @@ function renderBody(): void {
         if (view !== "recovery") return;
         b.innerHTML = renderRecoveryView(st, subHeader("备份与回收站"));
         b.scrollTop = keep;
-        bindRecoveryView(b, () => renderBody());
+        bindRecoveryView(
+          b,
+          () => renderBody(),
+          // `hint` = 第三级提示行（设计稿 11:2:1594）
+          (t, body, hint) => askConfirm(t, body, "永久删除", true, hint ?? ""),
+        );
       })
       .catch((e) => {
         if (view !== "recovery") return;
@@ -5562,28 +5863,91 @@ interface SkillInfo {
 }
 
 
+/**
+ * 候选来源的**显示名**（设计稿 06:2:1013「全局 · 自动蒸馏」）。
+ *
+ * 后端 `source` 只有三个值：model（模型主动提交）/ auto（轮末自动蒸馏）/
+ * user（用户手写）。这里翻成人话，并统一加「全局 ·」前缀 ——
+ * 目前项目记忆是直写 `projects/<名>/MEMORY.md`、**不进**候选队列，
+ * 所以队列里的候选一律是全局的。
+ */
+function memSourceLabel(source: string): string {
+  const s = (source ?? "").trim().toLowerCase();
+  const detail =
+    s === "auto" ? "自动蒸馏" : s === "user" ? "手写" : s === "model" ? "模型提交" : s || "模型提交";
+  return `全局 · ${detail}`;
+}
+
+/**
+ * 候选时间的**相对显示**（设计稿 06:2:1001「2 小时前」/「昨天」）。
+ *
+ * 后端 `created_at` 形如 `ts1795326872T13:54:32Z` —— 前 10 位是 epoch 秒。
+ * 这里只取那 10 位算差值，别去解析整串（那串里的时分秒是**本地时区**，
+ * 与 epoch 秒混在一块，解析它只会引出时区 bug）。
+ */
+function memRelTime(createdAt: string): string {
+  // ⚠️ epoch 现在是 **10 位**（`ts1792731001`）。后端格式是 `ts{secs:08}` ——
+  //    `:08` 只是「至少 8 位」，位数不够会自然长到 10 位。所以这里必须
+  //    匹配**全部**数字（`\d+`），写死 8 位会把 1792731001 截成 17927310，
+  //    差值算出来是 50 多年前 → 满屏「更早」。
+  const m = /^ts(\d+)/.exec((createdAt ?? "").trim());
+  if (!m) return (createdAt ?? "").trim();
+  const secs = Number(m[1]);
+  if (!Number.isFinite(secs) || secs <= 0) return (createdAt ?? "").trim();
+  const diff = Math.floor(Date.now() / 1000) - secs;
+  if (diff < 60) return "刚刚";
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+  if (diff < 86400 * 2) return "昨天";
+  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)} 天前`;
+  return "更早";
+}
+
 function renderMemView(
   list: Candidate[],
   files: MemoryFiles | null,
   skills: SkillInfo[],
   projects: ProjectMemoryView[],
+  stats: MemStats | null,
 ): string {
   // 回填缓存：设置入口页的「记忆」摘要要显示技能数，别让它白拉一遍
   skillsCache = skills;
+  // 底部状态栏与标题条徽标都要用这个数（渲染顺序：先 body 后 sub-bar）
+  memPendingCount = list.length;
+  memStatsCache = stats;
+
+  // 候选卡（设计稿 06:2:981）
+  // 结构照抄设计稿：候选头（来源标记 + 时间）· 正文 · 触发轮次 · 操作行（驳回/改写/批准）
   const pendingHtml =
     list.length === 0
-      ? `<div class="mem-empty">没有待审批的记忆。模型认为值得长期记住的信息会通过 <code>remember</code> 提交到这里。</div>`
+      ? `<div class="mem-empty mem-empty-done">全部处理完了。模型认为值得长期记住的信息会通过 <code>remember</code> 提交到这里。</div>`
       : list
           .map(
             (c) => `
-      <div class="mem-item">
-        <div class="mem-text">${esc(c.content)}</div>
-        <div class="mem-meta">${esc(c.source)} · ${esc(c.created_at)}
-          <input class="mem-reason" data-for="${esc(c.id)}" placeholder="驳回理由（可留空，写进 rejected.jsonl）" spellcheck="false" /></div>
-        <div class="mem-actions">
-          <button class="mem-btn ok" data-id="${esc(c.id)}" title="写入长期记忆">✓ 记住</button>
-          <button class="mem-btn no" data-id="${esc(c.id)}" title="驳回（留档）">✗ 丢弃</button>
+      <div class="mem-candidate" data-id="${esc(c.id)}">
+        <div class="cand-head">
+          <span class="cand-source">${esc(memSourceLabel(c.source))}</span>
+          <span class="cand-time">${esc(memRelTime(c.created_at))}</span>
         </div>
+        <div class="cand-body">${esc(c.content)}</div>
+        ${
+          c.turn_ref
+            ? `<div class="cand-turn">出自「${esc(c.turn_ref)}」这一轮</div>`
+            : ""
+        }
+        <div class="cand-actions">
+          <button type="button" class="mem-cand-btn reject" data-id="${esc(c.id)}" title="驳回（留档到 rejected.jsonl）">驳回</button>
+          <button type="button" class="mem-cand-btn edit" data-id="${esc(c.id)}" title="改写措辞，改完再点批准">改写</button>
+          <button type="button" class="mem-cand-btn approve" data-id="${esc(c.id)}" title="写入长期记忆">批准</button>
+        </div>
+        <div class="cand-edit" hidden>
+          <textarea class="cand-edit-box" spellcheck="false"></textarea>
+          <div class="cand-edit-ops">
+            <button type="button" class="mem-cand-btn cancel-edit">取消</button>
+            <button type="button" class="mem-cand-btn approve save-edit">保存改写</button>
+          </div>
+        </div>
+        <input class="mem-reason" data-for="${esc(c.id)}" placeholder="驳回理由（可留空，写进 rejected.jsonl）" spellcheck="false" hidden />
       </div>`,
           )
           .join("");
@@ -5605,12 +5969,12 @@ function renderMemView(
             // 三态徽标（修正）：空 source ≠ 路径失效 ——
             // 从没绑过路径的项目是「未绑定」，不该跟死路径一样标红吓人
             const badge = !p.source
-              ? `<span style="color:#f0c674">未绑定路径</span>`
+              ? `<span style="color:var(--sem-warn)">未绑定路径</span>`
               : !p.sourceAlive
-                ? `<span style="color:#f0a8a8">源路径不存在</span>`
+                ? `<span style="color:var(--sem-danger)">源路径不存在</span>`
                 : p.hasMemory
-                  ? `<span style="color:#8fd49a">已绑定</span>`
-                  : `<span style="color:#f0c674">MEMORY 为空</span>`;
+                  ? `<span style="color:var(--sem-ok)">已绑定</span>`
+                  : `<span style="color:var(--sem-warn)">MEMORY 为空</span>`;
             const canFix = !p.source || !p.sourceAlive;
             return `
       <div class="skill-item">
@@ -5644,7 +6008,6 @@ function renderMemView(
           .join("");
 
   return `
-    <div class="mem-head">待审批 ${list.length} 条</div>
     ${pendingHtml}
     <div class="mem-head"> 记忆文件族<button type="button" class="mem-btn mem-distill" title="打开蒸馏页：把 MEMORY.md 中转站的条目分流到 USER / SOUL / IDENTITY，拿不准的 AI 会向你提问">🧹 蒸馏</button></div>
     <div class="set-hint" style="margin-bottom:8px">
@@ -5661,9 +6024,11 @@ function renderMemView(
 }
 
 function bindMemButtons(root: HTMLElement): void {
-  // ⚠️ 选择器必须带 [data-id]：只有「待审批」那两颗按钮有 data-id，
-  //    项目记忆行上的「改路径/归档」也用 mem-btn 配色，别把它们绑成批准/驳回。
-  root.querySelectorAll<HTMLButtonElement>(".mem-btn.ok[data-id]").forEach((btn) =>
+  // ---- 待审批候选：批准 / 驳回 / 改写（设计稿 06:2:1004~2:1006）----
+  //
+  // ⚠️ 选择器带 `.mem-cand-btn` + 动作类名：项目记忆行上的「改路径/归档」
+  //    用的是 `.mem-btn` 配色，别把它们绑成批准/驳回。
+  root.querySelectorAll<HTMLButtonElement>(".mem-cand-btn.approve[data-id]").forEach((btn) =>
     btn.addEventListener("click", async () => {
       await invoke("mem_approve", { id: btn.dataset.id }).catch((e) =>
         pushEntry("error", `批准失败：${e}`),
@@ -5671,16 +6036,76 @@ function bindMemButtons(root: HTMLElement): void {
       renderBody();
     }),
   );
-  root.querySelectorAll<HTMLButtonElement>(".mem-btn.no[data-id]").forEach((btn) =>
+
+  // 驳回：第一次点**只展开理由输入框**（设计稿的卡里没有这个框，
+  // 但 rejected.jsonl 的「留理由」功能不能丢 —— 见 bindMemButtons 里
+  // `mem_reject` 的注释）。第二次点才真的驳回。
+  root.querySelectorAll<HTMLButtonElement>(".mem-cand-btn.reject[data-id]").forEach((btn) =>
     btn.addEventListener("click", async () => {
-      // 驳回理由跟着一起留档（2026-05-15）：rejected.jsonl 是留档，
-      // 只留内容不��理由，过几天只能问人「这条当初为什么被打回」。
       const id = btn.dataset.id ?? "";
       const box = root.querySelector<HTMLInputElement>(`.mem-reason[data-for="${CSS.escape(id)}"]`);
-      const reason = box?.value.trim() ?? "";
+      if (!box) return;
+      if (box.hidden) {
+        box.hidden = false;
+        btn.textContent = "确认驳回";
+        box.focus();
+        return;
+      }
+      // 驳回理由跟着一起留档（2026-05-15）：rejected.jsonl 是留档，
+      // 只留内容不留理由，过几天只能问人「这条当初为什么被打回」。
+      const reason = box.value.trim() ?? "";
       await invoke("mem_reject", { id, reason }).catch((e) =>
         pushEntry("error", `驳回失败：${e}`),
       );
+      renderBody();
+    }),
+  );
+
+  // 改写：把候选正文换成可编辑的文本框；「保存改写」只改内容（**不批准**），
+  // 改完再点「批准」才写进长期记忆 —— 改与批是两件事，不合并。
+  root.querySelectorAll<HTMLButtonElement>(".mem-cand-btn.edit[data-id]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const card = btn.closest(".mem-candidate");
+      const editor = card?.querySelector<HTMLElement>(".cand-edit");
+      const body = card?.querySelector<HTMLElement>(".cand-body");
+      const ta = card?.querySelector<HTMLTextAreaElement>(".cand-edit-box");
+      if (!editor || !body || !ta) return;
+      ta.value = body.textContent ?? "";
+      body.hidden = true;
+      editor.hidden = false;
+      ta.focus();
+    }),
+  );
+
+  root.querySelectorAll<HTMLButtonElement>(".mem-cand-btn.cancel-edit").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const card = btn.closest(".mem-candidate");
+      const editor = card?.querySelector<HTMLElement>(".cand-edit");
+      const body = card?.querySelector<HTMLElement>(".cand-body");
+      if (!editor || !body) return;
+      editor.hidden = true;
+      body.hidden = false;
+    }),
+  );
+
+  root.querySelectorAll<HTMLButtonElement>(".mem-cand-btn.save-edit").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      const card = btn.closest(".mem-candidate");
+      const ta = card?.querySelector<HTMLTextAreaElement>(".cand-edit-box");
+      const id = card?.getAttribute("data-id") ?? "";
+      const text = (ta?.value ?? "").trim();
+      if (!id) return;
+      if (!text) {
+        pushEntry("error", "改写内容不能为空");
+        return;
+      }
+      try {
+        await invoke("mem_rewrite", { id, content: text });
+        showToast("已改写，点「批准」写进长期记忆", "ok", 2400);
+      } catch (e) {
+        pushEntry("error", `改写失败：${e}`);
+        return;
+      }
       renderBody();
     }),
   );
@@ -5935,48 +6360,77 @@ const ICONS: Record<string, string> = {
   // 行为：滑杆
   behavior:
     '<path d="M3.5 8.5h9"/><path d="M17.5 8.5h3"/><circle cx="15" cy="8.5" r="2.2"/><path d="M3.5 15.5h3"/><path d="M11.5 15.5h9"/><circle cx="9" cy="15.5" r="2.2"/>',
+  // 命令面板：四宫格 = 一堆可用命令（网格 = 功能一览，最贴切）
+  commands:
+    '<rect x="3.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.6"/>',
 };
 
 function setIcon(name: string): string {
-  return `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] ?? ""}</svg>`;
+  // ⚠️ 2026-10-23 用户实报：设置页组头的前置图标（四宫格等）**根本看不见**。
+  // 根因：SVG 里的 `<path>`/`<rect>` 默认 `fill: black; stroke: none` ——
+  // 黑色填充画在深色底上 = 什么都没有（截图里那个位置只剩一块空）。
+  // 修法：图标统一用**描边**画（`fill:none; stroke:currentColor`），
+  // 颜色跟着外层容器的 `color` 走（组头是 `--g2`）。
+  return `<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${
+    ICONS[name] ?? ""
+  }</svg>`;
 }
 
 /**
- * 「记忆」入口摘要。
+ * 设置页 **4 个组头**的图标（设计稿 04:2:829 / 2:846 / 2:863 / 2:879）。
  *
- * ⚠️ 必须**显式提到技能**（曾因"skills 没找到在哪能打开"返工）：
- * 技能列表在记忆页最底下，而旧文案只写了「待审批、记忆文件族与项目绑定」——
- * 设置入口页上根本看不出这页里有技能，于是等于找不到。
- * 技能数进摘要后才看得出"哦有 N 个技能"。
+ * 全部 14×14、描边 #8A8A90（`.set-sec-ico` 上的 `color` 决定）。
+ * 形状照设计稿节点的构成画：
+ *
+ * | 组 | 设计稿节点 | 构成 |
+ * |---|---|---|
+ * | 模型与接入 | 2:829 | 圆角矩形 11.2×9.2 (2:894) + 内部短横 6.4×2.4 (2:895) |
+ * | 记忆与数据 | 2:846 | 对话气泡：上半 7.6×10.4 (2:898) + 下半带尾 10.4×5.4 (2:899) |
+ * | 行为与安全 | 2:863 | 盾牌 10×10.8 (2:903) + 勾 4.4×2.8 (2:904) |
+ * | 系统 | 2:879 | 圆 9.2×9.2 (2:908) + 一根齿 1.7×3.6 (2:909) |
+ *
+ * ⚠️ **别拿 `ICONS` 那套来顶**（用户实报「看他的配置，你照着抄也不明白吗」）：
+ * `ICONS` 是设置**入口页**的图标（四宫格 / 灯泡 / 滑块 / 齿轮），
+ * 跟设计稿组头画的**不是一回事** —— 入口页那些是「这一类设置」的隐喻，
+ * 组头这些是设计稿给每一组专门画的。
  */
-function memSummaryText(pendingCount: number): string {
-  const n = skillsCache.length;
-  const parts = [`技能 ${n} 个`, "记忆文件", "项目绑定"];
-  if (pendingCount > 0) parts.unshift(`待审批 ${pendingCount}`);
-  return parts.join(" · ");
+const SET_GROUP_ICONS: Record<string, string> = {
+  // 模型与接入：圆角矩形 + 一条横线
+  models:
+    '<rect x="1.4" y="2.4" width="11.2" height="9.2" rx="1.5"/><path d="M3.8 6.6h6.4"/>',
+  // 记忆与数据：对话气泡（圆角矩形 + 左下小尾巴）
+  mem: '<path d="M10.8 9.4H8.6l-3.2 2.6V9.4H3.2A1.6 1.6 0 0 1 1.6 7.8V3.9a1.6 1.6 0 0 1 1.6-1.6h7.6a1.6 1.6 0 0 1 1.6 1.6v3.9a1.6 1.6 0 0 1-1.6 1.6z"/>',
+  // 行为与安全：盾牌 + 勾
+  behavior:
+    '<path d="M7 1.7l4.9 2v4.1c0 2.9-2 5.3-4.9 6.1-2.9-.8-4.9-3.2-4.9-6.1V3.7z"/><path d="M4.9 6.7l1.6 1.6 3-2.5"/>',
+  // 系统：齿轮（圆 + 一根齿）
+  system: '<circle cx="7" cy="7" r="4.5"/><path d="M7 4.6v4.8"/>',
+};
+
+/** 设置页组头图标（描边，跟随 `.set-sec-ico` 的 color）。 */
+function setGroupIcon(name: string): string {
+  return `<svg viewBox="0 0 14 14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">${
+    SET_GROUP_ICONS[name] ?? ""
+  }</svg>`;
 }
 
 /**
- * 「会话管理」入口摘要。
+ * 设置页 = **4 组手风琴**（设计稿 04「04 · 设置页（分组手风琴）」）。
  *
- * ## 为什么必须有这个入口（2026-10-14 用户报）
+ * ## 为什么不是「大卡片列表」
  *
- * 用户原话：「这个没有会话管理啊」。设置页里模型 / 搜索 / Token / 备份 / MCP /
- * 安全闸门 / 记忆一应俱全，唯独没有会话 —— 于是想找个会话只能先知道「顶栏那颗
- * 史按钮」或「切换左上角项目下拉会顺带跳到会话页」这两条隐藏路径。
+ * 旧版是一屏 10 张大卡片，每张点进去才是子页 —— 想找「失焦自动收起」得点两层，
+ * 而且看不到**当前值**。设计稿 04 改成 **4 组 + 行内值 + 行内开关**：
+ * 一屏看全所有设置项和当前值，能改的直接在行里改（开关），不能改的显示摘要。
  *
- * 顶栏和项目下拉**都还在**（它们是快捷方式），但「设置里找不到会话」这件事本身
- * 就让人以为功能不存在。入口页的定位就是"这有什么、都在哪"，漏一行等于说没有。
+ * ## 照抄设计稿的值（Ardot 节点 id 记在注释里）
+ *   组块      #141418 + 描边 rgba(255,255,255,.07)   （04:2:795）
+ *   计数徽标  #1F1F23 + 字 #71717A                  （04:2:831）
+ *   文字      L1 #F2F2F4 / L2 #A8A8B4 / L3 #71717A   （04:2:830/2:834）
+ *   开关·开   底 #E4EBE7 + 滑块 #101012              （04:2:872/2:906）
+ *   开关·关   底 #26262B + 滑块 #6E6E74              （04:2:885/2:911）
+ *   待批徽标  #F0C46B + 字 #101012                  （04:2:848/2:900）
  */
-function sessionsSummaryText(): string {
-  const n = sessionList.length;
-  if (n === 0) return "还没有会话";
-  const cur = sessionList.find((s) => s.current);
-  const parts = [`共 ${n} 个会话`, "按项目分组"];
-  if (cur?.title) parts.push(`当前：${cur.title.slice(0, 12)}`);
-  return parts.join(" · ");
-}
-
 function renderSettingsMenu(
   mcp: McpStatus | null,
   pendingCount: number,
@@ -5987,119 +6441,247 @@ function renderSettingsMenu(
 
   const mcpSummary = mcp
     ? mcp.connected
-      ? `${mcp.groups.length} 组 / ${mcp.groups.reduce((a, g) => a + g.toolCount, 0)} 个工具` +
-        ` · 已加载 ${mcp.groups.filter((g) => g.active).length}`
+      ? `${mcp.groups.length} 组 / ${mcp.groups.reduce((a, g) => a + g.toolCount, 0)} 个工具`
       : "未连接"
     : "读取中…";
 
-  const searchSummary = searchInfo?.ready
-    ? `${searchInfo.providerLabel}${searchInfo.hasKey ? ` · ${searchInfo.keyPreview}` : ""}`
-    : "未配置（模型无 web_search）";
+  const searchReady = !!searchInfo?.ready;
+  const searchSummary = searchReady
+    ? `${searchInfo!.providerLabel}${searchInfo!.hasKey ? ` · ${searchInfo!.keyPreview}` : ""}`
+    : "未配置";
 
-  const item = (
-    act: string, // "models" 不是 View（它弹独立窗口），所以这里放宽成 string
+  /**
+   * 一行：名称 …… 值。
+   * `act` 有值 = 可点进子页；`swId` 有值 = 行内开关。
+   */
+  const row = (
+    name: string,
+    valHtml: string,
+    act?: string,
+    valClass = "",
+    swId?: string,
+    swOn?: boolean,
+  ): string => {
+    const tag = act ? "button" : "div";
+    const right = swId
+      ? `<button type="button" class="sw${swOn ? " on" : ""}" id="${swId}" role="switch"
+                aria-checked="${swOn}" title="${esc(name)}"><i></i></button>`
+      : `<span class="set-row-val ${valClass}">${valHtml}</span>`;
+    return `
+    <${tag} class="set-row${act ? "" : " set-row-static"}"${act ? ` data-act="${act}"` : ""}${
+      swId ? ` data-sw="${swId}"` : ""
+    }>
+      <span class="set-row-name">${esc(name)}</span>
+      ${right}
+    </${tag}>`;
+  };
+
+  /** 一个组：组头（图标 + 标题 + 计数徽标 + 折叠箭头）+ 组体 */
+  const sec = (
+    key: string,
     icon: string,
-    title: string,
-    /** `null` = 幽灵摘要（功能暂缓的幽灵函数会返回它）→ 不渲染那行 `<i>` */
-    summary: string | null,
-    badge?: string,
-    /** 暂时下线的行：渲染但 `hidden`（CSS 里 `.set-entry[hidden]{display:none!important}`） */
-    off?: boolean,
-  ) => `
-    <button class="set-entry" data-act="${act}"${off ? " hidden" : ""}>
-      <span class="set-entry-icon">${setIcon(icon)}</span>
-      <span class="set-entry-text">
-        <b>${title}</b>
-        ${summary === null ? "" : `<i>${esc(summary)}</i>`}
-      </span>
-      ${badge ? `<span class="set-entry-badge">${badge}</span>` : ""}
-      <span class="set-entry-arrow">›</span>
-    </button>`;
+    name: string,
+    count: number | null,
+    countCls: string,
+    body: string,
+  ): string => `
+    <section class="set-sec" data-sec="${key}">
+      <button type="button" class="set-sec-head" data-fold="${key}" aria-expanded="true">
+        <span class="set-sec-ico">${setGroupIcon(icon)}</span>
+        <span class="set-sec-name">${esc(name)}</span>
+        ${count === null ? "" : `<span class="set-sec-count ${countCls}">${count}</span>`}
+        <span class="set-sec-caret">▾</span>
+      </button>
+      <div class="set-sec-body">${body}</div>
+    </section>`;
 
-  // 页内不再重复「设置」标题 —— 固定标题条（#sub-bar）已经写了"⚙ 设置 + 返回"。
-  // 之前两处都写，屏上就出现两个"设置"。
-  //
-  // ⚠️ 减法——**下面 return 的是模板字符串，模板里的
-  // `//` 不是注释，是会被原样渲染到页面上的字面文本**（踩过一次：把「减法说明」
-  // 写在 `${item(...)}` 之间，结果整段注释直接显示在设置页上）。
-  // 所以这个函数的注释一律写在 `return` **外面**。
-  //
-  // 两个暂时下线的行（第 6 个参数 `true` = 渲染但隐藏）：
-  // - 「项目」：讲的是**拼装包**（projects/<名>/project.json），不是项目记忆。
-  // - 「数据源」：life.json 的生活清单源。
-  // 两者都只是**入口**隐藏：页面渲染、摘要函数、后端命令、vitest 全套测试
-  // 都原地保留，功能恢复时把那两处的 `true` 去掉即可，不用重写任何东西。
   return `
-    ${item("models", "models", "模型", `当前 ${curModelName} · 共 ${models.length} 个（独立窗口管理）`)}
-    ${item("sessions", "sessions", "会话管理", sessionsSummaryText())}
-    ${item("search", "search", "搜索 web_search", searchSummary)}
-    ${item("usage", "usage", "Token 用量", usageSummary)}
-    ${item("recovery", "recovery", "备份与回收站", recoverySummary)}
-    ${item("mcp", "mcp", "MCP 外部工具", mcpSummary)}
-    ${item("life", "life", "数据源", lifeSummaryText(), undefined, true)}
-    ${item("project", "project", "项目", projectSummaryText(), undefined, true)}
-    ${item("perm", "perm", "安全闸门", `文件 ${permCount} 条规则 · 命令白名单/硬阻断/审计`)}
-    ${item("mem", "mem", "记忆", memSummaryText(pendingCount), pendingCount > 0 ? String(pendingCount) : undefined)}
-
-    <div class="mem-head">行为</div>
-    ${item("behavior", "behavior", "执行位置 / 权限", behaviorSummary())}
-
-    <div class="mem-head">启动与退出</div>
-    <label class="set-check set-check-row">
-      <input type="checkbox" id="auto-start" ${autostartOn ? "checked" : ""} />
-      开机自动启动（写 HKCU\\...\\Run 注册表项，release 版无黑框）
-    </label>
-    <label class="set-check set-check-row">
-      <input type="checkbox" id="blur-collapse" ${blurCollapse ? "checked" : ""} />
-      面板失焦自动收起（点别处就缩回球，不挡屏幕）
-    </label>
-    <div class="set-hint" id="exe-path">程序路径读取中…</div>
-    <div class="set-actions" style="margin-top:10px">
-      <button class="set-btn del" id="btn-quit">⏻ 退出 orbcat</button>
-    </div>
-  `;
+    ${
+      settingsSearchOpen
+        ? `<div class="set-search">
+      <input id="set-search-input" placeholder="搜索设置项…" value="${esc(settingsSearchQ)}" spellcheck="false" autocomplete="off">
+    </div>`
+        : ""
+    }
+    <div class="set-acc">
+      ${sec(
+        "model",
+        "models",
+        "模型与接入",
+        5,
+        "",
+        `
+        ${row(
+          "当前模型",
+          `${esc(curModelName)} <span class="set-val-caret">▾</span>`,
+          "set-model",
+        )}
+        ${row("模型管理", `共 ${models.length} 个（独立窗口）`, "models")}
+        ${row("web_search", esc(searchSummary), "search", searchReady ? "ok" : "")}
+        ${row("MCP 工具组", esc(mcpSummary), "mcp")}
+        ${row("技能", `${skillsCache.length} 个已启用`, "mem")}
+      `,
+      )}
+      ${sec(
+        "data",
+        "mem",
+        "记忆与数据",
+        pendingCount || null,
+        "warn",
+        `
+        ${row(
+          "待审批候选",
+          pendingCount > 0
+            ? `<span class="set-val-badge">${pendingCount} 待批</span>`
+            : "无",
+          "mem",
+        )}
+        ${row("记忆文件", `${projects.length} 个项目`, "mem")}
+        ${row("备份与回收站", esc(recoverySummary), "recovery")}
+        ${row("Token 用量", esc(usageSummary), "usage")}
+        <!-- 「数据源」入口：功能暂缓（沿用旧版 off=true 的做法）——
+             设计稿 04 里没有这一行 ⇒ 界面上不显示，但**入口留在 DOM 里**，
+             功能恢复时把那层 hidden 去掉即可。 -->
+        <button class="set-row" data-act="life" hidden>数据源</button>
+        <!-- 「项目」入口：讲的是**拼装包**（projects/<名>/project.json），不是项目记忆。
+             功能暂缓 ⇒ 沿用旧版做法：行存在但 hidden，界面上不显示。 -->
+        <button class="set-row" data-act="project" hidden>项目</button>
+      `,
+      )}
+      ${sec(
+        "behavior",
+        "behavior",
+        "行为与安全",
+        null,
+        "",
+        `
+        ${row("执行位置", bgDeskEnabled ? "后台桌面" : "本机 pwsh", "behavior")}
+        ${row(
+          "内核",
+          "",
+          undefined,
+          "",
+          "sw-kernel",
+          usePiKernel,
+        )}
+        ${row("项目目录自动读写", "", undefined, "", "sw-dir", projectDirAutoread)}
+        ${row(
+          "命令策略",
+          `${cmdPolicyCounts.allow + cmdPolicyCounts.hard} 条规则 · ${cmdPolicyCounts.hard} 条硬阻断`,
+          "perm",
+        )}
+        ${row("失焦自动收起", "", undefined, "", "sw-blur", blurCollapse)}
+      `,
+      )}
+      ${sec(
+        "system",
+        "system",
+        "系统",
+        null,
+        "",
+        `
+        ${row("开机自动启动", "", undefined, "", "sw-autostart", autostartOn)}
+        ${row("会话管理", `${sessionList.length} 条`, "sessions")}
+        ${row("程序路径", '<span id="exe-path">读取中…</span>')}
+        <div class="set-actions set-actions-row">
+          <button class="set-btn del" id="btn-quit">⏻ 退出 orbcat</button>
+        </div>
+      `,
+      )}
+    </div>`;
 }
 
-function bindSettingsMenu(root: HTMLElement): void {
-  // 同 `sub-back`：设置入口页的返回按钮也归 `renderSubBar` 管了（不再长在内容流里）。
-  root.querySelectorAll<HTMLButtonElement>(".set-entry").forEach((b) => {
-    // 「模型」不再是面板内子页 —— 弹独立窗口（编辑住在外面，面板只管选）
-    if (b.dataset.act === "models") {
-      b.addEventListener("click", () => {
-        openModelsWindow();
+
+/**
+ * 设置页（4 组手风琴）的交互绑定。
+ *
+ * 三件事：
+ * ① 组头点击 = 折叠/展开该组（`data-fold`）
+ * ② 行点击 = 进子页（`data-act`）；「当前模型」那行是**行内下拉**（设计稿 04:2:806）
+ * ③ 行内开关 = 直接改设置（`data-sw`）
+ */
+function bindSettingsMenu(root: HTMLElement): void {  // ① 组头折叠
+  root.querySelectorAll<HTMLButtonElement>(".set-sec-head").forEach((h) => {
+    h.addEventListener("click", () => {
+      const sec = h.closest(".set-sec");
+      if (!sec) return;
+      const folded = sec.classList.toggle("folded");
+      h.setAttribute("aria-expanded", String(!folded));
+      const caret = h.querySelector(".set-sec-caret");
+      if (caret) caret.textContent = folded ? "▸" : "▾";
+    });
+  });
+
+  // ② 行 → 子页 / 行内模型下拉
+  root.querySelectorAll<HTMLElement>(".set-row[data-act]").forEach((b) => {
+    const act = b.dataset.act ?? "";
+    // 「模型管理」= 弹**独立窗口**（编辑住在外面，面板只管选）
+    if (act === "models") {
+      b.addEventListener("click", () => openModelsWindow());
+      return;
+    }
+    // 「当前模型」= 行内下拉（设计稿 04:2:806 「glm-5.2 ▾」）
+    if (act === "set-model") {
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        modelsDropdownOpen = !modelsDropdownOpen;
+        paintModelsDropdown("set-model-chip");
       });
       return;
     }
-    b.addEventListener("click", () => void switchView(b.dataset.act as View));
+    b.addEventListener("click", () => void switchView(act as View));
   });
 
-  // --- 开机自启 ---
-  const chk = document.getElementById("auto-start") as HTMLInputElement | null;
-  chk?.addEventListener("change", async () => {
-    try {
-      await invoke("autostart_set", { enable: chk.checked });
-    } catch (e) {
-      chk.checked = !chk.checked; // 回滚
-      pushEntry("error", `设置开机自启失败：${e}`);
-    }
-  });
+  // ③ 行内开关
+  const sw = (id: string, apply: (v: boolean) => Promise<void>): void => {
+    const btn = document.getElementById(id) as HTMLButtonElement | null;
+    if (!btn) return;
+    btn.addEventListener("click", async () => {
+      const next = !btn.classList.contains("on");
+      btn.classList.toggle("on", next);
+      btn.setAttribute("aria-checked", String(next));
+      try {
+        await apply(next);
+      } catch (e) {
+        btn.classList.toggle("on", !next); // 回滚
+        btn.setAttribute("aria-checked", String(!next));
+        pushEntry("error", `设置失败：${e}`);
+      }
+    });
+  };
 
-  // --- 失焦收起 ---
-  const bc = document.getElementById("blur-collapse") as HTMLInputElement | null;
-  bc?.addEventListener("change", async () => {
+  sw("sw-autostart", async (v) => {
+    await invoke("autostart_set", { enable: v });
+    autostartOn = v;
+  });
+  sw("sw-blur", async (v) => {
+    await invoke("set_blur_collapse", { enable: v });
+    blurCollapse = v;
+  });
+  sw("sw-dir", async (v) => {
+    await invoke("set_project_dir_autoread", { enable: v });
+    projectDirAutoread = v;
+  });
+  // 内核切换（pi ↔ 自研）—— 设计稿 02/04 都没有这颗 chip，
+  // 但「用户有权知道自己在用哪个内核」是项目铁律 ⇒ 放设置页行内开关。
+  const kb = document.getElementById("sw-kernel") as HTMLButtonElement | null;
+  kb?.addEventListener("click", async () => {
+    const next = !usePiKernel;
+    kb.classList.toggle("on", next);
+    kb.setAttribute("aria-checked", String(next));
     try {
-      await invoke("set_blur_collapse", { enable: bc.checked });
-      blurCollapse = bc.checked;
+      await toggleKernel();
     } catch (e) {
-      bc.checked = !bc.checked;
-      pushEntry("error", `设置失焦收起失败：${e}`);
+      kb.classList.toggle("on", !next);
+      kb.setAttribute("aria-checked", String(!next));
+      pushEntry("error", `切换内核失败：${e}`);
     }
   });
 
   void invoke<string>("exe_path")
     .then((p) => {
       const el = document.getElementById("exe-path");
-      if (el) el.textContent = `程序路径：${p}`;
+      if (el) el.textContent = p;
     })
     .catch(() => {});
 
@@ -6108,6 +6690,78 @@ function bindSettingsMenu(root: HTMLElement): void {
     void invoke("app_quit").catch(() => {});
   });
 }
+
+/**
+ * 设置页「搜索设置」（设计稿 04 右组 🔍 + 底栏「/ 搜索设置」）。
+ *
+ * 做什么：按关键词过滤 4 组手风琴里的**行** —— 命中的留下，其余隐藏；
+ * 一个命中都没有的组整组隐藏。命中时**自动展开**那个组（不然搜到了却看不见）。
+ *
+ * 为什么不搜组名：组名只有 4 个（模型与接入 / 记忆与数据 / 行为与安全 / 系统），
+ * 搜组名等于没用；用户记得的是「项目目录自动读写」这种**行名**。
+ */
+function applySettingsSearch(root: HTMLElement): void {
+  const box = root.querySelector<HTMLInputElement>("#set-search-input");
+  if (box) {
+    box.addEventListener("input", () => {
+      settingsSearchQ = box.value.trim();
+      applySettingsSearch(root);
+      refreshSettingsStat(root);
+      renderStatusBar();
+    });
+    box.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key === "Escape") {
+        settingsSearchQ = "";
+        box.value = "";
+        applySettingsSearch(root);
+        refreshSettingsStat(root);
+      }
+    });
+  }
+
+  const q = settingsSearchQ.toLowerCase();
+  root.querySelectorAll<HTMLElement>(".set-sec").forEach((sec) => {
+    let hit = 0;
+    sec.querySelectorAll<HTMLElement>(".set-sec-body .set-row").forEach((row) => {
+      const name = (row.querySelector(".set-row-name")?.textContent ?? "").toLowerCase();
+      const val = (row.querySelector(".set-row-val")?.textContent ?? "").toLowerCase();
+      const match = !q || name.includes(q) || val.includes(q);
+      // 命中的行永远显示；未命中的行在有搜索词时隐藏
+      row.style.display = !q || match ? "" : "none";
+      if (!q || match) hit++;
+    });
+    sec.style.display = hit > 0 ? "" : "none";
+    if (q && hit > 0) {
+      sec.classList.remove("folded");
+      const head = sec.querySelector(".set-sec-head");
+      head?.setAttribute("aria-expanded", "true");
+      const caret = sec.querySelector(".set-sec-caret");
+      if (caret) caret.textContent = "▾";
+    }
+  });
+}
+
+/** 设置页统计：数**可见**的组与行（搜索时统计跟着变）。 */
+function refreshSettingsStat(root: HTMLElement): void {
+  const secs = Array.from(root.querySelectorAll<HTMLElement>(".set-sec")).filter(
+    (s) => s.style.display !== "none",
+  );
+  let items = 0;
+  secs.forEach((s) => {
+    items += Array.from(s.querySelectorAll<HTMLElement>(".set-sec-body .set-row")).filter(
+      (r) => r.style.display !== "none" && !r.hasAttribute("hidden"),
+    ).length;
+  });
+  settingsStatCache = { groups: secs.length, items };
+}
+
+/** 打开/关闭设置页搜索（标题条 🔍 按钮）。 */
+function toggleSettingsSearch(): void {
+  settingsSearchOpen = !settingsSearchOpen;
+  if (!settingsSearchOpen) settingsSearchQ = "";
+  renderBody();
+}
+
 
 /**
  * 子页内容流里的**节标题**（不含返回按钮）。
@@ -6132,8 +6786,10 @@ const VIEW_BAR: Record<
   { title: string; icon: string; back: View; backLabel: string }
 > = {
   settings: { title: "设置", icon: "⚙", back: "chat", backLabel: "返回对话" },
-  sessions: { title: "会话历史", icon: "🕘", back: "chat", backLabel: "返回对话" },
-  mcp: { title: "MCP 外部工具", icon: "🔗", back: "settings", backLabel: "设置" },
+  sessions: { title: "会话", icon: "🕘", back: "chat", backLabel: "返回对话" },
+  // 设计稿 09:2:1489 —— 标题就叫「工具」（这页管的是**所有**工具组，
+  // 不只是 MCP；「MCP 外部工具」只是其中一个组）。
+  mcp: { title: "工具", icon: "🔗", back: "settings", backLabel: "设置" },
   perm: { title: "文件权限", icon: "🔒", back: "settings", backLabel: "设置" },
   cmdpolicy: { title: "命令策略", icon: "🛡", back: "settings", backLabel: "设置" },
   behavior: { title: "行为", icon: "🎛", back: "settings", backLabel: "设置" },
@@ -6148,7 +6804,16 @@ const VIEW_BAR: Record<
 /**
  * 画/收顶部标题条 —— 每次 `renderBody()` 都会调（view 一变它就得跟着变）。
  *
- * 非对话视图：亮 `#sub-bar`（当前页标题 + 返回），收 `#fg-ctx` ——
+ * ## 结构照抄设计稿 04/05/06/09/10
+ *
+ * 所有子页的标题条都是同一个形状：
+ * ```
+ * 左组：[返回图标] 页面标题(13px SemiBold)   右组：[这一页自己的动作按钮]
+ * ```
+ * 原来这里是「标题在左、返回在右」，与设计稿相反 —— 已按 04/05/06/09/10
+ * 的标题条改成左组返回 + 标题、右组放本页动作。
+ *
+ * 非对话视图：亮 `#sub-bar`，收 `#fg-ctx` ——
  * 后者是"用户当前在看什么"，在设置页里既没用又白占一行，正好把这一行让给返回。
  * 对话视图：反过来（前台条的显隐交给 `refreshFgCtx` 自己管，它有
  * "读取中/空态/失败"三种内容，这里不插手）。
@@ -6166,18 +6831,184 @@ function renderSubBar(): void {
 
   fg.style.display = "none";
   const cfg = VIEW_BAR[view];
+
+  // 右组：这一页自己的动作（设计稿 04 搜索设置 / 05 新建 / 06 全部批准 / 10 清空回收站）
+  const extra = subBarActions(view);
+
+  // 徽标：只有记忆页有（设计稿 06:2:978「3 待批」）
+  const badge =
+    view === "mem" && memPendingCount > 0
+      ? `<span class="sb-badge">${memPendingCount} 待批</span>`
+      : "";
+
   bar.innerHTML =
-    `<span class="sub-bar-title">${cfg.icon} ${esc(cfg.title)}</span>` +
+    `<div class="sb-left">` +
     // `id="sub-back"` 是**沿用旧锚点**：子页的返回按钮原来长在内容流里就带这个 id，
     // 现有 UI 测试直接查它来点击（见 tests/ui/flow.behavior.test.ts 等）。
     // 语义没变（还是"回上一层"），只是挪到了滚动区之外。
-    `<button class="mem-back sub-bar-back" id="sub-back" type="button">‹ ${esc(
+    `<button class="mem-back sub-bar-back" id="sub-back" type="button" title="${esc(
       cfg.backLabel,
-    )}</button>`;
+    )}">‹</button>` +
+    `<span class="sub-bar-title">${esc(cfg.title)}</span>` +
+    badge +
+    `</div>` +
+    `<div class="sb-right">${extra}</div>`;
+
+  bindSubBarActions(bar);
   bar.style.display = "flex";
   bar.querySelector<HTMLButtonElement>(".sub-bar-back")?.addEventListener("click", () => {
     void switchView(cfg.back);
   });
+}
+
+/**
+ * 子页标题条**右组**的按钮（设计稿 04/05/06/10）。
+ *
+ * 「动作」都放右组，「我在哪」放左组 —— 这样标题条自己就是一张地图：
+ * 左边告诉你站在哪儿，右边是这一页能做的事。
+ */
+function subBarActions(v: View): string {
+  switch (v) {
+    // 设计稿 04:2:794 —— 搜索设置（28×28 **线性**放大镜，灰白描边）
+    // ⚠️ 原来这里用 emoji 🔍 —— Windows 把它渲染成**彩色渐变**小球，
+    //    在冷灰面板上非常扎眼，而且跟设计稿的线性图标完全两回事。
+    case "settings":
+      return `<button class="sb-icon-btn" id="sb-set-search" type="button" title="搜索设置项">${setIcon(
+        "search",
+      )}</button>`;
+    // 设计稿 05:2:922 —— 新建会话（28×28 实心图标按钮）
+    case "sessions":
+      return '<button class="sb-icon-btn" id="sb-new-session" type="button" title="新建会话">＋</button>';
+    // 设计稿 06:2:980 —— 全部批准
+    // ⚠️ **有候选才显示**：候选还没加载出来时（memPendingCount = 0），
+    //    摆一颗点了没反应的按钮比不摆更糟 —— 用户会以为功能坏了。
+    case "mem":
+      return memPendingCount > 0
+        ? '<button class="sb-btn" id="mem-approve-all" type="button" title="把当前所有候选一次性写进长期记忆">全部批准</button>'
+        : "";
+    // 设计稿 09:2:1491 —— 「48 个工具 · 6 个组」（右边是**状态**，不是动作）
+    case "mcp":
+      return `<span class="sb-stat">${esc(
+        `${toolsStatCache.tools} 个工具 · ${toolsStatCache.groups} 个组`,
+      )}</span>`;
+    // 设计稿 10:2:1336 —— 清空回收站
+    // 备份区**不给**批量清空 —— 备份是安全网，清空它风险不对称（设计稿 §7）。
+    case "recovery":
+      return '<button class="rec-clear-trash" id="rec-clear-trash" type="button">清空回收站</button>';
+    default:
+      return "";
+  }
+}
+
+/** 给右组按钮绑事件（每次重画都要重绑）。 */
+function bindSubBarActions(bar: HTMLElement): void {
+  // ---- 10 回收站：清空回收站（不可还原，要二次确认）----
+  const clearBtn = bar.querySelector<HTMLButtonElement>("#rec-clear-trash");
+  clearBtn?.addEventListener("click", async () => {
+    const ok = await askConfirm(
+      "清空回收站？",
+      "回收站里的归档会被永久删除，不可还原。备份区不受影响。",
+      "永久清空",
+    );
+    if (!ok) return;
+    try {
+      const msg = await invoke<string>("recovery_clear_trash");
+      showToast(msg, "ok", 2600);
+      renderBody(); // 重画本页（switchView 对同一视图有 toggle 语义，会退回对话）
+    } catch (e) {
+      showToast(`清空回收站失败：${e}`, "error");
+    }
+  });
+
+  // ---- 06 记忆：全部批准 ----
+  const allBtn = bar.querySelector<HTMLButtonElement>("#mem-approve-all");
+  allBtn?.addEventListener("click", async () => {
+    if (memPendingCount <= 0) return;
+    const ok = await askConfirm(
+      `全部批准 ${memPendingCount} 条候选？`,
+      "这些候选会一次性写进长期记忆，以后每轮对话都会带上它们。",
+      "全部批准",
+      false,
+      "想一条条看，可以直接在下面逐条批准或驳回。",
+    );
+    if (!ok) return;
+    try {
+      const n = await invoke<number>("mem_approve_all");
+      showToast(`已批准 ${n} 条，写进长期记忆`, "ok", 2600);
+      renderBody();
+    } catch (e) {
+      showToast(`全部批准失败：${e}`, "error");
+    }
+  });
+
+  // ---- 05 会话：新建会话 ----
+  bar.querySelector<HTMLButtonElement>("#sb-new-session")?.addEventListener("click", () => {
+    void newSession();
+  });
+
+  // ---- 04 设置：搜索设置项 ----
+  bar.querySelector<HTMLButtonElement>("#sb-set-search")?.addEventListener("click", () => {
+    toggleSettingsSearch();
+  });
+}
+
+/**
+ * 底部状态栏（设计稿 04/05/06/07/09 的「底部状态栏」）。
+ *
+ * 04 设置：「设置」+「4 组 · 13 项」+「/ 搜索设置」
+ * 05 会话：「会话」+「17 条」
+ * 06 记忆：「待审批候选」+「N / M」（N 待批，M 候选总数）
+ * 09 工具：「工具」+「6 组 · 48 个工具」
+ *
+ * 固定在内容区**之外**：它是仪表盘，滚走就看不见了。
+ */
+function renderStatusBar(): void {
+  const el = document.getElementById("panel-status");
+  if (!el) return;
+  if (view === "chat") {
+    el.style.display = "none";
+    el.innerHTML = "";
+    return;
+  }
+
+  const left = "status-bar-left";
+  const right = "status-bar-right";
+  let html = "";
+  switch (view) {
+    case "settings":
+      html = `<span class="${left}">设置</span><span class="${right}">${esc(
+        `${settingsStatCache.groups} 组 · ${settingsStatCache.items} 项`,
+      )}</span><span class="${right} mono">/ 搜索设置</span>`;
+      break;
+    case "sessions":
+      html = `<span class="${left}">会话</span><span class="${right} mono">${esc(
+        `${sessionList.length} 条`,
+      )}</span>`;
+      break;
+    case "mem": {
+      const pending = memStatsCache?.pending ?? memPendingCount;
+      const total = pending + (memStatsCache?.handled ?? 0);
+      html = `<span class="${left}">待审批候选</span><span class="${right} mono">${esc(
+        `${pending} / ${total}`,
+      )}</span>`;
+      break;
+    }
+    case "mcp":
+      html = `<span class="${left}">工具</span><span class="${right} mono">${esc(
+        `${toolsStatCache.groups} 组 · ${toolsStatCache.tools} 个工具`,
+      )}</span>`;
+      break;
+    default:
+      html = "";
+  }
+
+  if (!html) {
+    el.style.display = "none";
+    el.innerHTML = "";
+    return;
+  }
+  el.innerHTML = html;
+  el.style.display = "flex";
 }
 
 // ---------------- 设置 › 行为（执行位置 / 执行权限） ----------------
@@ -6193,12 +7024,6 @@ function renderSubBar(): void {
 //    一句话：模式跟会话走、**建完不能改**，所以它不是"设置"而是"建会话的参数"。
 //    这里只剩执行位置与执行权限两维。别再往这儿加模式选择器。
 
-/** 设置入口页上那一行摘要 */
-function behaviorSummary(): string {
-  const trust = EXEC_TRUST_LABEL[execTrust] ?? EXEC_TRUST_LABEL.ask;
-  return `${bgDeskEnabled ? "后台" : "前台"}执行 · ${trust.full}`;
-}
-
 function renderBehaviorView(): string {
   const trust = EXEC_TRUST_LABEL[execTrust] ?? EXEC_TRUST_LABEL.ask;
 
@@ -6213,7 +7038,7 @@ function renderBehaviorView(): string {
       ⚠️ 隐形桌面上<b>没有合成键鼠</b>，所以只能驱动有自动化接口（COM / 命令行）的程序；
       要「点界面」的老软件请关掉它。<br>
       这是<b>进程级</b>开关，不落盘，重启回到前台。
-      ${bgDeskError ? `<br><span style="color:#ff9d8e">⚠️ ${esc(bgDeskError)}</span>` : ""}
+      ${bgDeskError ? `<br><span style="color:var(--sem-danger)">⚠️ ${esc(bgDeskError)}</span>` : ""}
     </div>
     ${
       bgDeskEnabled && bgDeskWindows.length
@@ -6332,26 +7157,6 @@ interface LifeStatus {
 }
 
 let lifeInfo: LifeStatus | null = null;
-
-/**
- * 🔶 幽灵函数 —— 「数据源」（`life.json` 生活清单）功能整体暂缓。
- *
- * 定论：这个功能未来再说，本轮不发布。理由与
- * [`projectSummaryText`] 完全一样 —— 页面与它那 11 个 vitest 用例都还是活的，
- * 留个返回 `null` 的空壳，恢复时把实现放回去即可，不用重建。
- */
-function lifeSummaryText(): null {
-  return null;
-  /* ↓↓↓ 恢复功能时把这段实现放回来（暂缓前的原样） ----------
-  if (!lifeInfo) return "读取中…";
-  const on = lifeInfo.sources.filter((s) => s.enabled);
-  if (lifeInfo.sources.length === 0) return "未配置（可接爬虫快照 / 命令）";
-  if (on.length === 0) return `${lifeInfo.sources.length} 个源 · 全部关闭`;
-  const bad = on.filter((s) => !s.ok).length;
-  const total = on.reduce((a, s) => a + s.count, 0);
-  return `${on.length} 个源启用 · ${total} 条` + (bad ? ` · ⚠️ ${bad} 个读取失败` : "");
-  -------------------------------------------------------------------- */
-}
 
 function renderLifeView(): string {
   const st = lifeInfo;
@@ -6926,12 +7731,34 @@ function splitArgs(raw: string): string[] {
   return out;
 }
 
+/** 内置工具的一条摘要（后端 `builtin_tools`） */
+interface BuiltinToolInfo {
+  name: string;
+  desc: string;
+}
+
+/**
+ * 工具页（设计稿 09）的**三个工具组**的折叠状态。
+ *
+ * 设计稿里「内置工具」默认展开，另两组默认折叠 —— 内置工具是最常看的，
+ * 另两组是「配了才看」的。
+ */
+const TOOLS_GROUP_OPEN: Record<string, boolean> = {
+  builtin: true,
+  mcp: false,
+  skills: false,
+};
+
 function renderMcpView(
   mcp: McpStatus | null,
   servers: McpServerCfg[],
   grants: string[],
+  builtins: BuiltinToolInfo[],
+  skills: SkillInfo[],
 ): string {
-  const head = subHeader("MCP 外部工具");
+  // ⚠️ 这里**不写** `subHeader("工具")` —— 设计稿 09 的内容区直接就是组块，
+  //    页名已经在标题条上（sub-bar），再写一遍就是重复。
+  const head = "";
 
   // ---- 多 server 列表（增删启用） ----
   const serverRows =
@@ -7086,7 +7913,141 @@ function renderMcpView(
       落盘 <code>mcp_grants.json</code>，跨会话、重启后仍生效。要收回就在这里撤销。
     </div>`;
 
-  return head + serverBlock + statusBlock + grantsBlock;
+  // ---- 组块（设计稿 09:2:1493 / 2:1524 / 2:1537）----
+  //
+  // 一个组 = 组头（图标 · 名字 · 计数徽标 · 开关 · 折叠指示）+ 组体。
+  // 「内置工具」「MCP 外部工具」带开关（能不能给模型）；「技能加载的工具」没有
+  // —— 技能随会话自动加载，用户不该在这里替它做决定。
+  const group = (
+    key: string,
+    icon: string,
+    name: string,
+    count: string,
+    body: string,
+    withSwitch: boolean,
+    switchId: string,
+    switchOn: boolean,
+  ): string => {
+    const open = TOOLS_GROUP_OPEN[key] !== false;
+    return `
+    <section class="mm-group${open ? "" : " folded"}" data-group="${key}">
+      <div class="mm-group-head">
+        <span class="mm-group-ico">${icon}</span>
+        <span class="mm-group-name">${esc(name)}</span>
+        <span class="mm-count">${esc(count)}</span>
+        <span class="mm-group-flex"></span>
+        ${
+          withSwitch
+            ? `<button type="button" class="sw mm-sw${switchOn ? " on" : ""}" id="${switchId}"
+                 role="switch" aria-checked="${switchOn}" title="是否给模型"><i></i></button>`
+            : ""
+        }
+        <button type="button" class="mm-fold" data-fold="${key}" title="展开/收起">${open ? "▾" : "▸"}</button>
+      </div>
+      <div class="mm-group-body"${open ? "" : " hidden"}>${body}</div>
+    </section>`;
+  };
+
+  // 内置工具行（设计稿 09:2:1503）—— 左工具名，右「中文名 · 说明」
+  const builtinRows = builtins
+    .map(
+      (t) => `
+      <div class="mm-tool-row">
+        <span class="mm-tool-ico">◆</span>
+        <span class="mm-tool-name">${esc(t.name)}</span>
+        <span class="mm-group-flex"></span>
+        <span class="mm-tool-desc">${esc(
+          [TOOL_LABELS[t.name] ?? "", t.desc].filter(Boolean).join(" · "),
+        )}</span>
+      </div>`,
+    )
+    .join("");
+
+  // 技能组体：技能清单（技能随会话加载，不单独开关）
+  const skillRows =
+    skills.length === 0
+      ? `<div class="mem-empty">还没有技能。对话中教它一套流程，让它用 <code>save_skill</code> 沉淀。</div>`
+      : skills
+          .map(
+            (s) => `
+      <div class="mm-tool-row">
+        <span class="mm-tool-ico">◇</span>
+        <span class="mm-tool-name">${esc(s.name)}</span>
+        <span class="mm-group-flex"></span>
+        <span class="mm-tool-desc">${esc(s.description)}</span>
+      </div>`,
+          )
+          .join("");
+
+  const mcpToolCount = mcp?.groups.reduce((a, g) => a + g.toolCount, 0) ?? 0;
+  const mcpGroupCount = mcp?.groups.length ?? 0;
+
+  const builtinGroup = group(
+    "builtin",
+    "◆",
+    "内置工具",
+    `${builtins.length} 个`,
+    builtinRows || `<div class="mem-empty">读不到内置工具清单。</div>`,
+    true,
+    "mm-sw-builtin",
+    builtinToolsEnabled,
+  );
+
+  const mcpGroup = group(
+    "mcp",
+    "◇",
+    "MCP 外部工具",
+    mcp ? `${mcpGroupCount} 组 · ${mcpToolCount} 工具` : "未连接",
+    serverBlock + statusBlock + grantsBlock,
+    true,
+    "mm-sw-mcp",
+    mcpAllGroups,
+  );
+
+  const skillGroup = group(
+    "skills",
+    "◈",
+    "技能加载的工具",
+    "随会话加载",
+    skillRows,
+    false,
+    "",
+    false,
+  );
+
+  // 说明块 + 权限闸门提示（设计稿 09:2:1548 / 2:1551）
+  const noteBlock = `
+    <div class="mm-note">
+      <div class="mm-note-title">工具组跟会话走</div>
+      <div class="mm-note-body">
+        会话创建时定死模式，模式决定哪些组可见（标准=全给 / 闲聊=无 MCP）。切会话会重算活跃组 —— 已有任务在跑也不跳过重算。
+        MCP 组默认「直接全给」，可逐组关闭；关闭后该组工具不在提示词里出现。
+      </div>
+    </div>
+    <div class="mm-warn">
+      <span class="mm-warn-ico">⚠</span>
+      <span class="mm-warn-text">工具可见 ≠ 有权限。文件与命令各有独立闸门，白名单外的动作会在对话流里弹出权限卡要你拍板。</span>
+    </div>`;
+
+  return (
+    head +
+    builtinGroup +
+    mcpGroup +
+    skillGroup +
+    noteBlock
+  );
+}
+
+/** 工具页统计（底部状态栏「N 组 · M 个工具」）。 */
+function refreshToolsStat(root: HTMLElement): void {
+  const groups = root.querySelectorAll<HTMLElement>(".mm-group").length;
+  const builtin = root.querySelectorAll<HTMLElement>(
+    '.mm-group[data-group="builtin"] .mm-tool-row',
+  ).length;
+  const skill = root.querySelectorAll<HTMLElement>(
+    '.mm-group[data-group="skills"] .mm-tool-row',
+  ).length;
+  toolsStatCache = { groups, tools: builtin + skill + mcpToolsCount };
 }
 
 function bindMcpView(root: HTMLElement): void {
@@ -7094,6 +8055,58 @@ function bindMcpView(root: HTMLElement): void {
   // ⚠️ 这里**不能**再绑一次：同一个按钮挂两个 handler 会让 `switchView` 跑两遍，
   //    第二遍撞上它的 toggle 逻辑（再点同一个非 chat 视图 → 回对话），
   //    表现出来就是"点了返回却回到了对话页"。
+
+  // ---- 组折叠（设计稿 09：组头右侧的 ▸/▾）----
+  root.querySelectorAll<HTMLButtonElement>(".mm-fold").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.fold ?? "";
+      const sec = btn.closest<HTMLElement>(".mm-group");
+      const body = sec?.querySelector<HTMLElement>(".mm-group-body");
+      if (!body) return;
+      const open = body.hasAttribute("hidden");
+      body.toggleAttribute("hidden", !open);
+      sec?.classList.toggle("folded", !open);
+      btn.textContent = open ? "▾" : "▸";
+      TOOLS_GROUP_OPEN[key] = open;
+    });
+  });
+
+  // ---- 内置工具总闸（设计稿 09:2:1501）----
+  const swBuiltin = root.querySelector<HTMLButtonElement>("#mm-sw-builtin");
+  swBuiltin?.addEventListener("click", async () => {
+    const next = !builtinToolsEnabled;
+    swBuiltin.classList.toggle("on", next);
+    swBuiltin.setAttribute("aria-checked", String(next));
+    try {
+      await invoke("set_builtin_tools", { enable: next });
+      builtinToolsEnabled = next;
+      showToast(
+        next ? "内置工具已给模型" : "内置工具已从模型工具表里拿掉",
+        "ok",
+        2400,
+      );
+    } catch (e) {
+      swBuiltin.classList.toggle("on", !next);
+      swBuiltin.setAttribute("aria-checked", String(!next));
+      pushEntry("error", `切换内置工具失败：${e}`);
+    }
+  });
+
+  // ---- MCP 组总闸（设计稿 09:2:1533，与组内逐组开关同源）----
+  const swMcp = root.querySelector<HTMLButtonElement>("#mm-sw-mcp");
+  swMcp?.addEventListener("click", async () => {
+    const next = !mcpAllGroups;
+    swMcp.classList.toggle("on", next);
+    swMcp.setAttribute("aria-checked", String(next));
+    try {
+      await invoke("mcp_set_all_groups", { all: next });
+      mcpAllGroups = next;
+    } catch (e) {
+      swMcp.classList.toggle("on", !next);
+      swMcp.setAttribute("aria-checked", String(!next));
+      pushEntry("error", `切换 MCP 工具组失败：${e}`);
+    }
+  });
 
   document.getElementById("mcp-refresh")?.addEventListener("click", async () => {
     await invoke("mcp_refresh").catch((e) => pushEntry("error", `刷新失败：${e}`));
@@ -7969,6 +8982,8 @@ function installProgressListener(): void {
             !isToolFailure(item.detail);
           if (pair && tail) {
             tail.result = item.detail;
+            // 耗时跟着返回走（合成成一行后，summary 上显示「· 1.2s」）
+            if (item.durationMs !== undefined) tail.durationMs = item.durationMs;
           } else {
             last.items.push(item);
           }
@@ -8136,12 +9151,18 @@ function progressItem(p: ProgressEvent): AgentStep | null {
     case "toolCall":
       return { kind: "tool_call", name: p.name ?? "?", detail: p.args ?? "" };
     case "toolResult":
-      return { kind: "tool_result", name: p.name ?? "?", detail: p.preview ?? "" };
+      return {
+        kind: "tool_result",
+        name: p.name ?? "?",
+        detail: p.preview ?? "",
+        durationMs: p.durationMs,
+      };
     case "toolError":
       return {
         kind: "tool_error",
         name: p.name ?? "?",
         detail: p.message ? `失败：${p.message}` : "执行失败",
+        durationMs: p.durationMs,
       };
     default:
       return null;
@@ -8321,6 +9342,68 @@ async function loadProjects(): Promise<void> {
  *
  * 「连发多条」现在只有一条路：run 已经在跑 → `sendSteer()` 进插话队列（原有机制）。
  */
+/**
+ * 用哪个内核跑对话。
+ *
+ * - "pi"    → `chat_pi`（pi 子进程，2026-10-22 新增）
+ * - "legacy"→ `chat`（自研 agent loop）
+ *
+ * 默认走 pi —— 但**只在 pi 内核可用时**。`piStatus` 拉到后才知道。
+ * 不可用就静默退回 legacy（用户不该看到一个不能用的选项）。
+ */
+let usePiKernel = true;
+let piKernelAvailable = false;
+let piStatusChecked = false;
+
+/**
+ * 查 pi 内核是否可用（启动时调一次）。
+ *
+ * 可用 = exe 旁边有 `runtime/`（内置 node + pi bundle）。
+ * 不可用就静默退回自研内核 —— 用户不该看到一个不能用的选项。
+ */
+async function refreshPiStatus(): Promise<void> {
+  if (piStatusChecked) return;
+  piStatusChecked = true;
+  try {
+    const st = await invoke<{ available: boolean }>("pi_status");
+    piKernelAvailable = !!st.available;
+    if (!piKernelAvailable) {
+      usePiKernel = false;
+    }
+  } catch {
+    piKernelAvailable = false;
+    usePiKernel = false;
+  }
+  updateKernelChip();
+}
+
+/**
+ * 刷新工具栏上的内核 chip。
+ *
+ * 只在 pi 可用时显示 chip；不可用就不显示（用户看不到一个不能用的选项）。
+ */
+function updateKernelChip(): void {
+  const el = document.getElementById("kernel-chip");
+  if (!el) return;
+  el.textContent = usePiKernel ? "pi" : "自研";
+  el.title = usePiKernel
+    ? "内核：pi（agent harness）—— 点开切换到自研内核"
+    : "内核：自研 —— 点开切换到 pi 内核";
+}
+
+/** 切换内核（pi ↔ 自研）。 */
+async function toggleKernel(): Promise<void> {
+  if (!piKernelAvailable) return;
+  usePiKernel = !usePiKernel;
+  updateKernelChip();
+  pushEntry(
+    "system",
+    usePiKernel
+      ? "已切换到 pi 内核（下一轮生效）"
+      : "已切换到自研内核（下一轮生效）",
+  );
+}
+
 async function send(): Promise<void> {
   // 当前会话在跑 → 走「插话」通道（排队），而不是静默吞掉用户打的字。
   // ⚠️ `busy` 是**按会话**算的（多会话并行 run）：别的会话在跑不影响这里开新任务。
@@ -8499,12 +9582,20 @@ async function sendSteer(): Promise<void> {
   if (!text && imgs.length === 0) return;
 
   try {
-    const ack = await invoke<{ id: string; queued: number }>("chat_steer", {
-      input: text,
-      images: imgs,
-      // 多会话并行 run：插话必须路由到**当前会话**那个 run 的收件箱
-      sessionId: currentSessionId,
-    });
+    // 内核分流：pi 内核走 `chat_pi_steer`（参数名不同：`message` 而非 `input`），
+    // 自研内核走 `chat_steer`。返回结构已对齐（`SteerAck`），渲染逻辑不变。
+    const usePi = usePiKernel && piKernelAvailable;
+    const ack = usePi
+      ? await invoke<{ id: string; queued: number }>("chat_pi_steer", {
+          message: text,
+          sessionId: currentSessionId,
+        })
+      : await invoke<{ id: string; queued: number }>("chat_steer", {
+          input: text,
+          images: imgs,
+          // 多会话并行 run：插话必须路由到**当前会话**那个 run 的收件箱
+          sessionId: currentSessionId,
+        });
     // 已经送出去了才清输入框
     input.value = "";
     input.style.height = "auto";
@@ -8534,6 +9625,133 @@ async function sendSteer(): Promise<void> {
 }
 
 /** 「停止」：请求中断当前轮 */
+// ---------------- 斜杠命令面板 ----------------
+
+/**
+ * 命令面板的浮层状态。
+ *
+ * 面板是**输入框的附属物** —— 打开/关闭由输入框内容决定：
+ * - 内容以 `/` 开头 → 打开
+ * - 内容里的 `/` 被删掉 → 关闭
+ *
+ * ⚠️ 只有**光标在开头**的 `/` 才触发。句中的 `/`（比如路径 `D:/workplace`）
+ * 绝不能被当成命令 —— 那是这个项目最常见的误触场景。
+ */
+const cmdPanel: CommandPanelState = newPanelState();
+
+/** 执行一条命令 —— 由面板回调 */
+async function runCommand(act: string): Promise<void> {
+  switch (act) {
+    case "mem":
+      await switchView("mem");
+      return;
+    case "model": {
+      // 模型的「管理」在独立窗口，「选择」在面板 —— 这里只管选择。
+      // 复用顶栏模型 chip 的逻辑：点开 `.mc-menu` 列表。
+      const chip = document.getElementById("model-chip") as HTMLElement | null;
+      chip?.click();
+      return;
+    }
+    case "new":
+      // 「＋」按钮按设计稿 03 从输入行删了 → 这里直接开菜单。
+      // 菜单锚在命令面板按钮附近（原来是锚在「＋」按钮上）。
+      {
+        const anchor = document.getElementById("btn-commands") ?? document.getElementById("input");
+        const r = anchor?.getBoundingClientRect();
+        void showNewMenu(r?.left ?? 10, (r?.bottom ?? 40) + 4);
+      }
+      return;
+    case "sessions":
+      await switchView("sessions");
+      return;
+    case "screen":
+      await grabScreen();
+      return;
+    case "tools":
+      await switchView("mcp");
+      return;
+    case "settings":
+      await switchView("settings");
+      return;
+    case "project":
+      await switchView("project");
+      return;
+    case "search":
+      await switchView("search");
+      return;
+    case "compact":
+      try {
+        const r = await invoke<{ before: number; after: number }>("session_compact", {
+          force: true,
+        });
+        showToast(
+          `上下文已压缩：${r.before} → ${r.after} 字`,
+          "ok",
+          2600,
+        );
+        renderBody();
+      } catch (e) {
+        showToast(`压缩失败：${e}`, "error");
+      }
+      return;
+    case "stop":
+      await stopRun();
+      return;
+    case "clear":
+      try {
+        await invoke("session_truncate", { upto: 0 });
+        draftInput = "";
+        showToast("已清空当前会话", "ok", 2200);
+        renderBody();
+      } catch (e) {
+        showToast(`清空失败：${e}`, "error");
+      }
+      return;
+    default:
+      showToast(`未知命令：${act}`, "error");
+  }
+}
+
+/**
+ * 输入框内容变了 → 决定面板开不开。
+ *
+ * 判定：内容**以 `/` 开头**且长度 > 1（光标不在那一个斜杠上）。
+ * 这时候面板里的命令**替换**输入框内容 —— 选中一条就把它当消息发出去。
+ */
+function syncCommandPanel(input: HTMLTextAreaElement): void {
+  const v = input.value;
+  const shouldOpen = v.startsWith("/") && v.length > 1;
+
+  if (!shouldOpen) {
+    if (cmdPanel.el) closeCommandPanel(cmdPanel);
+    return;
+  }
+  openCommandPanel(cmdPanel, v.slice(1), (act) => {
+    void runCommand(act);
+  });
+}
+
+/**
+ * 面板里的 Enter：选中当前高亮的命令，**直接执行**。
+ *
+ * ⚠️ 命令是**动作**，不是消息（2026-10-23 修的真 bug）。
+ * 原写法是把 `/新建会话` 填回输入框再 `send()` —— 结果模型收到一句
+ * 「新建会话」，而真正的新建动作**根本没发生**；而且原注释说
+ * 「用户还能在发送前改」，可 Enter 紧接着就 send() 了，根本没有改的机会。
+ * 现在：Enter = 执行该命令；用户打的那段 `/xxx` 一起吃掉（命令不是消息）。
+ */
+function runSelectedCommand(input: HTMLTextAreaElement): boolean {
+  const cmd = currentCommand(cmdPanel);
+  if (!cmd) return false;
+  closeCommandPanel(cmdPanel);
+  // 把 "/xxx" 清掉 —— 执行的是命令，不是这句话
+  input.value = "";
+  input.style.height = "auto";
+  draftInput = "";
+  void runCommand(cmd.act);
+  return true;
+}
+
 async function stopRun(): Promise<void> {
   const btn = document.getElementById("btn-stop") as HTMLButtonElement | null;
   if (btn) {
@@ -8926,6 +10144,10 @@ function boot(): void {
   installRegenHandlers();
   installProgressListener();
   installModelsListener();
+
+  // 查 pi 内核是否可用（内置 runtime 在不在）。
+  // 异步 —— 不阻塞首屏。查到后 chip 才会出现。
+  void refreshPiStatus();
 
   // 点面板空白处收起模型列表（点 chip 本身或列表内部不收 —— chip 自己管开关）
   document.addEventListener("mousedown", (e) => {

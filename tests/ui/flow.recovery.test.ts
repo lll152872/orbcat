@@ -16,8 +16,8 @@ import { setMock, resetMock } from "./mocks/tauri";
 async function openRecoveryView(): Promise<void> {
   await openPanel();
   document.getElementById("btn-gear")!.click();
-  await waitFor(() => !!document.querySelector(".set-entry"), 3000, "settings entries");
-  const entry = Array.from(document.querySelectorAll<HTMLButtonElement>(".set-entry")).find(
+  await waitFor(() => !!document.querySelector(".set-row"), 3000, "settings entries");
+  const entry = Array.from(document.querySelectorAll<HTMLButtonElement>(".set-row")).find(
     (b) => b.dataset.act === "recovery",
   );
   if (!entry) throw new Error("设置里找不到「备份与回收站」入口");
@@ -170,10 +170,11 @@ describe("设置 › 备份与回收站", () => {
 
     const back = document.querySelector<HTMLElement>("#sub-bar #sub-back");
     expect(back, "返回按钮应在固定的 #sub-bar 内").toBeTruthy();
-    expect(back!.textContent).toContain("设置");
+    // 设计稿 04/05/06/09/10 的返回是**纯图标**（28×28），目标写在 title 里
+    expect(back!.getAttribute("title")).toContain("设置");
     back!.click();
 
-    await waitFor(() => !!document.querySelector(".set-entry"), 3000, "回到设置入口");
+    await waitFor(() => !!document.querySelector(".set-row"), 3000, "回到设置入口");
     // 对话页的输入框是「在设置页」和「在对话页」最快的区分点：
     // renderBody 把它 display 切成 none/flex。双绑时这里会是 flex（= 跳去了对话）。
     const input = document.querySelector<HTMLElement>(".panel-input");
@@ -186,8 +187,8 @@ describe("设置 › 备份与回收站", () => {
     await bootApp();
     await openPanel();
     document.getElementById("btn-gear")!.click();
-    await waitFor(() => !!document.querySelector(".set-entry"), 3000, "settings entries");
-    const entry = Array.from(document.querySelectorAll<HTMLButtonElement>(".set-entry")).find(
+    await waitFor(() => !!document.querySelector(".set-row"), 3000, "settings entries");
+    const entry = Array.from(document.querySelectorAll<HTMLButtonElement>(".set-row")).find(
       (b) => b.dataset.act === "perm",
     );
     if (!entry) throw new Error("设置里找不到「安全闸门」入口");

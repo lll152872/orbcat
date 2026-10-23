@@ -115,3 +115,19 @@ export async function sendText(text: string): Promise<void> {
 }
 
 export { callsOf, state };
+
+/**
+ * 走**命令面板**执行一条命令（2026-10-23 起「＋新建」「史会话」两颗按钮按
+ * 设计稿 03 从输入行删了 —— 输入行就 4 件：命令面板按钮 · 输入框 · 截图 · 发送；
+ * 这两个入口在命令面板里：/new 新建会话、/sessions 会话列表）。
+ *
+ * 走的是真实链路：输入框打 /xxx → 命令面板打开 → Enter 选中并执行。
+ */
+export async function runCommandByName(cmd: string): Promise<void> {
+  const input = document.getElementById("input") as HTMLTextAreaElement | null;
+  if (!input) throw new Error("#input 不存在");
+  input.value = `/${cmd}`;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  await waitFor(() => !!document.querySelector(".cmd-panel"), 3000, `命令面板 /${cmd}`);
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+}

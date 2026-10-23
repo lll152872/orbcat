@@ -27,8 +27,8 @@ describe("模型管理独立窗口入口（编辑弹窗外）", () => {
     const before = callsOf("models_window_open").length;
 
     document.getElementById("btn-gear")!.click();
-    await waitFor(() => !!document.querySelector(".set-entry"), 3000, "settings menu");
-    const entry = Array.from(document.querySelectorAll(".set-entry")).find(
+    await waitFor(() => !!document.querySelector(".set-row"), 3000, "settings menu");
+    const entry = Array.from(document.querySelectorAll(".set-row")).find(
       (b) => (b as HTMLElement).dataset.act === "models",
     );
     expect(entry, "设置里找不到「模型」入口").toBeTruthy();

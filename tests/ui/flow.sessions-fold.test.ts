@@ -21,17 +21,20 @@
  * 另锁「无任务空间」组名（旧名「主对话 / 未挂靠」把两件事混成一句）。
  */
 import { describe, it, expect } from "vitest";
-import { bootApp, openPanel, waitFor, state, sleep } from "./helpers";
+import { bootApp, openPanel, waitFor, state, sleep,
+  runCommandByName,
+} from "./helpers";
 import { setMock } from "./mocks/tauri";
 
 const PROJECTS = [
-  { id: 1, name: "写作��业", rootPath: null, entryCount: 2, memoryChars: 80 },
+  { id: 1, name: "写作作业", rootPath: null, entryCount: 2, memoryChars: 80 },
   { id: 2, name: "论文", rootPath: null, entryCount: 1, memoryChars: 40 },
 ];
 
 /** 顶栏「史」→ 会话页 */
 async function openSessions(): Promise<void> {
-  (document.getElementById("btn-sess") as HTMLButtonElement).click();
+  // ⚠️ 2026-10-23：「史」按钮按设计稿 03 从输入行删了，入口改走命令面板的 /sessions
+  await runCommandByName("sessions");
   await waitFor(() => !!document.getElementById("sess-new"), 3000, "sessions view");
 }
 
@@ -223,6 +226,115 @@ describe("「无任务空间」组", () => {
     await openSessions();
     expect(sepOf("论文").textContent ?? "").toContain("论文");
     expect(sepOf("写作作业").textContent ?? "").toContain("写作作业");
+  });
+});
+
+/**
+ * 「无任务空间」这个叫法**必须到处一致**。
+ *
+ * ## 为什么锁这条
+ *
+ * 会话页那一组叫「无任务空间」，顶栏那颗下拉的第一项原先还叫「**主对话**」——
+ * 同一个概念（「当前没有激活任何项目」）在两个地方两个名字。而「主对话」这个词
+ * 在这个 app 里**本来就有另一个含义**（主聊天那条会话），所以旧名不只是"不一致"，
+ * 是**指错了东西**。
+ *
+ * 顺带把「主对话（不挂项目）」那个右键菜单项也一起改了 —— 它是同一个概念。
+ */
+describe("「无任务空间」到处一致", () => {
+  it("顶栏下拉的第一项叫「无任务空间」，不再叫「主对话」", async () => {
+    stageThreeGroups();
+    await bootApp();
+    await openPanel();
+
+    const psel = document.getElementById("project-select") as HTMLSelectElement;
+    const first = psel.options[0];
+    expect(first.textContent ?? "").toContain("无任务空间");
+    expect(first.textContent ?? "", "旧名指的是另一件事（主聊天那条会话）").not.toContain("主对话");
+  });
+
+  it("顶栏下拉与会话页那一组用同一个词", async () => {
+    stageThreeGroups();
+    await bootApp();
+    await openPanel();
+    await openSessions();
+
+    const psel = document.getElementById("project-select") as HTMLSelectElement;
+    // 选项文案带条数（`无任务空间 · 2`），比名字时要把尾巴去掉
+    const topBar = (psel.options[0].textContent ?? "").replace(/\s*·\s*\d+$/, "").trim();
+    const group = (sepOf("").querySelector(".sess-sep-name")?.textContent ?? "").trim();
+    expect(topBar, "两处指同一个东西，就得用同一个词").toBe(group);
+  });
+
+  /**
+   * 下拉里每项带**会话数**（学习别家的空间管理做法 —— 用户给的参考图里
+   * 那个下拉一列空间名、一个数都没有，选之前根本不知道哪个空间是空的）。
+   */
+  it("下拉里每项都带会话数，且与会话页对得上", async () => {
+    stageThreeGroups();
+    await bootApp();
+    await openPanel();
+
+    const psel = document.getElementById("project-select") as HTMLSelectElement;
+    const _s = document.getElementById("project-select") as HTMLSelectElement; console.log("DBG options.length=", _s.options.length, "innerHTML=", JSON.stringify(_s.innerHTML), "childNodes=", _s.childNodes.length);    const label = (name: string): string => {
+      const o = Array.from(psel.options).find((x) => (x.textContent ?? "").includes(name));
+      return (o?.textContent ?? "").trim();
+    };
+    // 「无任务空间」= 主聊天 + 没挂项目的任务会话 = 2 条
+    expect(label("无任务空间")).toMatch(/无任务空间 · 2$/);
+    expect(label("论文")).toMatch(/📁 论文 · 1$/);
+    expect(label("写作作业")).toMatch(/📁 写作作业 · 1$/);
+  });
+
+  it("条数跟着会话增删变（不是打开时算一次就冻住）", async () => {
+    stageThreeGroups();
+    await bootApp();
+    await openPanel();
+
+    const psel = document.getElementById("project-select") as HTMLSelectElement;
+    const paper = (): string =>
+      (Array.from(psel.options).find((x) => (x.textContent ?? "").includes("论文"))?.textContent ?? "")
+        .trim();
+
+    expect(paper()).toMatch(/· 1$/);
+
+    // 加一条挂到「论文」的会话。
+    // ⚠️ `projectName` 由 `refreshSessionProjectTags()` 从 `pmem_session_map` 覆盖，
+    //    所以光往 sessionList 里塞不够 —— 映射表也得同步加。
+    state.sessionList.push({
+      id: "sess-new-in-paper",
+      title: "新的一条",
+      kind: "task",
+      updatedAt: Date.now(),
+    });
+    setMock("pmem_session_map", {
+      "sess-xw": "写作作业",
+      "sess-ly": "论文",
+      "sess-new-in-paper": "论文",
+    });
+
+    // 走一条**会重画顶栏**的路径：切会话
+    // （switchSession → refreshSessionList → renderBody → align → paintProjectSelect）
+    await openSessions();
+    document.querySelector<HTMLButtonElement>('.sess-open[data-id="sess-ly"]')!.click();
+    await waitFor(() => !document.getElementById("sess-new"), 3000, "switched to 论文 session");
+
+    expect(paper(), "条数不能是打开时算一次就冻住的数").toMatch(/· 2$/);
+  });
+
+  it("会话右键的「不挂项目」项也用同一个词", async () => {
+    stageThreeGroups();
+    await bootApp();
+    await openPanel();
+    await openSessions();
+
+    // 右键一条会话 → 弹出「挂靠到项目」菜单
+    const row = document.querySelector<HTMLElement>('.sess-item[data-id="sess-a"]')!;
+    row.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 10, clientY: 10 }));
+    await waitFor(() => !!document.getElementById("sess-ctx"), 3000, "bind menu");
+    const menu = document.getElementById("sess-ctx")!;
+    expect(menu.textContent ?? "").toContain("无任务空间");
+    expect(menu.textContent ?? "").not.toContain("主对话");
   });
 });
 

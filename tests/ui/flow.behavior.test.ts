@@ -24,8 +24,8 @@ import { callsOf, resetMock } from "./mocks/tauri";
 
 async function openBehavior(): Promise<HTMLElement> {
   document.getElementById("btn-gear")!.click();
-  await waitFor(() => !!document.querySelector(".set-entry"), 3000, "设置入口页");
-  const entry = Array.from(document.querySelectorAll<HTMLElement>(".set-entry")).find(
+  await waitFor(() => !!document.querySelector(".set-row"), 3000, "设置入口页");
+  const entry = Array.from(document.querySelectorAll<HTMLElement>(".set-row")).find(
     (b) => b.dataset.act === "behavior",
   );
   if (!entry) throw new Error("设置里找不到「行为」入口");
@@ -60,14 +60,36 @@ describe("输入行只剩输入相关的东西", () => {
     expect(ta.title).toContain("Ctrl+V");
   });
 
-  it("输入行左侧那颗 🎛 真的能打开行为页（不能只摆样子）", async () => {
+  it("输入行左侧那颗按钮现在是「命令面板」入口（2026-10-23 改）", async () => {
     await bootApp();
     await openPanel();
-    const btn = document.getElementById("btn-behavior");
-    expect(btn, "输入行缺「行为」logo").toBeTruthy();
-    expect(document.querySelector(".panel-input")!.contains(btn), "🎛 必须在输入行里").toBe(true);
+    const btn = document.getElementById("btn-commands");
+    expect(btn, "输入行缺「命令面板」按钮").toBeTruthy();
+    expect(document.querySelector(".panel-input")!.contains(btn), "命令面板按钮必须在输入行里").toBe(true);
     btn!.click();
-    // 曾经只有 markup、没有 listener —— 点了毫无反应，所以这条必须点到底
+    // 点开就是命令清单 —— **不用记任何快捷键**（用户要求）
+    await waitFor(() => !!document.getElementById("cmd-panel"), 3000, "命令面板浮层");
+    const items = document.querySelectorAll(".cmd-item");
+    expect(items.length, "命令面板应该有命令").toBeGreaterThan(0);
+  });
+
+  it("行为页仍能从设置进（按钮换了，能力没丢）", async () => {
+    await bootApp();
+    await openPanel();
+    document.getElementById("btn-gear")!.click();
+    await waitFor(() => !!document.querySelector(".set-row"), 3000, "设置入口页");
+    // ⚠️ 定位用 `data-act="behavior"`，不要用文案匹配。
+    // 设置入口页里「行为」是**分组标题**（`.mem-head`），那一项自己的标题
+    // 叫「执行位置 / 权限」—— 按文案找「行为」会找不到（踩过）。
+    const beh = document.querySelector<HTMLElement>('.set-row[data-act="behavior"]');
+    expect(beh, "设置入口页缺「执行位置 / 权限」项").toBeTruthy();
+    // 分组标题「行为与安全」也要在 —— 否则用户看到的是一堆没归类的行
+    // （2026-10-23：设置页按设计稿 04 改成 4 组手风琴，组头是 .set-sec-name）
+    const heads = Array.from(document.querySelectorAll<HTMLElement>(".set-sec-name")).map(
+      (h) => h.textContent?.trim() ?? "",
+    );
+    expect(heads, "设置入口页缺「行为与安全」分组标题").toContain("行为与安全");
+    beh!.click();
     await waitFor(() => !!document.getElementById("bh-bgdesk"), 3000, "行为页渲染");
   });
 });
@@ -77,14 +99,16 @@ describe("设置 › 行为页", () => {
     await bootApp();
     await openPanel();
     document.getElementById("btn-gear")!.click();
-    await waitFor(() => !!document.querySelector(".set-entry"), 3000, "设置入口页");
-    const entry = Array.from(document.querySelectorAll<HTMLElement>(".set-entry")).find(
+    await waitFor(() => !!document.querySelector(".set-row"), 3000, "设置入口页");
+    const entry = Array.from(document.querySelectorAll<HTMLElement>(".set-row")).find(
       (b) => b.dataset.act === "behavior",
     )!;
+    // 2026-10-23：这一行按设计稿 04 只显示「执行位置」的值
+    // （本机 pwsh / 后台桌面）。执行**权限档位**在行为子页里（改设计稿没这一行）。
     const txt = entry.textContent ?? "";
-    expect(txt).toContain("前台");
-    expect(txt).toContain("询问");
-    // ⚠️ 模式**必须**从这一行消失 —— 它已归「＋」菜单管。
+    expect(txt).toContain("执行位置");
+    expect(txt).toMatch(/本机 pwsh|后台桌面/);
+    // ⚠️ 模式**必须**从这一行消失 —— 它归「新建会话」菜单管。
     // 留着的话用户会以为"设置里能改模式"，而改了对当前会话根本无效。
     expect(txt, "模式不该再出现在行为摘要里").not.toContain("标准模式");
   });
@@ -182,6 +206,6 @@ describe("设置 › 行为页", () => {
     const back = document.querySelector<HTMLElement>("#sub-bar #sub-back");
     expect(back, "返回按钮应在固定的 #sub-bar 内").toBeTruthy();
     back!.click();
-    await waitFor(() => !!document.querySelector(".set-entry"), 3000, "回到设置入口");
+    await waitFor(() => !!document.querySelector(".set-row"), 3000, "回到设置入口");
   });
 });
