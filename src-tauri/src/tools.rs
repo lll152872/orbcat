@@ -926,7 +926,9 @@ async fn run_project_tool(
     //    识别 `iex` / `$()` 等动态解析）。argv 直接执行会**绕过这套静态分析**。
     //    判定通过后**执行仍走原始 argv**（见下），所以判定看到的东西
     //    与实际跑的东西一致，而执行时又不引入任何 shell 语义。
-    match gate_command(&cmd_text, &cwd, ctx).await? {
+    // ⚠️ 这里传 **"argv"** 而不是某个 shell 名：L1 脚本是**直接按 argv 起进程**的
+    //    （不经任何解释器），审计记录要如实记。
+    match gate_command(&cmd_text, &cwd, ctx, "argv").await? {
         CmdGate::Allowed { .. } => {}
         CmdGate::Refused(out) => return Ok(out),
     }
@@ -4009,6 +4011,11 @@ async fn gate_command(
     cmd: &str,
     cwd: &Path,
     ctx: &ToolCtx<'_>,
+    // `shell`：这条命令**会用哪种解释器**跑（"pwsh" / "gitbash" / "argv"）。
+    //
+    // 只进审计记录 —— 判定本身与解释器无关（策略对两种形态都生效）。
+    // 但审计链必须记对：否则事后看日志会以为「这条 bash 命令是 pwsh 跑的」。
+    shell: &str,
 ) -> Result<CmdGate, String> {
     // ⚠️ 用 `project::effective_policy` 而**不是** `load_policy`：
     // 拼装项目可以在白名单上做**加法**（`permPreset.commandAllowExtra`）。
@@ -4021,7 +4028,7 @@ async fn gate_command(
         CmdVerdict::HardBlock { reason } => {
             audit_cmd(
                 ctx, cmd, &norm, cwd, "blocked", "hard-block", command_policy::Risk::High, None,
-                "pwsh",
+                shell,
             );
             Err(format!(
                 "命令被**硬性阻断**（不可申请）：{reason}\n\
@@ -4031,7 +4038,7 @@ async fn gate_command(
         }
         CmdVerdict::Allow { reason } => {
             let risk = command_policy::Risk::Low;
-            audit_cmd(ctx, cmd, &norm, cwd, "allowed", "whitelist", risk, None, "pwsh");
+            audit_cmd(ctx, cmd, &norm, cwd, "allowed", "whitelist", risk, None, shell);
             Ok(CmdGate::Allowed {
                 source: format!("白名单（{reason}）"),
                 risk,
@@ -4056,7 +4063,7 @@ async fn gate_command(
             };
 
             if hit {
-                audit_cmd(ctx, cmd, &norm, cwd, "allowed", "grant", risk, None, "pwsh");
+                audit_cmd(ctx, cmd, &norm, cwd, "allowed", "grant", risk, None, shell);
                 return Ok(CmdGate::Allowed {
                     source: "已授权（临时授权生效）".into(),
                     risk,
@@ -4091,7 +4098,7 @@ async fn gate_command(
                         _ => "完全访问",
                     }
                 );
-                audit_cmd(ctx, cmd, &norm, cwd, "allowed", "trust-auto", risk, None, "pwsh");
+                audit_cmd(ctx, cmd, &norm, cwd, "allowed", "trust-auto", risk, None, shell);
                 return Ok(CmdGate::Allowed { source, risk, norm });
             }
 
@@ -4112,7 +4119,7 @@ async fn gate_command(
                 .await?;
 
             if !verdict.is_approved() {
-                audit_cmd(ctx, cmd, &norm, cwd, "rejected", "user-denied", risk, None, "pwsh");
+                audit_cmd(ctx, cmd, &norm, cwd, "rejected", "user-denied", risk, None, shell);
                 return Ok(CmdGate::Refused(ToolOutput::text(verdict.to_model_message())));
             }
 
@@ -4127,7 +4134,7 @@ async fn gate_command(
                 CmdScope::Full => "记住完整命令",
             };
             let source = format!("用户已批准（{scope_label}）");
-            audit_cmd(ctx, cmd, &norm, cwd, "approved", "user-approved", risk, None, "pwsh");
+            audit_cmd(ctx, cmd, &norm, cwd, "approved", "user-approved", risk, None, shell);
             Ok(CmdGate::Allowed { source, risk, norm })
         }
     }
@@ -4159,43 +4166,77 @@ async fn run_command(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Stri
         .unwrap_or(600)
         .clamp(1, 3600);
 
+    // ---- 执行位置：两个**正交**维度 ----
+    //
+    // ① 「后台桌面 vs 本机」= `win32desk::is_enabled()`（进程级开关）—— 管的是"在哪儿跑"；
+    // ② 「用哪种 shell」    = `settings.execShell`（pwsh | gitbash）—— 管的是"用哪种解释器"。
+    //
+    // 为什么用进程级开关而不是 agent 模式：后台执行管的是"在哪儿跑"，
+    // 与模式管的"哪些工具可见"是正交的两个维度。
+    //
+    // ⚠️ **先定执行目标、再过策略**：审计链要记对解释器（"这条命令跑在哪种 shell 里"）。
+    #[cfg(windows)]
+    let bg_desk = crate::win32desk::is_enabled();
+    #[cfg(not(windows))]
+    let bg_desk = false;
+    let target = crate::shell::resolve_exec_target(ctx.data_dir, bg_desk);
+    let shell = target.shell_name();
+
     // ---- Gate 2：命令策略（唯一闸门，见 `gate_command`）----
     //
     // 与项目 L1 脚本工具**共用同一套判定** —— 不各写一份。
-    let (source, risk, norm) = match gate_command(&cmd, &cwd, ctx).await? {
+    //
+    // ⚠️ 判定**与解释器无关**：策略对 pwsh 形态与 bash 形态**都**生效
+    // （两套词法取最严）。所以选了 Git Bash 之后，`rm -rf /`、`curl … | sh`
+    // 这些照样被硬阻断 —— 换 shell 不是绕过策略的口子。
+    let (source, risk, norm) = match gate_command(&cmd, &cwd, ctx, shell).await? {
         CmdGate::Allowed { source, risk, norm } => (source, risk, norm),
         CmdGate::Refused(out) => return Ok(out),
     };
     // ---- 执行 ----
     //
-    // 两条路，取决于「后台桌面」开关（`win32desk::is_enabled`）：
-    //   · 普通：用户桌面上跑，有心跳 + 取消（默认，行为与以前完全一致）
-    //   · 后台：隐形桌面上跑 —— 应用自己弹的窗口不会闪到用户屏幕上、不抢焦点
-    //
-    // 为什么用进程级开关而不是 agent 模式：后台执行管的是"在哪儿跑"，
-    // 与模式管的"哪些工具可见"是正交的两个维度。
-    #[cfg(windows)]
-    let use_bg_desk = crate::win32desk::is_enabled();
-    #[cfg(not(windows))]
-    let use_bg_desk = false;
-
-    let out = if use_bg_desk {
-        eprintln!("[orbcat] run_command 走隐形桌面：{}", cmd.chars().take(80).collect::<String>());
-        match crate::shell::run_on_desktop(&cmd, &cwd, timeout_secs).await {
-            Ok(o) => o,
-            Err(e) => {
-                audit_cmd(ctx, &cmd, &norm, &cwd, "error", &source, risk, None, "pwsh");
-                return Err(format!("后台桌面执行失败：{e}"));
+    // 三条路：
+    //   · 隐形桌面 · pwsh：应用自己弹的窗口不会闪到用户屏幕上、不抢焦点
+    //   · 本机 · pwsh：用户桌面上跑，有心跳 + 取消（默认，行为与以前完全一致）
+    //   · 本机 · Git Bash：`bash.exe -lc "<cmd>"`（用户实机问的「git bash 呢」）
+    let out = match target {
+        crate::shell::ExecTarget::BackgroundDesktop => {
+            eprintln!(
+                "[orbcat] run_command 走隐形桌面：{}",
+                cmd.chars().take(80).collect::<String>()
+            );
+            match crate::shell::run_on_desktop(&cmd, &cwd, timeout_secs).await {
+                Ok(o) => o,
+                Err(e) => {
+                    audit_cmd(ctx, &cmd, &norm, &cwd, "error", &source, risk, None, shell);
+                    return Err(format!("后台桌面执行失败：{e}"));
+                }
             }
         }
-    } else {
-        let tick = ctx.tick.clone();
-        let cancel = ctx.cancel.clone();
-        match crate::shell::run_powershell_tick(&cmd, &cwd, timeout_secs, tick, cancel).await {
-            Ok(o) => o,
-            Err(e) => {
-                audit_cmd(ctx, &cmd, &norm, &cwd, "error", &source, risk, None, "pwsh");
-                return Err(format!("执行失败：{e}"));
+        crate::shell::ExecTarget::LocalPwsh => {
+            let tick = ctx.tick.clone();
+            let cancel = ctx.cancel.clone();
+            match crate::shell::run_powershell_tick(&cmd, &cwd, timeout_secs, tick, cancel).await {
+                Ok(o) => o,
+                Err(e) => {
+                    audit_cmd(ctx, &cmd, &norm, &cwd, "error", &source, risk, None, shell);
+                    return Err(format!("执行失败：{e}"));
+                }
+            }
+        }
+        crate::shell::ExecTarget::LocalGitBash => {
+            eprintln!(
+                "[orbcat] run_command 走本机 Git Bash：{}",
+                cmd.chars().take(80).collect::<String>()
+            );
+            let tick = ctx.tick.clone();
+            let cancel = ctx.cancel.clone();
+            match crate::shell::run_gitbash_tick(&cmd, &cwd, timeout_secs, tick, cancel).await {
+                Ok(o) => o,
+                Err(e) => {
+                    audit_cmd(ctx, &cmd, &norm, &cwd, "error", &source, risk, None, shell);
+                    return Err(format!("执行失败：{e}"));
+                }
             }
         }
     };
@@ -4207,7 +4248,7 @@ async fn run_command(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, Stri
     } else {
         "executed"
     };
-    audit_cmd(ctx, &cmd, &norm, &cwd, event, &source, risk, out.exit_code, "pwsh");
+    audit_cmd(ctx, &cmd, &norm, &cwd, event, &source, risk, out.exit_code, shell);
 
     Ok(ToolOutput::text(format_command_output(
         &cmd,

@@ -1235,6 +1235,19 @@ fn extract_bash_payload(args: &[String]) -> Option<String> {
                 return None;
             }
         }
+        // `-lc <payload>`（bash 的**合并短选项**：-l + -c）
+        //
+        // ⚠️ 漏掉这一条 = `bash -lc "rm -rf /"` 只会弹确认卡、不会被硬阻断。
+        //    （这条正是「用 Git Bash 执行」时最容易被绕过的形态 —— 因为
+        //    我们自己 spawn 的就是 `bash.exe -lc "<cmd>"`。）
+        if super::is_combined_command_flag(&a) {
+            let payload = args[i + 1..].join(" ");
+            let t = payload.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+            return None;
+        }
         i += 1;
     }
     None
