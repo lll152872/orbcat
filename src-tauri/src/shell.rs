@@ -123,20 +123,12 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 
 /// Git Bash 的候选 `bash.exe`（**多候选**，不写死一条路径）。
 ///
-/// ## 候选从哪来（与 pi 的 bash 工具同一套思路）
+/// ## 候选从哪来
 ///
 /// 1. 内置 runtime 里的 `git/bin/bash.exe`（发布包带了 git 才有）；
-/// 2. PATH 上的 `bash.exe` / `bash`；
-/// 3. Git for Windows 的常见安装位置。
-///
-/// ## 为什么这里自己列，而不用 `pi.rs` 里的同名函数
-///
-/// 发布线上的 `pi.rs` **还没有**这套候选 —— 它在 Pi内核 的
-/// `work/pi-kernel/pi-confirm-and-gate`（55d2978「runtime 内容校验 + git/bash 系统回落」）。
-/// 那条线对 `pi.rs` 改了 400 多行、还在飞；这边**不动 pi.rs**
-/// （不把冲突堆在别人的在飞文件上）。
-///
-/// ⚠️ 等那条线合进来后，这两处候选应当合并成**单一来源**（见交接条目）。
+/// 2. **系统装的** —— 直接用 [`crate::pi::system_bash_candidates`]（**单一来源**）：
+///    PATH 搜索 + Git for Windows 常见安装位置（优先 `bin` —— 那是 MSYS2 的
+///    launcher，PATH 处理比 `usr\bin` 那份稳）。
 ///
 /// ## ⚠️ 找不到就返回空 —— 调用方必须 fail-closed
 ///
@@ -147,22 +139,8 @@ pub fn git_bash_candidates(runtime_root: Option<&Path>) -> Vec<PathBuf> {
     if let Some(root) = runtime_root {
         v.push(root.join("git").join("bin").join("bash.exe"));
     }
-    // ② PATH 上
-    for name in ["bash.exe", "bash"] {
-        if let Some(p) = find_in_path(name) {
-            v.push(p);
-        }
-    }
-    // ③ Git for Windows 常见位置 —— **优先 bin**（那是 MSYS2 的 launcher，
-    //    PATH 处理比 usr\bin 那份稳）
-    for base in [
-        r"C:\Program Files\Git\bin",
-        r"C:\Program Files\Git\usr\bin",
-        r"C:\Program Files (x86)\Git\bin",
-        r"C:\Program Files (x86)\Git\usr\bin",
-    ] {
-        v.push(Path::new(base).join("bash.exe"));
-    }
+    // ② 系统装的 —— 单一来源在 `pi.rs`（含 PATH 搜索：用户把 bash 装在别处也能找到）
+    v.extend(crate::pi::system_bash_candidates());
     v
 }
 
@@ -1066,6 +1044,43 @@ mod tests {
             out.interpreter.to_lowercase().contains("bash"),
             "interpreter 应记成 bash：{}",
             out.interpreter
+        );
+    }
+
+    /// 系统装的 bash **没有 wrapper**（wrapper 的作用就是显式设 PATH）
+    /// ⇒ 必须靠 **`-l`**（login shell 读 `/etc/profile`）把 `/usr/bin` 补进 PATH。
+    /// 否则 `ls`/`head`/`cat` 会 `command not found`。
+    ///
+    /// 实测：把 Windows PATH 清成只剩 `C:\Windows\System32`，
+    /// `bash.exe -lc "ls --version"` 仍跑出 `ls (GNU coreutils) 8.32`。
+    ///
+    /// 这条用例把那个约束**锁住** —— 哪天有人把 `-l` 去掉，它会立刻红。
+    #[tokio::test]
+    async fn git_bash_login_shell_provides_unix_tools() {
+        let dir = std::env::temp_dir();
+        let out = match run_gitbash_tick("echo $PATH; ls --version | head -1", &dir, 30, None, None)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("[test] 跳过（起不了 Git Bash）：{e}");
+                return;
+            }
+        };
+        assert!(
+            out.stdout.contains("/usr/bin"),
+            "login shell 应把 /usr/bin 补进 PATH（否则 unix 工具 command not found），实际：{:?}",
+            out.stdout
+        );
+        assert!(
+            !out.stderr.contains("command not found"),
+            "unix 工具应可用，实际 stderr：{:?}",
+            out.stderr
+        );
+        assert!(
+            out.stdout.contains("coreutils") || out.stdout.contains("ls "),
+            "ls 应该真的能跑，实际输出：{:?}",
+            out.stdout
         );
     }
 
