@@ -19,54 +19,17 @@
  * 让主文件提供是最自然的边界。
  */
 
-import { invoke } from "@tauri-apps/api/core";
+// 数据接口层：业务代码只认 `data.<域>.<方法>()`，不再直接调 Tauri invoke。
+import { data } from "../data";
 import { esc, fmtBytes, fmtWhen, tailPath } from "../format";
+import type {
+  RecoveryState,
+} from "../data/types";
 
-// ---------------- 设置 › 备份与回收站 ----------------
 
-/**
- * 后端 `recovery::RecoveryState` 的镜像。
- *
- * 为什么要有这个视图：`backups/` 与 `.trash/` 在此之前**只进不出**
- * —— 实测 17.4 MB 备份 + 85.3 MB 归档，而还原只能靠用户手工搬文件。
- * 「可逆」是项目的底线承诺（决策 8 写的"30 天内可一键还原"），
- * 没有还原入口的归档等于半个硬删除。
- */
-export interface BackupRec {
-  id: string;
-  at: number;
-  /** 原路径。老备份（加清单之前）为空 → 前端显示"原路径未知"并要用户另选目标 */
-  original: string;
-  backup: string;
-  size: number;
-  legacy: boolean;
-}
 
-export interface TrashRec {
-  at: number;
-  original: string;
-  trashed: string;
-  kind: string;
-  count: number;
-  present: boolean;
-  size: number;
-}
 
-export interface RecoveryStats {
-  backupsCount: number;
-  backupsBytes: number;
-  trashCount: number;
-  trashBytes: number;
-  staleRecords: number;
-}
 
-export interface RecoveryState {
-  stats: RecoveryStats;
-  backups: BackupRec[];
-  trash: TrashRec[];
-  defaultKeepDays: number;
-  defaultKeepItems: number;
-}
 
 
 
@@ -218,7 +181,7 @@ export function bindRecoveryView(
       const id = b.dataset.id!;
       b.disabled = true;
       try {
-        const msg = await invoke<string>("recovery_restore_backup", { id, target: null });
+        const msg = await data.recovery.restoreBackup( { id, target: null });
         setMsg(msg.split("\n")[0], true);
       } catch (e) {
         setMsg(`还原失败：${e}`, false);
@@ -232,7 +195,7 @@ export function bindRecoveryView(
       const trashed = b.dataset.trashed!;
       b.disabled = true;
       try {
-        const msg = await invoke<string>("recovery_restore_trash", { trashed, target: null });
+        const msg = await data.recovery.restoreTrash( { trashed, target: null });
         setMsg(msg, true);
       } catch (e) {
         // 典型失败：目标已存在（拒绝覆盖）—— 把原因原样告诉用户，别吞掉
@@ -255,7 +218,7 @@ export function bindRecoveryView(
       if (!ok) return;
       b.disabled = true;
       try {
-        const msg = await invoke<string>("recovery_delete_backup", { id });
+        const msg = await data.recovery.deleteBackup( { id });
         setMsg(msg, true);
       } catch (e) {
         setMsg(`删除失败：${e}`, false);
@@ -276,7 +239,7 @@ export function bindRecoveryView(
       if (!ok) return;
       b.disabled = true;
       try {
-        const msg = await invoke<string>("recovery_delete_trash", { trashed });
+        const msg = await data.recovery.deleteTrash( { trashed });
         setMsg(msg, true);
       } catch (e) {
         setMsg(`删除失败：${e}`, false);
@@ -294,11 +257,7 @@ export function bindRecoveryView(
       return;
     }
     try {
-      const out = await invoke<{
-        backupsRemoved: number;
-        trashRemoved: number;
-        bytesFreed: number;
-      }>("recovery_prune", { keepDays: days, keepItems: items });
+      const out = await data.recovery.prune( { keepDays: days, keepItems: items });
       const n = out.backupsRemoved + out.trashRemoved;
       if (n === 0) {
         setMsg("没有符合清理条件的项（要**超期且超量**才删）", true);
@@ -322,7 +281,7 @@ export function bindRecoveryView(
     const btn = document.getElementById("rec-diag") as HTMLButtonElement | null;
     if (btn) btn.disabled = true;
     try {
-      const path = await invoke<string>("recovery_diagnostic");
+      const path = await data.recovery.diagnostic();
       setMsg(`诊断包已生成：${path}（key 已脱敏，可直接转发）`, true);
     } catch (e) {
       setMsg(`生成诊断包失败：${e}`, false);

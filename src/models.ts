@@ -13,56 +13,19 @@
  * - 无边框 + 顶部自绘标题栏拖动 + always-on-top，与悬浮球一致
  * - 增删改命令会广播 `models-changed` 事件，面板收到后刷新模型卡片
  */
-import { invoke } from "@tauri-apps/api/core";
+// 数据接口层：业务代码只认 `data.<域>.<方法>()`，不再直接调 Tauri invoke。
+import { data } from "./data";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { MODELS_INTENT_KEY } from "./format";
+import type {
+  ModelView,
+  RemoteModelInfo,
+} from "./data/types";
 
-// ---------------------------------------------------------------------------
-// 类型（与 Rust 端 camelCase 序列化一一对应）
-// ---------------------------------------------------------------------------
 
-/** 模型身份 = (Base URL, 接口 id)；同 id 可跨组共存，显示名已废弃 */
-interface ModelView {
-  id: string;
-  vendor: string;
-  url: string;
-  supportsToolCall: boolean;
-  supportsImages: boolean;
-  maxInputTokens?: number | null;
-  maxOutputTokens?: number | null;
-  hasKey?: boolean;
-}
 
-/** 远端 GET /models 返回的一项 */
-interface RemoteModelInfo {
-  id: string;
-  ownedBy?: string;
-  contextLength?: number | null;
-  maxOutputLength?: number | null;
-  /**
-   * 提供商自报的工具调用能力。
-   * `null` / `undefined` = 对方**没声明** → 沿用表单里的勾选；
-   * `false` = 明确不支持（要覆盖掉表单勾选）。
-   */
-  supportsToolCall?: boolean | null;
-  /** 提供商自报的看图能力（同上：`null` = 没声明） */
-  supportsImages?: boolean | null;
-}
 
-/** 编辑表单回填（不含完整 Key） */
-interface ModelEditView {
-  id: string;
-  vendor: string;
-  url: string;
-  supportsToolCall: boolean;
-  supportsImages: boolean;
-  headersText: string;
-  hasKey: boolean;
-  keyPreview: string;
-  maxInputTokens?: number | null;
-  maxOutputTokens?: number | null;
-}
 
 /** 添加/编辑表单的会话内状态（re-render 时保住输入，错误也能回填） */
 interface ModelFormState {
@@ -373,8 +336,8 @@ function askInput(title: string, body: string, initial = ""): Promise<string | n
 
 async function reloadModels(): Promise<void> {
   try {
-    models = await invoke<ModelView[]>("list_models");
-    const sel = await invoke<{ id: string; url: string | null } | null>("get_selected_model");
+    models = await data.models.list();
+    const sel = await data.models.selected();
     selectedModel = sel?.id ?? null;
     selectedModelUrl = sel?.url ?? null;
     // 同 main.ts：旧设置只有 id 没 url 时按 (id, url) 全等判定会命中**所有**同 id 的行
@@ -383,7 +346,7 @@ async function reloadModels(): Promise<void> {
       const resolved = models.find((x) => x.id === selectedModel);
       if (resolved) selectedModelUrl = resolved.url;
     }
-    modelGroupNames = await invoke<Record<string, string>>("model_group_names");
+    modelGroupNames = await data.models.groupNames();
   } catch (e) {
     showToast(`加载模型列表失败：${e}`, "error");
   }
@@ -873,7 +836,7 @@ function closeDialog(): void {
 function bindApp(): void {
   // —— 顶栏 ——
   document.getElementById("mw-close")?.addEventListener("click", () => {
-    void invoke("models_window_close").catch(() => {});
+    void data.models.windowClose().catch(() => {});
   });
 
   // 「添加模型」→ 先选类型（只留 Custom Endpoint）
@@ -929,7 +892,7 @@ function bindApp(): void {
           return;
         }
         try {
-          await invoke("model_group_rename", { url, name });
+          await data.models.groupRename( { url, name });
           if (name.trim()) modelGroupNames[url] = name.trim();
           else delete modelGroupNames[url];
           showToast(`已重命名为「${name.trim() || shortHost(url)}」`);
@@ -947,7 +910,7 @@ function bindApp(): void {
           return;
         }
         try {
-          const n = await invoke<number>("models_set_group_key", { url, apiKey: key });
+          const n = await data.models.setGroupKey( { url, apiKey: key });
           await reloadModels();
           showToast(`已更新 ${n} 个模型的 Key`);
         } catch (err) {
@@ -988,8 +951,7 @@ function bindApp(): void {
           return;
         }
         try {
-          const res = await invoke<{ moved: number; skipped: string[]; newUrl: string }>(
-            "models_change_group_url",
+          const res = await data.models.changeGroupUrl(
             { url, newUrl: next.trim() },
           );
           await reloadModels();
@@ -1012,7 +974,7 @@ function bindApp(): void {
           return;
         }
         try {
-          await invoke<number>("models_remove_group", { url });
+          await data.models.removeGroup( { url });
           await reloadModels();
           showToast(`已删除该组 ${n} 个模型`);
         } catch (err) {
@@ -1060,7 +1022,7 @@ function bindApp(): void {
     // 这里先记下"这次是不是走的继承"，拉完告诉用户一声 —— 否则他以为是自己填的。
     const inherited = !key && models.some((m) => sameUrl(m.url, url) && m.hasKey);
     try {
-      const list = await invoke<RemoteModelInfo[]>("models_fetch_remote", {
+      const list = await data.models.fetchRemote( {
         url,
         apiKey: key,
         headers: f.headersText.trim() ? f.headersText : null,
@@ -1122,7 +1084,7 @@ function bindApp(): void {
       return;
     }
     try {
-      const list = await invoke<RemoteModelInfo[]>("models_parse_spec", { payload: txt });
+      const list = await data.models.parseSpec( { payload: txt });
       if (!list.length) {
         setModelFormError("这段 JSON 里没解析出模型");
         return;
@@ -1169,7 +1131,7 @@ function bindApp(): void {
       const hit = models.find((m) => m.id === id && sameUrl(m.url, url0));
       if (hit) {
         try {
-          const ev = await invoke<ModelEditView>("models_get_edit", { id: hit.id, url: hit.url });
+          const ev = await data.models.getEdit( { id: hit.id, url: hit.url });
           modelForm = {
             editId: ev.id,
             editUrl: ev.url,
@@ -1236,7 +1198,7 @@ function bindApp(): void {
       if (typeof it.supportsImages === "boolean") imageFlags[it.id] = it.supportsImages;
     }
     try {
-      const result = await invoke<{ added: string[]; skipped: string[] }>("models_import_remote", {
+      const result = await data.models.importRemote( {
         ids,
         sourceId: null,
         url: f.url,
@@ -1277,7 +1239,7 @@ function bindApp(): void {
     b.addEventListener("click", async () => {
       selectedModel = b.dataset.id!;
       selectedModelUrl = b.dataset.url ?? null;
-      await invoke("set_selected_model", { id: selectedModel, url: selectedModelUrl }).catch((e) =>
+      await data.models.select( { id: selectedModel, url: selectedModelUrl }).catch((e) =>
         showToast(`保存失败：${e}`, "error"),
       );
       renderApp();
@@ -1292,7 +1254,7 @@ function bindApp(): void {
       const url = b.dataset.url!;
       const ok = await askConfirm("删除模型", `确定删除「${id}」？`);
       if (!ok) return;
-      await invoke("models_remove", { id, url }).catch((e) =>
+      await data.models.remove( { id, url }).catch((e) =>
         showToast(`删除失败：${e}`, "error"),
       );
       if (modelForm.editId === id && modelForm.editUrl && sameUrl(modelForm.editUrl, url)) {
@@ -1311,7 +1273,7 @@ function bindApp(): void {
       const id = b.dataset.id!;
       const url = b.dataset.url!;
       try {
-        const ev = await invoke<ModelEditView>("models_get_edit", { id, url });
+        const ev = await data.models.getEdit( { id, url });
         modelForm = {
           editId: ev.id,
           editUrl: ev.url,
@@ -1364,7 +1326,7 @@ function bindApp(): void {
       say(`正在测试 ${id} …`, "run");
 
       try {
-        const reply = await invoke<string>("test_model", { id, url });
+        const reply = await data.models.test( { id, url });
         say(`✅ 连通正常：${reply.slice(0, 150)}`, "ok");
         showToast(`✅ ${id} 连通正常`);
       } catch (e) {
@@ -1415,7 +1377,7 @@ function bindApp(): void {
         //   newUrl = 表单里填的**新** Base URL（= 换组）
         // 以前只发 url=f.editUrl（新值根本没上线），于是输入框里能改 Base URL、
         // 保存后静默丢弃 —— 用户看不到任何报错，以为改了其实没改。
-        await invoke("models_edit", {
+        await data.models.edit( {
           id: f.editId,
           url: f.editUrl,
           newUrl: url,
@@ -1442,7 +1404,7 @@ function bindApp(): void {
         }
         modelForm = emptyModelForm();
       } else {
-        await invoke<string>("models_add", {
+        await data.models.add( {
           id: newId,
           url,
           apiKey: key,
@@ -1456,7 +1418,7 @@ function bindApp(): void {
         // 新加的模型设为当前（与旧版行为一致）；后端会广播事件刷新面板
         selectedModel = newId;
         selectedModelUrl = url;
-        await invoke("set_selected_model", { id: newId, url }).catch(() => {});
+        await data.models.select( { id: newId, url }).catch(() => {});
         modelForm = emptyModelForm();
         showToast(`已保存 ${newId}`);
       }
@@ -1490,7 +1452,7 @@ window.addEventListener("keydown", (e) => {
   // confirm-mask 自己带 Esc（document 捕获阶段），能走到这里说明没有弹层
   if (document.querySelector(".confirm-mask")) return;
   e.preventDefault();
-  void invoke("models_window_close").catch(() => {});
+  void data.models.windowClose().catch(() => {});
 });
 
 // ---------------------------------------------------------------------------
@@ -1504,7 +1466,7 @@ window.addEventListener("keydown", (e) => {
  * 这条链路本身失败也不能再抛错（静默吞掉）。
  */
 function diag(msg: string): void {
-  void invoke("diag_log", { msg }).catch(() => {});
+  void data.system.diagLog( { msg }).catch(() => {});
 }
 
 window.addEventListener("error", (e) => {

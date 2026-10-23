@@ -12,7 +12,8 @@
  *    Tauri 的 setSize 走的是受约束的路径。Rust 侧用 Win32 SetWindowPos 绕开。
  */
 
-import { invoke } from "@tauri-apps/api/core";
+// 数据接口层：业务代码只认 `data.<域>.<方法>()`，不再直接调 Tauri invoke。
+import { data } from "./data";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { mdToHtml, splitStable } from "./markdown";
@@ -20,6 +21,35 @@ import { MAX_BUBBLES, splitBubbles } from "./bubble";
 import { clipLines } from "./truncate";
 // 定时器回调的环境守卫（见 dom-alive.ts 头部说明）。
 import { domAlive } from "./dom-alive";
+import type {
+  AgentStep,
+  BuiltinToolInfo,
+  Candidate,
+  CmdAuditRecord,
+  CmdGrantsView,
+  CmdPolicy,
+  ContextCapability,
+  FgCtx,
+  LifeStatus,
+  McpServerCfg,
+  McpStatus,
+  MemStats,
+  MemoryFiles,
+  ModeView,
+  ModelView,
+  PendingPerm,
+  PermRule,
+  ProgressEvent,
+  ProjectListView,
+  ProjectMemoryView,
+  ProjectRow,
+  SearchStatus,
+  Session,
+  SessionMeta,
+  SkillInfo,
+  TokenUsage,
+} from "./data/types";
+
 // 纯格式化/工具函数已抽到 format.ts（拆模块，见该文件头部说明）。
 // 这里集中 re-import，避免散落各处 import 语句。
 import {
@@ -33,7 +63,6 @@ import {
   bindRecoveryView,
   recoverySummaryText,
   renderRecoveryView,
-  type RecoveryState,
 } from "./views/recovery";
 import {
   closeCommandPanel,
@@ -66,126 +95,12 @@ const MAX_IMAGE_CHARS = 8 * 1024 * 1024;
 
 type Mode = "orb" | "panel" | "menu";
 
-interface SearchStatus {
-  provider: string;
-  providerLabel: string;
-  hasKey: boolean;
-  keyPreview: string;
-  ready: boolean;
-  path: string;
-}
-
-/** 模型身份 = (Base URL, 接口 id)；同 id 可跨组共存，显示名已废弃 */
-interface ModelView {
-  id: string;
-  vendor: string;
-  url: string;
-  supportsToolCall: boolean;
-  supportsImages: boolean;
-  maxInputTokens?: number | null;
-  maxOutputTokens?: number | null;
-  hasKey?: boolean;
-}
-
-/** pmem.projects 一行（SQLite 索引；记忆正文在 projects/<名>/MEMORY.md） */
-interface ProjectRow {
-  id: number;
-  name: string;
-  rootPath: string;
-  createdAt: string;
-}
 
 
-interface AgentStep {
-  kind: string;
-  name: string | null;
-  detail: string;
-  /**
-   * 工具执行心跳（"⏳ 已运行 12s｜<输出尾巴>"）—— 只在 live 进行中气泡里用。
-   * 独立字段而不是塞 detail：tool_call 的 detail 是参数 JSON（要过 summarizeArgs），
-   * 混进心跳文本会把摘要搅掉。
-   */
-  tick?: string;
-  /**
-   * **工具耗时（毫秒）** —— 只对 tool_call / tool_result / tool_error 有意义。
-   *
-   * 为什么单开字段：耗时是**元信息**，不是结果内容。混进 `detail` 会污染
-   * 结果预览（detail 要原样展示给用户，还要过 summarizeArgs）。
-   * 后端 pi 路径取 `tool_execution_end.durationMs`，自研内核自己掐表。
-   */
-  durationMs?: number;
-  /**
-   * 插话（kind === "steer"）附带的图片**文件路径**。
-   *
-   * 为什么单独一个字段：steer 的 detail 是插话文字，图不能混进去（会污染文本）。
-   * 落盘时存在 user 消息的 `images` 里，读回来时由后端补到 steer 条目上
-   * （见 `sessions.rs` 的 `attach_steer_images`）。
-   */
-  images?: string[];
-  /**
-   * 工具返回预览 —— **只有已配对的 `tool_call` 条目**才有这个字段。
-   *
-   * 为什么存在：后端落盘是 `tool_call` + `tool_result` 两条（`agent.rs` 工具循环），
-   * 时间线上就是两行（`🔧 列目录` / `✅ 列目录`）。设计要求是
-   * **一条工具只占一行**，所以前端读盘 / 收流时用 `pairToolSteps()` 把返回并进
-   * 调用条目里（`detail` 仍是参数），渲染成一行、点开才看参数与返回。
-   *
-   * ⚠️ 只在**前端**合并，不落盘 —— `AgentStep` 的磁盘形态（Rust `StoredStep`）
-   *    保持 kind/name/detail 三条；合并发生在前端的内存条目上。
-   */
-  result?: string;
-}
 
-interface AgentRun {
-  answer: string;
-  steps: AgentStep[];
-  iterations: number;
-  /** 本轮的思考过程（多轮时按「【第 N 轮】」分段） */
-  reasoning?: string;
-  /** 被「停止」打断 —— answer 是半截正文 */
-  interrupted?: boolean;
-  /** 执行中被消费掉的插话 */
-  steers?: { id: string; text: string; images: string[] }[];
-  /** 中断时没来得及送达的插话（还原到输入框，别让用户白打字） */
-  pendingSteers?: string[];
-  stopReason?: string;
-}
 
-/** 一条待用户拍板的权限申请（与后端 `perm_request::PendingView` 对应） */
-interface PendingPerm {
-  id: string;
-  /** "file"（文件级，路径维度） | "command"（命令级，指纹维度） */
-  kind: string;
-  // ---- 文件级 ----
-  path: string;
-  access: string;
-  deniedPath: string | null;
-  /** 申请范围比被拒路径宽了几层；null = 不是被拒路径的祖先 */
-  widenLevels: number | null;
-  widened: boolean;
-  // ---- 命令级 ----
-  /** 命令原文 */
-  command: string;
-  /** 归一化后的命令（别名/缩写已展开 —— 用户靠它看"实际会执行什么"） */
-  normalized: string;
-  /** 风险等级 low | medium | high */
-  risk: string;
-  /** 「可执行名 + 首个子命令」指纹（"记住这类命令"用） */
-  headFp: string;
-  /** 完整命令指纹（"记住这条命令"用） */
-  fullFp: string;
-  // ---- 公共 ----
-  tier: string;
-  reason: string;
-  sessionId: string;
-  createdAt: number;
-  timeoutMs: number;
-  // ---- ask_user（kind = "ask"）----
-  /** 问题正文 */
-  question: string;
-  /** 快捷选项（点一下即回答；空 = 自由输入） */
-  options: string[];
-}
+
+
 
 interface ChatEntry {
   role: "user" | "assistant" | "error" | "system" | "running";
@@ -248,89 +163,10 @@ interface ChatEntry {
   steerQueuePos?: number;
 }
 
-// ---------------- 会话持久化（类型与后端 sessions.rs 对应） ----------------
 
-/** 一次模型调用的 token 用量（后端 `llm::TokenUsage` 的归一化结果） */
-interface TokenUsage {
-  prompt: number;
-  completion: number;
-  /** 思维链 token（部分模型单独给） */
-  reasoning?: number;
-  /** 缓存命中（读）token */
-  cacheHit?: number;
-  /** 缓存写入 token */
-  cacheWrite?: number;
-  total: number;
-}
 
-interface StoredMsg {
-  role: "user" | "assistant";
-  text: string;
-  images?: string[];
-  steps?: AgentStep[];
-  /** 本轮的思考过程。老数据没有这个字段 */
-  reasoning?: string;
-  /** 本轮被中断（text 是半截） */
-  interrupted?: boolean;
-  /**
-   * **未定稿**的助手消息（"退出不丢轮"机制）。
-   *
-   * 进程在轮内被关掉时，磁盘上留下的是"跑到一半"的占位消息：它带着已产出的
-   * 思考与工具步骤，但没有最终正文。UI 要明确告诉用户"这轮没跑完"，
-   * 否则会被当成正常回答。
-   */
-  partial?: boolean;
-  /** 插话 id —— UI 不铺气泡，画在 steps 时间线（真实交错） */
-  steerId?: string;
-  /** 生成本条回答的模型 id（用量统计用）。老数据没有 */
-  model?: string;
-  /** 本轮问答的 token 用量合计。老数据 / 服务端没给 usage → 无此字段 */
-  usage?: TokenUsage;
-  at: number;
-}
 
-interface Session {
-  id: string;
-  title: string;
-  createdAt: number;
-  updatedAt: number;
-  messages: StoredMsg[];
-  /** main = 主聊天（唯一、不可删、可被分叉）；task = 任务会话；fork = 分叉出来的会话 */
-  kind: "main" | "task" | "fork";
-  /** 分叉来源（只有 kind === "fork" 时有） */
-  forkedFrom?: string;
-  /** 分叉点：源会话里的第几条消息 */
-  forkAt?: number;
-  /**
-   * 这条会话**自己的** Agent 模式 id。
-   *
-   * 约定："模式跟会话走，一个会话模式不能变"。建会话时定死，之后只读。
-   * 老会话（升级前建的）磁盘上没这个字段 → Rust 侧兜到内置默认
-   * （`modes::DEFAULT_MODE_ID` = standard），所以这里在切到老会话后可能短暂是
-   * undefined —— 真正判定模式一律走 `currentModeId()`（它自己带兜底）。
-   */
-  mode?: string;
-}
 
-interface SessionMeta {
-  id: string;
-  title: string;
-  createdAt: number;
-  updatedAt: number;
-  count: number;
-  current: boolean;
-  /** 主会话固定在列表置顶且不可删；fork 是分叉出来的会话，其余都是任务会话 */
-  kind: "main" | "task" | "fork";
-  /** 已挂靠的项目名（右键挂靠后显示） */
-  projectName?: string | null;
-  /** 这条会话的模式 id（Rust `SessionMeta.mode` 必给：老会话回退成默认模式） */
-  mode: string;
-}
-
-interface SessionState {
-  session: Session;
-  list: SessionMeta[];
-}
 
 let currentSessionId = "";
 let sessionList: SessionMeta[] = [];
@@ -471,12 +307,7 @@ let dataDirExists = true;
 /** 启动自检：agent-data 不存在 / 没有模型 → 标记需要引导 */
 async function checkBoot(): Promise<void> {
   try {
-    const st = await invoke<{
-      needsInit: boolean;
-      hasModels: boolean;
-      dataDir: string;
-      dataDirExists?: boolean;
-    }>("boot_state");
+    const st = await data.system.bootState();
     needsInit = st.needsInit;
     hasModels = st.hasModels;
     // 老版本后端没这个字段 → 保守当成"存在"，宁可不说"不存在"也不说假话
@@ -494,7 +325,7 @@ async function checkBoot(): Promise<void> {
 
 async function loadSession(): Promise<void> {
   try {
-    const st = await invoke<SessionState>("session_state");
+    const st = await data.sessions.state();
     currentSessionId = st.session.id;
     sessionList = st.list;
     entries = sessionToEntries(st.session);
@@ -528,7 +359,7 @@ async function newSession(mode?: string): Promise<void> {
   // 而且你很可能正是因为"这边跑着、我还要开个新任务"才点它。
   try {
     const want = mode ?? defaultModeId ?? "standard";
-    const s = await invoke<Session>("session_new", { mode: want });
+    const s = await data.sessions.create( { mode: want });
     currentSessionId = s.id;
     entries = [];
     await refreshSessionList();
@@ -536,7 +367,7 @@ async function newSession(mode?: string): Promise<void> {
     await loadModes(s.id);
     // 只绑**这一条新会话**，不动其它
     if (activeProjectId != null) {
-      await invoke("pmem_bind_session", {
+      await data.projects.pmemBindSession( {
         sessionId: s.id,
         projectId: activeProjectId,
       }).catch(() => {});
@@ -571,7 +402,7 @@ async function switchSession(id: string): Promise<void> {
     return;
   }
   try {
-    const s = await invoke<Session>("session_switch", { id });
+    const s = await data.sessions.switch( { id });
     currentSessionId = s.id;
     entries = sessionToEntries(s);
     // 切回**正在跑的**会话时：磁盘上有一条 `partial` 占位（begin_turn 落的），
@@ -589,7 +420,7 @@ async function switchSession(id: string): Promise<void> {
     await refreshSessionProjectTags();
     // 顶栏跟着**会话**走：主聊天永不挂项目 → 记忆回「无任务空间」
     activeProjectId = sessionProjectId(sessionList.find((x) => x.id === id));
-    await invoke("pmem_set_active", { id: activeProjectId }).catch(() => {});
+    await data.projects.pmemSetActive( { id: activeProjectId }).catch(() => {});
     paintProjectSelect();
     // 计数是**按当前视图**的 —— 换会话就清零，别把上一条的"漏看 N 条"
     // 挂到这一条上（用户看到按钮上的 3 会以为这条有 3 条没看）
@@ -643,7 +474,7 @@ async function forkSession(upto: number): Promise<void> {
     return;
   }
   try {
-    const s = await invoke<Session>("session_fork", { upto });
+    const s = await data.sessions.fork( { upto });
     currentSessionId = s.id;
     entries = sessionToEntries(s);
     await refreshSessionList();
@@ -838,7 +669,7 @@ async function deleteMessagesFrom(upto: number): Promise<void> {
 
   let total = victims.length;
   try {
-    const st = await invoke<SessionState>("session_state");
+    const st = await data.sessions.state();
     total = Math.max(0, st.session.messages.length - upto);
   } catch {
     // 读不到就用面板上的估算，不影响确认框继续
@@ -851,7 +682,7 @@ async function deleteMessagesFrom(upto: number): Promise<void> {
   if (!ok) return;
 
   try {
-    const s = await invoke<Session>("session_truncate", { upto });
+    const s = await data.sessions.truncate( { upto });
     currentSessionId = s.id;
     entries = sessionToEntries(s);
     await refreshSessionList();
@@ -911,7 +742,7 @@ async function editUserMessage(upto: number): Promise<void> {
   // 要丢弃的条数（磁盘上 [upto..]）；读不到就按"含本条"最少 1 条提示
   let total = 1;
   try {
-    const st = await invoke<SessionState>("session_state");
+    const st = await data.sessions.state();
     total = Math.max(1, st.session.messages.length - upto);
   } catch {
     // 读不到会话状态就按最少 1 条提示，不拦操作
@@ -927,7 +758,7 @@ async function editUserMessage(upto: number): Promise<void> {
   );
   if (!ok) return;
   try {
-    const s = await invoke<Session>("session_truncate", { upto });
+    const s = await data.sessions.truncate( { upto });
     currentSessionId = s.id;
     entries = sessionToEntries(s);
     await refreshSessionList();
@@ -966,10 +797,16 @@ async function regenerateFrom(upto: number): Promise<void> {
     return;
   }
 
+  // 失败轮（R-033）：`upto` 之后**没有**落盘的条目 ⇒ 这一轮只落了提问，
+  // 回答没落上（写盘失败等）。重跑 = 保留那条提问、重发它。
+  const failedTurn = !entries.some((e) => e.storedIdx === upto);
+
   const ok = await askConfirm(
-    "重新生成这条回答？",
-    "将丢弃这条 AI 回复，并基于同一条提问重新生成。\n会重新消耗 token。",
-    "重新生成",
+    failedTurn ? "重跑这一轮？" : "重新生成这条回答？",
+    failedTurn
+      ? "这一轮没有跑完（回答没落盘）。\n要重新发送上面那条提问吗？会重新消耗 token。"
+      : "将丢弃这条 AI 回复，并基于同一条提问重新生成。\n会重新消耗 token。",
+    failedTurn ? "重跑" : "重新生成",
     false,
   );
   if (!ok) return;
@@ -980,7 +817,7 @@ async function regenerateFrom(upto: number): Promise<void> {
 
   try {
     // 1) 截断到那条提问之前（丢掉 assistant 及其后），保持"刚问完"的状态
-    const s = await invoke<Session>("session_truncate", { upto });
+    const s = await data.sessions.truncate( { upto });
     currentSessionId = s.id;
     entries = sessionToEntries(s);
     await refreshSessionList();
@@ -1020,10 +857,11 @@ async function resendPrompt(text: string, imgs: string[]): Promise<void> {
 
   try {
     // 选内核：pi 可用就走 pi，否则走自研的。
-    // ⚠️ 两个命令的**参数名与返回结构完全一致**（PiRun 是 AgentRun 的同构体），
+    // ⚠️ 两个方法的**参数名与返回结构完全一致**（PiRun 是 AgentRun 的同构体），
     //    所以这里只有一行分流，渲染逻辑一行都不用改。
-    const cmd = usePiKernel && piKernelAvailable ? "chat_pi" : "chat";
-    const run = await invoke<AgentRun>(cmd, { input: text, images: imgs });
+    const run = usePiKernel && piKernelAvailable
+      ? await data.chat.sendPi({ input: text, images: imgs })
+      : await data.chat.send({ input: text, images: imgs });
     // 用户可能在等的时候切走了 → 别动当前视图（结果后端已落回它自己的会话）
     if (runSid !== currentSessionId) return;
     const idx = entries.findIndex((x) => x.role === "running");
@@ -1061,7 +899,9 @@ function installRegenHandlers(): void {
     const btn = t.closest<HTMLElement>(".msg-regen");
     if (!btn) return;
     e.stopPropagation();
-    const upto = Number(btn.dataset.upto);
+    // 回答轮走 data-upto；失败轮走 data-rr（= 提问下标 + 1，语义见 renderRegenBtn）
+    const raw = btn.dataset.upto ?? btn.dataset.rr;
+    const upto = Number(raw);
     if (!Number.isFinite(upto) || upto < 0) return;
     void regenerateFrom(upto);
   });
@@ -1077,9 +917,9 @@ async function deleteSession(id: string): Promise<void> {
     const meta = sessionList.find((s) => s.id === id);
     const proj = meta?.projectName ?? null;
     const sibs = sessionList.filter((s) => s.projectName === proj && s.id !== id);
-    await invoke("session_delete", { id });
+    await data.sessions.delete( { id });
     // 若删的是当前会话，后端会切到别的 → 重新对齐
-    const st = await invoke<SessionState>("session_state");
+    const st = await data.sessions.state();
     currentSessionId = st.session.id;
     sessionList = st.list;
     entries = sessionToEntries(st.session);
@@ -1091,7 +931,7 @@ async function deleteSession(id: string): Promise<void> {
         true,
       );
       if (clear) {
-        await invoke("pmem_clear_memory", { name: proj }).catch(() => {});
+        await data.projects.pmemClear( { name: proj }).catch(() => {});
         showToast(`已清空「${proj}」项目记忆`, "ok");
       }
     }
@@ -1106,7 +946,7 @@ async function deleteSession(id: string): Promise<void> {
 
 async function refreshSessionList(): Promise<void> {
   try {
-    const st = await invoke<SessionState>("session_state");
+    const st = await data.sessions.state();
     sessionList = st.list;
     currentSessionId = st.session.id;
   } catch {
@@ -1412,13 +1252,13 @@ async function showNewMenu(x: number, y: number): Promise<void> {
     );
     if (!got?.name) return;
     try {
-      const p = await invoke<ProjectRow>("pmem_create", {
+      const p = await data.projects.pmemCreate( {
         name: got.name,
         rootPath: got.root || null,
       });
       await loadProjects();
       activeProjectId = p.id;
-      await invoke("pmem_set_active", { id: p.id }).catch(() => {});
+      await data.projects.pmemSetActive( { id: p.id }).catch(() => {});
       await refreshSessionProjectTags();
       showToast(`已创建「${p.name}」，再选个模式开新会话`, "ok", 2600);
       // 项目就位、会话还没建 → 原地重开菜单让用户定模式（新会话会绑到 p.id）
@@ -1446,7 +1286,7 @@ async function showNewMenu(x: number, y: number): Promise<void> {
 /** 切换「后台执行」到指定状态（设置页的复选框用） */
 async function setBgDesk(on: boolean): Promise<void> {
   try {
-    await invoke<boolean>("bg_desk_set", { enabled: on });
+    await data.settings.bgDeskSet( { enabled: on });
     bgDeskEnabled = on;
     await loadBgDesk();
     showToast(on ? "已切到后台执行（隐形桌面）" : "已切回前台执行", "ok", 2600);
@@ -1472,8 +1312,7 @@ let modesStamp = 0;
 async function loadModes(sessionId?: string): Promise<void> {
   const my = ++modesStamp;
   try {
-    const r = await invoke<{ activeMode: string; defaultMode?: string; modes: ModeView[] }>(
-      "modes_get",
+    const r = await data.settings.modesGet(
       // `|| null` 而不是 `?? null`：`currentSessionId` 在会话加载完成前是**空串**，
       // 空串会被 Rust 当成 `Some("")` 去查一条不存在的会话。统一成 null 走默认模式。
       { sessionId: sessionId || null },
@@ -1491,12 +1330,7 @@ async function loadModes(sessionId?: string): Promise<void> {
 /** 拉一次「后台执行」状态（启动、开关后、面板展开时调） */
 async function loadBgDesk(): Promise<void> {
   try {
-    const r = await invoke<{
-      enabled: boolean;
-      available: boolean;
-      error: string | null;
-      windows: { title: string; width: number; height: number; pid: number }[];
-    }>("bg_desk_status");
+    const r = await data.settings.bgDeskStatus();
     bgDeskEnabled = !!r?.enabled;
     bgDeskError = r?.error ?? null;
     bgDeskWindows = Array.isArray(r?.windows) ? r.windows : [];
@@ -1544,7 +1378,7 @@ function showSessionBindMenu(x: number, y: number, sid: string, kind: string): v
       if (!got?.title) return;
       // 用 session_set_title；后端若无则回退 truncate 不可 —— 需已有命令
       try {
-        await invoke("session_set_title", { id: sid, title: got.title });
+        await data.sessions.setTitle( { id: sid, title: got.title });
         await refreshSessionList();
         renderBody();
         showToast("已重命名", "ok", 2000);
@@ -1562,7 +1396,7 @@ function showSessionBindMenu(x: number, y: number, sid: string, kind: string): v
       const ok = await askConfirm("删除会话", `确定删除「${meta?.title ?? sid}」？`, "删除");
       if (!ok) return;
       try {
-        await invoke("session_delete", { id: sid });
+        await data.sessions.delete( { id: sid });
         // 最后一条才问清不清项目记忆
         if (proj && sibs.length === 0) {
           const clear = await askConfirm(
@@ -1572,7 +1406,7 @@ function showSessionBindMenu(x: number, y: number, sid: string, kind: string): v
             true,
           );
           if (clear) {
-            await invoke("pmem_clear_memory", { name: proj }).catch(() => {});
+            await data.projects.pmemClear( { name: proj }).catch(() => {});
             showToast(`已清空「${proj}」项目记忆`, "ok");
           }
         }
@@ -1595,7 +1429,7 @@ function showSessionBindMenu(x: number, y: number, sid: string, kind: string): v
       }
       const pid = t.dataset.pid === "" ? null : Number(t.dataset.pid);
       try {
-        await invoke("pmem_bind_session", { sessionId: sid, projectId: pid });
+        await data.projects.pmemBindSession( { sessionId: sid, projectId: pid });
         await refreshSessionProjectTags();
         renderBody();
         showToast(
@@ -1617,14 +1451,14 @@ function showSessionBindMenu(x: number, y: number, sid: string, kind: string): v
 /** 拉 session→项目名 映射；顺带把误绑到项目上的主聊天解绑 */
 async function refreshSessionProjectTags(): Promise<void> {
   try {
-    const map = await invoke<Record<string, string | null>>("pmem_session_map");
+    const map = await data.projects.pmemSessionMap();
     for (const s of sessionList) {
       s.projectName = map[s.id] ?? null;
     }
     // 主聊天永不挂项目 —— 清历史脏数据
     for (const s of sessionList) {
       if (s.kind === "main" && s.projectName) {
-        await invoke("pmem_bind_session", { sessionId: s.id, projectId: null }).catch(() => {});
+        await data.projects.pmemBindSession( { sessionId: s.id, projectId: null }).catch(() => {});
         s.projectName = null;
       }
     }
@@ -1769,7 +1603,7 @@ function alignProjectToSession(): void {
   const want = sessionProjectId(meta);
   if (want !== activeProjectId) {
     activeProjectId = want;
-    void invoke("pmem_set_active", { id: want }).catch(() => {});
+    void data.projects.pmemSetActive( { id: want }).catch(() => {});
   }
   paintProjectSelect();
 }
@@ -1821,7 +1655,7 @@ function installSessionBindHandler(root: HTMLElement): void {
       );
       if (!got?.name || got.name === pname) return;
       try {
-        await invoke("pmem_rename", { id: pid, name: got.name });
+        await data.projects.pmemRename( { id: pid, name: got.name });
         await loadProjects();
         if (activeProjectId === pid) {
           // 名字变了，active 不变
@@ -1854,8 +1688,7 @@ async function compactCurrent(): Promise<void> {
     btn.textContent = "压缩中…（要发一次模型请求）";
   }
   try {
-    const r = await invoke<{ summarized: number; kept: number; summaryChars: number }>(
-      "session_compact",
+    const r = await data.sessions.compact(
       { force: true },
     );
     showToast(
@@ -1871,103 +1704,11 @@ async function compactCurrent(): Promise<void> {
   }
 }
 
-/** Rust 侧推上来的进度事件 */
-interface ProgressEvent {
-  kind:
-    | "thinking"
-    | "status"
-    | "delta"
-    | "toolCall"
-    | "toolResult"
-    | "toolError"
-    | "toolTick"
-    | "answering"
-    | "discardStream"
-    | "steer";
-  iteration?: number;
-  /** delta / status */
-  text?: string;
-  /**
-   * status：这是否是「值得留在时间线」的状态（限流退避重试）。
-   *
-   * 「正在请求 / 等首包」这类过场状态只刷标题，不进时间线 —— 每轮都有，
-   * 记下来纯属刷屏。后端按同一条件决定要不要落盘。
-   */
-  retry?: boolean;
-  reasoning?: string;
-  /** tool* */
-  name?: string;
-  args?: string;
-  preview?: string;
-  message?: string;
-  /** toolTick：长工具执行心跳（已运行秒数 + 输出尾巴） */
-  elapsedSecs?: number;
-  tail?: string;
-  /**
-   * 工具耗时（毫秒）—— pi 的 `tool_execution_end.durationMs`，
-   * 自研内核是后端掐的表。工具行后面显示「· 1.2s」。
-   */
-  durationMs?: number;
-  /** discardStream */
-  reason?: string;
-  /** steer：被消费掉的那条插话的 id */
-  id?: string;
-  /** steer：插话附带的图片（文件路径）；插话不铺气泡，图要画在时间线 steer 条目上 */
-  images?: string[];
-}
 
-interface Candidate {
-  id: string;
-  content: string;
-  source: string;
-  created_at: string;
-  /** 触发轮次（用户原话，截断过）—— 后端可选，老数据没有 */
-  turn_ref?: string | null;
-}
 
-/** 审批页底部状态栏的统计（后端 `mem_stats`） */
-interface MemStats {
-  /** 当前待批数 */
-  pending: number;
-  /** 已处理数（已批准 + 已驳回） */
-  handled: number;
-}
 
-interface McpGroupView {
-  name: string;
-  summary: string;
-  toolCount: number;
-  tokens: number;
-  active: boolean;
-  hasDestructive: boolean;
-}
 
-interface McpStatus {
-  connected: boolean;
-  error: string | null;
-  /** 当前网关地址；空串 = 未配置（没有默认值，不配就不启用） */
-  url: string;
-  /** 活跃工具 schema 的粗略 token 估算（仅展示，无加载上限） */
-  activeTokens: number;
-  groups: McpGroupView[];
-}
 
-/** 一条 MCP server 配置（对应 Rust `config::McpServerCfg`，camelCase 序列化） */
-interface McpServerCfg {
-  id: string;
-  /** HTTP 形态的网关地址；stdio 形态留空 */
-  url: string;
-  enabled: boolean;
-  label: string;
-  /** "auto" | "http" | "stdio"；缺省按 url / command 推断 */
-  transport?: "auto" | "http" | "stdio";
-  /** stdio 形态：可执行文件 / 脚本路径 */
-  command?: string;
-  /** stdio 形态：argv（逐参传递，不经 shell） */
-  args?: string[];
-  /** stdio 形态：附加环境变量 */
-  env?: Record<string, string>;
-}
 
 /**
  * MCP server 列表的**前端权威副本**。
@@ -1979,33 +1720,7 @@ interface McpServerCfg {
  */
 let mcpServers: McpServerCfg[] = [];
 
-// ---------------- 项目（拼装包，对应 Rust `project.rs`） ----------------
 
-/** 一个项目包（`projects/<id>/project.json`）的清单摘要 */
-interface BundleInfo {
-  id: string;
-  name: string;
-  description: string;
-  active: boolean;
-  /** false = schema 不认识 / 结构不合法（设置页标黄，可看 error） */
-  valid: boolean;
-  error?: string | null;
-  skillCount: number;
-  toolCount: number;
-  /** 带权限预设（导入时要提示用户确认） */
-  hasPermPreset: boolean;
-}
-
-/** `project_list` 的返回 */
-interface ProjectListView {
-  bundles: BundleInfo[];
-  active: string | null;
-  /** 引用解析失败项：`[类别, id, 原因]` */
-  unresolved: [string, string, string][];
-  /** permPreset 被整份丢弃的原因（fail-closed） */
-  permError: string | null;
-  tools: { name: string; description: string; template: string[]; perm: string }[];
-}
 
 /**
  * 设置入口页要的项目摘要（懒加载，进页面时才有）。
@@ -2272,12 +1987,6 @@ type View =
 
 let view: View = "chat";
 
-/** 权限规则（前端镜像，用于渲染） */
-interface PermRule {
-  prefix: string;
-  access: "deny" | "read" | "readwrite" | "full";
-  label: string;
-}
 
 /** 开机自启是否已开启（设置页显示用） */
 let autostartOn = false;
@@ -2330,27 +2039,6 @@ let activeModeId = "standard";
 let defaultModeId = "standard";
 let modesCache: ModeView[] = [];
 
-interface ModeView {
-  id: string;
-  name: string;
-  description: string;
-  /** 工具呈现方式：`native` / `ptc`（老后端不返回时按 native 处理） */
-  toolPresentation?: "native" | "ptc";
-  /**
-   * 正文能不能发图。老后端不返回时按 `work` 处理。
-   *
-   * ⚠️ 只用于**显示**，前端不做拦截：工作模式也要渲染产物图（截图/图表），
-   * 按这个值降级会把它一起挡掉。真正的约束在系统提示的措辞里。
-   */
-  imageReplies?: "work" | "free";
-  /** 模式注入的场景上下文（可能为空） */
-  promptExtra?: string;
-  /**
-   * 聊天式呈现：一条回复拆成多个气泡、且**不显示过程**。
-   * 只有闲聊模式开 —— 工作模式的结构化长答案切成 5 个泡会非常难读。
-   */
-  chatty?: boolean;
-}
 
 /** 每个内置模式的图标。模式是 JSON 自定义的，认不出来就用通用图标。 */
 const MODE_ICON: Record<string, string> = {
@@ -2686,7 +2374,7 @@ async function sleepOrb(): Promise<void> {
   } else {
     applyOrbState();
   }
-  await invoke("orb_ui_action", { action: "sleep" }).catch((e) =>
+  await data.system.orbUiAction( { action: "sleep" }).catch((e) =>
     console.error("[orbcat] 睡眠失败:", e),
   );
 }
@@ -2703,7 +2391,7 @@ async function sleepOrb(): Promise<void> {
 async function wakeOrb(): Promise<void> {
   orbSleeping = false;
   applyOrbState();
-  await invoke("orb_ui_action", { action: "wake" }).catch((e) =>
+  await data.system.orbUiAction( { action: "wake" }).catch((e) =>
     console.error("[orbcat] 唤醒失败:", e),
   );
 }
@@ -2720,7 +2408,7 @@ function installOrbUiListener(): void {
     applyOrbState();
   });
   // 启动补拉：前端重载后同步一次（后端状态是内存态，重启后恒为清醒）
-  void invoke<{ sleeping: boolean }>("orb_ui_state")
+  void data.system.orbUiState()
     .then((s) => {
       orbSleeping = !!s?.sleeping;
       applyOrbState();
@@ -2745,7 +2433,7 @@ function installOpenPanelListener(): void {
     void openPanelFromOutside();
   });
   // 兜底：启动时问一次"刚才有没有人让我打开面板"
-  void invoke<boolean>("take_open_panel_request")
+  void data.system.takeOpenPanelRequest()
     .then((pending) => {
       if (pending) void openPanelFromOutside();
     })
@@ -2775,7 +2463,7 @@ async function openPanelFromOutside(): Promise<void> {
   // 告诉后端"这次开面板我接住了" —— 它在等这个确认来决定要不要自愈退回球态
   // （不确认 = 前端不在场/启动失败 → 后端把窗口退回球状，免得留一个
   //  面板大小、里面画着球的坏窗口）
-  void invoke("confirm_panel_opened").catch(() => {});
+  void data.system.confirmPanelOpened().catch(() => {});
 }
 
 // ---------------- 图片缩略图缓存 ----------------
@@ -2804,7 +2492,7 @@ function thumbOf(path: string): string | null {
   if (thumbCache.has(path)) return thumbCache.get(path)!; // "" = 已判定读不出来
   if (!thumbInflight.has(path)) {
     thumbInflight.add(path);
-    void invoke<string>("image_thumb", { path, maxEdge: 320 })
+    void data.system.imageThumb( { path, maxEdge: 320 })
       .then((url) => {
         thumbCache.set(path, url);
       })
@@ -2863,7 +2551,7 @@ function bodyImgOf(path: string): string | null {
   if (bodyImgCache.has(path)) return bodyImgCache.get(path)!;
   if (!bodyImgInflight.has(path)) {
     bodyImgInflight.add(path);
-    void invoke<string>("image_thumb", { path, maxEdge: BODY_IMG_MAX_EDGE })
+    void data.system.imageThumb( { path, maxEdge: BODY_IMG_MAX_EDGE })
       .then((url) => {
         bodyImgCache.set(path, url);
       })
@@ -4120,7 +3808,7 @@ function renderMessagesInner(): string {
           // 点了毫无反应"的前科（flow.behavior.test.ts:70 的注释），
           // 宁可不加，也不摆一个假的。
           e.text || e.storedIdx !== undefined
-            ? `<div class="msg-foot">${tokBadge}<span class="msg-more">${renderEditBtn(e, lastUserStored)}${renderForkBtn(e)}${renderRegenBtn(e)}${renderDelBtn(e)}${
+            ? `<div class="msg-foot">${tokBadge}<span class="msg-more">${renderEditBtn(e, lastUserStored)}${renderForkBtn(e)}${renderRegenBtn(e, idx)}${renderDelBtn(e)}${
                 e.text
                   ? `<button type="button" class="msg-copy" data-idx="${idx}" title="复制这条消息">复制</button>`
                   : ""
@@ -4419,7 +4107,7 @@ function refreshPermCards(): void {
 async function decidePerm(id: string, act: string, reason = ""): Promise<void> {
   try {
     // reason 只在拒绝时有意义（批准时后端会忽略），原样回给模型当"为什么不行"
-    await invoke("perm_request_decide", { id, decision: act, reason });
+    await data.permissions.decide( { id, decision: act, reason });
   } catch (e) {
     const msg = String(e);
     // 已被处理 / 超时作废：卡片留着也没意义，安静移除即可
@@ -4474,7 +4162,7 @@ function installPermHandlers(): void {
   });
 
   // 启动补拉：前端重载后别把已经挂起的申请弄丢（后端还在阻塞等它）
-  void invoke<PendingPerm[]>("perm_requests_list")
+  void data.permissions.requests()
     .then((list) => {
       if (list.length === 0) return;
       pendingPerms = list;
@@ -4618,10 +4306,10 @@ function renderPanelRefreshChip(): void {
  * 排查时截图可能拿不到，日志文件是可靠通道。
  */
 function openModelsWindow(): void {
-  void invoke("models_window_open").catch((err) => {
+  void data.models.windowOpen().catch((err) => {
     const msg = `打开模型管理失败：${err}`;
     showToast(msg, "error");
-    void invoke("diag_log", { msg: `main.ts ${msg}` }).catch(() => {});
+    void data.system.diagLog( { msg: `main.ts ${msg}` }).catch(() => {});
   });
 }
 
@@ -4696,7 +4384,7 @@ function paintModelsDropdown(anchorId = "model-chip"): void {
       paintModelsDropdown();
       renderPanelRefreshChip();
       renderImageHint(); // 换模型可能改变「支不支持图片」
-      await invoke("set_selected_model", { id: selectedModel, url: selectedModelUrl }).catch(
+      await data.models.select( { id: selectedModel, url: selectedModelUrl }).catch(
         (err) => pushEntry("error", `保存模型选择失败：${err}`),
       );
     }),
@@ -4938,7 +4626,7 @@ function renderPanel(): void {
     const id = psel.value === "" ? null : Number(psel.value);
     activeProjectId = id;
     try {
-      await invoke("pmem_set_active", { id });
+      await data.projects.pmemSetActive( { id });
       // 只切记忆上下文，不改任何会话的挂靠
       await refreshSessionProjectTags();
     } catch (e) {
@@ -5050,27 +4738,7 @@ function renderPanel(): void {
   void refreshFgCtx();
 }
 
-/** 前台应用指示条 —— 展示「用户最近在看的几个应用/目录」 */
-interface FgCtx {
-  app: string;
-  title: string;
-  dir: string | null;
-  file: string | null;
-}
 
-/**
- * 前台上下文的能力级别（对应 Rust 侧 `platform::ContextCapability`）。
- *
- * macOS 上「知道你在哪个 app」和「知道你在编辑哪个文件」是两个权限级别，
- * 所以这里要区分 `appOnly` 与 `full`，据此决定要不要引导用户授权。
- * Windows 恒为 `full`（不需要任何系统权限），这段逻辑在 Windows 上不会触发。
- */
-interface ContextCapability {
-  level: "unavailable" | "appOnly" | "full";
-  detail: string;
-  canRequest: boolean;
-  needsSystemSettings: boolean;
-}
 
 /** 能力级别缓存。Windows 上第一次问完就固定了；macOS 上会随用户授权而变。 */
 let fgCapability: ContextCapability | null = null;
@@ -5089,7 +4757,7 @@ async function fetchCapability(force = false): Promise<ContextCapability | null>
   if (!force && fgCapability && fgCapability.level !== "appOnly") return fgCapability;
   try {
     const c = await withTimeout(
-      invoke<ContextCapability>("context_capability"),
+      data.system.contextCapability(),
       1500,
       null as ContextCapability | null,
     );
@@ -5110,7 +4778,7 @@ async function fetchCapability(force = false): Promise<ContextCapability | null>
  */
 async function requestFgPermission(): Promise<void> {
   try {
-    await invoke("request_context_permission");
+    await data.system.requestContextPermission();
   } catch {
     // 非 macOS 或用户拒绝：走降级，不打扰
     fgCapabilityDismissed = true;
@@ -5191,7 +4859,7 @@ async function refreshFgCtx(loop = true): Promise<void> {
   }
   try {
     const list = await withTimeout(
-      invoke<FgCtx[]>("foreground_history"),
+      data.system.foregroundHistory(),
       2000,
       [] as FgCtx[],
     );
@@ -5252,7 +4920,7 @@ async function refreshFgCtx(loop = true): Promise<void> {
       });
       document.getElementById("fg-perm-open")?.addEventListener("click", (e) => {
         e.stopPropagation();
-        void invoke("open_accessibility_settings").catch(() => {});
+        void data.system.openAccessibilitySettings().catch(() => {});
       });
       document.getElementById("fg-perm-no")?.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -5441,11 +5109,11 @@ function renderBody(): void {
     const keepMem = b.scrollTop;
     b.innerHTML = `<div class="mem-loading">加载中…</div>`;
     void Promise.all([
-      invoke<Candidate[]>("mem_pending").catch(() => [] as Candidate[]),
-      invoke<MemoryFiles>("mem_files").catch(() => null),
-      invoke<SkillInfo[]>("skills_list").catch(() => [] as SkillInfo[]),
-      invoke<ProjectMemoryView[]>("mem_projects").catch(() => [] as ProjectMemoryView[]),
-      invoke<MemStats>("mem_stats").catch(() => null),
+      data.memory.pending().catch(() => [] as Candidate[]),
+      data.memory.files().catch(() => null),
+      data.system.skillsList().catch(() => [] as SkillInfo[]),
+      data.memory.projects().catch(() => [] as ProjectMemoryView[]),
+      data.memory.stats().catch(() => null),
     ]).then(([list, files, sk, projects, st]) => {
       if (view !== "mem") return;
       b.innerHTML = renderMemView(list, files, sk, projects ?? [], st);
@@ -5494,21 +5162,21 @@ function renderBody(): void {
     b.innerHTML = `<div class="mem-loading">加载中…</div>`;
     const bd = <T,>(pr: Promise<T>, fb: T) => withTimeout(pr, 3000, fb);
     void Promise.all([
-      bd(invoke<McpStatus>("mcp_status").catch(() => null), null),
-      bd(invoke<Candidate[]>("mem_pending").catch(() => [] as Candidate[]), [] as Candidate[]),
-      bd(invoke<boolean>("autostart_status").catch(() => false), false),
+      bd(data.mcp.status().catch(() => null), null),
+      bd(data.memory.pending().catch(() => [] as Candidate[]), [] as Candidate[]),
+      bd(data.settings.autostartStatus().catch(() => false), false),
       
-      bd(invoke<{ blurCollapse?: boolean; projectDirAutoread?: boolean }>("get_settings").catch(() => null), null),
-      bd(invoke<UsageRecord[]>("usage_report").catch(() => [] as UsageRecord[]), [] as UsageRecord[]),
-      bd(invoke<SearchStatus | null>("search_status").catch(() => null), null),
-      bd(invoke<RecoveryState>("recovery_state").catch(() => null), null),
-      bd(invoke<ProjectListView>("project_list").catch(() => null), null),
+      bd(data.settings.get().catch(() => null), null),
+      bd(data.system.usageReport().catch(() => [] as UsageRecord[]), [] as UsageRecord[]),
+      bd(data.search.status().catch(() => null), null),
+      bd(data.recovery.state().catch(() => null), null),
+      bd(data.projects.list().catch(() => null), null),
       // 数据源：摘要行要显示条数，所以这里拉一次（内部对未启用的源不读取）
-      bd(invoke<LifeStatus>("life_status").catch(() => null), null),
+      bd(data.life.status().catch(() => null), null),
       // 技能：同样只为摘要里的个数（skills_list 是热扫描目录，失败退化成空）
-      bd(invoke<SkillInfo[]>("skills_list").catch(() => [] as SkillInfo[]), [] as SkillInfo[]),
+      bd(data.system.skillsList().catch(() => [] as SkillInfo[]), [] as SkillInfo[]),
       // 命令策略：设置页「行为与安全」组要显示「N 条规则 · M 条硬阻断」
-      bd(invoke<{ allow?: string[]; hardBlock?: string[] }>("perm_cmd_policy").catch(() => null), null),
+      bd(data.permissions.cmdPolicy().catch(() => null), null),
     ])
       .then(([mcp, pending, autoOn, settings, usage, search, recovery, proj, life, skills, cmdPolicy]) => {
         if (view !== "settings") return;
@@ -5521,7 +5189,7 @@ function renderBody(): void {
         skillsCache = skills;
         cmdPolicyCounts = {
           allow: cmdPolicy?.allow?.length ?? 0,
-          hard: cmdPolicy?.hardBlock?.length ?? 0,
+          hard: cmdPolicy?.hard_block?.length ?? 0,
         };
         const tSum = todayTokenTotal(usage);
         const summary = usage.length ? `今日 ${fmtTokens(tSum)} · 共 ${usage.length} 次问答` : "暂无记录";
@@ -5542,7 +5210,7 @@ function renderBody(): void {
 
   if (view === "search") {
     b.innerHTML = `<div class="mem-loading">加载中…</div>`;
-    void invoke<SearchStatus | null>("search_status")
+    void data.search.status()
       .catch(() => null)
       .then((st) => {
         if (view !== "search") return;
@@ -5555,7 +5223,7 @@ function renderBody(): void {
 
   if (view === "life") {
     b.innerHTML = `<div class="mem-loading">加载中…</div>`;
-    void invoke<LifeStatus>("life_status")
+    void data.life.status()
       .then((st) => {
         if (view !== "life") return;
         lifeInfo = st;
@@ -5576,7 +5244,7 @@ function renderBody(): void {
 
   if (view === "perm") {
     b.innerHTML = `<div class="mem-loading">加载中…</div>`;
-    void invoke<PermRule[]>("perm_rules")
+    void data.permissions.rules()
       .then((rules) => {
         if (view !== "perm") return;
         b.innerHTML = renderPermView(rules);
@@ -5594,10 +5262,10 @@ function renderBody(): void {
     const keep = b.scrollTop;
     b.innerHTML = `<div class="mem-loading">加载中…</div>`;
     void Promise.all([
-      invoke<CmdPolicy>("perm_cmd_policy").catch(() => ({ allow: [], hard_block: [] })),
-      invoke<string>("perm_cmd_policy_path").catch(() => ""),
-      invoke<CmdGrantsView[]>("perm_cmd_grants_list").catch(() => [] as CmdGrantsView[]),
-      invoke<CmdAuditRecord[]>("perm_cmd_audit_tail", { limit: 80 }).catch(() => [] as CmdAuditRecord[]),
+      data.permissions.cmdPolicy().catch(() => ({ allow: [], hard_block: [] })),
+      data.permissions.cmdPolicyPath().catch(() => ""),
+      data.permissions.cmdGrants().catch(() => [] as CmdGrantsView[]),
+      data.permissions.cmdAuditTail( { limit: 80 }).catch(() => [] as CmdAuditRecord[]),
     ])
       .then(([policy, path, grants, audit]) => {
         if (view !== "cmdpolicy") return;
@@ -5628,13 +5296,13 @@ function renderBody(): void {
     const keep = b.scrollTop;
     b.innerHTML = `<div class="mem-loading">加载中…</div>`;
     void Promise.all([
-      invoke<McpStatus>("mcp_status").catch(() => null),
-      invoke<McpServerCfg[]>("mcp_servers_list").catch(() => [] as McpServerCfg[]),
-      invoke<string[]>("mcp_grants_list").catch(() => [] as string[]),
-      invoke<Record<string, boolean>>("mcp_group_settings").catch(() => ({})),
-      invoke<BuiltinToolInfo[]>("builtin_tools").catch(() => [] as BuiltinToolInfo[]),
-      invoke<SkillInfo[]>("skills_list").catch(() => [] as SkillInfo[]),
-      invoke<{ builtinToolsEnabled?: boolean }>("get_settings").catch(() => null),
+      data.mcp.status().catch(() => null),
+      data.mcp.serversList().catch(() => [] as McpServerCfg[]),
+      data.mcp.grantsList().catch(() => [] as string[]),
+      data.mcp.groupSettings().catch(() => ({})),
+      data.system.builtinTools().catch(() => [] as BuiltinToolInfo[]),
+      data.system.skillsList().catch(() => [] as SkillInfo[]),
+      data.settings.get().catch(() => null),
     ])
       .then(([st, servers, grants, grpSettings, builtins, skills, stg]) => {
         if (view !== "mcp") return;
@@ -5667,7 +5335,7 @@ function renderBody(): void {
   if (view === "project") {
     const keep = b.scrollTop;
     b.innerHTML = `<div class="mem-loading">加载中…</div>`;
-    void invoke<ProjectListView>("project_list")
+    void data.projects.list()
       .then((v) => {
         if (view !== "project") return;
         projectInfo = v;
@@ -5685,7 +5353,7 @@ function renderBody(): void {
   if (view === "recovery") {
     const keep = b.scrollTop;
     b.innerHTML = `<div class="mem-loading">加载中…</div>`;
-    void invoke<RecoveryState>("recovery_state")
+    void data.recovery.state()
       .then((st) => {
         if (view !== "recovery") return;
         b.innerHTML = renderRecoveryView(st, subHeader("备份与回收站"));
@@ -5708,7 +5376,7 @@ function renderBody(): void {
   if (view === "usage") {
     const keep = b.scrollTop;
     b.innerHTML = `<div class="mem-loading">加载中…</div>`;
-    void invoke<UsageRecord[]>("usage_report")
+    void data.system.usageReport()
       .then((recs) => {
         if (view !== "usage") return;
         b.innerHTML = renderUsageView(recs ?? []);
@@ -5782,13 +5450,7 @@ function bindInitPrompt(root: HTMLElement): void {
     btn.disabled = true;
     btn.textContent = "创建中…";
     try {
-      const r = await invoke<{
-        dataDir: string;
-        createdDirs: string[];
-        createdFiles: string[];
-        skipped: string[];
-        hasModels: boolean;
-      }>("bootstrap_data");
+      const r = await data.system.bootstrapData();
 
       console.log(
         `[orbcat] 初始化完成：建目录 ${r.createdDirs.length} 个 / 建文件 ${r.createdFiles.length} 个 / 跳过 ${r.skipped.length} 个 → ${r.dataDir}`,
@@ -5813,54 +5475,11 @@ function bindInitPrompt(root: HTMLElement): void {
   });
 }
 
-/** 记忆文件族（Rust mem_files 返回） */
-interface MemoryFiles {
-  rules: string;
-  soul: string;
-  identity: string;
-  user: string;
-  memory: string;
-}
 
-interface ProjectMemoryView {
-  name: string;
-  source: string;
-  sourceAlive: boolean;
-  hasMemory: boolean;
-}
 
-interface CmdPolicy {
-  allow: string[];
-  hard_block: string[];
-}
 
-interface CmdGrantsView {
-  fingerprint: string;
-  display: string;
-  scope: string;
-  tier: string;
-  remaining?: number | null;
-  reason?: string;
-}
 
-interface CmdVerdictView {
-  verdict: "allow" | "ask" | "hard-block" | string;
-  reason: string;
-  risk: string;
-  normalized: string;
-}
 
-interface CmdAuditRecord {
-  ts: number;
-  sequence: number;
-  event: string;
-  source: string;
-  command: string;
-  normalized: string;
-  cwd: string;
-  risk: string;
-  exit_code?: number | null;
-}
 
 const MEM_FILE_DEFS: Array<{ key: keyof MemoryFiles; icon: string; name: string; desc: string }> = [
   { key: "rules", icon: "⚠️", name: "RULES.md", desc: "行为红线（最高优先级）" },
@@ -5870,12 +5489,6 @@ const MEM_FILE_DEFS: Array<{ key: keyof MemoryFiles; icon: string; name: string;
   { key: "memory", icon: "📜", name: "memory/MEMORY.md", desc: "长期记忆（审批后写入）" },
 ];
 
-/// 技能清单项（Rust `skills_list` 返回）
-interface SkillInfo {
-  name: string;
-  description: string;
-  path: string;
-}
 
 
 /**
@@ -6045,7 +5658,7 @@ function bindMemButtons(root: HTMLElement): void {
   //    用的是 `.mem-btn` 配色，别把它们绑成批准/驳回。
   root.querySelectorAll<HTMLButtonElement>(".mem-cand-btn.approve[data-id]").forEach((btn) =>
     btn.addEventListener("click", async () => {
-      await invoke("mem_approve", { id: btn.dataset.id }).catch((e) =>
+      await data.memory.approve( { id: btn.dataset.id ?? "" }).catch((e) =>
         pushEntry("error", `批准失败：${e}`),
       );
       renderBody();
@@ -6069,7 +5682,7 @@ function bindMemButtons(root: HTMLElement): void {
       // 驳回理由跟着一起留档（2026-05-15）：rejected.jsonl 是留档，
       // 只留内容不留理由，过几天只能问人「这条当初为什么被打回」。
       const reason = box.value.trim() ?? "";
-      await invoke("mem_reject", { id, reason }).catch((e) =>
+      await data.memory.reject( { id, reason }).catch((e) =>
         pushEntry("error", `驳回失败：${e}`),
       );
       renderBody();
@@ -6115,7 +5728,7 @@ function bindMemButtons(root: HTMLElement): void {
         return;
       }
       try {
-        await invoke("mem_rewrite", { id, content: text });
+        await data.memory.rewrite( { id, content: text });
         showToast("已改写，点「批准」写进长期记忆", "ok", 2400);
       } catch (e) {
         pushEntry("error", `改写失败：${e}`);
@@ -6149,7 +5762,7 @@ function bindMemButtons(root: HTMLElement): void {
       );
       if (!ok) return;
       try {
-        const dest = await invoke<string>("mem_project_archive", { name });
+        const dest = await data.memory.projectArchive( { name });
         showToast(`已归档到 ${dest}`, "ok", 4500);
       } catch (e) {
         showToast(`归档失败：${e}`, "error");
@@ -6176,7 +5789,7 @@ function bindMemButtons(root: HTMLElement): void {
  */
 async function distillStart(): Promise<void> {
   try {
-    const s = await invoke<Session>("distill_session_open");
+    const s = await data.system.distillSessionOpen();
     currentSessionId = s.id;
     entries = sessionToEntries(s);
     view = "chat";
@@ -6230,7 +5843,7 @@ async function startProjMemoryEdit(name: string): Promise<void> {
 
   let text = "";
   try {
-    text = await invoke<string>("pmem_memory_read", { name });
+    text = await data.projects.pmemRead( { name });
   } catch (e) {
     showToast(`读取项目记忆失败：${e}`, "error");
     return;
@@ -6256,7 +5869,7 @@ async function startProjMemoryEdit(name: string): Promise<void> {
     const btn = desc.querySelector<HTMLButtonElement>(".proj-mem-save");
     if (btn) btn.disabled = true;
     try {
-      const bak = await invoke<string>("pmem_memory_write", { name, text: ta.value });
+      const bak = await data.projects.pmemWrite( { name, text: ta.value });
       showToast(bak ? `已保存「${name}」的项目记忆（备份 ${bak}）` : `已保存「${name}」的项目记忆`, "ok");
       renderBody();
     } catch (e) {
@@ -6298,7 +5911,7 @@ function startProjEdit(name: string): void {
   input.focus();
   const save = async (): Promise<void> => {
     try {
-      await invoke("mem_project_set_source", { name, path: input.value });
+      await data.memory.projectSetSource( { name, path: input.value });
       showToast(`已更新「${name}」的源路径`, "ok");
       renderBody();
     } catch (e) {
@@ -6331,6 +5944,15 @@ async function switchView(v: View): Promise<void> {
   view = next;
   renderBody();
 }
+
+/**
+ * 预览用的切屏钩子（**只给「纯 HTML 渲染件」用**）。
+ *
+ * 预览页要精确落到某一屏（会话页 / 权限卡 / 记忆审批…），
+ * 靠点球 + 命令面板一格格点太脆。这里只导出「切屏」这一个动作，
+ * **不导出任何内部状态** —— 聊天区的 DOM / 样式 / 逻辑一概没动。
+ */
+export { switchView as __previewSwitchView };
 
 // ---------------- 设置：入口页 ----------------
 
@@ -6666,15 +6288,15 @@ function bindSettingsMenu(root: HTMLElement): void {  // ① 组头折叠
   };
 
   sw("sw-autostart", async (v) => {
-    await invoke("autostart_set", { enable: v });
+    await data.settings.autostartSet( { enable: v });
     autostartOn = v;
   });
   sw("sw-blur", async (v) => {
-    await invoke("set_blur_collapse", { enable: v });
+    await data.settings.setBlurCollapse( { enable: v });
     blurCollapse = v;
   });
   sw("sw-dir", async (v) => {
-    await invoke("set_project_dir_autoread", { enable: v });
+    await data.settings.setProjectDirAutoread( { enable: v });
     projectDirAutoread = v;
   });
   // 内核切换（pi ↔ 自研）—— 设计稿 02/04 都没有这颗 chip，
@@ -6693,7 +6315,7 @@ function bindSettingsMenu(root: HTMLElement): void {  // ① 组头折叠
     }
   });
 
-  void invoke<string>("exe_path")
+  void data.system.exePath()
     .then((p) => {
       const el = document.getElementById("exe-path");
       if (el) el.textContent = p;
@@ -6702,7 +6324,7 @@ function bindSettingsMenu(root: HTMLElement): void {  // ① 组头折叠
 
   // --- 退出 ---
   document.getElementById("btn-quit")?.addEventListener("click", () => {
-    void invoke("app_quit").catch(() => {});
+    void data.system.appQuit().catch(() => {});
   });
 }
 
@@ -6927,7 +6549,7 @@ function bindSubBarActions(bar: HTMLElement): void {
     );
     if (!ok) return;
     try {
-      const msg = await invoke<string>("recovery_clear_trash");
+      const msg = await data.recovery.clearTrash();
       showToast(msg, "ok", 2600);
       renderBody(); // 重画本页（switchView 对同一视图有 toggle 语义，会退回对话）
     } catch (e) {
@@ -6948,7 +6570,7 @@ function bindSubBarActions(bar: HTMLElement): void {
     );
     if (!ok) return;
     try {
-      const n = await invoke<number>("mem_approve_all");
+      const n = await data.memory.approveAll();
       showToast(`已批准 ${n} 条，写进长期记忆`, "ok", 2600);
       renderBody();
     } catch (e) {
@@ -7124,7 +6746,7 @@ function bindBehaviorView(root: HTMLElement): void {
     el.addEventListener("change", async () => {
       if (!el.checked) return;
       try {
-        const saved = await invoke<string>("set_exec_trust", { mode: el.value });
+        const saved = await data.settings.setExecTrust( { mode: el.value });
         execTrust = (saved as typeof execTrust) || (el.value as typeof execTrust);
         showToast(`执行权限：${EXEC_TRUST_LABEL[execTrust].full}`, "ok");
         renderBody();
@@ -7136,40 +6758,7 @@ function bindBehaviorView(root: HTMLElement): void {
   );
 }
 
-// ---------------- 设置 › 数据源 ----------------
-//
-// 数据源 = 给 agent 的**认知面**注入（与 MCP 的能力面正交）。
-//
-// 为什么单独一页而不是塞进 MCP：MCP 是"模型决定去调"，数据源是
-// "系统决定呈现"。问「帮我安排下今天」时模型**没有理由**先去调一个工具，
-// 而「更懂你」的前提恰恰是不用说就知道 —— 这是触发权不同，不是工具多少。
-//
-// 注入策略（定稿）：system prompt 里只常驻每个源**一行**
-// （条数 + 新鲜度），细节要模型调 `life_items`。
 
-interface LifeSourceView {
-  id: string;
-  label: string;
-  enabled: boolean;
-  kind: "file" | "command";
-  /** 文件路径或命令 */
-  target: string;
-  itemsPath: string;
-  staleHours: number | null;
-  complete: boolean;
-  ok: boolean;
-  error: string;
-  updatedAt: string;
-  ageHours: number | null;
-  stale: boolean;
-  count: number;
-  preview: string[];
-}
-
-interface LifeStatus {
-  path: string;
-  sources: LifeSourceView[];
-}
 
 let lifeInfo: LifeStatus | null = null;
 
@@ -7266,7 +6855,7 @@ function bindLifeView(root: HTMLElement): void {
   //    表现出来就是"点了返回却回到了对话页"。
 
   document.getElementById("life-refresh")?.addEventListener("click", async () => {
-    await invoke("life_refresh").catch(() => {});
+    await data.life.refresh().catch(() => {});
     await loadLifeStatus();
     renderBody();
     showToast("已重新读取", "ok", 1500);
@@ -7277,7 +6866,7 @@ function bindLifeView(root: HTMLElement): void {
       const id = cb.dataset.id!;
       const on = cb.checked;
       try {
-        await invoke("life_set_enabled", { id, enabled: on });
+        await data.life.setEnabled( { id, enabled: on });
         showToast(`${on ? "已启用" : "已关闭"}「${id}」`, "ok", 2000);
       } catch (e) {
         pushEntry("error", `${on ? "启用" : "关闭"}「${id}」失败：${e}`);
@@ -7291,7 +6880,7 @@ function bindLifeView(root: HTMLElement): void {
 /** 拉一次数据源状态（设置入口页与子页都要用） */
 async function loadLifeStatus(): Promise<void> {
   try {
-    lifeInfo = await invoke<LifeStatus>("life_status");
+    lifeInfo = await data.life.status();
   } catch (e) {
     console.warn("[orbcat] 读数据源失败:", e);
     lifeInfo = null;
@@ -7355,11 +6944,11 @@ function bindSearchView(_root: HTMLElement): void {
   document.getElementById("search-save")?.addEventListener("click", async () => {
     const provider = (document.getElementById("search-provider") as HTMLSelectElement).value;
     const keyInput = (document.getElementById("search-key") as HTMLInputElement).value;
-    const args: Record<string, unknown> = { provider };
+    const args: { provider: string; apiKey?: string | null } = { provider };
     // 空输入 = 不改 key；非空 = 覆盖
     if (keyInput.trim()) args.apiKey = keyInput.trim();
     try {
-      const st = await invoke<SearchStatus>("search_set", args);
+      const st = await data.search.set( args);
       searchInfo = st;
       say(
         st.ready
@@ -7386,7 +6975,7 @@ function bindSearchView(_root: HTMLElement): void {
     btn.textContent = "测…";
     say("正在搜索 ping…", "run");
     try {
-      const r = await invoke<string>("search_test");
+      const r = await data.search.test();
       say(`✅ ${r}`, "ok");
       showToast("✅ 搜索连通正常", "ok");
     } catch (e) {
@@ -7483,10 +7072,10 @@ function bindPermView(root: HTMLElement): void {
   root.querySelectorAll<HTMLButtonElement>(".set-btn.del").forEach((b) =>
     b.addEventListener("click", async () => {
       const idx = Number(b.dataset.idx);
-      const rules = await invoke<PermRule[]>("perm_rules").catch(() => [] as PermRule[]);
+      const rules = await data.permissions.rules().catch(() => [] as PermRule[]);
       const target = rules[idx];
       if (!target) return;
-      await invoke("perm_remove_rule", { prefix: target.prefix }).catch((e) =>
+      await data.permissions.removeRule( { prefix: target.prefix }).catch((e) =>
         pushEntry("error", `删除失败：${e}`),
       );
       renderBody();
@@ -7513,7 +7102,7 @@ function bindPermView(root: HTMLElement): void {
     }
 
     try {
-      await invoke("perm_add_rule", { prefix: path, access, label });
+      await data.permissions.addRule( { prefix: path, access, label });
       renderBody();
     } catch (e) {
       pushEntry("error", `添加规则失败：${e}`);
@@ -7526,7 +7115,7 @@ function bindPermView(root: HTMLElement): void {
     const out = document.getElementById("p-test-result");
     if (!path || !out) return;
     try {
-      const ok = await invoke<string>("perm_check", { path, need });
+      const ok = await data.permissions.check( { path, need });
       out.innerHTML = `✅ 允许访问：<code>${esc(ok)}</code>`;
     } catch (e) {
       out.innerHTML = `❌ ${esc(String(e))}`;
@@ -7645,7 +7234,7 @@ function bindCmdPolicyView(_root: HTMLElement): void {
       const fp = btn.dataset.fp ?? "";
       if (!fp) return;
       try {
-        const n = await invoke<number>("perm_cmd_grant_revoke", { fingerprint: fp });
+        const n = await data.permissions.cmdGrantRevoke( { fingerprint: fp });
         showToast(n > 0 ? "已撤销这条命令授权" : "这条授权已经不存在了", "ok");
         renderBody();
       } catch (e) {
@@ -7656,7 +7245,7 @@ function bindCmdPolicyView(_root: HTMLElement): void {
 
   document.getElementById("cp-revoke-all")?.addEventListener("click", async () => {
     try {
-      const n = await invoke<number>("perm_cmd_grants_clear");
+      const n = await data.permissions.cmdGrantsClear();
       showToast(n > 0 ? `已撤销全部 ${n} 条命令授权` : "本来就没有命令授权", "ok");
       renderBody();
     } catch (e) {
@@ -7675,7 +7264,7 @@ function bindCmdPolicyView(_root: HTMLElement): void {
       .filter(Boolean);
     const msg = document.getElementById("cp-save-msg");
     try {
-      await invoke("perm_cmd_policy_set", { allow, hardBlock });
+      await data.permissions.cmdPolicySet( { allow, hardBlock });
       if (msg) msg.innerHTML = "✅ 已保存到 command_policy.json（立即生效）";
       showToast("命令策略已保存", "ok");
     } catch (e) {
@@ -7692,7 +7281,7 @@ function bindCmdPolicyView(_root: HTMLElement): void {
     }
     out.textContent = "判定中…";
     try {
-      const r = await invoke<CmdVerdictView>("perm_cmd_test", { command: cmd });
+      const r = await data.permissions.cmdTest( { command: cmd });
       const label =
         r.verdict === "allow" ? "✅ 白名单放行" : r.verdict === "hard-block" ? "⛔ 硬阻断" : "🟨 需确认卡";
       out.innerHTML = `${label} · 风险 ${esc(r.risk)}<br>${esc(r.reason)}${
@@ -7746,11 +7335,6 @@ function splitArgs(raw: string): string[] {
   return out;
 }
 
-/** 内置工具的一条摘要（后端 `builtin_tools`） */
-interface BuiltinToolInfo {
-  name: string;
-  desc: string;
-}
 
 /**
  * 工具页（设计稿 09）的**三个工具组**的折叠状态。
@@ -8093,7 +7677,7 @@ function bindMcpView(root: HTMLElement): void {
     swBuiltin.classList.toggle("on", next);
     swBuiltin.setAttribute("aria-checked", String(next));
     try {
-      await invoke("set_builtin_tools", { enable: next });
+      await data.settings.setBuiltinTools( { enable: next });
       builtinToolsEnabled = next;
       showToast(
         next ? "内置工具已给模型" : "内置工具已从模型工具表里拿掉",
@@ -8114,7 +7698,7 @@ function bindMcpView(root: HTMLElement): void {
     swMcp.classList.toggle("on", next);
     swMcp.setAttribute("aria-checked", String(next));
     try {
-      await invoke("mcp_set_all_groups", { all: next });
+      await data.mcp.setAllGroups( { all: next });
       mcpAllGroups = next;
     } catch (e) {
       swMcp.classList.toggle("on", !next);
@@ -8124,7 +7708,7 @@ function bindMcpView(root: HTMLElement): void {
   });
 
   document.getElementById("mcp-refresh")?.addEventListener("click", async () => {
-    await invoke("mcp_refresh").catch((e) => pushEntry("error", `刷新失败：${e}`));
+    await data.mcp.refresh().catch((e) => pushEntry("error", `刷新失败：${e}`));
     renderBody();
   });
 
@@ -8265,7 +7849,7 @@ function bindMcpView(root: HTMLElement): void {
     const msg = document.getElementById("mcp-srv-msg");
     try {
       if (msg) msg.textContent = "保存并连接中…";
-      await invoke("mcp_servers_save", { servers: collectServers() });
+      await data.mcp.serversSave( { servers: collectServers() });
       renderBody();
     } catch (e) {
       if (msg) msg.textContent = `保存失败：${e}`;
@@ -8277,7 +7861,7 @@ function bindMcpView(root: HTMLElement): void {
     const on = (e.target as HTMLInputElement).checked;
     mcpAllGroups = on;
     try {
-      await invoke("mcp_set_all_groups", { all: on });
+      await data.mcp.setAllGroups( { all: on });
       showToast(on ? "已设为「直接全给模型」" : "已切回按需加载", "ok");
     } catch (err) {
       showToast(`设置失败：${err}`, "error");
@@ -8291,7 +7875,7 @@ function bindMcpView(root: HTMLElement): void {
       const name = cb.dataset.group!;
       const on = cb.checked;
       try {
-        await invoke("mcp_set_group_enabled", { name, enabled: on });
+        await data.mcp.setGroupEnabled( { name, enabled: on });
         showToast(`${on ? "已启用" : "已停用"}「${name}」`, "ok", 2000);
       } catch (e) {
         pushEntry("error", `${on ? "启用" : "停用"}「${name}」失败：${e}`);
@@ -8306,7 +7890,7 @@ function bindMcpView(root: HTMLElement): void {
       const tool = btn.dataset.tool ?? "";
       if (!tool) return;
       try {
-        const n = await invoke<number>("mcp_grant_revoke", { tool });
+        const n = await data.mcp.grantRevoke( { tool });
         showToast(n > 0 ? "已撤销这条总是允许" : "这条授权已经不存在了", "ok");
         renderBody();
       } catch (e) {
@@ -8317,7 +7901,7 @@ function bindMcpView(root: HTMLElement): void {
 
   document.getElementById("mcp-grant-clear")?.addEventListener("click", async () => {
     try {
-      const n = await invoke<number>("mcp_grants_clear");
+      const n = await data.mcp.grantsClear();
       showToast(n > 0 ? `已撤销全部 ${n} 条总是允许` : "本来就没有总是允许", "ok");
       renderBody();
     } catch (e) {
@@ -8471,7 +8055,7 @@ function bindProjectView(root: HTMLElement): void {
   root.querySelectorAll<HTMLButtonElement>(".proj-activate").forEach((btn) => {
     btn.addEventListener("click", async () => {
       try {
-        await invoke("project_activate", { id: btn.dataset.id });
+        await data.projects.activate( { id: btn.dataset.id ?? "" });
         showToast("已激活项目（下一轮对话生效）", "ok");
         renderBody();
       } catch (e) {
@@ -8483,7 +8067,7 @@ function bindProjectView(root: HTMLElement): void {
   // 退出项目
   document.getElementById("proj-deactivate")?.addEventListener("click", async () => {
     try {
-      await invoke("project_activate", { id: null });
+      await data.projects.activate( { id: null });
       showToast("已退出项目", "ok");
       renderBody();
     } catch (e) {
@@ -8496,7 +8080,7 @@ function bindProjectView(root: HTMLElement): void {
     btn.addEventListener("click", async () => {
       const id = btn.dataset.id ?? "";
       try {
-        const body = await invoke<string>("project_read", { id });
+        const body = await data.projects.read( { id });
         const i = idEl();
         const b = bodyEl();
         if (i) i.value = id;
@@ -8518,7 +8102,7 @@ function bindProjectView(root: HTMLElement): void {
         return;
       }
       try {
-        await invoke("project_delete", { id });
+        await data.projects.delete( { id });
         showToast("已删除项目包", "ok");
         renderBody();
       } catch (e) {
@@ -8594,7 +8178,7 @@ function bindProjectView(root: HTMLElement): void {
     }
     try {
       if (m) m.textContent = "校验并保存中…";
-      await invoke("project_save", { id, body });
+      await data.projects.save( { id, body });
       showToast(`已保存项目包「${id}」`, "ok");
       renderBody();
     } catch (e) {
@@ -8855,7 +8439,7 @@ async function refreshPendingApprovals(): Promise<void> {
   // 记忆候选：轮询 mem_pending
   let memN = 0;
   try {
-    const cands = await invoke<Candidate[]>("mem_pending");
+    const cands = await data.memory.pending();
     memN = cands.length;
   } catch {
     // 读不到就当 0：一个统计查询失败不该把球弄成有事的颜色骗人
@@ -9108,7 +8692,39 @@ function currentSessionKind(): "main" | "task" | "fork" {
  * 下标必须用 `storedIdx`（磁盘下标），理由同删除/分叉：entries 下标会被
  * running/system 这类不落盘的条目顶偏。
  */
-function renderRegenBtn(e: ChatEntry): string {
+/**
+ * 「重新生成」按钮。
+ *
+ * ## 两种情形（R-033）
+ *
+ * 1. **回答轮**（`role === "assistant"`）：`data-upto` = 这条回答的磁盘下标。
+ *    重跑 = 截断到它之前（丢掉这条回答）→ 重发上面那条提问。
+ * 2. **失败轮**（`role === "error"`）：这一轮**回答没落上盘**（写盘失败等），
+ *    磁盘上只剩那条提问。老守卫只认 `assistant` ⇒ 失败轮**拿不到**重跑入口
+ *    （R-033 / 审计 F7）。
+ *    这里往上找最近一条用户消息，用它的下标 +1 当 `data-rr` ——
+ *    语义与「回答轮」一致（`data-rr` = 提问的下标 + 1 = 「保留提问」的那个截断点），
+ *    于是 `regenerateFrom()` 一条路走通，不用第二套逻辑。
+ *
+ * ⚠️ 按钮沿用现成的 `.msg-regen` class 与既有 CSS（**不新增样式**）——
+ * 聊天区是用户自己在改的，这里只补功能入口，不动它的样子。
+ */
+function renderRegenBtn(e: ChatEntry, idx: number): string {
+  if (e.role === "error") {
+    // 往上找最近一条用户消息 —— 那一轮的提问
+    let user: ChatEntry | undefined;
+    for (let i = idx - 1; i >= 0; i--) {
+      if (entries[i]?.role === "user") {
+        user = entries[i];
+        break;
+      }
+    }
+    // 提问必须**已落盘**（有 storedIdx）才能重发 —— 否则无从截断、也无从重发
+    if (!user || user.storedIdx === undefined) return "";
+    return `<button type="button" class="msg-regen" data-rr="${
+      user.storedIdx + 1
+    }" title="重跑这一轮：重新发送上面那条提问（会重新消耗 token）">↻</button>`;
+  }
   if (e.role !== "assistant" || e.storedIdx === undefined) return "";
   return `<button type="button" class="msg-regen" data-upto="${e.storedIdx}" title="重新生成这条回答：丢掉它并重跑这一轮（会重新消耗 token）">↻</button>`;
 }
@@ -9197,7 +8813,7 @@ function progressItem(p: ProgressEvent): AgentStep | null {
 
 async function grabScreen(): Promise<void> {
   try {
-    const dataUrl = await invoke<string>("capture_screen");
+    const dataUrl = await data.system.captureScreen();
     if (dataUrl.length > MAX_IMAGE_CHARS) {
       pushEntry("error", "截图太大，已丢弃");
       return;
@@ -9296,9 +8912,9 @@ function installFocusRefocus(): void {
 
 async function loadModels(): Promise<void> {
   try {
-    models = await invoke<ModelView[]>("list_models");
+    models = await data.models.list();
     // 身份 = (Base URL, 接口 id)：get_selected_model 返回 {id, url} 双字段
-    const sel = await invoke<{ id: string; url: string | null } | null>("get_selected_model");
+    const sel = await data.models.selected();
     selectedModel = sel?.id ?? null;
     selectedModelUrl = sel?.url ?? null;
     // ⚠️ 消歧回填：旧设置里**只有 id、没有 url**（身份键重构之前写的），
@@ -9308,7 +8924,7 @@ async function loadModels(): Promise<void> {
       const resolved = curModel();
       if (resolved) {
         selectedModelUrl = resolved.url;
-        await invoke("set_selected_model", { id: selectedModel, url: resolved.url }).catch(
+        await data.models.select( { id: selectedModel, url: resolved.url }).catch(
           () => {},
         );
       }
@@ -9317,14 +8933,14 @@ async function loadModels(): Promise<void> {
     if (!selectedModel && models.length > 0) {
       selectedModel = models[0].id;
       selectedModelUrl = models[0].url;
-      await invoke("set_selected_model", { id: selectedModel, url: selectedModelUrl }).catch(
+      await data.models.select( { id: selectedModel, url: selectedModelUrl }).catch(
         () => {},
       );
     }
     // 分组显示名：面板的模型卡片要显示「组别 + 模型名」
     // （定稿：这一块就是放模型的，组别+模型名）。
     // 以前只在独立窗口（models.ts）读，所以面板上永远只看到裸模型名。
-    modelGroupNames = await invoke<Record<string, string>>("model_group_names").catch(
+    modelGroupNames = await data.models.groupNames().catch(
       () => ({}),
     );
   } catch (e) {
@@ -9344,8 +8960,8 @@ function installModelsListener(): void {
 
 async function loadProjects(): Promise<void> {
   try {
-    projects = await invoke<ProjectRow[]>("pmem_list");
-    const act = await invoke<ProjectRow | null>("pmem_get_active");
+    projects = await data.projects.pmemList();
+    const act = await data.projects.pmemGetActive();
     activeProjectId = act?.id ?? null;
   } catch {
     projects = [];
@@ -9389,7 +9005,7 @@ async function refreshPiStatus(): Promise<void> {
   if (piStatusChecked) return;
   piStatusChecked = true;
   try {
-    const st = await invoke<{ available: boolean }>("pi_status");
+    const st = await data.system.piStatus();
     piKernelAvailable = !!st.available;
     if (!piKernelAvailable) {
       usePiKernel = false;
@@ -9456,7 +9072,7 @@ async function send(): Promise<void> {
   pendingImages = [];
   renderPreview();
 
-  const pendingBefore = await invoke<Candidate[]>("mem_pending").catch(
+  const pendingBefore = await data.memory.pending().catch(
     () => [] as Candidate[],
   );
   pushEntry("user", text || "（仅图片）", undefined, imgs);
@@ -9481,7 +9097,7 @@ async function send(): Promise<void> {
   permMuteThisTurn = false;
 
   try {
-    const run = await invoke<AgentRun>("chat", { input: text, images: imgs });
+    const run = await data.chat.send( { input: text, images: imgs });
     // ⚠️ 用户可能在等待期间切走了。切走后 entries 已经是**别的会话**的内容，
     //    所以清气泡 / 重载 / 提示一律不动 —— 这一轮的结果后端已经落回它自己的
     //    会话（`append_run_in`），切回去就能看到。
@@ -9579,7 +9195,7 @@ async function send(): Promise<void> {
   // 记忆候选若在本轮增加 → 提醒去设置审批（做完后提议记忆的产品闭环）。
   // 切走了就不往当前会话塞这条提示 —— 它属于刚才那轮。
   if (runSid !== currentSessionId) return;
-  const pendingAfter = await invoke<Candidate[]>("mem_pending").catch(
+  const pendingAfter = await data.memory.pending().catch(
     () => [] as Candidate[],
   );
   if (pendingAfter.length > pendingBefore.length) {
@@ -9626,11 +9242,11 @@ async function sendSteer(): Promise<void> {
 
   try {
     const ack = usePi
-      ? await invoke<{ id: string; queued: number }>("chat_pi_steer", {
+      ? await data.chat.steerPi( {
           message: text,
           sessionId: currentSessionId,
         })
-      : await invoke<{ id: string; queued: number }>("chat_steer", {
+      : await data.chat.steer( {
           input: text,
           images: imgs,
           // 多会话并行 run：插话必须路由到**当前会话**那个 run 的收件箱
@@ -9722,7 +9338,7 @@ async function runCommand(act: string): Promise<void> {
       return;
     case "compact":
       try {
-        const r = await invoke<{ before: number; after: number }>("session_compact", {
+        const r = await data.sessions.compact( {
           force: true,
         });
         showToast(
@@ -9740,7 +9356,7 @@ async function runCommand(act: string): Promise<void> {
       return;
     case "clear":
       try {
-        await invoke("session_truncate", { upto: 0 });
+        await data.sessions.truncate( { upto: 0 });
         draftInput = "";
         showToast("已清空当前会话", "ok", 2200);
         renderBody();
@@ -9800,7 +9416,7 @@ async function stopRun(): Promise<void> {
     btn.textContent = "…";
     btn.title = "正在停止…";
   }
-  await invoke("chat_cancel", { sessionId: currentSessionId }).catch(() => {});
+  await data.chat.cancel( { sessionId: currentSessionId }).catch(() => {});
   const run = entries.find((x) => x.role === "running");
   if (run) {
     run.text = "正在停止…";
@@ -9867,7 +9483,7 @@ async function reloadSessionKeepScroll(expect = 0): Promise<void> {
   const bd = document.getElementById("panel-body");
   const atBottom = isChatAtBottom();
   try {
-    const st = await invoke<SessionState>("session_state");
+    const st = await data.sessions.state();
     const fresh = sessionToEntries(st.session);
     if (fresh.length < expect) {
       console.warn(
@@ -9947,7 +9563,7 @@ async function applyMode(next: Mode): Promise<void> {
         renderOrb();
       }
       mode = next;
-      await invoke("set_window_mode", { mode: next });
+      await data.settings.setWindowMode( { mode: next });
     } catch (e) {
       console.error("[orbcat] 切换窗口形态失败:", e);
     } finally {
@@ -9965,7 +9581,7 @@ async function applyMode(next: Mode): Promise<void> {
   //    blur 会把它当成"还在菜单态"而把窗口收回球大小。
   mode = next;
   try {
-    await invoke("set_window_mode", { mode: next });
+    await data.settings.setWindowMode( { mode: next });
   } catch (e) {
     // 窗口没改成不算失败内容，但 `mode` 已经写了 —— 立刻写回去，
     // 否则又落进"mode 与窗口实际尺寸不一致"那个不可恢复的状态。
@@ -10031,7 +9647,7 @@ async function collapseUnlessCapturing(): Promise<void> {
  */
 async function foregroundIsCaptureTool(): Promise<boolean> {
   try {
-    return await invoke<boolean>("foreground_is_capture_tool");
+    return await data.system.foregroundIsCaptureTool();
   } catch {
     return false;
   }
@@ -10073,7 +9689,7 @@ function renderMenu(): void {
       // 悬浮球设了 skipTaskbar（不占任务栏），所以必须给一个正常退出入口，
       // 否则用户只能去任务管理器杀进程
       if (act === "quit") {
-        await invoke("app_quit").catch(() => {});
+        await data.system.appQuit().catch(() => {});
         return;
       }
 
@@ -10156,20 +9772,20 @@ function boot(): void {
   renderOrb();
 
   // 诊断打点：主窗口前端启动 + 未捕获异常都落盘（排查窗口问题时唯一的可靠通道）
-  void invoke("diag_log", { msg: "main.ts boot: 开始" }).catch(() => {});
+  void data.system.diagLog( { msg: "main.ts boot: 开始" }).catch(() => {});
   window.addEventListener("error", (e) => {
-    void invoke("diag_log", {
+    void data.system.diagLog( {
       msg: `main.ts window.onerror: ${e.message} @ ${e.filename}:${e.lineno}`,
     }).catch(() => {});
   });
   window.addEventListener("unhandledrejection", (e) => {
-    void invoke("diag_log", { msg: `main.ts unhandledrejection: ${String(e.reason)}` }).catch(
+    void data.system.diagLog( { msg: `main.ts unhandledrejection: ${String(e.reason)}` }).catch(
       () => {},
     );
   });
 
   // 双保险：Rust 侧 setup 已经应用过一次，这里再确认一次
-  void invoke("set_window_mode", { mode: "orb" }).catch((e) =>
+  void data.settings.setWindowMode( { mode: "orb" }).catch((e) =>
     console.error("[orbcat] 初始化形态失败:", e),
   );
 
@@ -10223,7 +9839,7 @@ function boot(): void {
   }, 5000);
 
   // 执行权限档位：启动拉一次（chip 默认 ask，拉到什么显什么）
-  void invoke<{ execTrust?: string }>("get_settings")
+  void data.settings.get()
     .then((s) => {
       if (s?.execTrust) {
         execTrust = s.execTrust as typeof execTrust;
