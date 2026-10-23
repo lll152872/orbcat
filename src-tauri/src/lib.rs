@@ -4058,7 +4058,16 @@ async fn chat_pi(
 #[tauri::command]
 async fn pi_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let Some(pool) = state.pi.clone() else {
-        return Ok(serde_json::json!({"available": false}));
+        // ⚠️ runtime 缺失也要说清**缺什么**（否则用户只看到「pi 内核不可用」，
+        //    不知道是没打包还是包残了）。
+        let rt_status = std::env::current_exe()
+            .ok()
+            .map(|e| pi::runtime_status(&e))
+            .unwrap_or_default();
+        return Ok(serde_json::json!({
+            "available": false,
+            "runtime": rt_status,
+        }));
     };
     // ⚠️ 桥端口是**每个会话一个**（每会话一个 pi 进程 ⇒ 一个桥）。
     // 这里报**第一个**活着的会话的端口，够 UI 诊断用。
@@ -4070,6 +4079,12 @@ async fn pi_status(state: State<'_, AppState>) -> Result<serde_json::Value, Stri
         },
         None => (0, None),
     };
+    // ⚠️ 内置运行时的**组件状态** —— 让用户/诊断看得见「pi 到底有没有在用」。
+    //    （以前只在 stderr 打一行，用户看不到。）
+    let rt_status = std::env::current_exe()
+        .ok()
+        .map(|e| pi::runtime_status(&e))
+        .unwrap_or_default();
     Ok(serde_json::json!({
         "available": true,
         "runtimeDir": pool.runtime_dir().display().to_string(),
@@ -4078,6 +4093,8 @@ async fn pi_status(state: State<'_, AppState>) -> Result<serde_json::Value, Stri
         "liveSessions": sessions,
         "maxLive": pool.max_live(),
         "currentSession": first,
+        // node ✓ / pi ✓ / python ✗ / git ✗（用系统）—— 一眼看出缺什么
+        "runtime": rt_status,
     }))
 }
 

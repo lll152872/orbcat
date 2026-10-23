@@ -353,8 +353,8 @@ async fn pi能通过桥调到rust工具() {
     let host: pi::PiHostFn = Arc::new(|_req: PiHostRequest| Some(PiHostReply::Confirm(true)));
     let client = PiClient::spawn(cfg, host).await.expect("pi 应能起");
 
-    // 订阅事件
-    let mut rx = client.take_events().expect("应能取到事件通道");
+    // 订阅事件（**每轮一个独立通道** —— 旧的 take 语义会导致第二轮取不到）
+    let (sub_id, mut rx) = client.subscribe_events();
 
     // 发一条 prompt，让模型去调那个工具
     let _ = client.prompt("只调用一次 orb_probe_tool，x 填 hello。不要做别的事。", vec![]).await;
@@ -378,6 +378,9 @@ async fn pi能通过桥调到rust工具() {
             }
         }
     }
+
+    // 退订（与 `PiRuntime::run_inner` 同口径：不退订订阅者列表会一直涨）
+    client.unsubscribe_events(sub_id);
 
     assert!(saw_tool, "模型应该发起了 orb_probe_tool 调用");
     assert!(

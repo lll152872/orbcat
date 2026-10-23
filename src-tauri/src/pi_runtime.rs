@@ -1027,8 +1027,40 @@ impl PiRuntime {
     ) -> Result<PiRun, String> {
         let client = self.ensure_running().await?;
 
-        // 订阅事件（**必须在发 prompt 之前**，否则会漏掉快速完成的事件）
-        let mut rx = client.take_events().ok_or("事件通道已被占用")?;
+        // ── 订阅事件（**必须在发 prompt 之前**，否则会漏掉快速完成的事件）──
+        //
+        // ⚠️ **每轮一个独立通道**（不是从池子里「取走」一个共享的）。
+        //
+        // 旧实现是 `client.take_events()`（**take 移走语义**）⇒ 唯一调用点取走后
+        // **再没有任何地方归还** ⇒ 同一个 pi 进程（= 同一个会话）的
+        // **第二轮必然取不到通道** ⇒ 硬错「事件通道已被占用」。
+        // ⇒ **用户第一条有回复、发第二条就报错**（2026-10-23 22:16 守门 CDP 实测，
+        //    部署态真 app；pi 是默认路径 ⇒ 必现）。
+        //
+        // 现在每轮新建一个通道 ⇒ ① 第二轮一定能拿到；② 新通道是空的
+        // ⇒ **不吃上一轮残留事件**（比 broadcast 方案更稳：broadcast 的 buffer
+        // 会把上一轮的事件留给下一轮订阅者）。
+        let (sub_id, mut rx) = client.subscribe_events();
+
+        let result = self
+            .run_events(client.clone(), rx, input, images, progress, checkpoint)
+            .await;
+
+        // ⚠️ **无论成功失败都要退订** —— 否则订阅者列表会一直涨。
+        client.unsubscribe_events(sub_id);
+        result
+    }
+
+    /// 真正跑一轮（**已订阅好事件通道**）。
+    async fn run_events(
+        &self,
+        client: std::sync::Arc<crate::pi::PiClient>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::pi::PiEvent>,
+        input: &str,
+        images: Vec<String>,
+        progress: ProgressFn,
+        checkpoint: Option<crate::agent::CheckpointFn>,
+    ) -> Result<PiRun, String> {
 
         // 把 system prompt 交给 pi：靠 `orbcat-prompt.ts` 的 `before_agent_start`
         // 回调宿主拿（`POST /prompt` → `agent::build_system_prompt_full`）。

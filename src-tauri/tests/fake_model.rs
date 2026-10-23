@@ -53,6 +53,11 @@ pub struct FakeModel {
     prefix_orb: bool,
     /// 最后一次收到的请求体（测试用来检查 prompt 接管）
     last_req: Arc<std::sync::Mutex<Option<Value>>>,
+    /// **全部**收到的请求体（按顺序）—— 断言「多轮之间的上下文延续」要用它。
+    ///
+    /// ⚠️ `last_request()` 只给最后一次 ⇒ 测「第二轮有没有带上第一轮上下文」
+    /// 必须看历史。
+    reqs: Arc<std::sync::Mutex<Vec<Value>>>,
     /// **请求体落盘路径**（副作用判据用）。
     ///
     /// 为 `None` 时不落盘（默认），不影响任何既有测试。
@@ -104,6 +109,7 @@ impl FakeModel {
             final_text: final_text.into(),
             prefix_orb,
             last_req: Arc::new(std::sync::Mutex::new(None)),
+            reqs: Arc::new(std::sync::Mutex::new(Vec::new())),
             trace_file: Arc::new(std::sync::Mutex::new(None)),
             delay_ms: Arc::new(AtomicU64::new(0)),
         });
@@ -135,6 +141,14 @@ impl FakeModel {
     /// 最后一次收到的请求体。
     pub fn last_request(&self) -> Option<Value> {
         self.last_req.lock().unwrap().clone()
+    }
+
+    /// **全部**收到的请求体（按顺序，克隆出来）。
+    ///
+    /// 断言「第二轮的 provider 请求里带第一轮上下文」用它 ——
+    /// `last_request()` 只看最后一次，看不见前几轮。
+    pub fn request_history(&self) -> Vec<Value> {
+        self.reqs.lock().unwrap().clone()
     }
 
     /// 让假模型把**每个**收到的请求体追加写到这个文件（JSONL，一行一个）。
@@ -269,6 +283,8 @@ impl FakeModel {
     /// 按 OpenAI 流式协议回一个回复。
     fn stream_chat(&self, stream: &mut TcpStream, req: &Value) -> std::io::Result<()> {
         *self.last_req.lock().unwrap() = Some(req.clone());
+        // 记全量历史（多轮上下文断言要用）
+        self.reqs.lock().unwrap().push(req.clone());
         // 延迟：给「agent 还在 streaming 时插话」留窗口
         let d = self.delay_ms.load(Ordering::Relaxed);
         if d > 0 {
