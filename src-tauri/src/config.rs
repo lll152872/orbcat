@@ -764,6 +764,66 @@ impl ExecTrust {
     }
 }
 
+/// **执行命令时用哪种 shell**。
+///
+/// ## 为什么是「配置项」而不是「模型自己决定」
+///
+/// 模型写命令时通常不知道宿主跑在哪种 shell 上（`ls` 在 pwsh 里是别名、
+/// 在 bash 里是 GNU coreutils；`rm -rf` 在 pwsh 里根本不是这个意思）。
+/// 把它做成**宿主侧配置**，模型就不用猜，执行器也不用做「方言自纠」。
+///
+/// ## 与「后台桌面 vs 本机」是**两个正交维度**
+///
+/// - 这一项决定**用哪种解释器**（pwsh / Git Bash）；
+/// - 「后台桌面 vs 本机」（`win32desk`）决定**在哪儿跑**。
+///
+/// 前端会把两者合成一个三选一（后台桌面 / 本机 pwsh / 本机 Git Bash），
+/// 落盘时拆成这两个字段。
+///
+/// ## 默认值必须是 pwsh
+///
+/// 老用户升级后行为必须**完全不变** —— 这是硬要求，不是偏好。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecShell {
+    /// 本机 PowerShell（默认）。
+    #[default]
+    Pwsh,
+    /// 本机 Git Bash（`bash.exe -lc "<cmd>"`）。
+    Gitbash,
+}
+
+impl ExecShell {
+    /// 落盘 / 传参用的字符串。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pwsh => "pwsh",
+            Self::Gitbash => "gitbash",
+        }
+    }
+
+    /// 解析字符串；认不出来返回 `None`（调用方决定报错还是回落）。
+    ///
+    /// ⚠️ 与 [`ExecTrust::parse`] 不同：这里**不回落**到默认值。
+    /// 执行位置是用户**显式**选的，写错了就报错让用户改，
+    /// 悄悄回落 pwsh = 用户以为在 Git Bash 里跑、其实不是。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pwsh" | "powershell" | "ps" => Some(Self::Pwsh),
+            "gitbash" | "git-bash" | "bash" | "git bash" => Some(Self::Gitbash),
+            _ => None,
+        }
+    }
+
+    /// UI 展示名。
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Pwsh => "本机 PowerShell",
+            Self::Gitbash => "本机 Git Bash",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentSettings {
@@ -861,6 +921,15 @@ pub struct AgentSettings {
     /// 存的是物理像素，跨不同 DPI 显示器时也由那道校验兜住。
     #[serde(default)]
     pub orb_pos: Option<OrbPos>,
+    /// **执行命令时用哪种 shell**（"pwsh" | "gitbash"）。
+    ///
+    /// 默认 "pwsh" ⇒ **老用户升级后行为完全不变**（硬要求）。
+    ///
+    /// ⚠️ 与「后台桌面 vs 本机」是**两个正交维度**：
+    /// 这一项决定用哪种解释器，后台桌面决定在哪儿跑。
+    /// 前端把两者合成一个三选一（后台桌面 / 本机 pwsh / 本机 Git Bash）。
+    #[serde(default)]
+    pub exec_shell: ExecShell,
 }
 
 /// 悬浮球位置（物理像素，左上角、不含 pad）。
@@ -915,6 +984,7 @@ impl Default for AgentSettings {
             active_bundle: None,
             selected_model_url: None,
             orb_pos: None,
+            exec_shell: ExecShell::default(),
         }
     }
 }
@@ -2227,5 +2297,58 @@ mod tests {
             got.len()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // 执行位置用的 shell（execShell）
+    // -----------------------------------------------------------------------
+
+    /// `execShell` 默认必须是 **pwsh** —— 老用户升级后行为**完全不变**。
+    ///
+    /// 这条是整个特性的地基：默认改了 = 所有老用户的命令执行器一夜之间换了。
+    #[test]
+    fn exec_shell_defaults_to_pwsh() {
+        let d = tmp_dir("exec_shell_default");
+        assert_eq!(load_settings(&d).exec_shell, ExecShell::Pwsh);
+        assert_eq!(AgentSettings::default().exec_shell, ExecShell::Pwsh);
+
+        // 老的 settings.json（没有这个字段）也要回落成 pwsh，不能解析失败
+        std::fs::write(
+            d.join("settings.json"),
+            r#"{"selectedModel":null,"blurCollapse":true}"#,
+        )
+        .unwrap();
+        assert_eq!(load_settings(&d).exec_shell, ExecShell::Pwsh);
+    }
+
+    /// 选了 Git Bash 要能落盘并读回来（前端改设置 → 重启后还在）。
+    #[test]
+    fn exec_shell_round_trips_through_settings_json() {
+        let d = tmp_dir("exec_shell_persist");
+        let mut s = load_settings(&d);
+        s.exec_shell = ExecShell::Gitbash;
+        save_settings(&d, &s).unwrap();
+
+        let raw = std::fs::read_to_string(d.join("settings.json")).unwrap();
+        assert!(
+            raw.contains("\"execShell\""),
+            "落盘键名应为 execShell（camelCase）：{raw}"
+        );
+        assert_eq!(load_settings(&d).exec_shell, ExecShell::Gitbash);
+    }
+
+    /// 解析：**认不出来就返回 None**，不许悄悄回落。
+    ///
+    /// 执行位置是用户**显式**选的，写错了要报错让用户改 ——
+    /// 悄悄回落 pwsh = 用户以为在 Git Bash 里跑、其实不是。
+    #[test]
+    fn exec_shell_parse_rejects_unknown_instead_of_falling_back() {
+        assert_eq!(ExecShell::parse("pwsh"), Some(ExecShell::Pwsh));
+        assert_eq!(ExecShell::parse("powershell"), Some(ExecShell::Pwsh));
+        assert_eq!(ExecShell::parse("gitbash"), Some(ExecShell::Gitbash));
+        assert_eq!(ExecShell::parse("Git Bash"), Some(ExecShell::Gitbash));
+        assert_eq!(ExecShell::parse("bash"), Some(ExecShell::Gitbash));
+        assert_eq!(ExecShell::parse("nonsense"), None);
+        assert_eq!(ExecShell::parse(""), None);
     }
 }

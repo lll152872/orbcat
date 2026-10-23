@@ -878,6 +878,32 @@ fn classify_segment_depth(policy: &CommandPolicy, seg: &Segment, depth: usize) -
 ///
 /// 抽不出（`-File script.ps1`、无 `-Command` 类开关、开关后无内容）→ `None`。
 /// 说明：tokenize 已剥引号，引号内的整串会作为**单个 token** 保留，正好是内联命令。
+/// 判断一个参数是不是「**带 `c` 的合并短选项**」（如 `-lc` / `-ic` / `-lic`）。
+///
+/// ## 为什么需要（这是个真漏洞，不是洁癖）
+///
+/// bash 允许把多个单字母选项合并：`bash -lc "cmd"` 等价于 `bash -l -c "cmd"`。
+/// 旧的判定只认**单独的** `-c`，于是 `bash -lc "rm -rf /"` **走不到**
+/// 「内层命令递归」那条路 ⇒ 只弹一张确认卡，**不会被硬阻断** ——
+/// 而它本该跟 `bash -c "rm -rf /"` 一样硬阻断。
+///
+/// ## 判定口径
+///
+/// 只在 **shell spawner**（bash / sh / pwsh / cmd / wsl）语境下调用。
+/// `-` 开头、不是 `--` 开头、字母里含 `c` ⇒ 当成「要执行后面那条命令」。
+///
+/// 长选项（`--command` 之类）**不算** —— 它们的语义各不相同，不能靠猜。
+fn is_combined_command_flag(arg: &str) -> bool {
+    let Some(rest) = arg.strip_prefix('-') else {
+        return false;
+    };
+    if rest.is_empty() || arg.starts_with("--") {
+        return false;
+    }
+    // 只认纯字母的短选项簇（`-lc`）；`-x=1` 这种带值的不算
+    rest.chars().all(|c| c.is_ascii_alphabetic()) && rest.contains('c')
+}
+
 fn extract_shell_payload(seg: &Segment) -> Option<String> {
     if !SHELL_SPAWNERS.contains(&seg.exe.as_str()) {
         return None;
@@ -897,6 +923,16 @@ fn extract_shell_payload(seg: &Segment) -> Option<String> {
         }
         // 形如 `-command <payload>` / `-c <payload>` / `/c <payload>` / `/k <payload>`
         if matches!(lower, "-command" | "-c" | "/c" | "/k") {
+            let t = args[i + 1..].join(" ");
+            let t = t.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+        // 形如 `-lc <payload>`（bash 的**合并短选项**：-l + -c）
+        //
+        // ⚠️ 漏掉这一条 = `bash -lc "rm -rf /"` 只会弹确认卡、不会被硬阻断。
+        if is_combined_command_flag(lower) {
             let t = args[i + 1..].join(" ");
             let t = t.trim();
             if !t.is_empty() {
@@ -1832,5 +1868,45 @@ mod tests {
         assert_eq!(back.hard_block, p.hard_block);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 **合并短选项 `-lc` 也要能递归进内层命令**（这是修掉的一个真漏洞）。
+    ///
+    /// `bash -lc "rm -rf /"` = `bash -l -c "rm -rf /"`。
+    /// 旧判定只认单独的 `-c` ⇒ 这条**走不到内层递归** ⇒ 只弹确认卡、**不硬阻断**。
+    ///
+    /// 为什么重要：我们自己 spawn Git Bash 用的就是 `bash.exe -lc "<cmd>"` ——
+    /// 也就是说这个形态是**我们自己**会产生的，绝不能是策略的盲区。
+    #[test]
+    fn bash_combined_short_flag_lc_recurses_into_inner_command() {
+        let p = allow_policy();
+
+        // ① 合并短选项 ⇒ 与单独的 `-c` **同等**处置（硬阻断，不是确认卡）
+        for cmd in [
+            r#"bash -lc "rm -rf /""#,
+            r#"bash -lic "rm -rf /""#,
+            r#"bash -ic "rm -rf /""#,
+        ] {
+            let v = evaluate(&p, cmd);
+            assert!(
+                matches!(v, CmdVerdict::HardBlock { .. }),
+                "「{cmd}」必须硬阻断（内层 rm -rf），实际 {v:?}"
+            );
+        }
+
+        // ② 单独的 `-c` 仍然照旧（回归锁）
+        let v = evaluate(&p, r#"bash -c "rm -rf /""#);
+        assert!(
+            matches!(v, CmdVerdict::HardBlock { .. }),
+            "「bash -c」必须硬阻断，实际 {v:?}"
+        );
+
+        // ③ 长选项**不**当命令标志（语义各不相同，不能靠猜）
+        assert!(!is_combined_command_flag("--command"));
+        assert!(!is_combined_command_flag("--exec"));
+        assert!(!is_combined_command_flag("-x"));
+        assert!(!is_combined_command_flag("-l"));
+        assert!(is_combined_command_flag("-lc"));
+        assert!(is_combined_command_flag("-ic"));
     }
 }

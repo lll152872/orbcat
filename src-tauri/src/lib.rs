@@ -1990,6 +1990,54 @@ fn set_exec_trust(state: State<'_, AppState>, mode: String) -> Result<String, St
     Ok(t.as_str().to_string())
 }
 
+/// 设置**执行位置用的 shell**（`pwsh` / `gitbash`）。
+///
+/// ## 与「后台桌面」是**两个维度**
+///
+/// - 这一项决定**用哪种解释器**跑命令（pwsh / Git Bash）；
+/// - 「后台桌面 vs 本机」（`win32desk`）决定**在哪儿跑**。
+///
+/// 前端把两者合成一个三选一（后台桌面 / 本机 pwsh / 本机 Git Bash），
+/// 落盘时拆成这两个字段。
+///
+/// ## ⚠️ 换 shell **不是**绕过命令策略的口子
+///
+/// 策略对 pwsh 形态与 bash 形态**都**生效（两套词法取最严）：
+/// `rm -rf /`、`curl … | sh` 这些在 Git Bash 下照样被硬阻断。
+///
+/// ## ⚠️ 找不到 Git Bash 会**直接报错**
+///
+/// 不会静默回落到 pwsh —— 那样用户以为在 Git Bash 里跑、其实不是。
+#[tauri::command]
+fn set_exec_shell(state: State<'_, AppState>, shell: String) -> Result<String, String> {
+    let parsed = config::ExecShell::parse(&shell)
+        .ok_or_else(|| format!("未知执行位置「{shell}」（可用：pwsh / gitbash）"))?;
+    let mut s = config::load_settings(&state.data_dir);
+    s.exec_shell = parsed;
+    config::save_settings(&state.data_dir, &s)?;
+    eprintln!("[orbcat] 执行位置 shell: {}", parsed.as_str());
+    Ok(parsed.as_str().to_string())
+}
+
+/// 查**执行位置用的 shell**（`pwsh` / `gitbash`）与 Git Bash 是否可用。
+///
+/// 设置页用：选了「本机 Git Bash」但这台机器没装 Git for Windows 时，
+/// 要**当场告诉用户**，别等跑命令时才炸。
+#[tauri::command]
+fn exec_shell_status(state: State<'_, AppState>) -> serde_json::Value {
+    let s = config::load_settings(&state.data_dir);
+    let (bash_found, bash_path) = match crate::shell::resolve_git_bash() {
+        Ok(p) => (true, p.to_string_lossy().to_string()),
+        Err(_) => (false, String::new()),
+    };
+    serde_json::json!({
+        "execShell": s.exec_shell.as_str(),
+        "label": s.exec_shell.label(),
+        "gitBashAvailable": bash_found,
+        "gitBashPath": bash_path,
+    })
+}
+
 /// 采集一次前台应用上下文（模型工具用；返回缓存的「非自身前台」）
 #[tauri::command]
 fn foreground_context() -> Option<context::ForegroundContext> {
@@ -5694,6 +5742,8 @@ pub fn run() {
             set_builtin_tools,
             builtin_tools,
             set_exec_trust,
+            set_exec_shell,
+            exec_shell_status,
             modes_get,
             bg_desk_status,
             bg_desk_set,
