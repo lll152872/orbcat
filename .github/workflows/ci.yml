@@ -106,6 +106,58 @@ jobs:
       - name: Rust tests
         run: cargo test --lib --manifest-path src-tauri/Cargo.toml
 
+      # ---- 集成测试（src-tauri/tests/）-------------------------------
+      #
+      # ⚠️ 这一步以前**从来没有过**（2026-10-23 守门实测：ci.yml 全文只有两处
+      #   `cargo test --lib`，build-windows / build-macos 各一处，
+      #   `cargo test --tests` 一次都没跑过）⇒
+      #   `src-tauri/tests/` 下的集成测试（pi_integration / pi_mcp_e2e /
+      #   pi_mock_e2e / pi_l1_project_e2e / pi_security_e2e …）**在 CI 里一条都不执行**，
+      #   集成层回归只能靠人本地跑。
+      #
+      #   为什么用 `--tests` 而不是逐个 `--test pi_xxx`：
+      #   cargo 的 `--tests` = 所有 test=true 的目标，**包含 lib 单测**，
+      #   所以上面那条 `--lib` 会再跑一遍（652 个 ≈ 4s，可接受）。
+      #   换来的是：**新增的集成测试文件自动进 CI**，不用改这里 ——
+      #   逐个枚举的写法一旦漏了新文件，就会静悄悄不执行，正是本条要修的病。
+      #
+      #   位置必须在上面 "Frontend build" 之后 —— tauri-build 递归 Walk dist/，
+      #   目录不存在直接 exit 101（那条踩坑注释别动）。
+      #
+      # ---- ⚠️⚠️ 「假绿」防线（这一段才是本步骤的要点）----------------
+      #   `src-tauri/tests/pi_*.rs` 里有两个**静默跳过**入口：
+      #     ① `runtime_dir()` 找不到 runtime/ → 「跳过：runtime/ 未构建」
+      #     ② `orbcat_data_dir()` 找不到 models.json → 「跳过：找不到 orbcat 的 agent-data/」
+      #   两者都是 `return` 掉这个用例，**测试照样算通过** ⇒
+      #   只加一行 `cargo test --tests` = CI 全绿而一条 e2e 都没跑（比不跑更坏，
+      #   因为它让人以为集成层有守门人了）。
+      #   ⇒ ① 用下面的复合 action 把 runtime/{node,pi} 装上并**断言它真在**；
+      #     ② 同一套 action 补一份夹具 models.json；
+      #     ③ 这一步跑完再**扫一遍输出**：出现上面两种「跳过」字样就红。
+      - name: Setup runtime for integration tests (node + pi)
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/setup-runtime
+
+      - name: Rust integration tests (src-tauri/tests)
+        shell: bash
+        run: |
+          set -o pipefail
+          # ⚠️ `-- --nocapture` 不能省：cargo 默认**不打印通过用例的 stderr**，
+          #   而「跳过：runtime/ 未构建」正是用 eprintln 打出来的 ⇒
+          #   不加 --nocapture，下面的 grep 永远匹配不到，断言形同虚设（= 又一次假绿）。
+          cargo test --tests --manifest-path src-tauri/Cargo.toml -- --nocapture 2>&1 | tee cargo-integration-tests.log
+          # ⚠️ 「跳过」= 没真跑。这里必须红 —— 见上面「假绿防线」。
+          #   注意只拦这两个**坏跳过**；「跳过：这是打真模型的测试」是设计内的
+          #   （真模型测试要显式设 ORBCAT_REAL_MODEL=1 才跑），不在拦名单里。
+          if grep -q "跳过：runtime/ 未构建" cargo-integration-tests.log; then
+            echo "::error::pi 集成测试因缺 runtime/ 全部跳过 —— 这是假绿，不是通过"
+            exit 1
+          fi
+          if grep -q "跳过：找不到 orbcat 的 agent-data/" cargo-integration-tests.log; then
+            echo "::error::pi 集成测试因找不到 agent-data/models.json 全部跳过 —— 这是假绿，不是通过"
+            exit 1
+          fi
+
       # ── 出包 ──────────────────────────────────────────────
       # 放在测试之后：测试红了就没必要编，编了也是白编。
       #
@@ -412,29 +464,13 @@ jobs:
       #
       # ⚠️ 只在 Windows 装配 zip 时需要。macOS 那条走 tauri bundle 成 .app，
       #    它的 runtime 归属另议（现在 .app 里没有 runtime/，pi 内核在 macOS 上不可用）。
-      - name: Fetch runtime assets (node + pi)
+      #
+      # ⚠️ 这里用**复合 action**，不自己再抄一份下载/构建逻辑 ——
+      #    build-windows 那条要跑集成测试，也需要同一套 runtime；
+      #    两边各抄一份的话，改了版本号只改一处，另一处照旧 ⇒ 又是一轮「各自实现」。
+      - name: Setup runtime (node + pi)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path tools/.cache | Out-Null
-          # node.exe —— pi 要求 >= 22.19.0
-          $nodeVer = "22.23.4"
-          Invoke-WebRequest -Uri "https://nodejs.org/dist/v$nodeVer/node-v$nodeVer-win-x64.zip" -OutFile node.zip
-          Expand-Archive -Force node.zip
-          Copy-Item "node-v$nodeVer-win-x64/node.exe" tools/.cache/node.exe
-          # pi 内核 —— 公开 npm 包
-          npm pack @earendil-works/pi-coding-agent@1.4.0 --pack-destination tools/.cache
-          tar -xzf "tools/.cache/earendil-works-pi-coding-agent-1.4.0.tgz" -C tools/.cache
-          Move-Item -Force tools/.cache/package tools/.cache/pi-pkg
-          # jiti 是 pi 的依赖 —— runtime-ext/*.ts 是 .ts 扩展，靠它加载
-          npm pack jiti@2.7.0 --pack-destination tools/.cache
-          tar -xzf "tools/.cache/jiti-2.7.0.tgz" -C tools/.cache
-          New-Item -ItemType Directory -Force -Path tools/.cache/pi-pkg/node_modules | Out-Null
-          Move-Item -Force tools/.cache/package tools/.cache/pi-pkg/node_modules/jiti
-
-      - name: Build runtime (node + pi)
-        if: runner.os == 'Windows'
-        run: node tools/build-runtime-assets.mjs
+        uses: ./.github/actions/setup-runtime
 
       # ---- Windows（x64 / arm64）------------------------------------------
       - name: Build Windows

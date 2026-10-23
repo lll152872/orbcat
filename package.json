@@ -9,10 +9,11 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "check:no-user-data": "node tools/check-no-user-data.mjs",
-    "test": "npm run check:no-user-data && npm run test:ui && npm run test:rust",
+    "test": "npm run check:no-user-data && npm run test:ui && npm run test:rust && npm run test:rust:integration",
     "test:ui": "vitest run",
     "test:ui:watch": "vitest",
     "test:rust": "cargo test --lib --manifest-path src-tauri/Cargo.toml",
+    "test:rust:integration": "cargo test --tests --manifest-path src-tauri/Cargo.toml",
     "test:e2e:mock": "python tests/e2e/mock_openai.py",
     "test:e2e:live": "python tests/e2e/run_live_flow.py"
   },

@@ -450,3 +450,59 @@ describe("内置运行时契约 —— 坏包不许放行（F1/F2）", () => {
     expect(r.notes.join(" ")).toMatch(/git/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 审计 F3：CI 必须真的执行 src-tauri/tests/ 下的集成测试 ——
+// 而且必须**防住「静默跳过」**，否则加上去的那一步是假绿。
+//
+// 背景：`cargo test --lib` **根本不编译** `src-tauri/tests/`，所以 1811 行
+// pi e2e 测试在 CI 里一条都没跑过（2026-10-23 守门实测 + 审计复核）。
+// 而 `src-tauri/tests/pi_*.rs` 有**两个静默跳过**入口：
+//   ① `runtime_dir()` 找不到 runtime/        → 「跳过：runtime/ 未构建」
+//   ② `orbcat_data_dir()` 找不到 models.json → 「跳过：找不到 orbcat 的 agent-data/」
+// 两者都是 `return` 掉整个用例，测试照样算通过 ⇒ CI 全绿而一条 e2e 都没跑。
+// 这比不跑更坏：它让人以为集成层已经有守门人了。
+//
+// 所以这里锁四条：**跑 --tests** + **装 runtime** + **补夹具** + **扫「跳过」字样**。
+// ---------------------------------------------------------------------------
+
+describe("集成测试闸门（审计 F3）—— 跑 + 不许静默跳过", () => {
+  const ci = readFileSync(
+    path.join(REPO_ROOT, ".github", "workflows", "ci.yml"),
+    "utf8"
+  );
+  const actionDir = path.join(REPO_ROOT, ".github", "actions", "setup-runtime");
+
+  it("CI 真的跑 cargo test --tests（--lib 不编译 src-tauri/tests/，那些是死代码）", () => {
+    expect(ci).toMatch(/cargo test --tests --manifest-path src-tauri\/Cargo\.toml/);
+  });
+
+  it("runtime 装配走复合 action，两处共用同一份实现（不各抄一遍）", () => {
+    // build-windows（跑集成测试）+ release job（装发布包）都要 runtime
+    const uses = ci.match(/uses: \.\/\.github\/actions\/setup-runtime/g) ?? [];
+    expect(uses.length).toBeGreaterThanOrEqual(2);
+    // 复合 action 本体必须存在
+    expect(existsSync(path.join(actionDir, "action.yml"))).toBe(true);
+    expect(existsSync(path.join(actionDir, "assert-runtime.mjs"))).toBe(true);
+    expect(existsSync(path.join(actionDir, "ensure-fixture-models.mjs"))).toBe(true);
+    // 旧的内联下载步骤不能再留一份（各抄一份 = 改版本号只改一处，另一处照旧）
+    expect(ci).not.toMatch(/Invoke-WebRequest -Uri "https:\/\/nodejs\.org/);
+  });
+
+  it("「静默跳过」要变成红：CI 扫输出里的跳过字样", () => {
+    expect(ci).toMatch(/跳过：runtime\/ 未构建/);
+    expect(ci).toMatch(/跳过：找不到 orbcat 的 agent-data\//);
+    // ⚠️ `-- --nocapture` 不能省（2026-10-23 守门实测踩到）：
+    //   cargo 默认**不打印通过用例的 stderr**，而那两句「跳过：…」正是 eprintln
+    //   打出来的 ⇒ 没有 --nocapture，grep 永远匹配不到，断言形同虚设 = 又一次假绿。
+    expect(ci).toMatch(/cargo test --tests[^\n]*-- --nocapture/);
+  });
+
+  it("本地 npm test 也要跑集成测试（package.json 的 test 链不能只有 --lib）", () => {
+    const pkg = JSON.parse(
+      readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")
+    );
+    expect(pkg.scripts["test:rust:integration"]).toMatch(/cargo test --tests/);
+    expect(pkg.scripts.test).toContain("test:rust:integration");
+  });
+});
