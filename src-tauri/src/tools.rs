@@ -3469,15 +3469,18 @@ fn append_file(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
 
 /// 找 git 可执行文件。
 ///
-/// ## 探测顺序（2026-10-22 改）
+/// ## 探测顺序（2026-10-23 改）
 ///
-/// 1. **内置的 `runtime/git/cmd/git.exe`** ← 发布包自带，用户零安装
-/// 2. PATH 上的 `git.exe` / `git`
-/// 3. 常见安装位置
+/// 1. **内置的 `runtime/git/cmd/git.exe`**（老发布包可能还带着）
+/// 2. **系统装的** git（[`crate::pi::bundled_git`] 内部已含这个回落）
+/// 3. PATH 上的 `git.exe` / `git`
+/// 4. 常见安装位置
+///
+/// ⚠️ **发布包不再分发 git**（GPLv2）⇒ 新包的第 1 条必然落空，
+/// 实际用的是**系统装的** git。用户没装 git ⇒ git 相关工具不可用（其它功能不受影响）。
 ///
 /// 为什么不查 `ORBCAT_GIT` 环境变量：git 工具是**只读查询**，
 /// 用哪份 git 不影响安全边界（写操作本来就走 `run_command` + 命令策略）。
-/// 内置那份是裁剪过的（64.2 MB，省 84%），子命令全内置，功能等价。
 ///
 /// ⚠️ **返回全路径**：`CreateProcessW` 不做 PATH 搜索（见 `shell.rs` 的注释）。
 fn resolve_git() -> PathBuf {
