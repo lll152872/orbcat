@@ -458,7 +458,16 @@ pub enum Progress {
     /// 模型决定调用某个工具
     ToolCall { name: String, args: String },
     /// 工具返回了
-    ToolResult { name: String, preview: String },
+    ///
+    /// `duration_ms`：工具实际跑了多久（毫秒）。pi 侧由 `tool_execution_end.durationMs`
+    /// 给，自研内核侧由本层自己计时。**没有就是 None**（工具没跑起来）。
+    /// 前端在工具行后面显示「· 1.2s」。
+    ToolResult {
+        name: String,
+        preview: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
     /// 工具执行**还在跑**（长命令每 2s 一次心跳）—— 前端据此刷"已运行 N 秒 + 输出尾巴"，
     /// 消掉「界面卡在 run_com 步骤不动」的假死感。
     ToolTick {
@@ -468,7 +477,13 @@ pub enum Progress {
         tail: String,
     },
     /// 工具执行失败
-    ToolError { name: String, message: String },
+    ToolError {
+        name: String,
+        message: String,
+        /// 同 `ToolResult::duration_ms`
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
     /// 准备输出最终答案（流式下已经边收边发了，这里只作为收尾信号）
     Answering,
     /// 本轮流了正文出来，但模型最终决定去调工具 —— 前端把那半截话淡化掉
@@ -858,6 +873,7 @@ fn absorb_reason(
         kind: "reasoning".into(),
         name: None,
         detail: txt.clone(),
+        duration_ms: None,
         images: Vec::new(),
     });
     if !total.is_empty() {
@@ -883,6 +899,7 @@ fn drain_status_steps(log: &std::sync::Mutex<Vec<String>>, steps: &mut Vec<Agent
             kind: "status".into(),
             name: None,
             detail: text,
+            duration_ms: None,
             images: Vec::new(),
         });
     }
@@ -899,6 +916,13 @@ pub struct AgentStep {
     /// 插话不铺独立气泡，图只能画在时间线这条 steer 条目上。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// **工具耗时（毫秒）** —— 只对 `tool_call` / `tool_result` / `tool_error` 有意义。
+    ///
+    /// 为什么要单开一个字段：耗时是**元信息**，不是结果内容。
+    /// 混进 `detail` 会污染结果预览（`detail` 要过 `summarizeArgs`，
+    /// 还要原样展示给用户看）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1384,6 +1408,7 @@ pub async fn run(
                 kind: "steer".into(),
                 name: Some(m.id.clone()),
                 detail: m.text.clone(),
+                duration_ms: None,
                 images: m.images.clone(),
             });
             on_progress(Progress::Steer {
@@ -1624,6 +1649,7 @@ pub async fn run(
                     kind: "error".into(),
                     name: None,
                     detail: e.clone(),
+                    duration_ms: None,
                     images: Vec::new(),
                 });
                 return Err(RunAbort { message: e, run });
@@ -1697,6 +1723,7 @@ pub async fn run(
                                 "⚠️ 模型把 {} 个工具调用写成了正文（未真正执行），已解析回真实调用继续",
                                 pseudo.len()
                             ),
+                            duration_ms: None,
                             images: Vec::new(),
                         });
                         // 正文那半截是"伪日志"，不作为最终答案。
@@ -1779,6 +1806,7 @@ pub async fn run(
                             detail: "⚠️ 模型收尾只写了「见上一条回复」，\
                                      已把它本轮中途写好的结论提升为最终答复"
                                 .into(),
+                            duration_ms: None,
                             images: Vec::new(),
                         });
                         on_progress(Progress::Answering);
@@ -1786,6 +1814,7 @@ pub async fn run(
                             kind: "assistant".into(),
                             name: None,
                             detail: promoted.clone(),
+                            duration_ms: None,
                             images: Vec::new(),
                         });
                         return Ok(AgentRun {
@@ -1847,6 +1876,7 @@ pub async fn run(
                         } else {
                             "⚠️ 回合结束但没有可用正文（空内容或纯确认），已自动要求正面作答".into()
                         },
+                        duration_ms: None,
                         images: Vec::new(),
                     });
                     continue;
@@ -1902,6 +1932,7 @@ pub async fn run(
                         detail: "⚠️ 模型收尾只有一句自我交代（没交付内容），\
                                  已把它本轮中途写好的结论提升为最终答复"
                             .into(),
+                        duration_ms: None,
                         images: Vec::new(),
                     });
                 }
@@ -1910,6 +1941,7 @@ pub async fn run(
                     kind: "assistant".into(),
                     name: None,
                     detail: answer_text.clone(),
+                    duration_ms: None,
                     images: Vec::new(),
                 });
                 return Ok(AgentRun {
@@ -1963,6 +1995,7 @@ pub async fn run(
                     kind: "midturn".into(),
                     name: None,
                     detail,
+                    duration_ms: None,
                     images: Vec::new(),
                 });
             }
@@ -1991,9 +2024,14 @@ pub async fn run(
                 kind: "tool_call".into(),
                 name: Some(call.function.name.clone()),
                 detail: call.function.arguments.clone(),
+                duration_ms: None,
                 images: Vec::new(),
             });
 
+            // 工具耗时（自研内核自己计时）——
+            // pi 侧是 `tool_execution_end.durationMs`，这条路径没有那个字段，
+            // 自己掐表，两条路径的口径才对得上。
+            let tool_started = std::time::Instant::now();
             let output = {
                 // 长命令心跳：每 2s 把「已运行 N 秒 + 输出尾巴」推给前端（工具名绑进闭包）
                 let tick: crate::shell::TickFn = {
@@ -2023,13 +2061,20 @@ pub async fn run(
                     perm,
                     tick: Some(tick),
                     cancel: Some(cancel_probe),
+                    // 本轮用户原话 → `remember` 提交候选时记进 `turn_ref`，
+                    // 审批页就能显示「出自「…」这一轮」。
+                    turn_ref: Some(user_input),
                 };
+                // 工具耗时（自研内核自己计时）——
+                // pi 侧是 `tool_execution_end.durationMs`，这条路径没有那个字段，
+                // 自己掐表，两条路径的口径才对得上。
                 match tools::execute(&call.function.name, &args, &ctx).await {
                     Ok(o) => o,
                     Err(e) => {
                         on_progress(Progress::ToolError {
                             name: call.function.name.clone(),
                             message: e.chars().take(200).collect(),
+                            duration_ms: Some(tool_started.elapsed().as_millis() as u64),
                         });
                         tools::ToolOutput::text(format!("工具执行失败：{e}"))
                     }
@@ -2041,12 +2086,14 @@ pub async fn run(
                 on_progress(Progress::ToolResult {
                     name: call.function.name.clone(),
                     preview: preview.clone(),
+                    duration_ms: Some(tool_started.elapsed().as_millis() as u64),
                 });
             }
             steps.push(AgentStep {
                 kind: "tool_result".into(),
                 name: Some(call.function.name.clone()),
                 detail: preview,
+                duration_ms: Some(tool_started.elapsed().as_millis() as u64),
                 images: Vec::new(),
             });
 
@@ -2785,8 +2832,9 @@ pub fn build_system_prompt_full(
            **禁止**用 `run_command` 跑 `Get-Content` / `Select-String` / `findstr` / `Get-ChildItem` 去读搜文件。\n\
            ⚠️ `grep_files` 的用法要点（踩过坑，2026-10-01）：\n\
            - `path` **可以传目录，也可以直接传单个文件** —— 搜一个文件就传它本身，别传父目录；\n\
-           - 只做**字面量子串**匹配：**不要写正则**（`a|b`、`.*`、`\\d`、`^x` 都会直接报错）；\
-           多个词请**分开搜几次**；\n\
+           - `pattern` 默认按**字面子串**匹配，但**含正则语法（`a|b`、`.*`、`\\d`、`^x`、`[abc]`）时会自动按正则跑**\n\
+           （返回标题会写明「已自动按正则匹配」）；要强制口径就传 `regex: true/false`；\n\
+           正则是 Rust regex 语法（不支持反向引用/前后看）；\n\
            - 默认**大小写不敏感**，一般不用管大小写；\n\
            - 返回里的「命中 N 行」**只数真正的命中行**（不含 context 行）；\n\
            - ⚠️ 若返回里出现「⚠️ 注意：…未读」，说明**有文件被跳过了**（超 2MB / 非文本 / 权限）——\n\
@@ -3110,18 +3158,21 @@ mod tests {
                 kind: "reasoning".into(),
                 name: None,
                 detail: "先算一下".into(),
+                duration_ms: None,
                 images: Vec::new(),
             },
             AgentStep {
                 kind: "midturn".into(),
                 name: None,
                 detail: format!("  {promoted}\n"), // 落盘时可能带空白
+                duration_ms: None,
                 images: Vec::new(),
             },
             AgentStep {
                 kind: "tool_call".into(),
                 name: Some("read_file".into()),
                 detail: "{}".into(),
+                duration_ms: None,
                 images: Vec::new(),
             },
         ];
@@ -3302,6 +3353,7 @@ mod tests {
             kind: "tool_call".into(),
             name: Some("list_dir".into()),
             detail: "{}".into(),
+            duration_ms: None,
             images: Vec::new(),
         });
 

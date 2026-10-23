@@ -1021,6 +1021,11 @@ pub async fn ping(cfg: &ModelConfig) -> Result<String, String> {
 /// 部分网关（如 SenseNova）会在 `/models` 里返回它们，导入模型时就能
 /// 自动填上 `maxInputTokens`，省得用户去翻文档手填。
 /// 不返回的网关（如火山方舟 `/models` 直接 404）只能手填 —— 这里保持 `None`。
+///
+/// `supports_tool_call` / `supports_images` 是**能力自报**：OpenRouter 风格
+/// 的模型描述里会带 `capabilities: {tools, vision}`，有的网关给的是
+/// `supports_tools` / `supports_vision`。`None` = 对方没声明 →
+/// 沿用表单里的勾选（前端行为不变）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteModelInfo {
@@ -1033,6 +1038,12 @@ pub struct RemoteModelInfo {
     /// 最大输出（token）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_length: Option<u64>,
+    /// 支持工具调用？`None` = 提供商没声明
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_tool_call: Option<bool>,
+    /// 支持看图？`None` = 提供商没声明
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_images: Option<bool>,
 }
 
 /// 从对象里按多个候选键名取一个正整数。
@@ -1059,6 +1070,84 @@ fn pick_u64(obj: &Value, keys: &[&str]) -> Option<u64> {
     None
 }
 
+/// 从对象里按多个候选键名取一个布尔值。
+///
+/// 兼容 `true` / `"true"` / `1` 三种写法 —— 有的网关给的是字符串。
+fn pick_bool(obj: &Value, keys: &[&str]) -> Option<bool> {
+    for k in keys {
+        let Some(v) = obj.get(*k) else { continue };
+        if let Some(b) = v.as_bool() {
+            return Some(b);
+        }
+        if let Some(s) = v.as_str() {
+            let t = s.trim().to_ascii_lowercase();
+            if t == "true" || t == "1" || t == "yes" {
+                return Some(true);
+            }
+            if t == "false" || t == "0" || t == "no" {
+                return Some(false);
+            }
+        }
+        if let Some(n) = v.as_u64() {
+            return Some(n != 0);
+        }
+    }
+    None
+}
+
+/// **工具调用**能力。
+///
+/// OpenRouter 风格：`capabilities: { tools: true }`；
+/// 其它常见写法：`supports_tools` / `supports_tool_call` / `supports_function_calling`。
+/// 都没有 → `None`（"对方没声明"，不是"不支持"）。
+fn pick_tool_flag(item: &Value) -> Option<bool> {
+    if let Some(caps) = item.get("capabilities") {
+        if let Some(b) = pick_bool(caps, &["tools", "tool_calling", "function_calling"]) {
+            return Some(b);
+        }
+    }
+    pick_bool(
+        item,
+        &[
+            "supports_tools",
+            "supports_tool_call",
+            "supports_tool_calls",
+            "tool_calling",
+            "supports_function_calling",
+        ],
+    )
+}
+
+/// **看图**能力。
+///
+/// 优先看显式声明（`capabilities.vision` / `supports_vision` / `supports_images`）；
+/// 都没有时看 OpenRouter 的 `architecture.input_modalities` 里有没有 `"image"`
+/// —— 那才是"能不能吃图片"的真答案（`capabilities.vision` 常常缺省）。
+fn pick_vision_flag(item: &Value) -> Option<bool> {
+    if let Some(caps) = item.get("capabilities") {
+        if let Some(b) = pick_bool(caps, &["vision", "image", "images", "multimodal"]) {
+            return Some(b);
+        }
+    }
+    if let Some(b) = pick_bool(
+        item,
+        &["supports_vision", "supports_images", "vision", "image_input"],
+    ) {
+        return Some(b);
+    }
+    if let Some(arch) = item.get("architecture") {
+        if let Some(mods) = arch.get("input_modalities").and_then(|x| x.as_array()) {
+            let has_image = mods.iter().any(|m| {
+                m.as_str()
+                    .map(|s| s.to_ascii_lowercase().contains("image"))
+                    .unwrap_or(false)
+            });
+            return Some(has_image);
+        }
+    }
+    None
+}
+
 /// 解析 OpenAI 兼容的 `GET /models` 响应体。
 ///
 /// 兼容常见形态：
@@ -1066,13 +1155,35 @@ fn pick_u64(obj: &Value, keys: &[&str]) -> Option<u64> {
 ///   - 部分网关把数组放在 `models` 字段
 ///   - 裸数组：`["id1", ...]` 或 `[{id}, ...]`
 ///   - id 字段名可能是 `id` / `name` / `model`
+///
+/// 还能吃下 **OpenRouter 风格**的模型描述（就是各家 `/models` 现在爱返的那种）：
+/// ```json
+/// {
+///   "id": "nemotron-3.5-lightning-free",
+///   "context_length": 262144,
+///   "max_completion_tokens": 262144,
+///   "top_provider": { "context_length": 262144, "max_completion_tokens": 262144 },
+///   "architecture": { "modality": "text->text", "input_modalities": ["text"] },
+///   "capabilities": { "vision": false, "tools": true, "reasoning": true },
+///   "supports_vision": false,
+///   "supports_tools": true
+/// }
+/// ```
+/// 窗口大小取 `context_length` / `max_context_length` / `max_input_tokens`；
+/// 最大输出取 `max_completion_tokens` / `max_output_tokens` / `max_output_length`；
+/// 能力取 `capabilities.tools` / `capabilities.vision`（或 `supports_*`），
+/// 都没有时从 `architecture.input_modalities` 推断"能不能看图"。
 pub fn parse_models_payload(v: &Value) -> Result<Vec<RemoteModelInfo>, String> {
-    let arr = if let Some(d) = v.get("data").and_then(|x| x.as_array()) {
+    let arr: &[Value] = if let Some(d) = v.get("data").and_then(|x| x.as_array()) {
         d.as_slice()
     } else if let Some(d) = v.get("models").and_then(|x| x.as_array()) {
         d.as_slice()
     } else if let Some(d) = v.as_array() {
         d.as_slice()
+    } else if v.get("id").is_some() || v.get("name").is_some() || v.get("model").is_some() {
+        // **裸的单个模型描述** —— 用户从文档里粘一段 JSON 进来就是这个形态
+        // （`{"id":"...","context_length":...,"capabilities":{...}}`），不是数组。
+        std::slice::from_ref(v)
     } else {
         return Err("响应里找不到模型数组（期望 data / models / 顶层数组）".into());
     };
@@ -1090,6 +1201,8 @@ pub fn parse_models_payload(v: &Value) -> Result<Vec<RemoteModelInfo>, String> {
                     owned_by: String::new(),
                     context_length: None,
                     max_output_length: None,
+                    supports_tool_call: None,
+                    supports_images: None,
                 }
             }
             Value::Object(_) => {
@@ -1113,6 +1226,7 @@ pub fn parse_models_payload(v: &Value) -> Result<Vec<RemoteModelInfo>, String> {
                     .unwrap_or("")
                     .to_string();
                 // 上下文窗口：各家字段名不一，尽力而为
+                let top = item.get("top_provider");
                 let context_length = pick_u64(
                     item,
                     &[
@@ -1125,22 +1239,42 @@ pub fn parse_models_payload(v: &Value) -> Result<Vec<RemoteModelInfo>, String> {
                         "maxInputTokens",
                         "max_tokens",
                     ],
-                );
+                )
+                .or_else(|| {
+                    top.and_then(|t| {
+                        pick_u64(
+                            t,
+                            &["context_length", "contextLength", "max_context_length"],
+                        )
+                    })
+                });
                 let max_output_length = pick_u64(
                     item,
                     &[
                         "max_output_length",
                         "maxOutputLength",
+                        "max_completion_tokens",
+                        "maxCompletionTokens",
                         "max_output_tokens",
                         "maxOutputTokens",
                         "output_length",
                     ],
-                );
+                )
+                .or_else(|| {
+                    top.and_then(|t| {
+                        pick_u64(
+                            t,
+                            &["max_completion_tokens", "maxCompletionTokens", "max_output_tokens"],
+                        )
+                    })
+                });
                 RemoteModelInfo {
                     id,
                     owned_by,
                     context_length,
                     max_output_length,
+                    supports_tool_call: pick_tool_flag(item),
+                    supports_images: pick_vision_flag(item),
                 }
             }
             _ => continue,
@@ -1154,6 +1288,19 @@ pub fn parse_models_payload(v: &Value) -> Result<Vec<RemoteModelInfo>, String> {
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out.dedup_by(|a, b| a.id == b.id);
     Ok(out)
+}
+
+/// 解析**一段 JSON 文本**（用户粘进来的模型描述）。
+///
+/// 走的是同一个 [`parse_models_payload`]，所以"粘 JSON 导入"和"从提供商拉列表"
+/// 的口径完全一致 —— 不会出现"拉得到、粘进来就丢字段"这种两套标准。
+pub fn parse_models_text(text: &str) -> Result<Vec<RemoteModelInfo>, String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Err("内容为空".into());
+    }
+    let v: Value = serde_json::from_str(t).map_err(|e| format!("不是合法 JSON：{e}"))?;
+    parse_models_payload(&v)
 }
 
 /// 用显式 url / key / 额外头拉取远端模型列表。
@@ -1563,6 +1710,75 @@ mod tests {
 
         let v: Value = serde_json::from_str(r#"{"ok":true}"#).unwrap();
         assert!(parse_models_payload(&v).is_err());
+    }
+
+    /// OpenRouter 风格的模型描述也要能解析（用户实测贴过来的就是这种）。
+    ///
+    /// 认出来的字段：窗口 `context_length`、最大输出 `max_completion_tokens`、
+    /// 工具能力 `capabilities.tools`、视觉能力 `capabilities.vision`。
+    #[test]
+    fn parse_models_openrouter_style() {
+        let txt = r#"{
+            "id": "nemotron-3.5-lightning-free",
+            "context_length": 262144,
+            "max_context_length": 262144,
+            "max_input_tokens": 262144,
+            "max_completion_tokens": 262144,
+            "max_output_tokens": 262144,
+            "top_provider": { "context_length": 262144, "max_completion_tokens": 262144 },
+            "architecture": { "modality": "text->text", "input_modalities": ["text"] },
+            "capabilities": { "vision": false, "tools": true, "reasoning": true },
+            "supports_vision": false,
+            "supports_tools": true
+        }"#;
+        let list = parse_models_text(txt).unwrap();
+        assert_eq!(list.len(), 1);
+        let m = &list[0];
+        assert_eq!(m.id, "nemotron-3.5-lightning-free");
+        assert_eq!(m.context_length, Some(262_144), "窗口应从 context_length 认出来");
+        assert_eq!(m.max_output_length, Some(262_144), "最大输出应认 max_completion_tokens");
+        assert_eq!(m.supports_tool_call, Some(true), "capabilities.tools 应认出来");
+        assert_eq!(m.supports_images, Some(false), "capabilities.vision=false 应认出来");
+    }
+
+    /// 没写 `capabilities` 时，视觉能力从 `architecture.input_modalities` 推断。
+    #[test]
+    fn parse_models_infers_vision_from_input_modalities() {
+        let txt = r#"{"id":"m-1","architecture":{"modality":"text->text","input_modalities":["text","image"]}}"#;
+        let list = parse_models_text(txt).unwrap();
+        assert_eq!(list[0].supports_images, Some(true));
+        assert_eq!(list[0].supports_tool_call, None, "没声明就该是 None（不是 false）");
+
+        let txt = r#"{"id":"m-2","architecture":{"modality":"text->text","input_modalities":["text"]}}"#;
+        let list = parse_models_text(txt).unwrap();
+        assert_eq!(list[0].supports_images, Some(false));
+    }
+
+    /// 顶层数组 / `data` 包装的 OpenRouter 风格列表同样要能吃下。
+    #[test]
+    fn parse_models_openrouter_style_in_data_array() {
+        let txt = r#"{"data":[
+            {"id":"a-model","context_length":128000,"max_completion_tokens":8192,"capabilities":{"tools":false,"vision":true}},
+            {"id":"b-model","context_length":64000,"supports_tools":true}
+        ]}"#;
+        let list = parse_models_text(txt).unwrap();
+        assert_eq!(list.len(), 2);
+        let a = list.iter().find(|m| m.id == "a-model").unwrap();
+        assert_eq!(a.context_length, Some(128_000));
+        assert_eq!(a.max_output_length, Some(8192));
+        assert_eq!(a.supports_tool_call, Some(false));
+        assert_eq!(a.supports_images, Some(true));
+        let b = list.iter().find(|m| m.id == "b-model").unwrap();
+        assert_eq!(b.supports_tool_call, Some(true), "supports_tools 也认");
+        assert_eq!(b.supports_images, None, "没声明就是 None");
+    }
+
+    /// 粘进来的不是 JSON → 报错要说人话。
+    #[test]
+    fn parse_models_text_reports_bad_json() {
+        assert!(parse_models_text("").is_err());
+        assert!(parse_models_text("not json").is_err());
+        assert!(parse_models_text(r#"{"ok":true}"#).is_err());
     }
 
     #[test]

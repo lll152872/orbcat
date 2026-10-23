@@ -59,6 +59,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util"] }
 futures-util = "0.3"
 glob = "0.3"
+# grep_files 的正则支持（2026-10-18）。
+# 之前只做字面子串、遇到正则直接报错，把模型逼去 `run_command` 跑 rg ——
+# 绕权限网关 + 撞 24KB 截断。现在内置 regex，**默认仍是子串快路径**，
+# 只有 pattern 长得像正则（或显式 regex:true）才走这里。
+# 该 crate 早已作为传递依赖躺在 Cargo.lock 里（regex 1.13.1），不新增下载量。
+regex = "1"
 # 项目/会话索引库（仿 WorkBuddy：SQLite 只管索引，长期记忆仍写 md）
 rusqlite = { version = "0.32", features = ["bundled"] }
 

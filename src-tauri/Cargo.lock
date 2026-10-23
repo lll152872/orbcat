@@ -2586,6 +2586,7 @@ dependencies = [
  "glob",
  "image",
  "indexmap 1.9.3",
+ "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",

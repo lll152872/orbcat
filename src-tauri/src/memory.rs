@@ -48,6 +48,15 @@ pub struct Candidate {
     pub source: String,
     /// 提交时间（本地时区，ISO 风格）
     pub created_at: String,
+    /// **触发轮次**：这条记忆是从哪一句用户提问里诞生的（截断后的用户原话）。
+    ///
+    /// 2026-10-23 加（设计稿 06「触发轮次」）：审批页要能回答
+    /// 「这条到底是从哪句话里冒出来的」—— 没有它就只剩一句孤零零的结论，
+    /// 用户批不批全靠猜。
+    ///
+    /// 老数据没这个字段 → `serde(default)` 读成 `None`，前端回退到占位文案。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_ref: Option<String>,
     /// **驳回理由**（只写进 `rejected.jsonl`，不进 `candidates.jsonl`）。
     ///
     /// 2026-10-15 加：以前驳回只把条目搬走、不留理由，于是过几天问
@@ -169,6 +178,16 @@ impl MemoryStore {
         self.pending_dir().join("rejected.jsonl")
     }
 
+    /// **已批准留档**（`pending/approved.jsonl`）。
+    ///
+    /// 为什么单独留一份：审批页底部要显示「N / M」（待批 / 候选总数），
+    /// 而「已批准多少条」从 MEMORY.md 里数不出来 —— 那个文件里还有
+    /// 手写内容，还有蒸馏搬过去的条目，混在一起统计就是假账。
+    /// 留一份只追加不删的台账，数字才真。
+    fn approved_path(&self) -> PathBuf {
+        self.pending_dir().join("approved.jsonl")
+    }
+
     fn long_term_path(&self) -> PathBuf {
         // ⚠️ 必须与 agent.rs 的 build_system_prompt 读的路径一致
         // （memory/MEMORY.md）。早先这里是 root/MEMORY.md —— 审批通过的写这，
@@ -218,16 +237,34 @@ impl MemoryStore {
 
     /// 提交一条记忆候选（remember 工具 / 用户手写都会走这里）
     pub fn propose(&self, content: &str, source: &str) -> Result<Candidate, String> {
+        self.propose_with_ref(content, source, None)
+    }
+
+    /// 提交一条记忆候选，并记下**触发轮次**（用户原话，截断过）。
+    ///
+    /// `turn_ref` 为空串视作「没有」—— 免得调用方为了「没有」还得构造 `None`。
+    pub fn propose_with_ref(
+        &self,
+        content: &str,
+        source: &str,
+        turn_ref: Option<&str>,
+    ) -> Result<Candidate, String> {
         let content = content.trim().to_string();
         if content.is_empty() {
             return Err("记忆内容不能为空".into());
         }
+
+        let turn_ref = turn_ref
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(40).collect::<String>());
 
         let c = Candidate {
             id: format!("{}_{}", now_string(), short_hash(&content)),
             content,
             source: source.to_string(),
             created_at: now_string(),
+            turn_ref,
             rejected_reason: None,
             rejected_at: None,
         };
@@ -280,6 +317,31 @@ impl MemoryStore {
         Self::read_jsonl(&self.candidates_path())
     }
 
+    /// 追加一条到「已批准留档」（`pending/approved.jsonl`）。
+    fn log_approved(&self, c: &Candidate) -> Result<(), String> {
+        std::fs::create_dir_all(self.pending_dir())
+            .map_err(|e| format!("建 pending 目录失败: {e}"))?;
+        let line = serde_json::to_string(c).map_err(|e| format!("序列化失败: {e}"))?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.approved_path())
+            .map_err(|e| format!("打开批准留档失败: {e}"))?;
+        writeln!(f, "{line}").map_err(|e| format!("写入批准留档失败: {e}"))
+    }
+
+    /// 审批页底部的统计：**（待批数, 已处理数）**。
+    ///
+    /// 「已处理」= 已批准 + 已驳回。两者都从**只追加的台账**数，
+    /// 不从 MEMORY.md 反推 —— 那个文件里还有手写内容和蒸馏搬过去的条目，
+    /// 混进来统计就是假账。
+    pub fn stats(&self) -> Result<(usize, usize), String> {
+        let pending = Self::read_jsonl::<Candidate>(&self.candidates_path())?.len();
+        let approved = Self::read_jsonl::<Candidate>(&self.approved_path())?.len();
+        let rejected = Self::read_jsonl::<Candidate>(&self.rejected_path())?.len();
+        Ok((pending, approved + rejected))
+    }
+
     /// 批准一条：从候选队列移除，追加进 MEMORY.md
     pub fn approve(&self, id: &str) -> Result<(), String> {
         let mut all = Self::read_jsonl::<Candidate>(&self.candidates_path())?;
@@ -301,7 +363,64 @@ impl MemoryStore {
         let entry = format!("\n- {}（{}）\n", c.content, c.created_at);
         f.write_all(entry.as_bytes())
             .map_err(|e| format!("写入 MEMORY.md 失败: {e}"))?;
+        f.flush().map_err(|e| format!("落盘失败: {e}"))?;
 
+        self.log_approved(&c)?;
+        Self::rewrite_jsonl(&self.candidates_path(), &all)
+    }
+
+    /// **全部批准**：把当前所有候选一次性写进长期记忆，返回写入条数。
+    ///
+    /// 设计稿 06 标题条上的「全部批准」。为什么后端做而不是前端循环调
+    /// `mem_approve`：前端循环会留下「批了 3 条、剩 2 条失败」的半截状态，
+    /// 而这里一次读写、要么全进要么报错。
+    pub fn approve_all(&self) -> Result<usize, String> {
+        let mut all = Self::read_jsonl::<Candidate>(&self.candidates_path())?;
+        if all.is_empty() {
+            return Ok(0);
+        }
+
+        let lt = self.long_term_path();
+        if let Some(parent) = lt.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("建 memory 目录失败: {e}"))?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&lt)
+            .map_err(|e| format!("打开 MEMORY.md 失败: {e}"))?;
+
+        let n = all.len();
+        let batch: Vec<Candidate> = all.drain(..).collect();
+        for c in &batch {
+            let entry = format!("\n- {}（{}）\n", c.content, c.created_at);
+            f.write_all(entry.as_bytes())
+                .map_err(|e| format!("写入 MEMORY.md 失败: {e}"))?;
+        }
+        f.flush().map_err(|e| format!("落盘失败: {e}"))?;
+
+        for c in &batch {
+            self.log_approved(c)?;
+        }
+        Self::rewrite_jsonl(&self.candidates_path(), &all)?;
+        Ok(n)
+    }
+
+    /// **改写**一条候选的内容（仍然留在待审批队列里，等用户点「批准」）。
+    ///
+    /// 设计稿 06 的「改写」按钮：模型蒸馏出来的句子往往太长或太满，
+    /// 用户想收紧措辞再决定要不要写进长期记忆。
+    /// 改写**不自动批准** —— 改完还要用户自己点「批准」，两件事分开。
+    pub fn rewrite(&self, id: &str, content: &str) -> Result<(), String> {
+        let content = content.trim();
+        if content.is_empty() {
+            return Err("改写内容不能为空".into());
+        }
+        let mut all = Self::read_jsonl::<Candidate>(&self.candidates_path())?;
+        let Some(pos) = all.iter().position(|c| c.id == id) else {
+            return Err(format!("找不到候选 {id}"));
+        };
+        all[pos].content = content.to_string();
         Self::rewrite_jsonl(&self.candidates_path(), &all)
     }
 
@@ -923,6 +1042,152 @@ mod tests {
     fn empty_content_is_rejected() {
         let (s, dir) = fresh_store("empty");
         assert!(s.propose("   ", "model").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **触发轮次**要记进候选里 —— 审批页要能回答「这条从哪句话来的」。
+    #[test]
+    fn turn_ref_is_recorded_on_propose() {
+        let (s, dir) = fresh_store("turn_ref");
+
+        let c = s
+            .propose_with_ref("回答前先给结论", "model", Some("回答先给结论"))
+            .unwrap();
+        assert_eq!(c.turn_ref.as_deref(), Some("回答先给结论"));
+
+        // 落盘后重读要还在（不是只在内存里）
+        let pend = s.list_pending().unwrap();
+        assert_eq!(pend.len(), 1);
+        assert_eq!(pend[0].turn_ref.as_deref(), Some("回答先给结论"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 没给触发轮次（或给了空白）→ 存 `None`，不能存空串。
+    #[test]
+    fn turn_ref_absent_or_blank_is_none() {
+        let (s, dir) = fresh_store("turn_ref_blank");
+
+        let a = s.propose_with_ref("甲", "model", None).unwrap();
+        assert!(a.turn_ref.is_none(), "没给就该是 None");
+
+        let b = s.propose_with_ref("乙", "model", Some("   ")).unwrap();
+        assert!(b.turn_ref.is_none(), "空白该当没给");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 老数据没有 `turn_ref` 字段 —— 反序列化不能炸（否则历史候选全读不出来）。
+    #[test]
+    fn legacy_candidate_without_turn_ref_still_parses() {
+        let legacy = r#"{"id":"x_1","content":"老条目","source":"model","created_at":"ts"}"#;
+        let c: Candidate = serde_json::from_str(legacy).unwrap();
+        assert!(c.turn_ref.is_none());
+        assert_eq!(c.content, "老条目");
+    }
+
+    /// **改写**只改内容，**不动审批状态** —— 改完还得用户自己点「批准」。
+    #[test]
+    fn rewrite_changes_content_but_stays_pending() {
+        let (s, dir) = fresh_store("rewrite");
+
+        let c = s.propose("回答前先给结论，可能大概也许", "model").unwrap();
+        s.rewrite(&c.id, "回答前先给结论。").unwrap();
+
+        let pend = s.list_pending().unwrap();
+        assert_eq!(pend.len(), 1, "改写不该把它移出待批队列");
+        assert_eq!(pend[0].content, "回答前先给结论。");
+        assert!(
+            !dir.join("memory").join("MEMORY.md").exists(),
+            "改写不该直接写进长期记忆"
+        );
+
+        // 改完再批准 → 写进去的是**改写后**的内容
+        s.approve(&c.id).unwrap();
+        let mem = std::fs::read_to_string(dir.join("memory").join("MEMORY.md")).unwrap();
+        assert!(mem.contains("回答前先给结论。"));
+        assert!(!mem.contains("可能大概也许"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 改写空内容 / 改写不存在的候选 → 报错，不静默吞掉。
+    #[test]
+    fn rewrite_rejects_blank_and_unknown_id() {
+        let (s, dir) = fresh_store("rewrite_bad");
+
+        let c = s.propose("原内容", "model").unwrap();
+        assert!(s.rewrite(&c.id, "   ").is_err(), "空内容该报错");
+        assert!(s.rewrite("不存在的id", "x").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **全部批准**：一次全写进长期记忆，队列清空。
+    #[test]
+    fn approve_all_writes_everything_and_empties_queue() {
+        let (s, dir) = fresh_store("approve_all");
+
+        s.propose("第一条", "model").unwrap();
+        s.propose("第二条", "model").unwrap();
+        assert_eq!(s.list_pending().unwrap().len(), 2);
+
+        let n = s.approve_all().unwrap();
+        assert_eq!(n, 2);
+        assert!(s.list_pending().unwrap().is_empty(), "全部批准后队列应清空");
+
+        let mem = std::fs::read_to_string(dir.join("memory").join("MEMORY.md")).unwrap();
+        assert!(mem.contains("第一条") && mem.contains("第二条"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 没候选时「全部批准」不该报错（幂等），返回 0。
+    #[test]
+    fn approve_all_on_empty_queue_is_ok() {
+        let (s, dir) = fresh_store("approve_all_empty");
+        assert_eq!(s.approve_all().unwrap(), 0);
+        assert!(!dir.join("memory").join("MEMORY.md").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 统计口径：**待批数**与**已处理数**（已批准 + 已驳回）分开算。
+    #[test]
+    fn stats_counts_pending_and_handled() {
+        let (s, dir) = fresh_store("stats");
+
+        let a = s.propose("甲", "model").unwrap();
+        let b = s.propose("乙", "model").unwrap();
+        let c = s.propose("丙", "model").unwrap();
+
+        let (pending, handled) = s.stats().unwrap();
+        assert_eq!(pending, 3);
+        assert_eq!(handled, 0);
+
+        s.approve(&a.id).unwrap();
+        s.reject(&b.id, "不要").unwrap();
+
+        let (pending, handled) = s.stats().unwrap();
+        assert_eq!(pending, 1, "批一条驳一条，剩一条");
+        assert_eq!(handled, 2, "已批准 1 + 已驳回 1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = c;
+    }
+
+    /// 「全部批准」也要进已处理台账（不然统计会一直停在半路）。
+    #[test]
+    fn approve_all_is_counted_as_handled() {
+        let (s, dir) = fresh_store("stats_all");
+
+        s.propose("甲", "model").unwrap();
+        s.propose("乙", "model").unwrap();
+        s.approve_all().unwrap();
+
+        let (pending, handled) = s.stats().unwrap();
+        assert_eq!(pending, 0);
+        assert_eq!(handled, 2);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

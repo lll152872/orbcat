@@ -118,7 +118,7 @@ pub fn create_project(data_dir: &Path, name: &str, root_path: &str) -> Result<Pr
     let mem = mem_dir.join("MEMORY.md");
     if !mem.exists() {
         let body = format!(
-            "# 项目记忆 — {name}\n\n> 跨会话沉淀；主对话切换到本项目后由 system prompt 注入。\n> 用 `remember` 提交候选，或直接改本文件。\n"
+            "# 项目记忆 — {name}\n\n> 跨会话沉淀；切到本项目后由 system prompt 注入。\n> 用 `remember` 提交候选，或直接改本文件。\n"
         );
         std::fs::write(&mem, body).map_err(|e| format!("写 MEMORY.md 失败: {e}"))?;
     }

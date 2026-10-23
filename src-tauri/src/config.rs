@@ -299,6 +299,26 @@ pub fn load_models(data_dir: &Path) -> Result<Vec<ModelConfig>, String> {
     Ok(models)
 }
 
+/// 批量导入时**每个模型各自的元信息**（来自提供商的 `/models` 返回）。
+///
+/// 为什么要按模型分：OpenRouter 风格的描述里，窗口大小和能力都是
+/// **逐模型**的（`context_length` / `max_completion_tokens` /
+/// `capabilities.tools`）—— 同一批里有的支持工具、有的不支持，
+/// 一刀切地按表单勾选会把能力标错。
+///
+/// 表里没有的项 → 走表单里的统一勾选 / 来源模型的兜底值。
+#[derive(Debug, Clone, Default)]
+pub struct ImportMeta {
+    /// 模型 id → 上下文窗口
+    pub context_lengths: std::collections::HashMap<String, u64>,
+    /// 模型 id → 最大输出
+    pub max_output_tokens: std::collections::HashMap<String, u64>,
+    /// 模型 id → 是否支持工具调用
+    pub tool_flags: std::collections::HashMap<String, bool>,
+    /// 模型 id → 是否支持看图
+    pub image_flags: std::collections::HashMap<String, bool>,
+}
+
 /// 批量导入远端模型列表里的若干 id。
 ///
 /// 共用 `source` 的 url / apiKey / headers。
@@ -312,7 +332,7 @@ pub fn import_models_from_source(
     ids: &[String],
     supports_tool_call: bool,
     supports_images: bool,
-    context_lengths: &std::collections::HashMap<String, u64>,
+    meta: &ImportMeta,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let mut all = load_models(data_dir)?;
     let src_url = url_key(&source.url);
@@ -337,16 +357,36 @@ pub fn import_models_from_source(
         } else {
             source.vendor.trim().to_string()
         };
-        let max_input = context_lengths.get(id).copied().or(source.max_input_tokens);
+        // 逐模型优先：提供商自报的值 > 来源模型的兜底值
+        let max_input = meta
+            .context_lengths
+            .get(id)
+            .copied()
+            .or(source.max_input_tokens);
+        let max_output = meta
+            .max_output_tokens
+            .get(id)
+            .copied()
+            .or(source.max_output_tokens);
+        let tool = meta
+            .tool_flags
+            .get(id)
+            .copied()
+            .unwrap_or(supports_tool_call);
+        let img = meta
+            .image_flags
+            .get(id)
+            .copied()
+            .unwrap_or(supports_images);
         all.push(ModelConfig {
             id: id.to_string(),
             vendor,
             url: source.url.clone(),
             api_key: source.api_key.clone(),
-            supports_tool_call,
-            supports_images,
+            supports_tool_call: tool,
+            supports_images: img,
             max_input_tokens: max_input,
-            max_output_tokens: source.max_output_tokens,
+            max_output_tokens: max_output,
             headers: source.headers.clone(),
         });
         added.push(id.to_string());
@@ -488,6 +528,87 @@ pub fn group_key_for_url(all: &[ModelConfig], url: &str) -> String {
         .find(|m| url_key(&m.url) == want && !m.api_key.trim().is_empty())
         .map(|m| m.api_key.clone())
         .unwrap_or_default()
+}
+
+/// 同组（同 Base URL）里第一个模型配置的**额外请求头**。
+///
+/// 跟 [`group_key_for_url`] 同一个心智：用户认为"一个提供商一套凭据"，
+/// 所以往已有组里加模型时，Key 和额外头都该自动继承 —— 不然「获取 ID」
+/// 拉列表会因为少了必需的头（比如 OpenCode Zen 的 `x-opencode-session`）直接失败。
+pub fn group_headers_for_url(
+    all: &[ModelConfig],
+    url: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let want = url_key(url);
+    all.iter()
+        .find(|m| url_key(&m.url) == want && !m.headers.is_empty())
+        .map(|m| m.headers.clone())
+        .unwrap_or_default()
+}
+
+/// **整组改 Base URL** 的结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupUrlChange {
+    /// 成功挪到新组的条数
+    pub moved: usize,
+    /// 新组里已经有同 id 的（**跳过**，这些模型留在原组）
+    pub skipped: Vec<String>,
+    /// 归一化后的新 Base URL
+    pub new_url: String,
+}
+
+/// 把某组（Base URL）下的**所有模型**挪到新的 Base URL 下。
+///
+/// 为什么要它：组菜单里能改组名、能改 Key，但**改不了 Base URL** ——
+/// 想把一整组模型切到另一个网关（换域名 / 换端口 / 补 `/v1`）只能逐个点编辑。
+///
+/// 撞名处理：目标组里已经有同 id 的模型时，**不覆盖**（那是别人已有的配置），
+/// 那条留在原组并记进 `skipped`。
+pub fn change_group_url(
+    data_dir: &Path,
+    old_url: &str,
+    new_url: &str,
+) -> Result<GroupUrlChange, String> {
+    let old_key = url_key(old_url);
+    let new_url = normalize_base_url(new_url)?;
+    let new_key = url_key(&new_url);
+    if old_key == new_key {
+        return Err("新旧 Base URL 一样".into());
+    }
+    let mut all = load_models(data_dir)?;
+    if !all.iter().any(|m| url_key(&m.url) == old_key) {
+        return Err("这个 Base URL 下没有模型".into());
+    }
+    // 目标组已有哪些 id（撞了就跳过，不覆盖别人的配置）
+    let taken: std::collections::HashSet<String> = all
+        .iter()
+        .filter(|m| url_key(&m.url) == new_key)
+        .map(|m| m.id.clone())
+        .collect();
+
+    let mut moved = 0usize;
+    let mut skipped = Vec::new();
+    for m in all.iter_mut() {
+        if url_key(&m.url) != old_key {
+            continue;
+        }
+        if taken.contains(&m.id) {
+            skipped.push(m.id.clone());
+            continue;
+        }
+        m.url = new_url.clone();
+        moved += 1;
+    }
+    if moved == 0 && skipped.is_empty() {
+        return Err("这个 Base URL 下没有模型".into());
+    }
+    save_models(data_dir, &all)?;
+    Ok(GroupUrlChange {
+        moved,
+        skipped,
+        new_url,
+    })
 }
 
 /// 模型实际应使用的 API Key：自身非空用自身；否则回落**同组** Key。
@@ -653,6 +774,23 @@ pub struct AgentSettings {
     /// 面板失去焦点时自动收起为悬浮球（防止一直挡屏幕）。
     /// 默认开 —— 悬浮球的本分是「用时展开、完事让路」。
     pub blur_collapse: bool,
+    /// **项目目录自动读写**（设计稿 04「行为与安全」组的行内开关）。
+    ///
+    /// 默认开：激活项目绑定的目录，项目活跃期间自动给 ReadWrite
+    /// （见 `AppState::refresh_project_dir_rules` —— 那条动态规则只活内存，
+    /// 随项目切换重建，不落盘、不进设置页规则列表）。
+    /// 关掉它 = 项目目录不再自动授权，工具碰项目目录一律走弹卡审批。
+    #[serde(default = "default_true")]
+    pub project_dir_autoread: bool,
+    /// **内置工具是否给模型**（设计稿 09「内置工具」组的行内开关）。
+    ///
+    /// 默认开。关掉 = 模型工具表里**没有**任何内置工具（`read_file` /
+    /// `write_file` / `run_command` …），只剩 MCP 外部工具与项目脚本工具。
+    ///
+    /// 为什么放在设置里而不是会话里：内置工具是**全局能力底座**，
+    /// 关掉它等于换一种 agent 形态 —— 该是全局决定，不该每开一个会话重选。
+    #[serde(default = "default_true")]
+    pub builtin_tools_enabled: bool,
     /// 快答模式：不发工具列表，system prompt 只带人格段（见
     /// `agent::build_quick_system_prompt`）。托盘菜单手动切换 —— 不做自动
     /// 启发式，误判（该带工具没带）比省那点 token 严重得多。
@@ -765,6 +903,8 @@ impl Default for AgentSettings {
             selected_model: None,
             last_session: None,
             blur_collapse: true,
+            project_dir_autoread: true,
+            builtin_tools_enabled: true,
             quick_mode: false,
             active_project_id: None,
             exec_trust: ExecTrust::Ask,
@@ -1660,8 +1800,8 @@ mod tests {
             ..Default::default()
         };
         add_model(&dir, src.clone()).unwrap();
-        let mut ctx = std::collections::HashMap::new();
-        ctx.insert("alpha".to_string(), 262_144u64);
+        let mut meta = ImportMeta::default();
+        meta.context_lengths.insert("alpha".to_string(), 262_144u64);
         // `src-model` 与来源**同 URL 同 id** → 已配置，跳过
         let (added, skipped) = import_models_from_source(
             &dir,
@@ -1669,7 +1809,7 @@ mod tests {
             &["alpha".into(), "src-model".into(), "beta".into()],
             true,
             true,
-            &ctx,
+            &meta,
         )
         .unwrap();
         assert_eq!(added, vec!["alpha", "beta"]);
@@ -1688,6 +1828,175 @@ mod tests {
         let b = find_model(&dir, "beta").unwrap();
         assert_eq!(b.max_input_tokens, None, "无 context_length 时保持来源值");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 逐模型的元信息要能压过表单的统一勾选（OpenRouter 风格：一批里能力不一样）。
+    #[test]
+    fn import_uses_per_model_meta() {
+        let dir = std::env::temp_dir().join(format!("fa-import-meta-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("models.json"), "[]").unwrap();
+        let src = ModelConfig {
+            id: "__src__".into(),
+            url: "https://gw.example.com/v1".into(),
+            api_key: "sk-K".into(),
+            ..Default::default()
+        };
+        let mut meta = ImportMeta::default();
+        meta.context_lengths.insert("vision-model".into(), 262_144);
+        meta.max_output_tokens.insert("vision-model".into(), 32_768);
+        meta.tool_flags.insert("vision-model".into(), false);
+        meta.image_flags.insert("vision-model".into(), true);
+        // 这个没上报 → 走表单的统一勾选（true / true）
+        let (added, skipped) = import_models_from_source(
+            &dir,
+            &src,
+            &["vision-model".into(), "plain-model".into()],
+            true,
+            true,
+            &meta,
+        )
+        .unwrap();
+        assert_eq!(added, vec!["vision-model", "plain-model"]);
+        assert!(skipped.is_empty());
+
+        let v = find_model(&dir, "vision-model").unwrap();
+        assert_eq!(v.max_input_tokens, Some(262_144));
+        assert_eq!(v.max_output_tokens, Some(32_768));
+        assert!(!v.supports_tool_call, "提供商说不支持工具 → 压过表单勾选");
+        assert!(v.supports_images, "提供商说支持看图 → 压过表单勾选");
+
+        let p = find_model(&dir, "plain-model").unwrap();
+        assert!(p.supports_tool_call, "没上报就沿用表单勾选");
+        assert!(p.supports_images);
+        assert_eq!(p.max_input_tokens, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **整组改 Base URL**：一次把整组挪走，Key/窗口/能力都跟着走。
+    #[test]
+    fn change_group_url_moves_whole_group() {
+        let dir = std::env::temp_dir().join(format!("fa-grpurl-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("models.json"), "[]").unwrap();
+        for (id, key) in [("m-1", "sk-1"), ("m-2", "sk-2")] {
+            add_model(
+                &dir,
+                ModelConfig {
+                    id: id.into(),
+                    url: "http://39.105.206.31:8792/v1".into(),
+                    api_key: key.into(),
+                    supports_tool_call: true,
+                    max_input_tokens: Some(128_000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        // 另一个组，不该被动
+        add_model(
+            &dir,
+            ModelConfig {
+                id: "other".into(),
+                url: "https://other.example.com/v1".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let res = change_group_url(&dir, "http://39.105.206.31:8792/v1", "http://39.105.206.31:8792/v1/chat")
+            .unwrap();
+        assert_eq!(res.moved, 2);
+        assert!(res.skipped.is_empty());
+        assert_eq!(res.new_url, "http://39.105.206.31:8792/v1/chat");
+
+        let moved = find_model_by_url_id(&dir, "http://39.105.206.31:8792/v1/chat", "m-1").unwrap();
+        assert_eq!(moved.api_key, "sk-1", "Key 必须跟着搬");
+        assert_eq!(moved.max_input_tokens, Some(128_000));
+        assert!(moved.supports_tool_call);
+        assert!(
+            find_model_by_url_id(&dir, "http://39.105.206.31:8792/v1", "m-1").is_err(),
+            "旧组下不该还留着"
+        );
+        assert!(
+            find_model_by_url_id(&dir, "https://other.example.com/v1", "other").is_ok(),
+            "别的组不该被动"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 目标组里已经有同 id 的 → **不覆盖**，那条留在原组。
+    #[test]
+    fn change_group_url_skips_duplicate_ids() {
+        let dir = std::env::temp_dir().join(format!("fa-grpurl-dup-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("models.json"), "[]").unwrap();
+        add_model(
+            &dir,
+            ModelConfig {
+                id: "dup".into(),
+                url: "https://old.example.com/v1".into(),
+                api_key: "sk-old".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        add_model(
+            &dir,
+            ModelConfig {
+                id: "dup".into(),
+                url: "https://new.example.com/v1".into(),
+                api_key: "sk-new".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        add_model(
+            &dir,
+            ModelConfig {
+                id: "fresh".into(),
+                url: "https://old.example.com/v1".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let res = change_group_url(&dir, "https://old.example.com/v1", "https://new.example.com/v1")
+            .unwrap();
+        assert_eq!(res.moved, 1, "只有 fresh 能搬");
+        assert_eq!(res.skipped, vec!["dup"], "撞名的留在原组");
+        // 目标组那条**原样保留**（Key 不能被覆盖）
+        let kept = find_model_by_url_id(&dir, "https://new.example.com/v1", "dup").unwrap();
+        assert_eq!(kept.api_key, "sk-new");
+        // 原组的 dup 也还在
+        assert!(find_model_by_url_id(&dir, "https://old.example.com/v1", "dup").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同组 Key / 额外头继承：往已有组里加模型时不该要求再粘一遍。
+    #[test]
+    fn group_key_and_headers_are_inheritable() {
+        let all = vec![ModelConfig {
+            id: "m-1".into(),
+            url: "https://gw.example.com/v1".into(),
+            api_key: "sk-GROUP".into(),
+            headers: [("x-opencode-session".to_string(), "abc".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            group_key_for_url(&all, "https://gw.example.com/v1/"),
+            "sk-GROUP"
+        );
+        assert_eq!(group_key_for_url(&all, "https://other.example.com/v1"), "");
+        assert_eq!(
+            group_headers_for_url(&all, "https://gw.example.com/v1")
+                .get("x-opencode-session")
+                .map(|s| s.as_str()),
+            Some("abc")
+        );
+        assert!(group_headers_for_url(&all, "https://other.example.com/v1").is_empty());
     }
 
     #[test]
@@ -1711,7 +2020,7 @@ mod tests {
             &["glm-5.3-flash".into()],
             true,
             true,
-            &std::collections::HashMap::new(),
+            &ImportMeta::default(),
         )
         .unwrap();
         assert!(added.is_empty());
@@ -1729,7 +2038,7 @@ mod tests {
             &["glm-5.3-flash".into()],
             true,
             true,
-            &std::collections::HashMap::new(),
+            &ImportMeta::default(),
         )
         .unwrap();
         assert!(skipped.is_empty(), "不同来源不算已配置：{skipped:?}");
@@ -1750,7 +2059,7 @@ mod tests {
             &["glm-5.3-flash".into()],
             true,
             true,
-            &std::collections::HashMap::new(),
+            &ImportMeta::default(),
         )
         .unwrap();
         assert!(skipped.is_empty());

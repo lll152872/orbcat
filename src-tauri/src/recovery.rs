@@ -240,6 +240,86 @@ pub fn list_backups(data_dir: &Path) -> Vec<BackupRec> {
     recs
 }
 
+/// **永久删除一份备份**（设计稿 10：每行加「删除」，二次确认）。
+///
+/// ⚠️ 不可还原 —— 这是**故意**的：设计稿 §7 原文「可还原 ≠ 不可删除」，
+/// 「可逆性被误当成了不可删」是旧版的缺陷。用户要的是「清掉 456 份备份」这个能力。
+///
+/// `id` 是**文件名**（不是路径）—— 只接受单层文件名，
+/// 含 `/` `\\` 或 `..` 一律拒绝（防路径穿越把别的文件删了）。
+pub fn delete_backup(data_dir: &Path, id: &str) -> Result<String, String> {
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err(format!("备份 id 不合法：{id}"));
+    }
+    let dir = backups_dir(data_dir);
+    let path = dir.join(id);
+    if !path.is_file() {
+        // 清单里记的副本可能不在目录里（在别处）→ 顺着清单里的 backup 路径删
+        let recs = list_backups(data_dir);
+        let rec = recs
+            .iter()
+            .find(|r| r.id == id)
+            .ok_or_else(|| format!("找不到备份 {id}"))?;
+        let p = Path::new(&rec.backup);
+        if !p.is_file() {
+            return Err(format!("备份文件已不存在：{id}"));
+        }
+        std::fs::remove_file(p).map_err(|e| format!("删除失败：{e}"))?;
+        return Ok(format!("已永久删除备份 {id}"));
+    }
+    std::fs::remove_file(&path).map_err(|e| format!("删除失败：{e}"))?;
+    Ok(format!("已永久删除备份 {id}"))
+}
+
+/// **永久删除一项归档**（设计稿 10：回收站每行加「删除」）。
+///
+/// `trashed` 是归档目录下的**相对路径**（可能有层级）—— 所以不能用
+/// 「只接受单层文件名」那套限制，但必须规范化后确认它仍在 `.trash/` 里，
+/// 否则一个 `../` 就能把别的目录删了。
+pub fn delete_trash(data_dir: &Path, trashed: &str) -> Result<String, String> {
+    let dir = trash_dir(data_dir);
+    let p = dir.join(trashed);
+    let canon_dir = dir.canonicalize().map_err(|e| format!("回收站目录不可读：{e}"))?;
+    let canon = p
+        .canonicalize()
+        .map_err(|_| format!("找不到归档：{trashed}"))?;
+    if !canon.starts_with(&canon_dir) {
+        return Err("归档路径不在回收站内，拒绝删除".to_string());
+    }
+    if canon.is_dir() {
+        std::fs::remove_dir_all(&canon).map_err(|e| format!("删除失败：{e}"))?;
+    } else {
+        std::fs::remove_file(&canon).map_err(|e| format!("删除失败：{e}"))?;
+    }
+    Ok(format!("已永久删除归档 {trashed}"))
+}
+
+/// **清空回收站**（设计稿 10：回收站标题条加「清空回收站」）。
+///
+/// ⚠️ 不可还原。备份区**不给**批量清空 —— 备份是安全网，清空它风险不对称
+/// （设计稿 §7 原话）。所以只有回收站能一键清空。
+pub fn clear_trash(data_dir: &Path) -> Result<String, String> {
+    let dir = trash_dir(data_dir);
+    let mut n = 0usize;
+    let mut freed = 0u64;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+            let ok = if p.is_dir() {
+                std::fs::remove_dir_all(&p).is_ok()
+            } else {
+                std::fs::remove_file(&p).is_ok()
+            };
+            if ok {
+                n += 1;
+                freed += size;
+            }
+        }
+    }
+    Ok(format!("已清空回收站（{n} 项，释放 {freed} 字节）"))
+}
+
 /// 还原一个备份到指定路径。
 ///
 /// `target` 为空则回原路径。**还原前会把目标的现状再备份一次** ——

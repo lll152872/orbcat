@@ -394,6 +394,17 @@ impl Drop for WorkDir {
 
 /// 找 Node 可执行文件。
 ///
+/// ## 探测顺序（2026-10-22 改）
+///
+/// 1. `ORBCAT_NODE` 环境变量（用户显式指定，优先级最高）
+/// 2. **内置的 `runtime/node/node.exe`** ← 新增，发布包自带，用户零安装
+/// 3. PATH
+/// 4. 常见安装位置
+///
+/// 为什么把内置那份排在 PATH 前面：PATH 上那份可能是**版本太老**的
+/// （pi 要求 Node ≥ 22.19.0），也可能压根没有。而内置那份版本是构建时锁定的。
+/// 但 `ORBCAT_NODE` 仍然最高优先 —— 用户显式指定就该听用户的。
+///
 /// 为什么不用 `Command::new("node")` 让系统搜 PATH：与 `shell.rs` 的
 /// `resolve_interpreter` 同一个坑 —— 隐形桌面下 `CreateProcessW` **不做 PATH 搜索**，
 /// 传 "node" 直接 `GetLastError=2`。所以这里显式探测几个常见位置。
@@ -406,7 +417,14 @@ pub fn resolve_node() -> Option<PathBuf> {
         }
     }
 
-    // 2) PATH（std::process::Command 会搜，用于探测；真正起进程时传绝对路径）
+    // 2) 内置 runtime（发布包自带）
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(p) = crate::pi::bundled_node(&exe) {
+            return Some(p);
+        }
+    }
+
+    // 3) PATH（std::process::Command 会搜，用于探测；真正起进程时传绝对路径）
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
             for name in ["node.exe", "node"] {
@@ -418,7 +436,7 @@ pub fn resolve_node() -> Option<PathBuf> {
         }
     }
 
-    // 3) 常见安装位置（PATH 没配全时的兜底）
+    // 4) 常见安装位置（PATH 没配全时的兜底）
     let mut cands: Vec<PathBuf> = vec![
         PathBuf::from(r"D:\NODE.JS\node.exe"),
         PathBuf::from(r"C:\Program Files\nodejs\node.exe"),

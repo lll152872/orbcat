@@ -153,19 +153,21 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "grep_files",
-            "在指定路径下递归搜索子串文本，返回 文件:行号:内容。\
+            "在指定路径下递归搜索文本，返回 文件:行号:内容。\
              `path` **可以是目录，也可以直接是一个文件**（搜单个文件时直接传它，别传父目录）。\
-             **优先于** run_command 跑 Select-String/findstr。受文件权限网关管辖。\
-             ⚠️ 只做**字面量子串**匹配：不支持 `|`、`.*`、`\\d` 这类正则语法（传了会直接报错提示）。\
-             多个词请分开搜几次。默认**大小写不敏感**。\
+             **优先于** run_command 跑 Select-String/findstr/rg。受文件权限网关管辖。\
+             `pattern` 默认按**字面子串**匹配；**含正则语法（`a|b`、`.*`、`\\d`、`^x`、`[abc]`）时自动按正则匹配**\
+             （标题会标明「已自动按正则匹配」）。要强制某种口径就显式传 `regex`。\
+             正则语法为 Rust regex：支持 `|` `.*` `+` `?` `[]` `()` `\\d` `\\w` `^` `$`，不支持反向引用与前后瞻。\
+             默认**大小写不敏感**。\
              若有文件因体积/编码/权限被跳过，返回里会**明确列出**——看到「无匹配」时先看有没有跳过项。",
             json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "要搜索的文本（**字面量子串**，不是正则；默认大小写不敏感）" },
+                    "pattern": { "type": "string", "description": "要搜索的文本。普通词按字面子串匹配；含正则语法（a|b、.*、\\d、^x、[abc]）时自动按正则匹配（默认大小写不敏感）" },
                     "path": { "type": "string", "description": "搜索根目录（绝对路径），或要搜索的单个文件" },
                     "ext": { "type": "string", "description": "只搜这些扩展名，如 'rs,md'（可选）" },
-                    "regex": { "type": "boolean", "description": "未启用；传 true 会报错。只用子串 pattern" },
+                    "regex": { "type": "boolean", "description": "强制口径：true=一律正则（语法错会报错并给出原因），false=一律字面子串。**不传则自动判断**（推荐）" },
                     "caseSensitive": { "type": "boolean", "description": "是否区分大小写（默认 false，不区分）" },
                     "context": { "type": "integer", "description": "命中行前后各显示几行（默认 0，最大 3）。注意「命中 N 行」只数真正的命中行" }
                 },
@@ -693,13 +695,47 @@ pub fn tool_specs_for_distill(
 /// 为什么单独留一个函数：PTC 下"模型能调什么"与"程序里能调什么"是**同一份**
 /// 工具集，只是呈现形态不同。若 SDK 用另一份来源生成，两边迟早对不上
 /// （典型症状：SDK 里声明了某工具，实际调用却报"没有这个工具"）。
+/// 内置工具的**清单**（名字 + 一句话说明），给设置页「工具」页用。
+///
+/// 设计稿 09 的「内置工具」组要列出每个工具（名字 + 右侧说明）。
+/// 这里只取**第一句**说明 —— 完整描述是写给模型看的（含一堆「不要这样用」，
+/// 动辄两三百字），直接摆到界面上没法看。
+pub fn builtin_tool_summaries() -> Vec<(String, String)> {
+    builtin_specs()
+        .into_iter()
+        .map(|s| {
+            let first = s
+                .description
+                .split(['。', '\n'])
+                .map(str::trim)
+                .find(|x| !x.is_empty())
+                .unwrap_or("")
+                .to_string();
+            let short = if first.chars().count() > 32 {
+                format!("{}…", first.chars().take(32).collect::<String>())
+            } else {
+                first
+            };
+            (s.name, short)
+        })
+        .collect()
+}
+
 pub fn all_tool_specs(
     mcp: Option<&crate::mcp::ToolRegistry>,
     web_search_ready: bool,
     data_dir: &Path,
     session_id: Option<&str>,
 ) -> Vec<ToolSpec> {
-    let mut specs = builtin_specs();
+    // ── 内置工具总闸（设计稿 09「内置工具」组的开关）──────────────────
+    //
+    // 关掉 = 模型工具表里**没有**内置工具，只剩 MCP 外部工具与项目脚本工具。
+    //
+    // 为什么在这里拦而不是在提示词里劝：提示词劝不住 —— 工具表里还在，
+    // 模型照样会调。这里是**从工具表里拿掉**，属于硬闸门，与
+    // `send_meme` 按模式闸住是同一个手法。
+    let builtin_on = crate::config::load_settings(data_dir).builtin_tools_enabled;
+    let mut specs = if builtin_on { builtin_specs() } else { Vec::new() };
 
     // ── 发图：只有"发表情包"那一半按模式闸住 ────────────────────────────
     //
@@ -711,13 +747,15 @@ pub fn all_tool_specs(
     // 为什么模式判断放在函数内部、不改签名：与 `ptc::mode_active(data_dir)`
     // 同一个手法 —— `data_dir` 已经在参数里了，为传一个 mode 把 6 个调用点
     // 全改一遍不划算。
-    if memes_allowed(data_dir, session_id) {
+    if builtin_on && memes_allowed(data_dir, session_id) {
         specs.push(send_meme_spec());
     }
 
-    specs.push(fetch_url_spec());
-    if web_search_ready {
-        specs.push(web_search_spec());
+    if builtin_on {
+        specs.push(fetch_url_spec());
+        if web_search_ready {
+            specs.push(web_search_spec());
+        }
     }
 
     // ── L1：当前项目的脚本工具 ──────────────────────────────────────────
@@ -978,6 +1016,11 @@ pub struct ToolCtx<'a> {
     /// 长工具执行期的**取消探针**（用户点「停止」→ `run_command` 立刻杀进程树）。
     /// `None` = 不响应取消（测试与短工具）。见 `shell::CancelFn`。
     pub cancel: Option<crate::shell::CancelFn>,
+    /// **本轮用户原话**（截断过）。`remember` 工具提交记忆候选时记进
+    /// `turn_ref`，审批页就能显示「出自「…」这一轮」。
+    ///
+    /// `None` = 不知道触发轮次（桥调用、测试、手写候选）→ 前端回退占位文案。
+    pub turn_ref: Option<&'a str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,6 +1224,185 @@ pub async fn execute(
     execute_inner(name, args, ctx, false).await
 }
 
+
+// ---------------------------------------------------------------------------
+// pi 工具桥入口（2026-10-22 新增）
+// ---------------------------------------------------------------------------
+//
+// pi 只有 8 个内置工具，orbcat 有 34 个 —— 其中一半是 Windows 深度集成
+// （截屏、前台窗口、图像发送、表情包、life/pmem、记忆蒸馏、跨会话检索…），
+// 这些在 TS 里**根本拿不到**。
+//
+// 所以工具**留在 Rust**（一行代码不重写），pi 通过本地 HTTP 回调来调
+// （见 `pi_bridge.rs` 与 `runtime-ext/orbcat-tools.ts`）。
+//
+// ⚠️ **权限没有旁路**：桥调的是**同一个** [`execute`]，因此文件网关、
+//    命令策略、确认卡、审计链全部照旧生效。桥不是后门。
+
+/// 桥侧的工具清单（给 pi 的 extension 注册用）。
+///
+/// 只给**内置**工具（不含 MCP、不含项目脚本工具）：
+/// - MCP 工具 pi 自己有内置 MCP client，用不着我们桥
+/// - 项目脚本工具是当前项目特有的，pi 侧按需再桥
+pub fn bridge_specs() -> Vec<ToolSpec> {
+    builtin_specs()
+}
+
+/// 桥侧要暴露给 pi 的**全部**工具清单。
+///
+/// ## 与 [`bridge_specs`] 的区别
+///
+/// `bridge_specs()` 只有内置工具（静态）。这一份额外带上：
+/// - **L1 项目脚本工具**（`check_homework` 这种，随项目 bundle 变）
+/// - `fetch_url` / `web_search`（可选工具）
+///
+/// 工具名**原样**（项目工具名就是普通标识符）。
+///
+/// ⚠️ 项目工具的名字可能和 pi 内置工具撞（`read`/`write`/…）——
+/// 那时 extension 侧要用 `orb_` 前缀包一层再注册，避免撞名。
+pub fn bridge_specs_for_dir(data_dir: &Path) -> Vec<ToolSpec> {
+    let mut specs = builtin_specs();
+    specs.push(fetch_url_spec());
+    specs.extend(project_tool_specs(data_dir));
+    specs
+}
+
+/// 桥侧权限裁决（pi 的 `tool_call` hook 用）。
+///
+/// ## 两种工具，两种口径
+///
+/// - **orbcat 私有工具**（`orb_` 前缀）→ **一律放行**。
+///   真正的裁决在 [`execute`] 里面（`authorize()` 那一步）——
+///   在这里再判一次会造出两套口径，必然漂移。
+/// - **pi 内置工具**（`write`/`edit`/`bash`/…）→ **要判**。
+///   它们**不走** orbcat 的文件网关（那是 pi 自己的实现）——
+///   如果这里也放行，用户在 orbcat 里设的"只允许读 D:/work"
+///   这类规则对 pi 内置工具**完全无效**，那才是真漏洞。
+///
+/// ## 裁决口径
+///
+/// 写类操作（`write`/`edit`/`bash`/`powershell`）→ 要求路径落在**已授权目录**内，
+/// 否则拒绝。读类操作 → 放行。
+///
+/// 为什么不弹确认卡：pi 内置工具的写操作在 pi 侧没有我们的权限卡通道
+/// （`extension_ui_request` 只在 extension 主动调 `ctx.ui.confirm` 时才发）。
+/// **保守拒绝**比"默默放行"安全。
+pub fn gate_bridge(name: &str, args: &Value, data_dir: &Path) -> Result<(bool, String), String> {
+    // orbcat 私有工具：放行（裁决在 execute 内部）
+    if is_builtin_tool_name(name) {
+        return Ok((true, String::new()));
+    }
+
+    // MCP 工具（`mcp__<server>__<tool>`）：pi 原生连 MCP server，
+    // 工具调用**绕过 Rust 的 execute**（走 pi 的 MCP client），
+    // 所以裁决必须落在这里 —— 否则 MCP 就是权限的盲区。
+    //
+    // 口径与自研内核那条路一致（`tools.rs` 的 execute → `mcp__*` 分支）：
+    // 1. 已在 `mcp_grants.json` 里「总是允许」→ 放行
+    // 2. 项目执行信任开了 auto → 放行
+    // 3. 否则 → 拒绝（由调用方弹确认卡）
+    if let Some((server, tool)) = crate::mcp::parse_mcp_tool_name(name) {
+        let full = crate::mcp::mcp_tool_full_name(&server, &tool);
+        if crate::mcp::is_mcp_tool_allowed(data_dir, &full)
+            || crate::project::effective_exec_trust(data_dir).auto_allows_mcp()
+        {
+            return Ok((true, String::new()));
+        }
+        return Ok((
+            false,
+            format!("MCP 工具 {full} 需要授权（用户确认后可写入「总是允许」）"),
+        ));
+    }
+
+    // pi 内置工具：只对**写类**做路径裁决
+    let writeish = matches!(name, "write" | "edit" | "bash" | "powershell");
+    if !writeish {
+        return Ok((true, String::new()));
+    }
+
+    // 取路径参数（不同工具参数名不一样）
+    let path = args
+        .get("path")
+        .or_else(|| args.get("file_path"))
+        .or_else(|| args.get("filePath"))
+        .and_then(|x| x.as_str());
+    let Some(path) = path else {
+        // 没有明确路径参数 → 保守放行（bash 的 command 没法静态解析）
+        return Ok((true, String::new()));
+    };
+
+    let app_dir = data_dir.parent().unwrap_or(data_dir);
+    let gate = crate::permission::load_gate(data_dir, app_dir);
+    let p = Path::new(path);
+    match gate.check(p, Access::Read) {
+        Ok(_) => Ok((true, String::new())),
+        Err(e) => Ok((false, format!("orbcat 权限网关拒绝：{e}"))),
+    }
+}
+
+/// 桥侧执行一个工具（**带真实权限网关**）。
+///
+/// 桥的调用来自 pi 子进程（另一个进程），拿不到 orbcat 的 `AppState`。
+/// 所以这里**自己加载**一份 gate —— 规则从 `permissions.json` 读，
+/// 与主进程同一份文件、同一套口径。
+///
+/// ## ⚠️ 这里曾经是个真 bug（2026-10-22 修）
+///
+/// 早期实现用 `PermissionGate::default()`（**空规则**）→ 于是**所有文件操作
+/// 全部被拒**，报"不在任何已授权范围内"—— 而用户的 `permissions.json`
+/// 里明明配了规则。实测表现为：pi 调 `orb_read_file` 永远失败。
+///
+/// 代价：gate 是**一次性加载的快照** —— 用户在设置里改了权限，
+/// 桥要重启才生效。（主进程那条热加载路在 `AppState::sync_perm_file`，
+/// 桥这边暂未接。）
+pub async fn execute_bridge(
+    name: &str,
+    args: &Value,
+    data_dir: &Path,
+) -> Result<Value, String> {
+    // MCP 工具不走这里（pi 自己有 MCP client）
+    if !is_builtin_tool_name(name) {
+        // L1 项目脚本工具（`check_homework` 这种）：**要放行** ——
+        // 它们的执行路径就在 `execute` 的 `other` 分支里（`run_project_tool`），
+        // 权限判定走的是项目自己的闸门（文件网关 + 命令策略，与 `run_command` 同套）。
+        if let Some(a) = crate::project::active(data_dir) {
+            if a.bundle.tools.iter().any(|t| t.name == name) {
+                // 命中项目工具 → 继续往下走 `execute`
+            } else {
+                return Err(format!("未知工具: {name}"));
+            }
+        } else {
+            return Err(format!("未知工具: {name}"));
+        }
+    }
+
+    // 加载真实 gate（app_dir = data_dir 的父目录，与 lib.rs 同口径）
+    let app_dir = data_dir.parent().unwrap_or(data_dir);
+    let gate = crate::permission::load_gate(data_dir, app_dir);
+
+    // MCP 注册表：内置工具不用它，给个空壳
+    let mcp = tokio::sync::Mutex::new(crate::mcp::ToolRegistry::new(""));
+    // 授权表：桥没有会话上下文，用空的
+    let perm = crate::perm_request::PermHub::new();
+
+    let ctx = ToolCtx {
+        gate: &gate,
+        data_dir,
+        mcp: &mcp,
+        session_id: "",
+        perm: &perm,
+        tick: None,
+        cancel: None,
+        turn_ref: None,
+    };
+    let out = execute(name, args, &ctx).await?;
+    Ok(json!({
+        "content": [{"type": "text", "text": out.text}],
+        "details": {},
+        "image": out.image,
+    }))
+}
+
 /// 同 [`execute`]，但标记这次调用来自 PTC 程序内部（跳过坍缩检查）。
 async fn execute_inner(
     name: &str,
@@ -1245,7 +1467,7 @@ async fn execute_inner(
                 ms
             )))
         }
-        "remember" => remember(args, ctx.data_dir),
+        "remember" => remember(args, ctx.data_dir, ctx.turn_ref),
         "distill_move" => distill_move(args, ctx.data_dir),
         "memory_delete" => memory_delete(args, ctx.data_dir),
         "life_items" => life_items(args, ctx).await,
@@ -1823,7 +2045,7 @@ fn recall_in_session(
 /// 主对话里记的东西就**全部沉进那个项目**，全局待批队列长期为空 ——
 /// `memory/MEMORY.md` 再也不更新。现在「这条是否跨项目通用」由模型按**内容**
 /// 判断，路由不再由会话状态决定。
-fn remember(args: &Value, data_dir: &Path) -> Result<ToolOutput, String> {
+fn remember(args: &Value, data_dir: &Path, turn_ref: Option<&str>) -> Result<ToolOutput, String> {
     let content = get_str(args, "content")?;
 
     // 落点：global / project / auto（auto = 旧行为，兼容没带 scope 的老调用）
@@ -1848,7 +2070,7 @@ fn remember(args: &Value, data_dir: &Path) -> Result<ToolOutput, String> {
 
     match scope {
         // 跨项目通用 —— **无视**激活项目，一律进待批候选
-        "global" => remember_to_candidates(data_dir, &content),
+        "global" => remember_to_candidates(data_dir, &content, turn_ref),
         // 只在本项目成立 —— 没有激活项目就明说，不静默改投
         "project" => {
             let Some(p) = active else {
@@ -1885,7 +2107,7 @@ fn remember(args: &Value, data_dir: &Path) -> Result<ToolOutput, String> {
                     p.name, p.name
                 )));
             }
-            remember_to_candidates(data_dir, &content)
+            remember_to_candidates(data_dir, &content, turn_ref)
         }
     }
 }
@@ -1893,9 +2115,13 @@ fn remember(args: &Value, data_dir: &Path) -> Result<ToolOutput, String> {
 /// 全局通道：**只提交待批候选**，用户在 设置 › 记忆 批准后才进 `memory/MEMORY.md`。
 ///
 /// 返回文案必须说清落点与下一步 —— 模型会把它原样转述给用户。
-fn remember_to_candidates(data_dir: &Path, content: &str) -> Result<ToolOutput, String> {
+fn remember_to_candidates(
+    data_dir: &Path,
+    content: &str,
+    turn_ref: Option<&str>,
+) -> Result<ToolOutput, String> {
     let store = crate::memory::MemoryStore::new(data_dir);
-    let c = store.propose(content, "model")?;
+    let c = store.propose_with_ref(content, "model", turn_ref)?;
     Ok(ToolOutput::text(format!(
         "已提交**全局**记忆候选（id: {}）。用户在 设置 › 记忆 批准后，它才会进入 \
          memory/MEMORY.md 并跨会话生效。",
@@ -2576,31 +2802,115 @@ fn read_text_lossy(path: &Path) -> Option<(String, bool)> {
     }
 }
 
+/// grep 的匹配语义 —— 必须在标题里回报给模型，让它知道这次是**按什么规则**搜的。
+///
+/// 为什么要区分「显式」和「自动」：自动启用正则时模型并没有要求过，
+/// 不说一声的话它会以为结果被工具悄悄改了口径。
+#[derive(Clone, Copy, PartialEq)]
+enum GrepMode {
+    /// 字面子串（`contains` 快路径）
+    Literal,
+    /// 调用方写了 `regex: true`
+    RegexExplicit,
+    /// 没写 `regex`，但 pattern 长得像正则 → 自动按正则匹配
+    RegexAuto,
+    /// 自动模式下正则**编译失败** → 回落字面子串（典型：Windows 路径 `D:\workplace`）
+    LiteralFallback,
+}
+
+impl GrepMode {
+    fn is_regex(self) -> bool {
+        matches!(self, Self::RegexExplicit | Self::RegexAuto)
+    }
+
+    /// 标题里的标注。没有特殊语义就返回空串 —— 不制造噪声。
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Literal => "",
+            Self::RegexExplicit => "（正则）",
+            Self::RegexAuto => "（pattern 含正则语法，已自动按正则匹配）",
+            Self::LiteralFallback => "（pattern 不是合法正则，已按字面子串匹配）",
+        }
+    }
+}
+
+/// grep 的匹配器：字面子串（快路径）或 `regex` 引擎。
+///
+/// ## 为什么两种都要
+/// - **字面**是绝大多数调用的真实形态（实测 543 次里 pattern 多为普通词），
+///   `contains` 不编译、不回溯，比正则快一个量级，且不会因 `.`/`(` 误伤。
+/// - **正则**是模型的默认思维定式（实测 32 次直接写 `a|b`、`.*`、`\[x\]`）。
+///   旧版对此一律报错，把它逼去 `run_command` 跑 rg —— 绕权限网关、撞 24KB 截断。
+enum MatcherKind {
+    /// needle 已按 `case_sensitive` 预处理（不敏感时是小写）
+    Literal(String),
+    Regex(regex::Regex),
+}
+
+struct Matcher {
+    kind: MatcherKind,
+    case_sensitive: bool,
+}
+
+impl Matcher {
+    fn literal(needle: &str, case_sensitive: bool) -> Self {
+        let needle = if case_sensitive {
+            needle.to_string()
+        } else {
+            needle.to_lowercase()
+        };
+        Self {
+            kind: MatcherKind::Literal(needle),
+            case_sensitive,
+        }
+    }
+
+    /// 编译正则。**大小写不敏感靠行内 flag 前缀**，不靠改写 pattern ——
+    /// 改写会踩到 `\W`、`\.` 这类含大写字母的转义。
+    fn compile_regex(needle: &str, case_sensitive: bool) -> Result<Self, regex::Error> {
+        let expr = if case_sensitive {
+            needle.to_string()
+        } else {
+            format!("(?i){needle}")
+        };
+        Ok(Self {
+            kind: MatcherKind::Regex(regex::Regex::new(&expr)?),
+            case_sensitive,
+        })
+    }
+
+    /// 大小写不敏感 + 字面模式时把 haystack 折成小写。
+    /// 正则模式**不折** —— `(?i)` 已在引擎里生效，再折一次只会让字节下标对不上。
+    fn fold<'a>(&self, line: &'a str) -> std::borrow::Cow<'a, str> {
+        match &self.kind {
+            MatcherKind::Literal(_) if !self.case_sensitive => {
+                std::borrow::Cow::Owned(line.to_lowercase())
+            }
+            _ => std::borrow::Cow::Borrowed(line),
+        }
+    }
+
+    /// 这一行是否命中。**每行只算一次命中**（同一行多处命中不重复计数）。
+    fn is_match(&self, line: &str) -> bool {
+        match &self.kind {
+            MatcherKind::Literal(n) => self.fold(line).contains(n.as_str()),
+            MatcherKind::Regex(re) => re.is_match(line),
+        }
+    }
+
+    /// 首个命中的**字节**区间（用于围绕命中位置取窗口）。没命中返回 `None`。
+    fn find(&self, line: &str) -> Option<(usize, usize)> {
+        match &self.kind {
+            MatcherKind::Literal(n) => self.fold(line).find(n.as_str()).map(|b| (b, b + n.len())),
+            MatcherKind::Regex(re) => re.find(line).map(|m| (m.start(), m.end())),
+        }
+    }
+}
+
 fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     let needle = get_str(args, "pattern")?;
     let raw = get_str(args, "path")?;
     let roots = authorize(ctx, &raw, Access::Read)?;
-
-    // 不支持正则（本项目不引 regex crate）。schema/描述只承诺子串匹配。
-    let use_regex = args
-        .get("regex")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if use_regex {
-        return Err(
-            "grep_files 只支持子串匹配（regex=true 未启用）。请用普通 pattern，或 run_command + rg".into(),
-        );
-    }
-    // 模型习惯性写正则（实测 32 次：`a|b`、`.*`、`\[x\]`）—— 子串匹配下必然 0 命中。
-    // 与其让它拿到"无匹配"去猜，不如直接点破。
-    if let Some(hint) = regex_looking_pattern(&needle) {
-        return Err(format!(
-            "grep_files 只做**字面量子串**匹配，不支持正则。你给的 pattern 含正则语法（{hint}），\
-             照这样搜一定 0 命中。\n\
-             → 请改成普通子串（例如搜 `foo` 而不是 `foo|bar`），\
-             多个词就**分开搜几次**；确实需要正则时用 run_command 跑 rg。"
-        ));
-    }
 
     let context = args
         .get("context")
@@ -2615,6 +2925,38 @@ fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    // ── 匹配语义：显式 > 自动 > 字面 ────────────────────────────────────────
+    //
+    // 默认「自动」而不是「一律正则」：绝大多数调用就是搜一个词，
+    // 那种走 `contains` 快路径最稳（`.` `(` 之类的字符也不会被当元符号吃掉）。
+    // 反过来，**看起来像正则的 pattern 自动按正则跑** —— 模型就是这么写的，
+    // 与其报错把它逼去 `run_command` 跑 rg，不如直接满足。
+    let explicit_regex = args.get("regex").and_then(Value::as_bool);
+    let (matcher, mode) = match explicit_regex {
+        Some(true) => {
+            let m = Matcher::compile_regex(&needle, case_sensitive).map_err(|e| {
+                format!(
+                    "grep_files 的 pattern 不是合法正则：{e}\n\
+                     → 改正语法（Rust regex：支持 `|` `.*` `+` `?` `[]` `()` `\\d` `\\w` `^` `$`，\
+                     **不支持**反向引用与前后瞻）；\
+                     或加 \"regex\": false 按字面子串搜。"
+                )
+            })?;
+            (m, GrepMode::RegexExplicit)
+        }
+        // 显式关掉：`a|b` 就当**字面**的 `a|b` 搜，绝不解释成正则
+        Some(false) => (Matcher::literal(&needle, case_sensitive), GrepMode::Literal),
+        None if regex_looking_pattern(&needle).is_some() => {
+            match Matcher::compile_regex(&needle, case_sensitive) {
+                Ok(m) => (m, GrepMode::RegexAuto),
+                // 长得像正则却编译不过 —— 多半是 Windows 路径（`D:\workplace` 里的 `\w`）。
+                // 那本意就是**字面路径**，回落子串才是对的，绝不能报错。
+                Err(_) => (Matcher::literal(&needle, case_sensitive), GrepMode::LiteralFallback),
+            }
+        }
+        None => (Matcher::literal(&needle, case_sensitive), GrepMode::Literal),
+    };
+
     let exts: Vec<String> = args
         .get("ext")
         .and_then(Value::as_str)
@@ -2628,11 +2970,6 @@ fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
 
     // 搜索单个文件的内容。抽成闭包是因为下面要处理两种入口：
     // ① `path` 是目录 → walk 出每个文件；② `path` 是文件 → 直接搜它。
-    let needle_cmp = if case_sensitive {
-        needle.clone()
-    } else {
-        needle.to_lowercase()
-    };
     let scan_file = |p: &Path, hits: &mut Vec<String>, hit_count: &mut usize, skips: &mut GrepSkips| {
         if *hit_count >= MAX_GREP_HITS {
             return;
@@ -2673,12 +3010,7 @@ fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
             if *hit_count >= MAX_GREP_HITS {
                 return;
             }
-            let matched = if case_sensitive {
-                line.contains(&needle_cmp)
-            } else {
-                line.to_lowercase().contains(&needle_cmp)
-            };
-            if !matched {
+            if !matcher.is_match(line) {
                 continue;
             }
             *hit_count += 1;
@@ -2688,11 +3020,11 @@ fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
                 for j in start..end {
                     let mark = if j == i { ">" } else { " " };
                     // 上下文行也要围绕命中位置取窗口
-                    let shown = window_around(all[j], &needle_cmp, case_sensitive, 120);
+                    let shown = window_around(&matcher, all[j], 120);
                     hits.push(format!("{}:{}: {mark} {}", safe.display(), j + 1, shown));
                 }
             } else {
-                let shown = window_around(line, &needle_cmp, case_sensitive, GREP_LINE_CHARS);
+                let shown = window_around(&matcher, line, GREP_LINE_CHARS);
                 hits.push(format!("{}:{}: {}", safe.display(), i + 1, shown));
             }
         }
@@ -2727,7 +3059,13 @@ fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     } else {
         format!("{} 中", roots.display())
     };
-    let mut out = format!("在 {}搜索「{}」，命中 {} 行\n", scope, needle, hit_count);
+    let mut out = format!(
+        "在 {}搜索「{}」{}，命中 {} 行\n",
+        scope,
+        needle,
+        mode.tag(),
+        hit_count
+    );
     for h in &hits {
         out.push_str(h);
         out.push('\n');
@@ -2742,6 +3080,14 @@ fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
         } else {
             out.push_str("(无匹配)\n");
         }
+        // 字面模式下零命中，多半是模型**本想写正则**却写得不像（`fn \w+`、`[a-z]+_init`）。
+        // 与其让它去猜，不如告诉它「换个口径再来一次」——这是唯一能纠偏的地方。
+        if !mode.is_regex() {
+            out.push_str(
+                "提示：本次按**字面子串**匹配。若你本意是正则（如 `a|b`、`foo\\d+`、`^use`），\
+                 加上 \"regex\": true 再搜一次。\n",
+            );
+        }
     }
 
     Ok(ToolOutput::text(out))
@@ -2751,17 +3097,16 @@ fn grep_files(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
 ///
 /// 压缩/单行文件里命中位置可能在几十万字符处，从行首截等于返回一段
 /// 与所搜词无关的内容 —— 模型会认为"命中了但内容不对"，进而放弃工具。
-fn window_around(line: &str, needle_lower: &str, case_sensitive: bool, max_chars: usize) -> String {
+fn window_around(m: &Matcher, line: &str, max_chars: usize) -> String {
     let trimmed = line.trim();
-    // 找到命中位置（字符下标，避免多字节切坏）
-    let hay = if case_sensitive {
-        trimmed.to_string()
-    } else {
-        trimmed.to_lowercase()
-    };
-    let byte_pos = hay.find(needle_lower).unwrap_or(0);
-    // 字节位置 → 字符位置
-    let char_pos = hay[..byte_pos].chars().count();
+    // 命中位置（字符下标，避免多字节切坏）。
+    // ⚠️ 大小写不敏感的字面匹配是在**小写副本**上 find 的，字节下标未必落在
+    //    `trimmed` 的字符边界上 —— 用 `get(..)` 取不到就退回 0，绝不切坏字符串。
+    let char_pos = m
+        .find(trimmed)
+        .and_then(|(b, _)| trimmed.get(..b))
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
 
     let chars: Vec<char> = trimmed.chars().collect();
     if chars.len() <= max_chars {
@@ -2782,9 +3127,12 @@ fn window_around(line: &str, needle_lower: &str, case_sensitive: bool, max_chars
     s
 }
 
-/// pattern 看着像正则就返回命中的语法提示（用于给出**可操作**的报错）。
+/// pattern 看着像正则就返回命中的语法提示。
 ///
-/// 只认明确的信号，避免把普通文本误判：`|` 交替、`.*`/`.+`、`\d`/`\w`/`\s`、
+/// 用途：决定**要不要自动切到正则模式**（见 `grep_files`）——
+/// 旧版是拿它报错拒绝，现在它是自动启用正则的判据。
+///
+/// 只认明确的信号，避免把普通文本误判成正则：`|` 交替、`.*`/`.+`、`\d`/`\w`/`\s`、
 /// 字符类 `[...]`、锚点 `^`/`$`、转义括号 `\(`/`\[`。
 fn regex_looking_pattern(pat: &str) -> Option<&'static str> {
     if pat.contains("|") {
@@ -3117,6 +3465,48 @@ fn append_file(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     )))
 }
 
+/// 找 git 可执行文件。
+///
+/// ## 探测顺序（2026-10-22 改）
+///
+/// 1. **内置的 `runtime/git/cmd/git.exe`** ← 发布包自带，用户零安装
+/// 2. PATH 上的 `git.exe` / `git`
+/// 3. 常见安装位置
+///
+/// 为什么不查 `ORBCAT_GIT` 环境变量：git 工具是**只读查询**，
+/// 用哪份 git 不影响安全边界（写操作本来就走 `run_command` + 命令策略）。
+/// 内置那份是裁剪过的（64.2 MB，省 84%），子命令全内置，功能等价。
+///
+/// ⚠️ **返回全路径**：`CreateProcessW` 不做 PATH 搜索（见 `shell.rs` 的注释）。
+fn resolve_git() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(p) = crate::pi::bundled_git(&exe) {
+            return p;
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in ["git.exe", "git"] {
+                let cand = dir.join(name);
+                if cand.is_file() {
+                    return cand;
+                }
+            }
+        }
+    }
+    for c in [
+        PathBuf::from(r"C:\Program Files\Git\cmd\git.exe"),
+        PathBuf::from(r"C:\Program Files (x86)\Git\cmd\git.exe"),
+        PathBuf::from(r"D:\git\Git\cmd\git.exe"),
+    ] {
+        if c.is_file() {
+            return c;
+        }
+    }
+    // 兜底交回裸名，让错误信息里带上原始名字
+    PathBuf::from("git")
+}
+
 /// Git 只读查询。写子命令明确拒绝，避免静默绕过 `command_policy`。
 fn git_tool(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
     let sub = get_str(args, "subcommand")?;
@@ -3140,7 +3530,7 @@ fn git_tool(args: &Value, ctx: &ToolCtx<'_>) -> Result<ToolOutput, String> {
         .map(|s| s.split_whitespace().map(|x| x.to_string()).collect::<Vec<_>>())
         .unwrap_or_default();
 
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = std::process::Command::new(resolve_git());
     cmd.arg(&sub).current_dir(&repo);
 
     // 只读白名单：拒绝一切可能写工作区/输出到文件/调外部 diff 的 flag。
@@ -3978,6 +4368,7 @@ mod tests {
                 perm: leak_hub!(),
                 tick: None,
                 cancel: None,
+                turn_ref: None,
             }
         };
     }
@@ -3993,6 +4384,7 @@ mod tests {
                 perm: leak_hub!(),
                 tick: None,
                 cancel: None,
+                turn_ref: None,
             }
         };
     }
@@ -4077,6 +4469,53 @@ mod tests {
 
     /// `send_meme` 必须被模式**硬**闸住。
     ///
+    /// 内置工具**总闸**（设计稿 09「内置工具」组的开关）。
+    ///
+    /// 关掉后工具表里一个内置工具都不该剩 —— 闸门的意义是"模型想调也调不到"，
+    /// 留着工具只是提示词劝阻是假闸门。
+    #[test]
+    fn builtin_tools_switch_removes_them_from_the_tool_list() {
+        let d = std::env::temp_dir().join(format!(
+            "orbcat_builtoff_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|x| x.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+
+        let on = all_tool_specs(None, false, &d, None);
+        assert!(!on.is_empty(), "默认该有内置工具");
+        assert!(on.iter().any(|s| s.name == "read_file"));
+
+        let mut s = crate::config::load_settings(&d);
+        s.builtin_tools_enabled = false;
+        crate::config::save_settings(&d, &s).unwrap();
+
+        let off = all_tool_specs(None, false, &d, None);
+        let names: Vec<&str> = off.iter().map(|x| x.name.as_str()).collect();
+        assert!(
+            names.is_empty(),
+            "关掉后内置工具应一个不剩，实际还剩：{names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 内置工具清单（设置页「工具」页用）：名字 + 一句话说明，不能为空。
+    #[test]
+    fn builtin_tool_summaries_are_non_empty() {
+        let list = builtin_tool_summaries();
+        assert!(list.len() >= 10, "内置工具不该只有这么几个：{}", list.len());
+        assert!(list.iter().any(|(n, _)| n == "read_file"));
+        for (name, desc) in &list {
+            assert!(!name.is_empty());
+            assert!(!desc.is_empty(), "{name} 的说明不该是空的");
+        }
+    }
+
     /// 这条别退化成提示词：闸门的意义就是"模型想调也调不到"。
     /// 同时钉住另一半 —— `send_image` 常驻（工作模式也要贴截图 / 图表）。
     #[test]
@@ -4996,7 +5435,7 @@ Write-Output "ARG=[$msg]"
         let mut line = "x".repeat(500_000);
         line.push_str("NEEDLE_HERE");
         line.push_str(&"y".repeat(500_000));
-        let shown = window_around(&line, "needle_here", false, 200);
+        let shown = window_around(&Matcher::literal("needle_here", false), &line, 200);
         assert!(
             shown.to_lowercase().contains("needle_here"),
             "围绕命中位置取窗口后必须仍能看到所搜词，实际: {}",
@@ -5004,14 +5443,34 @@ Write-Output "ARG=[$msg]"
         );
         assert!(shown.chars().count() <= 202, "窗口不能超长（含省略号）");
         // 短行原样返回
-        assert_eq!(window_around("hello world", "world", false, 200), "hello world");
+        assert_eq!(
+            window_around(&Matcher::literal("world", false), "hello world", 200),
+            "hello world"
+        );
+    }
+
+    /// 正则模式也必须围绕**命中位置**取窗口 —— 单行文件里匹配同样可能在
+    /// 几十万字符处，从行首截一样会让模型看到「命中了但内容对不上」。
+    #[test]
+    fn window_around_works_for_regex_matches() {
+        let mut line = "x".repeat(500_000);
+        line.push_str("Error: boom");
+        line.push_str(&"y".repeat(500_000));
+        let m = Matcher::compile_regex("Error: [a-z]+", false).unwrap();
+        let shown = window_around(&m, &line, 200);
+        assert!(
+            shown.contains("Error: boom"),
+            "正则命中的窗口必须保留整段匹配，实际: {}",
+            &shown[..shown.len().min(80)]
+        );
+        assert!(shown.chars().count() <= 202, "窗口不能超长（含省略号）");
     }
 
     #[test]
     fn window_around_is_multibyte_safe() {
         // 中文命中位置不能把字符切坏
         let line = format!("{}目标词{}", "汉".repeat(500), "字".repeat(500));
-        let shown = window_around(&line, "目标词", false, 120);
+        let shown = window_around(&Matcher::literal("目标词", false), &line, 120);
         assert!(shown.contains("目标词"), "中文窗口必须保留命中词");
     }
 
@@ -5193,24 +5652,150 @@ Write-Output "ARG=[$msg]"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 正则语法要**当场点破**，而不是返回一个误导性的「无匹配」。
+    /// 含正则语法的 pattern **自动按正则匹配** —— 这正是模型习惯写的形态
+    /// （实测 32 次：`a|b`、`.*`、`\[x\]`）。旧版一律报错，把它逼去
+    /// `run_command` 跑 rg（绕权限网关 + 撞 24KB 截断）。
     #[test]
-    fn grep_files_rejects_regex_syntax_with_actionable_error() {
+    fn grep_files_auto_enables_regex_for_regex_looking_pattern() {
         let dir = fresh_tmp("grep_regex");
-        std::fs::write(dir.join("a.md"), "mimo-server-cn").unwrap();
+        std::fs::write(
+            dir.join("a.md"),
+            "上游是 mimo-server-cn\n下游是 /api/route/chat\n与两者都无关\n",
+        )
+        .unwrap();
 
         let gate = gate_for(&dir);
         let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
         let ctx = ctx_for!(gate, &dir, mcp);
 
-        // 模型真实写过的形态：多词用 | 串联
-        let err = grep_files(
+        // 模型真实写过的形态：多词用 | 串联。旧版这里**直接报错**。
+        let out = grep_files(
             &json!({ "pattern": "mimo-server-cn|/api/route/chat", "path": dir.to_string_lossy() }),
             &ctx,
         )
-        .expect_err("含正则语法必须报错，不能返回误导性的 0 命中");
-        assert!(err.contains("子串"), "错误信息要说清是子串匹配: {err}");
-        assert!(err.contains("|"), "应点出具体是哪个语法: {err}");
+        .expect("含正则语法的 pattern 应被自动接受，而不是报错");
+        assert!(out.text.contains("命中 2 行"), "两个分支都应命中:\n{}", out.text);
+        // 自动启用必须**说明白**，否则模型会以为口径被悄悄改了
+        assert!(
+            out.text.contains("已自动按正则匹配"),
+            "标题要标明本次按正则匹配:\n{}",
+            out.text
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `regex: false` = 强制字面。搜 `a|b` 这个**字符串**时必须只命中字面那一行，
+    /// 而不是把它当交替。
+    #[test]
+    fn grep_files_literal_mode_ignores_regex_metacharacters() {
+        let dir = fresh_tmp("grep_literal");
+        std::fs::write(dir.join("a.txt"), "运维手册 a|b 备用通道\n另一行只有 a\n还有 b\n")
+            .unwrap();
+
+        let gate = gate_for(&dir);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &dir, mcp);
+
+        let out = grep_files(
+            &json!({
+                "pattern": "a|b",
+                "path": dir.to_string_lossy(),
+                "regex": false
+            }),
+            &ctx,
+        )
+        .unwrap();
+        assert!(
+            out.text.contains("命中 1 行"),
+            "regex:false 时只能命中字面的 `a|b`:\n{}",
+            out.text
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows 路径 `D:\workplace` 含 `\w`（会被判定为"像正则"），
+    /// 但正则编译不过 —— 那本意就是**字面路径**，必须回落子串而不是报错。
+    #[test]
+    fn grep_files_falls_back_to_literal_when_pattern_is_not_valid_regex() {
+        let dir = fresh_tmp("grep_fallback");
+        std::fs::write(dir.join("a.md"), "工程放在 D:\\workplace\\orbcat 下\n").unwrap();
+
+        let gate = gate_for(&dir);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &dir, mcp);
+
+        let out = grep_files(
+            &json!({ "pattern": "D:\\workplace\\orbcat", "path": dir.to_string_lossy() }),
+            &ctx,
+        )
+        .expect("非法正则不该让整个调用失败，应回落字面搜索");
+        assert!(out.text.contains("命中 1 行"), "字面路径必须能搜到:\n{}", out.text);
+        assert!(
+            out.text.contains("已按字面子串匹配"),
+            "回落必须说明白:\n{}",
+            out.text
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `regex: true` 是**显式**要求 —— 语法错就必须报错，并给出可操作的下一步，
+    /// 而不是悄悄改口径（那会让模型拿着错误结果去推理）。
+    #[test]
+    fn grep_files_explicit_regex_error_is_actionable() {
+        let dir = fresh_tmp("grep_badregex");
+        std::fs::write(dir.join("a.md"), "随便写点内容\n").unwrap();
+
+        let gate = gate_for(&dir);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &dir, mcp);
+
+        let err = grep_files(
+            &json!({ "pattern": "foo[unclosed", "path": dir.to_string_lossy(), "regex": true }),
+            &ctx,
+        )
+        .expect_err("显式 regex:true 时语法错必须报错");
+        assert!(err.contains("正则"), "要说清是正则问题: {err}");
+        assert!(err.contains("regex\": false") || err.contains("regex: false"), "要给出下一步: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 正则模式同样默认大小写不敏感 —— 否则模型写 `init[a-z]+` 去搜
+    /// `InitState` 会静默零命中。
+    #[test]
+    fn grep_files_regex_is_case_insensitive_by_default() {
+        let dir = fresh_tmp("grep_regexcase");
+        std::fs::write(dir.join("a.rs"), "struct InitState {}\nstruct Other {}\n").unwrap();
+
+        let gate = gate_for(&dir);
+        let mcp = tokio::sync::Mutex::new(ToolRegistry::new(""));
+        let ctx = ctx_for!(gate, &dir, mcp);
+
+        let out = grep_files(
+            &json!({ "pattern": "init[a-z]+", "path": dir.to_string_lossy() }),
+            &ctx,
+        )
+        .unwrap();
+        assert!(
+            out.text.contains("命中 1 行"),
+            "正则也该默认不区分大小写:\n{}",
+            out.text
+        );
+
+        // 显式要求区分大小写时不该命中
+        let out2 = grep_files(
+            &json!({
+                "pattern": "init[a-z]+",
+                "path": dir.to_string_lossy(),
+                "caseSensitive": true
+            }),
+            &ctx,
+        )
+        .unwrap();
+        assert!(out2.text.contains("命中 0 行"), "caseSensitive=true 时不应命中:\n{}", out2.text);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5963,6 +6548,7 @@ Write-Output "ARG=[$msg]"
         let out = remember(
             &json!({"content": "用户偏好：回答用中文", "scope": "global"}),
             &d,
+            None,
         )
         .unwrap();
         assert!(out.text.contains("全局"), "回执要说清落点：{}", out.text);
@@ -5987,6 +6573,7 @@ Write-Output "ARG=[$msg]"
         let err = remember(
             &json!({"content": "Fig.2 是任务表", "scope": "project"}),
             &d,
+            None,
         )
         .expect_err("没有激活项目时必须报错");
         assert!(err.contains("没有激活项目"), "{err}");
@@ -6014,6 +6601,7 @@ Write-Output "ARG=[$msg]"
         remember(
             &json!({"content": "Fig.2 是任务表", "scope": "project"}),
             &d,
+            None,
         )
         .unwrap();
         assert!(crate::pmem::project_memory_md(&d, "论文")
@@ -6035,7 +6623,7 @@ Write-Output "ARG=[$msg]"
         let mut s = crate::config::load_settings(&d);
         s.active_project_id = Some(p.id);
         crate::config::save_settings(&d, &s).unwrap();
-        remember(&json!({"content": "老调用不带 scope"}), &d).unwrap();
+        remember(&json!({"content": "老调用不带 scope"}), &d, None).unwrap();
         assert!(crate::pmem::project_memory_md(&d, "proj")
             .unwrap()
             .contains("老调用不带 scope"));
@@ -6043,7 +6631,7 @@ Write-Output "ARG=[$msg]"
         let mut s2 = crate::config::load_settings(&d);
         s2.active_project_id = None;
         crate::config::save_settings(&d, &s2).unwrap();
-        remember(&json!({"content": "无项目时的记忆"}), &d).unwrap();
+        remember(&json!({"content": "无项目时的记忆"}), &d, None).unwrap();
         let pend = crate::memory::MemoryStore::new(&d).list_pending().unwrap();
         assert_eq!(pend.len(), 1);
         assert!(pend[0].content.contains("无项目时的记忆"));
@@ -6054,7 +6642,7 @@ Write-Output "ARG=[$msg]"
     #[test]
     fn remember_rejects_unknown_scope() {
         let d = mem_tmp("bad");
-        let err = remember(&json!({"content": "x", "scope": "gobal"}), &d).unwrap_err();
+        let err = remember(&json!({"content": "x", "scope": "gobal"}), &d, None).unwrap_err();
         assert!(err.contains("scope"), "{err}");
         let _ = std::fs::remove_dir_all(&d);
     }

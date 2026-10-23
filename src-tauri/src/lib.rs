@@ -1,6 +1,6 @@
 //! orbcat — Tauri 后端入口
 
-mod agent;
+pub mod agent;
 /// 测试钩子 / 集成用例（**整个模块只在测试构建里编译**）
 ///
 /// ⚠️ `#[cfg(test)]` 不能省：这个文件里每个 fn 都带 `#[test]`，
@@ -27,6 +27,15 @@ mod memory;
 mod modes;
 mod perm_request;
 mod permission;
+// pi 内核相关模块 —— `pub` 是为了让 `tests/pi_integration.rs` 能直接用
+// （集成测试只能访问 crate 的公开 API）。
+//
+// ⚠️ `pi_run` 保持私有：它是**内部翻译层**（pi 事件 → orbcat Progress），
+//    没有对外暴露的必要。
+pub mod pi;
+pub mod pi_bridge;
+mod pi_run;
+pub mod pi_runtime;
 mod pmem;
 mod project;
 mod ptc;
@@ -282,6 +291,13 @@ struct AppState {
     /// 执行中「插话」的收件箱 + 取消标志，**按会话分槽**（多会话并行 run）。`chat` 开跑前 `begin(session_id)` 拿槽、收尾 `end()` 归还；
     /// `chat_steer` / `chat_cancel` 都带 `session_id` 路由到对应槽。
     runs: agent::RunRegistry,
+    /// **pi 内核运行时**（2026-10-22 新增）。
+    ///
+    /// 常驻一个 pi 子进程 + 一个工具桥。`chat_pi` 命令走它。
+    ///
+    /// 为什么单独一个而不是复用 `runs`：`runs` 管的是「旧内核的 run 槽位」，
+    /// pi 的 run 有自己的生命周期（进程常驻、上下文在 pi 的 session 文件里）。
+    pi: Option<std::sync::Arc<pi_runtime::PiRuntime>>,
 }
 
 /// 换会话时重装临时授权（**仅文件授权**）。
@@ -348,9 +364,20 @@ impl AppState {
     /// 调用点：启动、切项目、建/删/改名项目、改绑定路径、permissions.json
     /// 热加载之后。全部幂等 —— 先摘全部旧动态规则，再按当前激活项目挂新的。
     fn refresh_project_dir_rules(&self) {
-        let want = active_project_dir(&self.data_dir);
         let mut gate = self.gate.lock().unwrap();
         let removed = gate.retain_rules(|r| !permission::is_dynamic_label(&r.label));
+        drop(gate);
+        // ⚠️ 「项目目录自动读写」关掉 = 项目目录**不再自动授权**，
+        //    工具碰它一律走弹卡审批（设计稿 04「行为与安全」组的行内开关）。
+        let autoread = config::load_settings(&self.data_dir).project_dir_autoread;
+        if !autoread {
+            if removed > 0 {
+                eprintln!("[orbcat] 已摘除 {removed} 条旧的项目目录授权（自动读写已关）");
+            }
+            return;
+        }
+        let want = active_project_dir(&self.data_dir);
+        let mut gate = self.gate.lock().unwrap();
         if let Some((path, name)) = want {
             gate.add_rule(
                 &path,
@@ -1413,8 +1440,16 @@ fn models_get_edit(
 
 /// 手动填 URL + Key，拉取 OpenAI 兼容 `GET {url}/models`。
 /// 返回 id 列表（不含任何密钥）。
+///
+/// ⚠️ **Key 留空 = 继承同组 Key**（bug 修复）：
+/// 添加模型的表单里 API Key 留空是常态（提示词里明说"云端留空自动继承同组 Key"），
+/// 但这里以前**直接把空 Key 发出去** → 云端网关回 401 → 「获取 ID」按钮永远拉不到列表。
+/// 现在留空时会先在**同 Base URL** 的已配置模型里找一个 Key 用上（见
+/// [`config::group_key_for_url`]）；额外请求头同理继承同组的
+/// （OpenCode Zen 少了 `x-opencode-session` 会直接 400）。
 #[tauri::command]
 async fn models_fetch_remote(
+    state: State<'_, AppState>,
     url: String,
     api_key: String,
     headers: Option<String>,
@@ -1423,16 +1458,44 @@ async fn models_fetch_remote(
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err("URL 必须以 http:// 或 https:// 开头".into());
     }
-    let hs = match headers {
-        Some(t) if !t.trim().is_empty() => {
-            let map = parse_headers(&t)?;
-            map.into_iter().collect::<Vec<_>>()
-        }
-        _ => Vec::new(),
+    let mut hs = match headers {
+        Some(t) if !t.trim().is_empty() => parse_headers(&t)?,
+        _ => Default::default(),
     };
+    // Key / 额外头留空 → 继承同组（同 Base URL）已配置的
+    let mut key = api_key.trim().to_string();
+    let all = config::load_models(&state.data_dir).unwrap_or_default();
+    if key.is_empty() {
+        key = config::group_key_for_url(&all, &url);
+    }
+    if hs.is_empty() {
+        hs = config::group_headers_for_url(&all, &url);
+    }
     // Key 可空：Ollama / 本地网关不需要鉴权（预设下 Key 输入框必须可写，前端负责）
-    eprintln!("[orbcat] 拉取模型列表 @ {}", config::models_endpoint_from_base(&url));
-    llm::fetch_models_list(&url, &api_key, &hs).await
+    eprintln!(
+        "[orbcat] 拉取模型列表 @ {}（key {}）",
+        config::models_endpoint_from_base(&url),
+        if key.is_empty() { "空".into() } else { config::redact_key_str(&key) }
+    );
+    let hs_vec: Vec<(String, String)> = hs.into_iter().collect();
+    llm::fetch_models_list(&url, &key, &hs_vec).await.map_err(|e| {
+        if key.is_empty() {
+            format!(
+                "{e}\n（这个 Base URL 下没有已保存的 Key 可继承 —— 填一个 API Key，或先在同组配好一个模型）"
+            )
+        } else {
+            e
+        }
+    })
+}
+
+/// 解析用户**粘进来**的一段模型 JSON（OpenRouter / OpenAI 兼容的模型描述）。
+///
+/// 走的是**同一个** [`llm::parse_models_payload`] —— 「粘 JSON 导入」和
+/// 「从提供商拉列表」口径一致，不会出现"拉得到、粘进来就丢字段"。
+#[tauri::command]
+fn models_parse_spec(payload: String) -> Result<Vec<llm::RemoteModelInfo>, String> {
+    llm::parse_models_text(&payload)
 }
 
 /// 用**已配置模型**的 url/key/headers 拉取列表（设置页省得再手填 Key）。
@@ -1465,6 +1528,7 @@ struct ImportModelsResult {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn models_import_remote(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -1479,6 +1543,12 @@ fn models_import_remote(
     // 模型 id → 上下文窗口（来自 `/models` 返回的可选字段）。
     // 前端从拉取结果里带上；网关不提供时为空。
     context_lengths: Option<std::collections::HashMap<String, u64>>,
+    // 模型 id → 最大输出（OpenRouter 风格是 `max_completion_tokens`）
+    max_output_tokens: Option<std::collections::HashMap<String, u64>>,
+    // 模型 id → 是否支持工具调用（`capabilities.tools` / `supports_tools`）
+    tool_flags: Option<std::collections::HashMap<String, bool>>,
+    // 模型 id → 是否支持看图（`capabilities.vision` / `supports_vision`）
+    image_flags: Option<std::collections::HashMap<String, bool>>,
 ) -> Result<ImportModelsResult, String> {
     let source = if let Some(sid) = source_id.filter(|s| !s.trim().is_empty()) {
         // 按 (url, id) 精确找来源（同 id 可跨组共存）；url 缺失回落裸 id
@@ -1493,14 +1563,25 @@ fn models_import_remote(
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Err("URL 必须以 http:// 或 https:// 开头".into());
         }
-        let key = api_key.unwrap_or_default().trim().to_string();
+        // Key 留空 → 继承同组（同 Base URL）已配置的 Key（与「获取 ID」同一条口径）
+        let mut key = api_key.unwrap_or_default().trim().to_string();
         if key.is_empty() {
-            return Err("API key 不能为空".into());
+            let all = config::load_models(&state.data_dir).unwrap_or_default();
+            key = config::group_key_for_url(&all, &url);
         }
-        let hs = match headers {
+        let mut hs = match headers {
             Some(t) if !t.trim().is_empty() => parse_headers(&t)?,
             _ => Default::default(),
         };
+        if hs.is_empty() {
+            let all = config::load_models(&state.data_dir).unwrap_or_default();
+            hs = config::group_headers_for_url(&all, &url);
+        }
+        if key.is_empty() {
+            eprintln!(
+                "[orbcat] ⚠️ 批量导入时没有 API Key（{url} 也没有同组可继承的）—— 导入后请用组菜单「更新 API 密钥」补上"
+            );
+        }
         config::ModelConfig {
             id: "__import__".into(),
             vendor: "Custom".into(),
@@ -1514,25 +1595,69 @@ fn models_import_remote(
         }
     };
 
-    let ctx = context_lengths.unwrap_or_default();
+    let meta = config::ImportMeta {
+        context_lengths: context_lengths.unwrap_or_default(),
+        max_output_tokens: max_output_tokens.unwrap_or_default(),
+        tool_flags: tool_flags.unwrap_or_default(),
+        image_flags: image_flags.unwrap_or_default(),
+    };
     let (added, skipped) = config::import_models_from_source(
         &state.data_dir,
         &source,
         &ids,
         supports_tool_call,
         supports_images,
-        &ctx,
+        &meta,
     )?;
     eprintln!(
         "[orbcat] 批量导入模型：新增 {}，跳过 {}（带上下文窗口 {} 个）",
         added.len(),
         skipped.len(),
-        ctx.len()
+        meta.context_lengths.len()
     );
     if !added.is_empty() {
         let _ = app.emit("models-changed", ());
     }
     Ok(ImportModelsResult { added, skipped })
+}
+
+/// **整组改 Base URL**：把该组所有模型挪到新的 Base URL 下。
+///
+/// 补的是组菜单里一直缺的那一格：能改组名、能改 Key，却**改不了 Base URL** ——
+/// 想把一整组模型切到另一个网关只能逐个点编辑。撞了同 id 的那条跳过不覆盖。
+#[tauri::command]
+fn models_change_group_url(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    url: String,
+    new_url: String,
+) -> Result<config::GroupUrlChange, String> {
+    let old_url = url.trim().to_string();
+    let res = config::change_group_url(&state.data_dir, &old_url, &new_url)?;
+    let old_key = config::url_key(&old_url);
+
+    // 组显示名跟着搬家（键就是 Base URL）
+    let mut s = config::load_settings(&state.data_dir);
+    if let Some(name) = s.model_group_names.remove(&old_url) {
+        s.model_group_names.insert(res.new_url.clone(), name);
+    }
+    // 当前选中的模型如果在这一组 → selected_model_url 跟着改，否则「当前」标记会掉
+    if let Some(sel_url) = s.selected_model_url.clone() {
+        if config::url_key(&sel_url) == old_key {
+            s.selected_model_url = Some(res.new_url.clone());
+        }
+    }
+    config::save_settings(&state.data_dir, &s)?;
+
+    eprintln!(
+        "[orbcat] 组 {} → {}：搬走 {} 个，跳过 {} 个（重名）",
+        old_url,
+        res.new_url,
+        res.moved,
+        res.skipped.len()
+    );
+    let _ = app.emit("models-changed", ());
+    Ok(res)
 }
 /// 删除一个模型（按 **(Base URL, 接口 id)** 定位）。
 /// 若删的是当前选中项，顺带清除选中状态。
@@ -1811,6 +1936,42 @@ fn set_blur_collapse(state: State<'_, AppState>, enable: bool) -> Result<(), Str
     let mut s = config::load_settings(&state.data_dir);
     s.blur_collapse = enable;
     config::save_settings(&state.data_dir, &s)
+}
+
+/// 「项目目录自动读写」开关（设计稿 04「行为与安全」组）。
+///
+/// 关掉 = 激活项目绑定的目录**不再自动给 ReadWrite** —— 工具碰它一律走弹卡审批。
+/// 立刻重建动态规则（不用重启）。
+#[tauri::command]
+fn set_project_dir_autoread(
+    state: State<'_, AppState>,
+    enable: bool,
+) -> Result<(), String> {
+    let mut s = config::load_settings(&state.data_dir);
+    s.project_dir_autoread = enable;
+    config::save_settings(&state.data_dir, &s)?;
+    state.refresh_project_dir_rules();
+    Ok(())
+}
+
+/// **内置工具总闸**（设计稿 09「内置工具」组的开关）。
+///
+/// 关掉 = 模型工具表里**没有**任何内置工具，只剩 MCP 外部工具与项目脚本工具。
+/// 立刻生效（不用重启）—— 下一轮 run 重建工具表时就会变。
+#[tauri::command]
+fn set_builtin_tools(state: State<'_, AppState>, enable: bool) -> Result<(), String> {
+    let mut s = config::load_settings(&state.data_dir);
+    s.builtin_tools_enabled = enable;
+    config::save_settings(&state.data_dir, &s)
+}
+
+/// 内置工具清单（名字 + 一句话说明），给设置页「工具」页列工具行。
+#[tauri::command]
+fn builtin_tools() -> Vec<BuiltinToolInfo> {
+    tools::builtin_tool_summaries()
+        .into_iter()
+        .map(|(name, desc)| BuiltinToolInfo { name, desc })
+        .collect()
 }
 
 /// 设置执行权限档位（`ask` / `smart` / `full`）。
@@ -3530,6 +3691,24 @@ fn recovery_restore_trash(
 }
 
 /// 按保留策略清理（**只在用户点按钮时执行**，不做后台自动删除）。
+/// **永久删除一份备份**（设计稿 10）。不可还原 —— 前端要二次确认。
+#[tauri::command]
+fn recovery_delete_backup(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    recovery::delete_backup(&state.data_dir, &id)
+}
+
+/// **永久删除一项归档**（设计稿 10）。不可还原 —— 前端要二次确认。
+#[tauri::command]
+fn recovery_delete_trash(state: State<'_, AppState>, trashed: String) -> Result<String, String> {
+    recovery::delete_trash(&state.data_dir, &trashed)
+}
+
+/// **清空回收站**（设计稿 10）。不可还原 —— 前端要二次确认。
+#[tauri::command]
+fn recovery_clear_trash(state: State<'_, AppState>) -> Result<String, String> {
+    recovery::clear_trash(&state.data_dir)
+}
+
 #[tauri::command]
 fn recovery_prune(
     state: State<'_, AppState>,
@@ -3605,6 +3784,232 @@ fn chat_cancel(state: State<'_, AppState>, session_id: Option<String>) {
 ///
 /// 权限说明：这条消息**不在这里**做任何校验。它进的是同一个 `messages`、
 /// 同一个 agent loop、同一个权限网关 —— 越权与否在执行工具那一刻判定。
+
+// ---------------------------------------------------------------------------
+// Tauri 命令 —— pi 内核
+// ---------------------------------------------------------------------------
+
+/// pi 内核的**宿主权限闸门**。
+///
+/// pi 侧 `orbcat-gate.ts` 的 `tool_call` hook 会 POST `/gate`，
+/// 这里是真正的裁决方。
+///
+/// ## 裁决顺序（与自研内核**同口径**）
+///
+/// 1. `orb_` 前缀的 orbcat 私有工具 → **放行**（裁决在 Rust 工具层 `authorize`）
+/// 2. MCP 工具（`mcp__<server>__<tool>`）→
+///    - 已在 `mcp_grants.json`「总是允许」→ 放行
+///    - 项目执行信任开了 auto → 放行
+///    - 否则**弹确认卡**（Cline 式三档），按用户决定
+/// 3. pi 内置写类工具（`write`/`edit`/`bash`/`powershell`）→ 查文件网关
+/// 4. 其余只读 → 放行
+///
+/// ## 为什么 MCP 要单独判
+///
+/// pi **原生**连 MCP server（工具调用走 pi 的 MCP client，**不经过** Rust 的
+/// `tools::execute`）—— 所以 Rust 那道 `authorize` 拦不到它。
+/// 不在这里补一道，MCP 就是权限盲区。
+async fn pi_host_gate(
+    perm: &std::sync::Arc<perm_request::PermHub>,
+    data_dir: &Path,
+    session_id: &str,
+    tool: &str,
+    args: &serde_json::Value,
+) -> (bool, String) {
+    let real = tool.strip_prefix("orb_").unwrap_or(tool);
+
+    // 1. orbcat 私有工具：裁决在 Rust 工具层，这里不重复判
+    if tool.starts_with("orb_") {
+        return (true, String::new());
+    }
+
+    // 2. MCP 工具
+    if let Some((server, t)) = mcp::parse_mcp_tool_name(real) {
+        let full = mcp::mcp_tool_full_name(&server, &t);
+        if mcp::is_mcp_tool_allowed(data_dir, &full)
+            || project::effective_exec_trust(data_dir).auto_allows_mcp()
+        {
+            return (true, String::new());
+        }
+        // 弹确认卡（阻塞等前端回话，最多 3 分钟）
+        let preview = agent::summarize_args_pub(&args.to_string());
+        match perm
+            .ask_mcp_tool(full.clone(), preview, session_id)
+            .await
+        {
+            Ok(v) => {
+                if !v.is_approved() {
+                    return (false, v.to_model_message());
+                }
+                // 「总是允许」→ 落盘
+                if matches!(v.decision, perm_request::Decision::ApproveFull) {
+                    if let Err(e) = mcp::allow_mcp_tool(data_dir, &full) {
+                        eprintln!("[orbcat] ⚠️ 写 mcp_grants 失败: {e}");
+                    }
+                }
+                (true, String::new())
+            }
+            Err(e) => (false, format!("MCP 授权失败: {e}")),
+        }
+    } else {
+        // 3/4. pi 内置工具 → 静态裁决（文件网关）
+        tools::gate_bridge(real, args, data_dir).unwrap_or((false, "裁决失败".into()))
+    }
+}
+
+/// 用 **pi 内核**跑一轮对话。
+///
+/// 与 [`chat`] 的区别：内核换成 pi（`pi --mode rpc` 子进程），
+/// 工具通过本地 HTTP 桥回调 Rust（见 `pi_runtime.rs` / `pi_bridge.rs`）。
+///
+/// 返回结构与 [`chat`] 一致（`agent::AgentRun` 的同构体），
+/// 所以前端可以复用现有渲染。
+///
+/// ⚠️ **需要内置 runtime** —— 没有 `runtime/` 时返回明确错误，
+///    不静默退回旧内核（那会让用户以为在用 pi，其实不是）。
+#[tauri::command]
+async fn chat_pi(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    input: String,
+    images: Option<Vec<String>>,
+) -> Result<pi_runtime::PiRun, String> {
+    let rt = state
+        .pi
+        .clone()
+        .ok_or_else(|| "pi 内核不可用：未找到内置 runtime/（先跑 node tools/build-runtime-assets.mjs）".to_string())?;
+
+    // 图片先落盘（与旧内核同一条路）
+    let imgs = images::save_all(&state.data_dir, &images.unwrap_or_default());
+
+    // 当前会话 id
+    let session_id = sessions::current_id(&state.data_dir)
+        .unwrap_or_else(|| sessions::ensure_current(&state.data_dir).id);
+
+    // 开跑前落盘（与旧内核同一条路：先写占位，checkpoint 覆盖）
+    if let Err(e) = sessions::begin_turn_in(&state.data_dir, Some(&session_id), &input, &imgs) {
+        eprintln!("[orbcat] ⚠️ 开跑落盘失败（不影响对话）: {e}");
+    }
+    let on_checkpoint: agent::CheckpointFn = {
+        let dd = state.data_dir.clone();
+        let sid = session_id.clone();
+        std::sync::Arc::new(move |steps: &[agent::AgentStep], answer: &str, reasoning: &str| {
+            let stored = sessions::steps_from_agent(steps);
+            let r = if reasoning.is_empty() { None } else { Some(reasoning) };
+            if let Err(e) = sessions::checkpoint_turn_in(&dd, Some(&sid), &stored, answer, r) {
+                eprintln!("[orbcat] ⚠️ 轮内落盘失败（不影响对话）: {e}");
+            }
+        })
+    };
+
+    // 进度回调 → 前端（与旧内核同一条事件通道）
+    let progress: agent::ProgressFn = {
+        let win = window.clone();
+        let sid = session_id.clone();
+        std::sync::Arc::new(move |p: agent::Progress| {
+            let _ = win.emit(
+                "agent-progress",
+                &serde_json::json!({ "sessionId": sid, "p": p }),
+            );
+        })
+    };
+
+    eprintln!(
+        "[orbcat] chat_pi: 文字={} 字 图片={} 张",
+        input.chars().count(),
+        imgs.len()
+    );
+
+    // imgs 要留给落盘 → 先 clone 一份给 run
+    let result = rt
+        .run_with_checkpoint(&input, imgs.clone(), progress, Some(on_checkpoint))
+        .await?;
+
+    // 收尾落盘（与旧内核**完全同一条路**：`TurnRecord` + `append_run_in`）
+    let stored = sessions::steps_from_agent(&result.steps);
+    let model_id = state
+        .pi
+        .as_ref()
+        .map(|_| "pi")
+        .unwrap_or("pi");
+    if let Err(e) = sessions::append_run_in(
+        &state.data_dir,
+        Some(&session_id),
+        &sessions::TurnRecord {
+            user_text: &input,
+            images: &imgs,
+            steers: &result.steers,
+            answer: &result.answer,
+            reasoning: result.reasoning.as_deref(),
+            steps: &stored,
+            interrupted: result.interrupted,
+            model: model_id,
+            usage: result.usage,
+            last_prompt_tokens: result.last_prompt_tokens,
+            token_scale: result.token_scale,
+        },
+    ) {
+        eprintln!("[orbcat] ⚠️ 收尾落盘失败: {e}");
+    }
+
+    Ok(result)
+}
+
+/// pi 内核状态（给 UI 显示用）。
+#[tauri::command]
+async fn pi_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let Some(rt) = state.pi.clone() else {
+        return Ok(serde_json::json!({"available": false}));
+    };
+    Ok(serde_json::json!({
+        "available": true,
+        "runtimeDir": rt.runtime_dir().display().to_string(),
+        "agentDir": rt.agent_dir().display().to_string(),
+        "bridgePort": rt.bridge_port(),
+    }))
+}
+
+/// pi 内核：插话。
+///
+/// ## 返回值与 `chat_steer` **对齐**
+///
+/// 前端 `sendSteer()` 走一条路（`invoke("chat_steer")`），pi 内核下要换成
+/// `chat_pi_steer` —— 但**返回结构必须一样**，否则前端要写两套渲染逻辑
+/// （排队气泡的 `steerId` / `steerQueuePos`）。
+///
+/// 所以这里返回 `agent::SteerAck` 形状，字段用 pi 的口径填。
+#[tauri::command]
+async fn chat_pi_steer(
+    state: State<'_, AppState>,
+    message: String,
+    session_id: Option<String>,
+) -> Result<agent::SteerAck, String> {
+    let rt = state.pi.clone().ok_or("pi 内核不可用")?;
+    let text = message.trim().to_string();
+    if text.is_empty() {
+        return Err("插话内容为空".into());
+    }
+    rt.steer(&text).await?;
+    Ok(agent::SteerAck {
+        id: agent::new_steer_id(),
+        queued: 1,
+    })
+}
+
+/// pi 内核：中断。
+#[tauri::command]
+async fn chat_pi_abort(state: State<'_, AppState>) -> Result<(), String> {
+    let rt = state.pi.clone().ok_or("pi 内核不可用")?;
+    rt.abort().await
+}
+
+/// pi 内核：手动触发压缩。
+#[tauri::command]
+async fn chat_pi_compact(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let rt = state.pi.clone().ok_or("pi 内核不可用")?;
+    rt.compact().await
+}
+
 #[tauri::command]
 async fn chat_steer(
     state: State<'_, AppState>,
@@ -3960,6 +4365,24 @@ fn perm_grant_revoke(
 // Tauri 命令 —— 记忆
 // ---------------------------------------------------------------------------
 
+/// 审批页底部状态栏的统计（设计稿 06 底部状态栏「N / M」）。
+#[derive(Serialize)]
+struct MemStats {
+    /// 当前待批数
+    pending: usize,
+    /// 已处理数（已批准 + 已驳回）
+    handled: usize,
+}
+
+/// 一个内置工具的摘要（设计稿 09「内置工具」组的工具行）。
+#[derive(Serialize)]
+struct BuiltinToolInfo {
+    /// 工具名（`read_file` / `write_file` …）
+    name: String,
+    /// 一句话说明（描述的第一句，截到 32 字）
+    desc: String,
+}
+
 #[tauri::command]
 fn mem_pending(state: State<'_, AppState>) -> Result<Vec<memory::Candidate>, String> {
     state.memory.list_pending()
@@ -3968,6 +4391,32 @@ fn mem_pending(state: State<'_, AppState>) -> Result<Vec<memory::Candidate>, Str
 #[tauri::command]
 fn mem_approve(state: State<'_, AppState>, id: String) -> Result<(), String> {
     state.memory.approve(&id)
+}
+
+/// **改写**一条候选的内容（仍留在待批队列，等用户点「批准」才写进长期记忆）。
+///
+/// 设计稿 06 的「改写」按钮：模型蒸馏出来的句子常常太长或太满，
+/// 用户想收紧措辞再决定要不要记住。改写与批准是**两件事**，不合并。
+#[tauri::command]
+fn mem_rewrite(state: State<'_, AppState>, id: String, content: String) -> Result<(), String> {
+    state.memory.rewrite(&id, &content)
+}
+
+/// **全部批准**（设计稿 06 标题条）：一次性把当前所有候选写进长期记忆。
+///
+/// 返回写入条数。
+#[tauri::command]
+fn mem_approve_all(state: State<'_, AppState>) -> Result<usize, String> {
+    state.memory.approve_all()
+}
+
+/// 审批页底部状态栏的统计：**（待批数, 已处理数）**。
+///
+/// 「已处理」= 已批准 + 已驳回，都从只追加的台账数，不从 MEMORY.md 反推。
+#[tauri::command]
+fn mem_stats(state: State<'_, AppState>) -> Result<MemStats, String> {
+    let (pending, handled) = state.memory.stats()?;
+    Ok(MemStats { pending, handled })
 }
 
 /// 驳回一条候选。`reason` 可空 —— 空也照常留档，只是没有理由可看。
@@ -4099,7 +4548,7 @@ fn pmem_get_active(state: State<'_, AppState>) -> Result<Option<pmem::ProjectRow
 fn pmem_remember(state: State<'_, AppState>, content: String) -> Result<String, String> {
     let s = config::load_settings(&state.data_dir);
     let Some(pid) = s.active_project_id else {
-        return Err("当前是主对话，没有激活项目".into());
+        return Err("当前是「无任务空间」，没有激活项目".into());
     };
     let all = pmem::list_projects(&state.data_dir)?;
     let p = all
@@ -4836,6 +5285,63 @@ pub fn run() {
                 }
             }
 
+            // ── pi 内核运行时 ──
+            //
+            // 只有**内置 runtime 存在**时才建（`runtime/node/node.exe` + `runtime/pi/`）。
+            // 没有 runtime 就退回旧内核（`agent::run`）—— 用户没跑构建脚本也不至于
+            // 完全不能用。判定结果记进 `settings.json` 之外的状态里，UI 上给个提示。
+            let pi_rt = {
+                let runtime = std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| pi::runtime_dir(&exe));
+                match runtime {
+                    Some(rt) => {
+                        eprintln!("[orbcat] pi 内核已就绪: {}", rt.display());
+                        let rt = pi_runtime::PiRuntime::new(data_dir.clone(), rt);
+                        // ── 权限闸门接线 ──
+                        //
+                        // ⚠️ **这行以前是漏的** —— `set_gate` 从来没被调用过，
+                        // 意味着 pi 内核下宿主侧的闸门回调一直是空的
+                        // （2026-10-22 实测发现）。
+                        //
+                        // 现在接上：`orbcat-gate.ts` 的 `tool_call` hook 会 POST
+                        // `/gate`，Rust 侧用**同一套**权限逻辑裁决
+                        // （`pi_host_gate` → `permission::load_gate` /
+                        // `mcp_grants` / 确认卡）。
+                        //
+                        // 注意：Rust 的工具层（`tools::execute` → `authorize`）
+                        // 是**第二道**闸门，这里是第一道 —— 两道都要在，
+                        // 少一道就等于某个入口没人管。
+                        let perm_for_gate = perm.clone();
+                        let dd_for_gate = data_dir.clone();
+                        rt.set_gate(std::sync::Arc::new(move |tool, args| {
+                            let perm = perm_for_gate.clone();
+                            let dd = dd_for_gate.clone();
+                            let tool = tool.to_string();
+                            let args = args.clone();
+                            Box::pin(async move {
+                                // 会话 id 在这里取 —— gate 回调本身是**同步**注入的，
+                                // 拿不到 `State<AppState>`，所以每次调用时现取。
+                                let sid = sessions::current_id(&dd)
+                                    .unwrap_or_else(|| sessions::ensure_current(&dd).id);
+                                pi_host_gate(&perm, &dd, &sid, &tool, &args).await
+                            })
+                        }));
+                        Some(rt)
+                    }
+                    None => {
+                        eprintln!(
+                            "[orbcat] ⚠️ 未找到内置 runtime/（{}）—— pi 内核不可用，继续用旧内核。\n\
+                             构建方式: node tools/build-runtime-assets.mjs",
+                            std::env::current_exe()
+                                .map(|e| e.display().to_string())
+                                .unwrap_or_default()
+                        );
+                        None
+                    }
+                }
+            };
+
             app.manage(AppState {
                 gate: Mutex::new(gate),
                 perm_mtime: Mutex::new(None),
@@ -4844,6 +5350,7 @@ pub fn run() {
                 mcp: shared,
                 perm,
                 runs: agent::RunRegistry::default(),
+                pi: pi_rt,
             });
 
             // --- 窗口初始形态 ---
@@ -4937,6 +5444,12 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // ── pi 内核（2026-10-22 新增）──
+            chat_pi,
+            chat_pi_steer,
+            chat_pi_abort,
+            chat_pi_compact,
+            pi_status,
             perm_check,
             perm_rules,
             perm_add_rule,
@@ -4967,15 +5480,20 @@ pub fn run() {
             models_get_edit,
             models_fetch_remote,
             models_fetch_remote_using,
+            models_parse_spec,
             models_import_remote,
+            models_change_group_url,
             models_remove,
             test_model,
             chat,
             capture_screen,
             mem_pending,
             mem_approve,
+            mem_rewrite,
+            mem_approve_all,
             mem_reject,
             mem_propose,
+            mem_stats,
             distill_session_open,
             mem_project_set_source,
             mem_project_archive,
@@ -5003,6 +5521,9 @@ pub fn run() {
             life_refresh,
             life_config_path,
             set_blur_collapse,
+            set_project_dir_autoread,
+            set_builtin_tools,
+            builtin_tools,
             set_exec_trust,
             modes_get,
             bg_desk_status,
@@ -5038,6 +5559,9 @@ pub fn run() {
             recovery_restore_backup,
             recovery_restore_trash,
             recovery_prune,
+            recovery_delete_backup,
+            recovery_clear_trash,
+            recovery_delete_trash,
             recovery_diagnostic,
             mcp_status,
             mcp_refresh,

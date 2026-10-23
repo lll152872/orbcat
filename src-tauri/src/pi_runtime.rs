@@ -1,0 +1,1173 @@
+//! pi 运行时 —— 把 pi 变成 orbcat 的 agent 内核。
+//!
+//! ## 这一层负责什么
+//!
+//! 1. **常驻一个 pi 子进程**（不是每轮起一个 —— 冷启动 0.4s，每轮起太浪费）
+//! 2. **起工具桥**（`pi_bridge.rs`），把 orbcat 的 34 个工具接给 pi
+//! 3. **起权限闸门 extension**（`tool_call` → `ctx.ui.confirm()` → 回到 Rust 裁决）
+//! 4. **接管 system prompt**（读 orbcat 的四文件记忆 + 项目记忆 + 技能命中）
+//! 5. **把 pi 事件翻译成 orbcat 的 `Progress`**（`pi_run.rs`）
+//!
+//! ## 为什么 pi 进程要常驻
+//!
+//! - 冷启动 0.4 s（node 路线）—— 每轮起一个的话，每轮都付这个钱
+//! - pi 的 `models.json` / `auth.json` 读一次就够
+//! - 崩溃后要能自动重启（`ensure_running`）
+//!
+//! ## 崩溃恢复策略
+//!
+//! pi 进程死了 → 下次 `ensure_running()` 时重启 → **会话上下文靠 pi 的 session 文件恢复**
+//! （`--session-dir` 指向 orbcat 的目录）。如果用的是 `--no-session`，
+//! 那就只剩最后一轮 —— 所以**这里要用 `--session-dir` 而不是 `--no-session`**。
+//!
+//! ⚠️ 但 orbcat 自己的会话存储（`sessions.rs`，平铺 JSON）才是**前端显示用的真相**。
+//! pi 的 session 文件是**给 pi 自己续上下文用的**，两者并行存在、互不干扰。
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use serde_json::Value;
+
+use crate::agent::{Progress, ProgressFn};
+use crate::pi::{self, PiClient, PiHostReply, PiHostRequest};
+use crate::pi_bridge::{specs_to_json, ToolBridge, ToolHandler};
+
+/// 权限裁决回调（宿主提供）。
+///
+/// 签名：`(工具名, 参数)` → `(允许?, 理由)`。
+///
+/// ## 为什么是**异步**的
+///
+/// MCP 工具的授权要**弹确认卡**给用户（Cline 式三档：
+/// 允许一次 / 总是允许 / 拒绝）—— 那条路是 async 的
+/// （`PermHub::ask_mcp_tool` 阻塞在 oneshot 上等前端回话）。
+///
+/// 所以这里必须是 async，而不是同步的 `bool`。
+///
+/// ⚠️ 早期实现是 `Fn(&str, &Value) -> bool`（同步）——
+/// 那样 MCP 授权就**没法问用户**，只能一刀切放行或拒绝。
+pub type GateFn =
+    Arc<dyn Fn(&str, &Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = (bool, String)> + Send>> + Send + Sync>;
+
+/// 一轮对话的结果（与 `agent::AgentRun` 同构，便于前端复用现有渲染）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiRun {
+    /// 最终答复正文
+    pub answer: String,
+    /// 时间线步骤
+    pub steps: Vec<crate::agent::AgentStep>,
+    /// 轮数
+    pub iterations: usize,
+    /// 思考过程
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// 是否被打断
+    #[serde(default)]
+    pub interrupted: bool,
+    /// 插话
+    #[serde(default)]
+    pub steers: Vec<crate::agent::SteeredMsg>,
+    /// 中断时没送出去的插话
+    #[serde(default)]
+    pub pending_steers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// token 用量
+    #[serde(default)]
+    pub usage: crate::llm::TokenUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_scale: Option<f64>,
+}
+
+/// pi 运行时（全局单例）。
+pub struct PiRuntime {
+    /// 数据目录（`agent-data/`）
+    data_dir: PathBuf,
+    /// 内置 runtime 目录
+    runtime: PathBuf,
+    /// pi 的 agent 目录（存 models.json / auth.json）
+    agent_dir: PathBuf,
+    /// 当前 pi 客户端
+    client: tokio::sync::Mutex<Option<Arc<PiClient>>>,
+    /// 工具桥
+    bridge: tokio::sync::Mutex<Option<Arc<ToolBridge>>>,
+    /// 权限裁决回调（宿主提供）
+    gate: tokio::sync::Mutex<Option<GateFn>>,
+    /// 强制指定模型（`(provider, model)`）—— 覆盖从 settings 反查的结果。
+    ///
+    /// ## 什么时候用
+    ///
+    /// - **测试**：用户设置里那个模型可能额度用完了（429），
+    ///   要能显式换一个来验代码，而不是验"额度用完"。
+    /// - 前端**临时切模型**而不改 `settings.json`。
+    ///
+    /// 生产路径不设它 —— 走 `settings.selected_model` 那条反查。
+    model_override: tokio::sync::Mutex<Option<(String, String)>>,
+    /// 额外注入的 MCP server（**测试专用**）。
+    ///
+    /// 为什么要这个：测「pi 真的能连 MCP、真的能调到 MCP 工具」需要一个
+    /// **确定**的 server —— 不能依赖用户本机配的 `1mcp` 网关（它可能没起、
+    /// 工具名可能变）。测试通过 `add_mcp_server_for_test()` 注入一个本地的
+    /// 假 server，**不写用户的 `agent-data/mcp.json`**。
+    extra_mcp: tokio::sync::Mutex<Vec<TestMcpServer>>,
+    /// 正在跑的标记（防重入）
+    busy: AtomicBool,
+}
+
+/// 测试用的 MCP server 描述（直接对应 pi `mcp.json` 的一条 stdio entry）。
+#[derive(Debug, Clone)]
+pub struct TestMcpServer {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+impl PiRuntime {
+    /// 新建运行时。
+    ///
+    /// ## 两个目录别搞混
+    ///
+    /// - `data_dir` —— **orbcat 的数据目录**（`agent-data/`）。
+    ///   模型的来源（`models.json`）、记忆、设置都在这儿。
+    /// - `agent_dir` —— **pi 的 agent 目录**（`PI_CODING_AGENT_DIR`）。
+    ///   pi 的 `models.json` / `auth.json` / `sessions/` 落这儿。
+    ///
+    /// 默认 `agent_dir = data_dir/pi`（两者同源，省事）。
+    /// 但**测试**要把 agent_dir 指到临时目录（别污染真实数据），
+    /// 而 data_dir 必须指向真实数据（模型从那儿来）。
+    pub fn new(data_dir: PathBuf, runtime: PathBuf) -> Arc<Self> {
+        let agent_dir = data_dir.join("pi");
+        Self::with_agent_dir(data_dir, runtime, agent_dir)
+    }
+
+    /// 同 [`PiRuntime::new`]，但 agent 目录单独指定。
+    pub fn with_agent_dir(
+        data_dir: PathBuf,
+        runtime: PathBuf,
+        agent_dir: PathBuf,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            data_dir,
+            runtime,
+            agent_dir,
+            client: tokio::sync::Mutex::new(None),
+            bridge: tokio::sync::Mutex::new(None),
+            gate: tokio::sync::Mutex::new(None),
+            model_override: tokio::sync::Mutex::new(None),
+            extra_mcp: tokio::sync::Mutex::new(Vec::new()),
+            busy: AtomicBool::new(false),
+        })
+    }
+
+    /// 注入一个 MCP server（**测试专用**，不写用户的 `mcp.json`）。
+    ///
+    /// 与真实配置的区别：这里注入的 server **只在本进程内生效** ——
+    /// `sync_mcp()` 会把它一起写进 pi 的 `<agentDir>/mcp.json`，
+    /// 但用户自己的 `agent-data/mcp.json` 一个字节都不动。
+    pub async fn add_mcp_server_for_test(
+        &self,
+        name: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: std::collections::BTreeMap<String, String>,
+    ) {
+        self.extra_mcp.lock().await.push(TestMcpServer {
+            name: name.into(),
+            command: command.into(),
+            args,
+            env,
+        });
+    }
+
+    /// 强制指定模型（覆盖从 `settings.selected_model` 反查的结果）。
+    ///
+    /// 参数是**模型的 `(id, base URL)`** —— 不是 provider 名。
+    /// 因为 provider 名（`orb1`/`orb6`…）是按 URL 去重后的**插入顺序**
+    /// 生成的，外部没法预知（2026-10-22 踩到：以为能按名指定，结果错位）。
+    ///
+    /// 只在**测试**和「前端临时切模型」时用。生产路径不设它。
+    pub async fn set_model_override(&self, model_id: impl Into<String>, base_url: impl Into<String>) {
+        *self.model_override.lock().await = Some((model_id.into(), base_url.into()));
+    }
+
+    /// 设置权限裁决回调。
+    ///
+    /// 回调签名：`(工具名, 参数)` → `(允许?, 理由)`。
+    /// 宿主（`lib.rs`）用 `permission.rs` 的现成逻辑来判；
+    /// MCP 工具还要走 `PermHub::ask_mcp_tool` 弹确认卡。
+    ///
+    /// ## 为什么是**同步**的
+    ///
+    /// Tauri 的 `setup` 闭包是同步的 —— 里面没法 await。
+    /// 这个回调只在「起桥时」被读一次（存进 `GateHandler`），
+    /// 所以同步设置完全够用。
+    pub fn set_gate(&self, f: GateFn) {
+        if let Ok(mut g) = self.gate.try_lock() {
+            *g = Some(f);
+        }
+    }
+
+    /// 内置 runtime 目录。
+    pub fn runtime_dir(&self) -> &Path {
+        &self.runtime
+    }
+
+    /// pi 的 agent 目录。
+    pub fn agent_dir(&self) -> &Path {
+        &self.agent_dir
+    }
+
+    /// 工具桥端口（0 = 没起）。
+    pub fn bridge_port(&self) -> u16 {
+        // 同步方法不能用 await → try_lock（拿不到就报 0，调用方会再 ensure_bridge）
+        self.bridge
+            .try_lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|b| b.port()))
+            .unwrap_or(0)
+    }
+
+    /// 幂等地保证 pi 进程在跑。
+    ///
+    /// 崩溃了就在这里重启 —— 下一轮对话自动恢复，用户无感。
+    pub async fn ensure_running(&self) -> Result<Arc<PiClient>, String> {
+        // 已有活的且没被标记中止 → 直接用
+        {
+            let g = self.client.lock().await;
+            if let Some(c) = g.as_ref() {
+                if !c.is_aborted() {
+                    return Ok(c.clone());
+                }
+            }
+        }
+        self.restart().await
+    }
+
+    /// 强制重启 pi 进程。
+    pub async fn restart(&self) -> Result<Arc<PiClient>, String> {
+        // 先关旧的
+        if let Some(old) = self.client.lock().await.take() {
+            old.shutdown().await;
+        }
+
+        let cfg = self.build_config().await?;
+        let gate = self.gate.lock().await.clone();
+        let client = PiClient::spawn(cfg, Self::make_host(gate)).await?;
+        *self.client.lock().await = Some(client.clone());
+        Ok(client)
+    }
+
+    /// 拼 pi 启动配置。
+    async fn build_config(&self) -> Result<crate::pi::PiConfig, String> {
+        // 桥要先起 —— extension 要拿端口
+        let bridge = self.ensure_bridge().await?;
+
+        let mut cfg = crate::pi::PiConfig::new(
+            self.runtime.clone(),
+            self.agent_dir.clone(),
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        );
+        // ⚠️ **不能用 `--no-session`** —— 那样 pi 崩了就丢上下文。
+        // 用 orbcat 数据目录下的 pi/sessions，pi 自己能续。
+        let sessions = self.agent_dir.join("sessions");
+        let _ = std::fs::create_dir_all(&sessions);
+        cfg.session_dir = Some(sessions);
+
+        // 模型：从 orbcat 的 models.json 同步一份到 pi 的 models.json，
+        // 并**显式指定**用哪个（不指定 → pi 用内置模型 → 没 key → 一句都跑不起来）
+        //
+        // ⚠️ `sync_models()` **必须照常调** —— 它负责把 models.json 写到
+        // pi 的 agent 目录（否则 pi 找不到 provider）。
+        // 它内部已经优先按 `model_override` 选模型，返回的就是最终选中的那个。
+        if let Some((pid, mid)) = self.sync_models().await? {
+            cfg.provider = Some(pid);
+            cfg.model = Some(mid);
+        }
+
+        // 工具：pi 内置的 8 个 + orbcat 的 34 个（通过 bridge extension 注册）
+        // ⚠️ `--tools` 是**替换**语义 —— 必须列全，否则内置工具会被一起干掉。
+        let mut tools: Vec<String> = vec![
+            "read".into(),
+            "bash".into(),
+            "edit".into(),
+            "write".into(),
+            "grep".into(),
+            "find".into(),
+            "ls".into(),
+        ];
+        // orbcat 的工具用 `orb_` 前缀注册，避免和 pi 内置撞名
+        for name in crate::tools::BUILTIN_TOOL_NAMES {
+            tools.push(format!("orb_{name}"));
+        }
+        // L1 项目脚本工具（`check_homework` 这种）：名字随 bundle 变，
+        // 所以要**从当前项目现取** —— 换项目后白名单也要跟着变。
+        //
+        // ⚠️ 白名单是 `--tools`（**替换**语义），漏了就等于工具没注册。
+        for spec in crate::tools::bridge_specs_for_dir(&self.data_dir) {
+            // `fetch_url` / `web_search` 已在 BUILTIN_TOOL_NAMES 里（上面加过了）
+            if crate::tools::BUILTIN_TOOL_NAMES.contains(&spec.name.as_str()) {
+                continue;
+            }
+            tools.push(format!("orb_{}", spec.name));
+        }
+        // MCP 工具：pi 原生连自己的 MCP server。
+        //
+        // ⚠️ **必须显式加 `mcp__*`** —— pi 的 allowlist 逻辑是：
+        // 白名单里**没有** `mcp__` 开头的条目时，MCP 工具虽然仍被注册，
+        // 但只给 codemode / tool_search 用，**不直接声明给模型**
+        // （`agent-session.ts:1557` `_isAllowedTool`）。
+        // orbcat 的用户预期是「像别的工具一样直接调」→ 所以显式放行。
+        if self.sync_mcp().await? > 0 {
+            tools.push("mcp__*".into());
+        }
+        cfg.tools = tools;
+
+        // 桥端口 + 工具清单 → 通过环境变量传给 extension
+        cfg.bridge_port = bridge.port();
+        cfg.tool_specs = specs_to_json(&crate::tools::bridge_specs_for_dir(&self.data_dir));
+
+        // 权限闸门 extension（走 --extension 一次性加载）
+        let ext = self.runtime.join("pi").join("extensions").join("orbcat-gate.ts");
+        if ext.is_file() {
+            cfg.extra_args.push("--extension".into());
+            cfg.extra_args.push(ext.to_string_lossy().to_string());
+        }
+        // 工具桥 extension
+        let ext2 = self.runtime.join("pi").join("extensions").join("orbcat-tools.ts");
+        if ext2.is_file() {
+            cfg.extra_args.push("--extension".into());
+            cfg.extra_args.push(ext2.to_string_lossy().to_string());
+        }
+        // system prompt 接管 extension
+        //
+        // ⚠️ **顺序很重要**：prompt 那个必须**排在最后** ——
+        // `before_agent_start` 的 handler 按注册顺序跑，后面的能看到前面的改动。
+        // 放在最后 = 我们的替换是最终结果。
+        let ext3 = self.runtime.join("pi").join("extensions").join("orbcat-prompt.ts");
+        if ext3.is_file() {
+            cfg.extra_args.push("--extension".into());
+            cfg.extra_args.push(ext3.to_string_lossy().to_string());
+        } else {
+            eprintln!("[orbcat] ⚠️ 找不到 orbcat-prompt.ts —— pi 内核会用它自己的默认 prompt（人格与记忆不生效）");
+        }
+
+        Ok(cfg)
+    }
+
+    /// 把 orbcat 的 `models.json` 同步成 pi 的 `models.json`。
+    ///
+    /// 两边格式不同：
+    /// - orbcat：`[{id, vendor, url, apiKey, supportsToolCall, supportsImages, maxInputTokens, ...}]`
+    /// - pi：`{providers: {pid: {baseUrl, api, apiKey, models: [{id, contextWindow, ...}]}}}`
+    async fn sync_models(&self) -> Result<Option<(String, String)>, String> {
+        let _ = std::fs::create_dir_all(&self.agent_dir);
+        let dst = self.agent_dir.join("models.json");
+
+        // 读 orbcat 的模型清单
+        let src = self.data_dir.join("models.json");
+        let Ok(raw) = std::fs::read_to_string(&src) else {
+            return Ok(None); // 没有就跳过（pi 用自己的 catalog）
+        };
+        let Ok(list) = serde_json::from_str::<Vec<Value>>(&raw) else {
+            return Ok(None);
+        };
+
+        // 按 (url, apiKey) 分组成 provider
+        let mut providers: std::collections::BTreeMap<String, Value> = Default::default();
+        let mut idx: std::collections::BTreeMap<(String, String), String> = Default::default();
+
+        for m in list {
+            let Some(url) = m.get("url").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            if !url.starts_with("http") {
+                continue;
+            }
+            let key = m.get("apiKey").and_then(|x| x.as_str()).unwrap_or("");
+            let pk = (url.to_string(), key.to_string());
+            let pid = match idx.get(&pk) {
+                Some(p) => p.clone(),
+                None => {
+                    let p = format!("orb{}", providers.len() + 1);
+                    idx.insert(pk, p.clone());
+                    providers.insert(
+                        p.clone(),
+                        json_obj(&[
+                            ("name", Value::String(format!("orbcat {}", providers.len() + 1))),
+                            ("baseUrl", Value::String(url.to_string())),
+                            ("api", Value::String("openai-completions".into())),
+                            (
+                                "apiKey",
+                                // ⚠️ **不能是空串** —— pi 的 schema 要求 `minLength: 1`，
+                                // 一旦有一个 provider 的 apiKey 是空的，**整个 models.json
+                                // 校验失败**，所有 provider 都不加载（表现为
+                                // "Unknown provider orbN"）。2026-10-22 实测踩到。
+                                // 用 "dummy" 占位（Ollama 那种忽略 key 的端点也这么写）。
+                                Value::String(if key.is_empty() {
+                                    "dummy".into()
+                                } else {
+                                    key.to_string()
+                                }),
+                            ),
+                            ("models", Value::Array(vec![])),
+                        ]),
+                    );
+                    p
+                }
+            };
+            // 模型条目
+            let id = m.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let mut entry = json_obj(&[
+                ("id", Value::String(id.clone())),
+                ("name", Value::String(id)),
+            ]);
+            if let Some(v) = m.get("maxInputTokens").and_then(|x| x.as_u64()) {
+                entry["contextWindow"] = Value::from(v);
+            }
+            // ⚠️ `maxTokens` 必须是 **number**（schema: exclusiveMinimum 0）——
+            // orbcat 的 models.json 里它是 `null`（"没上限"），
+            // 直接透传会让整个 models.json 校验失败（2026-10-22 实测踩到）。
+            if let Some(v) = m.get("maxOutputTokens").and_then(|x| x.as_u64()) {
+                entry["maxTokens"] = Value::from(v);
+            } else {
+                entry["maxTokens"] = Value::from(16384);
+            }
+            let input = if m.get("supportsImages").and_then(|x| x.as_bool()) == Some(true) {
+                json_arr(&["text", "image"])
+            } else {
+                json_arr(&["text"])
+            };
+            entry["input"] = input;
+            entry["cost"] = json_obj(&[
+                ("input", Value::from(0)),
+                ("output", Value::from(0)),
+                ("cacheRead", Value::from(0)),
+                ("cacheWrite", Value::from(0)),
+            ]);
+            if let Some(p) = providers.get_mut(&pid) {
+                if let Some(arr) = p["models"].as_array_mut() {
+                    arr.push(entry);
+                }
+            }
+        }
+
+        // ── 先决定"想用哪个模型" ──
+        //
+        // `model_override` 存的是 **(模型 id, base URL)**，不是 provider 名 ——
+        // provider 名（`orb1`/`orb6`…）是按 URL 去重后的**插入顺序**生成的，
+        // 外部没法预知（2026-10-22 踩到：以为能按名指定，结果错位）。
+        let settings = crate::config::load_settings(&self.data_dir);
+        let (want_id, want_url) = match self.model_override.lock().await.clone() {
+            Some((id, url)) => (Some(id), Some(url)),
+            None => (
+                settings.selected_model.clone(),
+                settings.selected_model_url.clone(),
+            ),
+        };
+
+        // ── 覆盖的模型在 models.json 里**不存在** → 注入一个临时 provider ──
+        //
+        // 主要给**测试**用：假模型（`tests/fake_model.rs`）的 URL 不在用户的
+        // models.json 里，但 pi 要真的去连 `http://127.0.0.1:<port>/v1`。
+        //
+        // ⚠️ 必须在**写文件之前**注入 —— 否则写出去的 models.json 里没有它，
+        // pi 启动直接报 `Unknown provider "orbx7"`（2026-10-23 实测踩到）。
+        if let (Some(wid), Some(wurl)) = (&want_id, &want_url) {
+            let exists = providers.values().any(|p| {
+                p.get("baseUrl").and_then(|x| x.as_str()) == Some(wurl.as_str())
+                    && p.get("models")
+                        .and_then(|x| x.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .any(|m| m.get("id").and_then(|x| x.as_str()) == Some(wid.as_str()))
+                        })
+                        .unwrap_or(false)
+            });
+            if !exists {
+                let pid = format!("orbx{}", providers.len() + 1);
+                providers.insert(
+                    pid,
+                    json_obj(&[
+                        ("name", Value::String("orbcat override".into())),
+                        ("baseUrl", Value::String(wurl.clone())),
+                        ("api", Value::String("openai-completions".into())),
+                        ("apiKey", Value::String("dummy".into())),
+                        (
+                            "models",
+                            Value::Array(vec![json_obj(&[
+                                ("id", Value::String(wid.clone())),
+                                ("name", Value::String(wid.clone())),
+                                ("contextWindow", Value::from(128000)),
+                                ("maxTokens", Value::from(16384)),
+                                ("input", json_arr(&["text"])),
+                                (
+                                    "cost",
+                                    json_obj(&[
+                                        ("input", Value::from(0)),
+                                        ("output", Value::from(0)),
+                                        ("cacheRead", Value::from(0)),
+                                        ("cacheWrite", Value::from(0)),
+                                    ]),
+                                ),
+                            ])]),
+                        ),
+                    ]),
+                );
+            }
+        }
+
+        if providers.is_empty() {
+            return Ok(None);
+        }
+
+        // ── 写 pi 的 models.json ──
+        let mut pmap = serde_json::Map::new();
+        for (k, v) in &providers {
+            pmap.insert(k.clone(), v.clone());
+        }
+        let doc = json_obj(&[
+            (
+                "$schema",
+                Value::String("https://pi.dev/schemas/models.schema.json".into()),
+            ),
+            ("providers", Value::Object(pmap)),
+        ]);
+        let txt = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+        std::fs::write(&dst, txt).map_err(|e| format!("写 pi models.json 失败: {e}"))?;
+
+        // ── 选最终用的模型：优先用户在 orbcat 里选的那个（或 override）──
+        //
+        // 为什么必须显式告诉 pi 用哪个：pi 启动时如果没指定 provider/model，
+        // 它的默认模型是 catalog 里的某个内置模型 —— 而那个模型**没有 API key**
+        // → `prompt` 直接返回 "No API key found for the selected model"，
+        // 一次都跑不起来（2026-10-22 实测踩到）。
+        for (pid, p) in providers.iter() {
+            let p_url = p.get("baseUrl").and_then(|x| x.as_str()).unwrap_or("");
+            let models = p
+                .get("models")
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for m in models {
+                let mid = m.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                let hit = match (&want_id, &want_url) {
+                    (Some(w), Some(u)) => mid == w && p_url == u,
+                    (Some(w), None) => mid == w,
+                    _ => false,
+                };
+                if hit {
+                    return Ok(Some((pid.clone(), mid.to_string())));
+                }
+            }
+        }
+        // 没匹配上 → 用第一个 provider 的第一个模型
+        for (pid, p) in providers.iter() {
+            if let Some(m) = p
+                .get("models")
+                .and_then(|x| x.as_array())
+                .and_then(|a| a.first())
+                .and_then(|m| m.get("id"))
+                .and_then(|x| x.as_str())
+            {
+                return Ok(Some((pid.clone(), m.to_string())));
+            }
+        }
+        Ok(None)
+    }
+
+/// 把 orbcat 的 MCP 服务器配置同步成 pi 的 `mcp.json`。
+    ///
+    /// ## 为什么**不用桥**
+    ///
+    /// pi **原生支持 MCP**（`packages/coding-agent/src/extensions/mcp/config.ts`），
+    /// 而且工具命名口径与 orbcat **一模一样**：
+    /// - orbcat：`mcp__<server>__<tool>`（`mcp.rs:1767`）
+    /// - pi：`mcp__<server>__<tool>`（`mcp-servers.ts:157` `mcpNamespace`）
+    ///
+    /// 所以**不需要把 MCP 工具桥回 Rust** —— 让 pi 自己连、自己调，
+    /// 省掉 127 个工具的序列化往返，也省掉一份 schema 转换。
+    ///
+    /// ## 两边的配置格式
+    ///
+    /// - orbcat：`agent-data/mcp.json` = `{"servers":[{id,url,command,args,env,enabled,...}]}`
+    /// - pi：`<agentDir>/mcp.json` = `{"mcpServers":{"<name>":{url|command,args,env,enabled}}}`
+    ///
+    /// pi 的 server 名规则：`/^[A-Za-z0-9_-]+$/` —— orbcat 的 id 若含别的字符
+    /// 要替换掉（否则**整条 server 被静默丢弃**，只有 `errors` 里能看到）。
+    ///
+    /// ## exposure 的坑
+    ///
+    /// pi 默认 `exposure: "codemode"` —— 工具**不直接声明给模型**，
+    /// 只能通过 codemode / tool_search 调。orbcat 的习惯是**直接调**，
+    /// 所以这里显式写 `"exposure": "direct"`。
+    async fn sync_mcp(&self) -> Result<usize, String> {
+        let servers = crate::config::resolve_mcp_servers(&self.data_dir);
+        let extra = self.extra_mcp.lock().await.clone();
+
+        if servers.is_empty() && extra.is_empty() {
+            // 没有 server → 删掉旧文件（否则 pi 会拿上一轮的残留配置去连）
+            let dst = self.agent_dir.join("mcp.json");
+            let _ = std::fs::remove_file(dst);
+            return Ok(0);
+        }
+
+        let mut map = serde_json::Map::new();
+        let mut n = 0usize;
+
+        // ── 测试注入的 server（先放，真实配置可以覆盖同名项）──
+        for t in &extra {
+            let name = sanitize_server_name(&t.name);
+            if name.is_empty() {
+                continue;
+            }
+            let mut entry = serde_json::Map::new();
+            entry.insert("command".into(), Value::String(t.command.clone()));
+            entry.insert(
+                "args".into(),
+                Value::Array(t.args.iter().map(|a| Value::String(a.clone())).collect()),
+            );
+            if !t.env.is_empty() {
+                let mut e = serde_json::Map::new();
+                for (k, v) in &t.env {
+                    e.insert(k.clone(), Value::String(v.clone()));
+                }
+                entry.insert("env".into(), Value::Object(e));
+            }
+            // 测试 server 也一样要 direct —— 否则工具不直接给模型
+            entry.insert("exposure".into(), Value::String("direct".into()));
+            map.insert(name, Value::Object(entry));
+            n += 1;
+        }
+
+        for s in &servers {
+            // pi 的 server 名只允许字母/数字/`_`/`-`
+            let name = sanitize_server_name(&s.id);
+            if name.is_empty() {
+                continue;
+            }
+            let mut entry = serde_json::Map::new();
+            if s.is_stdio() {
+                entry.insert("command".into(), Value::String(s.command.clone()));
+                entry.insert(
+                    "args".into(),
+                    Value::Array(s.args.iter().map(|a| Value::String(a.clone())).collect()),
+                );
+                if !s.env.is_empty() {
+                    let mut e = serde_json::Map::new();
+                    for (k, v) in &s.env {
+                        e.insert(k.clone(), Value::String(v.clone()));
+                    }
+                    entry.insert("env".into(), Value::Object(e));
+                }
+            } else {
+                entry.insert("url".into(), Value::String(s.url.clone()));
+            }
+            if !s.enabled {
+                entry.insert("enabled".into(), Value::Bool(false));
+            }
+            // ⚠️ pi 默认是 "codemode" —— 工具不直接给模型，只能间接调。
+            // orbcat 的用户预期是**直接调**，所以显式写 "direct"。
+            entry.insert("exposure".into(), Value::String("direct".into()));
+            if !s.label.trim().is_empty() {
+                entry.insert("description".into(), Value::String(s.label.clone()));
+            }
+            map.insert(name, Value::Object(entry));
+            n += 1;
+        }
+
+        let _ = std::fs::create_dir_all(&self.agent_dir);
+        let doc = json_obj(&[("mcpServers", Value::Object(map))]);
+        let txt = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+        std::fs::write(self.agent_dir.join("mcp.json"), txt)
+            .map_err(|e| format!("写 pi mcp.json 失败: {e}"))?;
+        Ok(n)
+    }
+
+    /// 造宿主回调（pi 向我们提问时调）。
+    fn make_host(_gate: Option<GateFn>) -> crate::pi::PiHostFn {
+        Arc::new(move |req: PiHostRequest| -> Option<PiHostReply> {
+            match req {
+                PiHostRequest::Confirm { id, title, message } => {
+                    // ⚠️ 这里**不裁决** —— 真正的裁决在 Rust 的工具层（authorize）。
+                    // 这里只是让 pi 知道"宿主收到了"，具体放行交给工具自己。
+                    let _ = (id, title, message);
+                    Some(PiHostReply::Confirm(true))
+                }
+                PiHostRequest::Select { id, .. } => Some(PiHostReply::Select(Some(String::new()))),
+                PiHostRequest::Input { .. } => Some(PiHostReply::Input(String::new())),
+                PiHostRequest::Ignored { .. } => None,
+            }
+        })
+    }
+
+    /// 跑一轮对话。
+    ///
+    /// `progress` 回调把 pi 的事件翻译成 orbcat 的 `Progress` 推给前端。
+    ///
+    /// ## `checkpoint`
+    ///
+    /// 轮内增量落盘（与自研内核同一条路）。
+    ///
+    /// ⚠️ **这个回调不是可选的装饰** —— 前端跑完后会**按磁盘重建消息**。
+    /// 不落盘的话，模型「写了半截正文 → 又去调工具」那半截正文
+    /// 只活在运行中的内存气泡里，一轮跑完就**凭空消失**
+    /// （用户原话：「我的中途正文呢」）。
+    ///
+    /// 落盘形态：`kind: "text"` 的 step（正文）+ `kind: "reasoning"`（思考）。
+    pub async fn run(
+        &self,
+        input: &str,
+        images: Vec<String>,
+        progress: ProgressFn,
+    ) -> Result<PiRun, String> {
+        self.run_with_checkpoint(input, images, progress, None).await
+    }
+
+    /// 同 [`PiRuntime::run`]，但带轮内增量落盘回调。
+    pub async fn run_with_checkpoint(
+        &self,
+        input: &str,
+        images: Vec<String>,
+        progress: ProgressFn,
+        checkpoint: Option<crate::agent::CheckpointFn>,
+    ) -> Result<PiRun, String> {
+        // 防重入：同一时刻只跑一轮
+        if self.busy.swap(true, Ordering::SeqCst) {
+            return Err("上一轮还没跑完".into());
+        }
+        let result = self
+            .run_inner(input, images, progress, checkpoint)
+            .await;
+        self.busy.store(false, Ordering::SeqCst);
+        result
+    }
+
+    async fn run_inner(
+        &self,
+        input: &str,
+        images: Vec<String>,
+        progress: ProgressFn,
+        checkpoint: Option<crate::agent::CheckpointFn>,
+    ) -> Result<PiRun, String> {
+        let client = self.ensure_running().await?;
+
+        // 订阅事件（**必须在发 prompt 之前**，否则会漏掉快速完成的事件）
+        let mut rx = client.take_events().ok_or("事件通道已被占用")?;
+
+        // 把 system prompt 交给 pi（走 --append-system-prompt 不行 —— 那是启动参数，
+        // 运行期改不了）。用 extension 的 before_agent_start 更灵活，
+        // 但那条路要改 extension。**这里先不接管** —— 见下方 TODO。
+        client.prompt(input, images).await?;
+
+        // 收事件直到 settled
+        let mut answer = String::new();
+        let mut reasoning = String::new();
+        let mut steps: Vec<crate::agent::AgentStep> = Vec::new();
+        let mut iteration = 0usize;
+        let interrupted = false;
+
+        // ── 轮内落盘用的两个累加器 ──
+        //
+        // 「中途正文」= 模型在一次 turn 里写了字、然后又去调工具。
+        // 它必须**单独**落成 `kind:"text"` 的 step ——
+        // 否则前端按磁盘重建消息时这段就消失了（用户：「我的中途正文呢」）。
+        //
+        // 「中途思考」同理，落成 `kind:"reasoning"`。
+        let mut mid_text = String::new();
+        let mut mid_reasoning = String::new();
+
+        while let Some(ev) = rx.recv().await {
+            if pi::is_settled(&ev) {
+                break;
+            }
+            // ── 致命错误：立刻失败，别让它转圈 ──
+            //
+            // pi 自己的重试判定只认英文文案（`packages/ai/src/utils/retry.ts`），
+            // 国内厂商的中文「额度用完」它认不出来 → 当成瞬时限流 →
+            // 无限重试 → 整轮卡死（实测 15 分钟）。
+            //
+            // 这里在 Rust 侧兜住，把错误原样抛给用户。
+            //
+            // 两条路都要看：
+            // 1. `message_end{stopReason:"error"}` —— 单次调用就失败了
+            // 2. `auto_retry_start` —— pi 决定重试（错误文案在 `errorMessage`）
+            if let Some(msg) = pi::is_fatal_error(&ev) {
+                self.busy.store(false, Ordering::SeqCst);
+                return Err(format!("模型调用失败：{msg}"));
+            }
+            if ev.get("type").and_then(|x| x.as_str()) == Some("auto_retry_start") {
+                if let Some(err) = ev.get("errorMessage").and_then(|x| x.as_str()) {
+                    if pi::is_fatal_error_text(err) {
+                        self.busy.store(false, Ordering::SeqCst);
+                        return Err(format!("模型调用失败（不可重试）：{err}"));
+                    }
+                }
+            }
+            if pi::is_agent_end(&ev) {
+                // 最后一轮的正文
+                if let Some(t) = pi::assistant_text(&ev) {
+                    answer = t;
+                }
+                continue;
+            }
+            if let Some(t) = pi::assistant_text(&ev) {
+                if !t.is_empty() {
+                    answer = t;
+                }
+            }
+            // 翻译成 orbcat 的 Progress
+            if let Some(p) = crate::pi_run::translate(&ev, &mut iteration) {
+                match &p {
+                    Progress::Delta {
+                        text: Some(t), ..
+                    } => {
+                        answer.push_str(t);
+                        mid_text.push_str(t);
+                    }
+                    Progress::Delta {
+                        reasoning: Some(r), ..
+                    } => {
+                        reasoning.push_str(r);
+                        mid_reasoning.push_str(r);
+                    }
+                    Progress::ToolCall { name, args } => {
+                        // ── 工具调用前：把之前那段中途正文/思考**落成 step** ──
+                        //
+                        // 为什么在这落、而不是流式持续落：pi 的 delta 是
+                        // **逐 token** 的，每次都落盘 = 每 token 写一次文件。
+                        // 在**轮边界**（工具调用点 / turn 结束）落一次，
+                        // 既不丢内容，也不把磁盘写爆。
+                        //
+                        // ── 同时发 `DiscardStream`（与自研内核**同口径**）──
+                        //
+                        // 模型这一轮写了正文又去调工具 → 前端把那段正文
+                        // **淡化归档**（标注"不是最终答复"），而不是让它
+                        // 跟最终答复混在一起。
+                        //
+                        // ⚠️ 顺序很重要：**先判有没有正文、再 flush**。
+                        //    flush 会清空累加器，判晚了就永远发不出去了。
+                        let had_mid_text = !mid_text.trim().is_empty();
+                        let had_mid_reasoning = !mid_reasoning.trim().is_empty();
+                        flush_mid(&mut steps, &mut mid_text, &mut mid_reasoning);
+                        if had_mid_text || had_mid_reasoning {
+                            progress(Progress::DiscardStream {
+                                reason: "模型中途决定调用工具，以下内容不是最终答复".into(),
+                            });
+                        }
+                        steps.push(crate::agent::AgentStep {
+                            kind: "tool_call".into(),
+                            name: Some(name.clone()),
+                            detail: args.clone(),
+                            duration_ms: None,
+                            images: Vec::new(),
+                        });
+                        checkpoint_now(&checkpoint, &steps, &answer, &reasoning);
+                    }
+                    Progress::ToolResult { name, preview, duration_ms } => {
+                        steps.push(crate::agent::AgentStep {
+                            kind: "tool_result".into(),
+                            name: Some(name.clone()),
+                            detail: preview.clone(),
+                            duration_ms: *duration_ms,
+                            images: Vec::new(),
+                        });
+                        checkpoint_now(&checkpoint, &steps, &answer, &reasoning);
+                    }
+                    Progress::ToolError { name, message, duration_ms } => {
+                        steps.push(crate::agent::AgentStep {
+                            kind: "tool_error".into(),
+                            name: Some(name.clone()),
+                            detail: message.clone(),
+                            duration_ms: *duration_ms,
+                            images: Vec::new(),
+                        });
+                        checkpoint_now(&checkpoint, &steps, &answer, &reasoning);
+                    }
+                    _ => {}
+                }
+                progress(p);
+            }
+        }
+
+        // ── 收尾：把最后一段中途正文/思考也落成 step ──
+        flush_mid(&mut steps, &mut mid_text, &mut mid_reasoning);
+
+        // 取用量
+        let usage = match client.stats().await {
+            Ok(v) => parse_usage(&v),
+            Err(_) => Default::default(),
+        };
+
+        Ok(PiRun {
+            answer,
+            steps,
+            iterations: iteration,
+            reasoning: if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            },
+            interrupted,
+            steers: Vec::new(),
+            pending_steers: Vec::new(),
+            stop_reason: None,
+            usage,
+            last_prompt_tokens: None,
+            token_scale: None,
+        })
+    }
+
+    /// 插话。
+    pub async fn steer(&self, message: &str) -> Result<(), String> {
+        let client = self.ensure_running().await?;
+        client.steer(message).await
+    }
+
+    /// 中断当前运行。
+    pub async fn abort(&self) -> Result<(), String> {
+        if let Some(c) = self.client.lock().await.clone() {
+            c.set_aborted(true);
+            c.abort().await?;
+        }
+        Ok(())
+    }
+
+    /// 手动触发压缩。
+    pub async fn compact(&self) -> Result<Value, String> {
+        let client = self.ensure_running().await?;
+        client.compact(None).await
+    }
+
+    /// 切模型。
+    pub async fn set_model(&self, provider: &str, model: &str) -> Result<Value, String> {
+        let client = self.ensure_running().await?;
+        client.set_model(provider, model).await
+    }
+
+    /// 工具桥（供 extension 连）。
+    pub fn bridge(&self) -> Option<Arc<ToolBridge>> {
+        self.bridge.try_lock().ok().and_then(|g| g.clone())
+    }
+
+    /// 起（或复用）工具桥。
+    ///
+    /// 桥把 orbcat 的 34 个工具接给 pi 的 extension（`orbcat-tools.ts`）。
+    /// 端口通过环境变量 `ORB_BRIDGE_PORT` 传给 pi 子进程。
+    ///
+    /// 幂等：已经在跑就直接返回。
+    pub async fn ensure_bridge(&self) -> Result<Arc<ToolBridge>, String> {
+        if let Some(b) = self.bridge.lock().await.clone() {
+            return Ok(b);
+        }
+        let data_dir = self.data_dir.clone();
+        let handler: ToolHandler = Arc::new(move |tool, args| {
+            // 工具名去掉 `orb_` 前缀 —— 那是给 pi 侧避免撞名用的
+            let real = tool.strip_prefix("orb_").unwrap_or(tool);
+            // 桥是**同步**回调（HTTP 线程），但 `execute` 是 async。
+            // 用一个独立 runtime 把 future 跑完 —— 桥的线程本来就是
+            // 「一次一个请求」的一次性线程，等它跑完是安全的。
+            let args = args.clone();
+            let name = real.to_string();
+            let dd = data_dir.clone();
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt.block_on(async move {
+                    crate::tools::execute_bridge(&name, &args, &dd).await
+                }),
+                Err(e) => Err(format!("起工具执行 runtime 失败: {e}")),
+            }
+        });
+        let gate_dir = self.data_dir.clone();
+        // 宿主注入的 gate（**优先**）—— 它能弹确认卡（MCP 授权那套）。
+        let host_gate = self.gate.lock().await.clone();
+        let gate: crate::pi_bridge::GateHandler = Arc::new(move |tool, args| {
+            let real = tool.strip_prefix("orb_").unwrap_or(tool);
+            // 有宿主 gate → 用它（能弹卡、能走真实的 mcp_grants / 确认卡流程）
+            if let Some(g) = host_gate.clone() {
+                let real = real.to_string();
+                let args = args.clone();
+                // gate 是 async（可能阻塞在确认卡上）→ 桥是同步线程，
+                // 用独立 runtime 把 future 跑完（与工具执行那条路同口径）。
+                return match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    Ok(rt) => Ok(rt.block_on(async move { g(&real, &args).await })),
+                    Err(e) => Err(format!("起权限裁决 runtime 失败: {e}")),
+                };
+            }
+            // 没有宿主 gate → 退回本地静态裁决（文件网关 + MCP grants）
+            crate::tools::gate_bridge(real, args, &gate_dir)
+        });
+        // system prompt 由**宿主**提供 —— pi 自己的默认 prompt 是「coding agent」
+        // 那一套，与 orbcat 的「私人助手」定位、人格、记忆体系完全不同。
+        //
+        // 复用旧内核那条拼装路（`agent::build_system_prompt_full`）：
+        // 四文件记忆 + 项目记忆 + 记忆使用规则 + 技能命中，全是同一份逻辑 ——
+        // **两个内核看到的 prompt 逐字一致**，不会出现「切了内核人格就变了」。
+        let prompt_dir = self.data_dir.clone();
+        let prompt_handler: crate::pi_bridge::PromptHandler = Arc::new(move |user_text: &str| {
+            crate::agent::build_system_prompt_full(
+                &prompt_dir,
+                user_text,
+                None,
+                None,
+            )
+        });
+
+        let bridge = ToolBridge::start(handler, gate, prompt_handler)
+            .map_err(|e| format!("起工具桥失败: {e}"))?;
+        *self.bridge.lock().await = Some(bridge.clone());
+        Ok(bridge)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 小工具
+// ---------------------------------------------------------------------------
+
+/// 把累积的「中途正文」/「中途思考」落成 step，然后清空累加器。
+///
+/// ## 为什么要单独落成 step
+///
+/// 模型一轮里可能「先写了半截话 → 又决定去调工具」。
+/// 那半截话**不是**最终答复，但它是真实发生过的输出 ——
+/// 前端按磁盘重建消息时，如果它没落盘就**凭空消失**
+/// （用户原话：「我的中途正文呢」）。
+///
+/// 形态对齐自研内核：`kind: "text"` = 中途正文，
+/// `kind: "reasoning"` = 中途思考（前端会折叠它）。
+fn flush_mid(
+steps: &mut Vec<crate::agent::AgentStep>,
+mid_text: &mut String,
+mid_reasoning: &mut String,
+) {
+if !mid_reasoning.trim().is_empty() {
+    steps.push(crate::agent::AgentStep {
+        kind: "reasoning".into(),
+        name: None,
+        detail: std::mem::take(mid_reasoning),
+        duration_ms: None,
+        images: Vec::new(),
+    });
+} else {
+    mid_reasoning.clear();
+}
+if !mid_text.trim().is_empty() {
+    steps.push(crate::agent::AgentStep {
+        kind: "text".into(),
+        name: None,
+        detail: std::mem::take(mid_text),
+        duration_ms: None,
+        images: Vec::new(),
+    });
+} else {
+    mid_text.clear();
+}
+}
+
+/// 触发一次轮内落盘（没配回调就什么都不做）。
+fn checkpoint_now(
+cb: &Option<crate::agent::CheckpointFn>,
+steps: &[crate::agent::AgentStep],
+answer: &str,
+reasoning: &str,
+) {
+if let Some(f) = cb.as_ref() {
+    f(steps, answer, reasoning);
+}
+}
+
+fn json_obj(pairs: &[(&str, Value)]) -> Value {
+    let mut m = serde_json::Map::new();
+    for (k, v) in pairs {
+        m.insert((*k).to_string(), v.clone());
+    }
+    Value::Object(m)
+}
+
+fn json_arr(items: &[&str]) -> Value {
+    Value::Array(items.iter().map(|s| Value::String((*s).to_string())).collect())
+}
+
+/// 把 orbcat 的 MCP server id 洗成 pi 允许的名字。
+///
+/// pi 的规则是 `/^[A-Za-z0-9_-]+$/` —— 不合法的名字会让**整条 server
+/// 被静默丢弃**（只在 `mcp.json` 的 `errors` 里能看到一句），
+/// 表现为"配了 MCP 但一个工具都没有"。
+fn sanitize_server_name(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// 从 pi 的 `get_session_stats` 里抽 token 用量。
+fn parse_usage(v: &Value) -> crate::llm::TokenUsage {
+    let t = v.get("tokens");
+    let g = |k: &str| t.and_then(|x| x.get(k)).and_then(|x| x.as_u64()).unwrap_or(0);
+    crate::llm::TokenUsage {
+        prompt: g("input") as u32,
+        completion: g("output") as u32,
+        total: g("total") as u32,
+        reasoning: None,
+        cache_hit: g("cacheRead") as u32,
+        cache_write: g("cacheWrite") as u32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_usage_抽token() {
+        let v = serde_json::json!({
+            "tokens": {"input": 100, "output": 50, "cacheRead": 10, "cacheWrite": 5, "total": 165},
+            "cost": 0.25
+        });
+        let u = parse_usage(&v);
+        assert_eq!(u.prompt, 100);
+        assert_eq!(u.completion, 50);
+        assert_eq!(u.total, 165);
+    }
+
+    #[test]
+    fn parse_usage_缺字段不炸() {
+        let u = parse_usage(&serde_json::json!({}));
+        assert_eq!(u.prompt, 0);
+        assert_eq!(u.total, 0);
+    }
+
+    #[test]
+    fn json_obj_构造正确() {
+        let o = json_obj(&[("a", Value::from(1)), ("b", Value::from("x"))]);
+        assert_eq!(o["a"], 1);
+        assert_eq!(o["b"], "x");
+    }
+
+    #[test]
+    fn server名要洗成pi允许的字符() {
+        // pi 的规则：`/^[A-Za-z0-9_-]+$/`
+        assert_eq!(sanitize_server_name("1mcp"), "1mcp");
+        assert_eq!(sanitize_server_name("ssh"), "ssh");
+        assert_eq!(sanitize_server_name("playwright-mcp"), "playwright-mcp");
+        // 含非法字符 → 替换成 `_`（不能原样丢，否则整条 server 被静默丢弃）
+        assert_eq!(sanitize_server_name("my server"), "my_server");
+        assert_eq!(sanitize_server_name("a.b"), "a_b");
+        assert_eq!(sanitize_server_name("工具组"), "___");
+    }
+}
+
