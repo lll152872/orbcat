@@ -135,8 +135,20 @@ jobs:
       #
       #   位置必须在上面 "Frontend build" 之后 —— tauri-build 递归 Walk dist/，
       #   目录不存在直接 exit 101（那条踩坑注释别动）。
+      # ⚠️ **必须跳过一条**：`pi能通过桥调到rust工具`（src-tauri/tests/pi_integration.rs）
+      #   是**故意用真实模型**的（用例注释原话：「必须配真实模型 —— 否则 pi 的 prompt
+      #   直接返回 "No API key found for the selected model"」）⇒ 它要一个**可连通**的
+      #   provider。CI 里只有 `ensure-fixture-models.mjs` 造的夹具
+      #   （url 指向不可达的 127.0.0.1:9）⇒ 这条会 **Connection error → 红**。
+      #   （守门 2026-10-23 实测：换回真实 models.json 复跑 → 1 passed / 0 failed。）
+      #   ⇒ 这条在 CI 里**结构性无法跑**，先显式跳过，别让整个 job 永远红
+      #   （job 一直红 ⇒ 没人再看 ⇒ 闸门等于没有）。
+      #   ⏳ 待 @Pi内核 把它改成用 `fake_model.rs` 的假服务器（它本来就有 tool_call
+      #   能力：FakeModel::start(tool_name, tool_args, final_text)）⇒ 之后删掉这个 skip。
       - name: Rust integration tests (src-tauri/tests)
-        run: cargo test --tests --manifest-path src-tauri/Cargo.toml
+        run: >
+          cargo test --tests --manifest-path src-tauri/Cargo.toml
+          -- --skip 能通过桥调到rust工具
 
       # ── 出包 ──────────────────────────────────────────────
       # 放在测试之后：测试红了就没必要编，编了也是白编。
