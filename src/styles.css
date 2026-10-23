@@ -6860,7 +6860,9 @@ details.run-reason > summary::before,
 
 /* ---- 11 删除确认：黑遮罩 + 危险描边弹窗（设计稿 11:2:1568/2:1569）---- */
 .confirm-mask {
-  background: #000;
+  /* ⚠️ 原来这里是裸色值 `#000` —— 全文件最后一条裸色值。
+     同文件 :root 里已定义 `--black: #000000`（v2 定稿覆盖层），改用变量。 */
+  background: var(--black);
 }
 .confirm-card {
   background: var(--bg-float);

@@ -14,7 +14,8 @@
     "test:ui:watch": "vitest",
     "test:rust": "cargo test --lib --manifest-path src-tauri/Cargo.toml",
     "test:e2e:mock": "python tests/e2e/mock_openai.py",
-    "test:e2e:live": "python tests/e2e/run_live_flow.py"
+    "test:e2e:live": "python tests/e2e/run_live_flow.py",
+    "build:preview": "node tools/build-preview.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

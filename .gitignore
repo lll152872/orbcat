@@ -106,3 +106,6 @@ tools/.cache/
 #  probeN/ = exe + dist + agent-data 的隔离副本，跑完即弃。
 #  13 MB 的 exe 副本堆在仓库根会污染 git status，不进仓。
 probeN*/
+
+# 纯 HTML 预览件（构建产物：npm run build:preview ⇒ preview/preview.html）
+preview

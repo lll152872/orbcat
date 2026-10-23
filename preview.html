@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>orbcat · 纯 HTML 预览（mock 数据）</title>
+    <!-- 应用的样式（唯一色值来源在 styles.css 的 :root） -->
+    <link rel="stylesheet" href="/src/styles.css" />
+    <!-- 预览外壳样式 -->
+    <link rel="stylesheet" href="/src/preview/preview.css" />
+    <script type="module" src="/src/preview.ts" defer></script>
+  </head>
+
+  <body>
+    <div class="pv-stage">
+      <div class="pv-window">
+        <!-- 应用根节点：真界面渲染在这里 -->
+        <div id="app"></div>
+      </div>
+    </div>
+  </body>
+</html>
