@@ -15,6 +15,9 @@ use orbcat_lib::pi::{self, PiClient, PiHostReply, PiHostRequest};
 use orbcat_lib::pi_bridge::{GateHandler, PromptHandler, ToolBridge, ToolHandler};
 use serde_json::{json, Value};
 
+#[path = "fake_model.rs"]
+mod fake_model;
+
 fn runtime_dir() -> Option<PathBuf> {
     // 测试二进制在 target/debug/deps/ —— 往上找 runtime/
     let mut p = std::env::current_exe().ok()?;
@@ -34,10 +37,14 @@ fn runtime_dir() -> Option<PathBuf> {
 }
 
 
-/// 从 orbcat 的 `models.json` 生成 pi 的 `models.json`（测试用）。
+/// 从 orbcat 的 `models.json` 生成 pi 的 `models.json`（**调试真实模型时用**）。
+
+/// ⚠️ 2026-10-23：测试主路已改用**假模型**（`write_fake_models`），
+/// 这个函数留着给「需要跑真实模型做手工对照」用。
 ///
 /// 复用产品代码那条路（`pi_runtime.rs::sync_models` 的逻辑）——
 /// 测试和生产走同一条路，才能测出真问题。
+#[allow(dead_code)]
 fn write_pi_models(agent_dir: &std::path::Path, orbcat_data: &std::path::Path) -> Option<(String, String)> {
     let src = orbcat_data.join("models.json");
     let raw = std::fs::read_to_string(&src).ok()?;
@@ -87,7 +94,37 @@ fn write_pi_models(agent_dir: &std::path::Path, orbcat_data: &std::path::Path) -
     first
 }
 
+/// 给 pi 写一份指向**假模型**的 models.json（CI 里也能跑）。
+
+/// 形状与产品代码 `sync_models` 产出的完全一致（provider → baseUrl/api/apiKey/models），
+/// 差别只在 baseUrl 指向假服务器。
+fn write_fake_models(agent_dir: &std::path::Path, base_url: &str) -> (String, String) {
+    let _ = std::fs::create_dir_all(agent_dir);
+    let doc = json!({
+        "providers": {
+            "orb1": {
+                "name": "fake",
+                "baseUrl": base_url,
+                "api": "openai-completions",
+                "apiKey": "dummy",
+                "models": [{
+                    "id": "fake-model",
+                    "name": "fake-model",
+                    "contextWindow": 128000,
+                    "maxTokens": 16384,
+                    "input": ["text"],
+                    "cost": {"input":0,"output":0,"cacheRead":0,"cacheWrite":0}
+                }]
+            }
+        }
+    });
+    std::fs::write(agent_dir.join("models.json"), doc.to_string())
+        .expect("应能写 models.json");
+    ("orb1".to_string(), "fake-model".to_string())
+}
+
 /// orbcat 的数据目录（测试从这里读 models.json）。
+#[allow(dead_code)]
 fn orbcat_data_dir() -> PathBuf {
     // 仓库根的 orbcat/agent-data/
     let mut p = std::env::current_exe().ok().unwrap_or_default();
@@ -267,15 +304,25 @@ async fn pi能通过桥调到rust工具() {
         return;
     }
 
-    // ⚠️ **必须配真实模型** —— 否则 pi 的 `prompt` 直接返回
-    //    "No API key found for the selected model"，模型根本不会启动，
-    //    自然也没有 tool_call（2026-10-22 实测踩到）。
+    // ✅ **用假模型**（`fake_model.rs`）—— 2026-10-23 改：
+    //
+    // 原来这条**必须配真实模型**（注释原话：「否则 pi 的 prompt 直接返回
+    // 'No API key found for the selected model'，模型根本不会启动」）
+    // ⇒ 真模型的 key 不在 CI 里 ⇒ **CI 必红** ⇒ 只能给它加 `-- --skip`
+    // ⇒ **整条集成测试在 CI 里被静默默跳过**（最坏的一种假绿：
+    // 闸门「绿」了，但核心链路一条没跑）。
+    //
+    // 现在改成假模型：真 HTTP + 真 SSE + 真模型协议 + 真 extension，
+    // 只有「模型怎么想」是写死的 ⇒ **CI 里也能真跑**（skip 可以删了）。
     let agent_dir = std::env::temp_dir().join("orbcat-pi-test-agent2");
     let _ = std::fs::remove_dir_all(&agent_dir);
-    let Some((provider, model)) = write_pi_models(&agent_dir, &orbcat_data_dir()) else {
-        eprintln!("跳过：拿不到模型配置（需要 orbcat 的 models.json）");
-        return;
-    };
+    let fake = fake_model::FakeModel::start(
+        "probe_tool",
+        json!({ "x": "hello" }),
+        "调用完成",
+    )
+    .expect("假模型应能起");
+    let (provider, model) = write_fake_models(&agent_dir, &fake.base_url());
 
     let (bridge, calls) = start_bridge();
     let mut cfg = pi::PiConfig::new(

@@ -354,8 +354,10 @@ impl PiRuntime {
     ///
     /// Tauri 的 `setup` 闭包是同步的 —— 里面没法 await。
     ///
-    /// ⚠️ **不能只 `try_lock`** —— 抢不到就**静默丢**（那就等于没设 gate ⇒ P2 复发：
-    /// 桥会退回静态裁决，MCP 授权静默降级）。抢不到时退到 `blocking_lock`（等一下）。
+    /// ⚠️ **不能抢不到就静默丢**（那就等于没设 gate ⇒ P2 复发：
+    /// 桥会退回静态裁决，MCP 授权静默降级）。
+    /// 现在用 `std::sync::Mutex` + `lock().unwrap_or_else(|e| e.into_inner())`
+    /// —— 任何线程都安全（**不会在 async 上下文里 panic**），poison 也能继续用。
     /// 本函数只在**同步**上下文里被调（Tauri setup 闭包 / 池的 set_gate / 测试），
     /// 不会在 async 上下文里触发 tokio 的 panic。
     ///
@@ -1321,7 +1323,8 @@ impl PiRuntime {
 /// 说明降级发生过。
 ///
 /// 现在：闭包持有 `Arc<Mutex<Option<GateFn>>>`，每次调用现取。
-/// 桥的 handler 跑在**同步线程**里 ⇒ 用 `blocking_lock()`（不是 async 上下文）。
+/// 桥的 handler 跑在**同步线程**里 ⇒ `std::sync::Mutex::lock()` 在任何线程都安全
+/// （不会在 async 上下文里 panic，也不会阻塞读循环）。
 pub(crate) fn build_gate(
     gate_cell: &std::sync::Arc<std::sync::Mutex<Option<GateFn>>>,
     gate_sid: Option<String>,
@@ -1806,9 +1809,9 @@ mod tests {
         // ③ ⚠️ **建桥之后**才设宿主 gate —— 旧实现在这里就露馅了
         let cell2 = cell.clone();
         std::thread::spawn(move || {
-            // ⚠️ **不能 `.unwrap()`** —— `blocking_lock()` 返回 guard，
-            //    `.unwrap()` 会被自动 deref 成 `Option::unwrap()` ⇒ 拿到的是
-            //    GateFn 本身（不是 guard）⇒ 后面 `*g = ...` 直接类型错。
+            // ⚠️ `std::sync::Mutex::lock()` 返回 `LockResult` ——
+            //    用 `unwrap_or_else(|e| e.into_inner())` 而不是 `unwrap()`：
+            //    poison 时仍能拿到 guard（静默丢掉等于没设 gate）。
             let mut g = cell2.lock().unwrap_or_else(|e| e.into_inner());
             // ⚠️ 闭包参数**不要自己标类型** —— 交给 `GateFn` 推断，
             //    否则 boxed future 的协变推导不上（E0277）。
