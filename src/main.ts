@@ -4532,6 +4532,9 @@ function renderPanel(): void {
       <div class="panel-status" id="panel-status" style="display:none"></div>
 
       <div class="thumbs" id="thumbs"></div>
+      <!-- 拖放进来的路径条：单行 + 中间省略 + × 移除（完整路径在 title 里）。
+           和图片附件同一个待遇 —— 它是附件，不是用户正在编辑的文字。 -->
+      <div class="paths" id="paths"></div>
       <div class="img-hint" id="img-hint" style="display:none"></div>
 
       <div class="panel-input">
@@ -4563,9 +4566,15 @@ function renderPanel(): void {
     </div>
   `;
 
-  attachDrag(document.getElementById("panel-header")!, () => {
-    /* 标题栏只拖动 */
-  });
+  // ⚠️ 不能用 `!` 断言：`renderPanel` 可能在 DOM 被换掉之后才跑到这里
+  // （拖放展开面板是**异步**的 —— 测试 teardown / 快速切形态都会让元素消失）。
+  // 崩在这里会让整个 drop 的 promise 变成 unhandled rejection ⇒ 拖放功能整个失灵。
+  const panelHeader = document.getElementById("panel-header");
+  if (panelHeader) {
+    attachDrag(panelHeader, () => {
+      /* 标题栏只拖动 */
+    });
+  }
   // 滚动记账要在 innerHTML 落地**之后**才挂得上（此时才拿得到 #panel-body）。
   // `renderBody` 会把它整个换掉，所以这里每次都调；函数内部有重复挂防护。
   installScrollMemo();
@@ -4732,6 +4741,7 @@ function renderPanel(): void {
   });
 
   renderPreview();
+  renderPathBar();
   renderBody();
   // 面板可能是"跑着任务时收起 → 又展开"的，按钮布局要跟着当前状态走
   setBusyUi(busy);
@@ -8858,33 +8868,196 @@ function installPasteHandler(): void {
   });
 }
 
-/** 全局拖拽：把图片文件拖进面板 */
-function installDropHandler(): void {
-  document.addEventListener("dragover", (e) => {
-    if (mode !== "panel") return;
-    e.preventDefault();
-  });
+// ---------------- 拖放：把文件/文件夹拖到球上 = 在输入区填路径 ----------------
 
-  document.addEventListener("drop", async (e) => {
-    if (mode !== "panel") return;
-    e.preventDefault();
-    const files = Array.from(e.dataTransfer?.files ?? []).filter((f) =>
-      f.type.startsWith("image/"),
-    );
-    for (const f of files) {
-      try {
-        const dataUrl = await fileToDataUrl(f);
-        if (dataUrl.length > MAX_IMAGE_CHARS) {
-          pushEntry("error", `${f.name} 太大，已丢弃`);
-          continue;
-        }
-        pendingImages.push(dataUrl);
-      } catch (err) {
-        pushEntry("error", String(err));
-      }
-    }
-    if (files.length) renderPreview();
+/**
+ * 拖进来的路径（**完整值**；显示时才做省略）。
+ *
+ * 为什么存完整值：显示要「单行 + 中间省略」（长路径会把输入区撑爆），
+ * 但**送进模型的必须是完整路径** —— 省略号版路径对模型是废的。
+ */
+let pendingPaths: string[] = [];
+
+/**
+ * 中间省略：头尾各留一段，中间一个省略号。
+ *
+ * 为什么不用 CSS 的 `text-overflow: ellipsis`（那省的是**尾部**）：
+ * 路径最有辨识度的恰恰是**尾部**（文件名），尾部被吃掉就认不出是哪个文件了。
+ */
+function elideMiddle(text: string, max = 52): string {
+  if (text.length <= max) return text;
+  const head = Math.ceil((max - 1) * 0.55);
+  const tail = max - 1 - head;
+  return `${text.slice(0, head)}…${text.slice(text.length - tail)}`;
+}
+
+/**
+ * 拖进来的路径 → 送进模型的那段文字。
+ *
+ * 多选时**逐个加引号**：路径里有空格时，不加引号模型会把它拆成两个词。
+ * 单个路径原样（用户原话：「相当于输入里面输入了一个路径」）。
+ */
+function pathsToPrompt(paths: string[]): string {
+  if (paths.length === 0) return "";
+  if (paths.length === 1) return paths[0]!;
+  return paths.map((p) => `"${p}"`).join(" ");
+}
+
+/**
+ * 让路径在**实际像素宽度**内放下：放不下就做「中间省略」（尾部是文件名，必须保住）。
+ *
+ * 为什么不用纯字符数估：中文与 ASCII 的字宽差一倍多，
+ * 按字符数猜要么留白一大截、要么还是被 CSS 从尾部切掉（文件名没了）。
+ * ⇒ 量一次 `scrollWidth`（真实排版结果），不够就逐步收紧。
+ */
+function fitChipText(code: HTMLElement, full: string): void {
+  const max = code.clientWidth;
+  // ⚠️ **量不到宽度**（clientWidth === 0）时**不能直接显示完整路径**。
+  //
+  // 什么时候会量不到：① 元素还没布局完；② 容器 `display:none`；
+  // ③ 测试环境（happy-dom 没有排版引擎，宽度恒为 0）。
+  // ⇒ 这时退回**按字符数**的中间省略（`elideMiddle`）——
+  //    「显示成完整路径」看着像 bug（长路径会把输入区撑爆），
+  //    而字符级省略至少保证**单行 + 尾部文件名还在**。
+  if (!max) {
+    code.textContent = elideMiddle(full, 52);
+    return;
+  }
+  code.textContent = full;
+  if (code.scrollWidth <= max) return;
+  let keep = full.length;
+  for (let guard = 0; guard < 24 && code.scrollWidth > max; guard++) {
+    keep = Math.max(6, Math.floor(keep * 0.8));
+    const head = Math.ceil((keep - 1) / 2);
+    const tail = keep - 1 - head;
+    code.textContent = `${full.slice(0, head)}…${full.slice(full.length - tail)}`;
+  }
+}
+
+/**
+ * 路径条：单行 + 中间省略 + × 移除（完整路径在 title 里）。
+ *
+ * 为什么做成「条」而不是直接塞进输入框：输入框里的文字是**用户正在编辑的**，
+ * 路径是**附件** —— 和图片一个待遇（图片也是附件条）。塞进输入框的话，
+ * 用户接着打字就会把路径顶到看不见的地方，还没法删。
+ */
+function renderPathBar(): void {
+  const box = document.getElementById("paths");
+  if (!box) return;
+  if (pendingPaths.length === 0) {
+    box.innerHTML = "";
+    box.classList.remove("has");
+    return;
+  }
+  box.classList.add("has");
+  box.innerHTML = pendingPaths
+    .map(
+      (p, i) => `
+      <span class="path-chip" data-idx="${i}">
+        <code title="${esc(p)}">${esc(elideMiddle(p, 52))}</code>
+        <button type="button" class="path-x" data-idx="${i}" title="移除这个路径">×</button>
+      </span>`,
+    )
+    .join("");
+  // 按真实宽度做中间省略（要等 chip 进 DOM、量得到宽度才知道能放几个字）
+  box.querySelectorAll<HTMLElement>(".path-chip code").forEach((code, i) => {
+    fitChipText(code, pendingPaths[i] ?? "");
   });
+  box.querySelectorAll<HTMLButtonElement>(".path-x").forEach((b) => {
+    b.addEventListener("click", () => {
+      pendingPaths.splice(Number(b.dataset.idx), 1);
+      renderPathBar();
+    });
+  });
+}
+
+/**
+ * 拖放悬停时给球加状态反馈。
+ *
+ * ## 为什么必须有状态反馈（而不是等美术）
+ *
+ * 球实际显示只有 76×76，猫头在图上就 30px ——「张嘴」那个细节在真球上基本看不见。
+ * ⇒ 拖放反馈**不能只靠那张图**，得有一层状态反馈（放大 + 提亮 + 光晕）。
+ * 之后用户出了好图，两者是**叠加**而不是互相依赖。
+ */
+function setOrbDragHover(on: boolean): void {
+  const el = document.getElementById("orb");
+  if (!el) return;
+  el.classList.toggle("orb--dragover", on);
+}
+
+/**
+ * 窗口级拖放（Tauri 原生通道）。
+ *
+ * ## 为什么走原生而不是 HTML5
+ *
+ * - `tauri.conf.json` 里 `dragDropEnabled: true`（本轮从 false 改上来）⇒
+ *   **原生通道接管**，HTML5 的 dragover/drop 在 Windows 上**收不到事件**
+ *   （Tauri 文档原话：关掉原生通道才能用 HTML5 拖放）。
+ * - 原生通道给的是**路径数组**（文件与文件夹都给），HTML5 通道只能给 `File`
+ *   对象、且拿不到文件夹。
+ * - 旧的那个 HTML5 贴图拖放处理器因此**彻底失效**（本轮已删）：
+ *   它只认图片、且 `if (mode !== "panel") return` —— 球上拖放直接被丢弃。
+ *   贴图改走**手动**通道（Ctrl+V 粘贴 / 截屏按钮），都还在。
+ *
+ * ## 语义：**填路径，不执行**
+ *
+ * 拖进来只是把路径放进输入区 —— 绝不自动发送（用户还要能改、能删、能补话）。
+ */
+async function installWindowDragDrop(): Promise<void> {
+  let win: ReturnType<typeof getCurrentWindow>;
+  try {
+    win = getCurrentWindow();
+  } catch {
+    return; // 没有窗口（测试 / 无头环境）就跳过
+  }
+  try {
+    await win.onDragDropEvent((event) => {
+      const p = event.payload;
+      if (p.type === "enter" || p.type === "over") {
+        setOrbDragHover(true);
+        return;
+      }
+      if (p.type === "leave") {
+        setOrbDragHover(false);
+        return;
+      }
+      // drop：拿到路径
+      setOrbDragHover(false);
+      void applyDroppedPaths(p.paths ?? []);
+    });
+  } catch (e) {
+    console.warn("[orbcat] 注册窗口拖放失败:", e);
+  }
+}
+
+/**
+ * 拖进来的路径落地：**展开面板 → 填进输入区 → 聚焦**，**不自动发送**。
+ */
+async function applyDroppedPaths(paths: string[]): Promise<void> {
+  const list = paths.filter((p) => typeof p === "string" && p.length > 0);
+  if (!list.length) return;
+  pendingPaths = [...pendingPaths, ...list];
+  // 球态拖进来 ⇒ 先把面板展开（同一个窗口放大），否则用户看不到路径
+  if (mode !== "panel") {
+    // ⚠️ `expand()` 是**异步**的（要走 IPC + 一串 await）。
+    //    等它回来时，DOM 可能已经被换掉了（切形态 / 窗口被拆 / 测试 teardown）。
+    //    ⇒ 这里必须**容错**，否则异常会变成 unhandled rejection，
+    //    把「拖放填路径」整条链路带崩（而且报错栈指向 renderPanel，很难联想到拖放）。
+    try {
+      await expand();
+    } catch (e) {
+      console.warn("[orbcat] 展开面板失败，路径已保留:", e);
+    }
+  }
+  renderPathBar();
+  focusComposer();
+}
+
+/** 把焦点补回输入框（拖完路径直接能打字） */
+function focusComposer(): void {
+  const input = document.getElementById("input") as HTMLTextAreaElement | null;
+  input?.focus();
 }
 
 /**
@@ -9071,10 +9244,14 @@ async function send(): Promise<void> {
     return;
   }
   const input = document.getElementById("input") as HTMLTextAreaElement;
-  const text = (input?.value ?? "").trim();
+  const raw = (input?.value ?? "").trim();
   const imgs = pendingImages.slice();
+  // 拖进来的路径**并进正文**：路径在前、用户的话在后（空行分隔）。
+  // ⚠️ 用的是**完整路径**（pendingPaths 存的就是完整值），不是显示时省略过的版本。
+  const pathText = pathsToPrompt(pendingPaths);
+  const text = pathText ? (raw ? `${pathText}\n${raw}` : pathText) : raw;
 
-  // 允许"只发图不写字"
+  // 允许"只发图不写字"；只拖了路径没打字 ⇒ 也允许发
   if (!text && imgs.length === 0) return;
 
   if (!selectedModel) {
@@ -9089,7 +9266,9 @@ async function send(): Promise<void> {
   input.style.height = "auto";
   draftInput = ""; // 发出去才算用掉，这时候草稿才能清
   pendingImages = [];
+  pendingPaths = [];
   renderPreview();
+  renderPathBar();
 
   const pendingBefore = await data.memory.pending().catch(
     () => [] as Candidate[],
@@ -9805,7 +9984,9 @@ function boot(): void {
   );
 
   installPasteHandler();
-  installDropHandler();
+  // ⚠️ 旧的 HTML5 贴图拖放已删（原生通道接管后，Windows 上收不到 HTML5 拖放事件）。
+  //    贴图改走手动通道：Ctrl+V 粘贴 / 截屏按钮。
+  void installWindowDragDrop();
   installFocusRefocus();
   installContextMenu();
   installCopyHandlers();

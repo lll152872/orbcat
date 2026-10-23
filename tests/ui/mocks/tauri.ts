@@ -127,6 +127,15 @@ type MockBag = {
   calls: MockInvokeCall[];
   /** `listen` 注册的处理器 —— 测试用 `emitEvent` 模拟后端推事件 */
   listeners: { event: string; handler: (e: { payload: unknown }) => void }[];
+  /**
+   * 窗口拖放监听（`onDragDropEvent` 注册的）—— 测试用 `emitDragDrop` 触发。
+   *
+   * ⚠️ **必须放在 bag 上（globalThis 单例），不能是模块局部变量**：
+   * `bootApp()` 会 `vi.resetModules()`，前端拿到的是**新的 mock 模块实例**；
+   * 放局部的话，测试文件里的 `emitDragDrop` 触发的不是前端注册的那个 handler
+   * ⇒ 事件永远送不到（这坑与 `state` 必须上 globalThis 是同一个原因）。
+   */
+  dragDropHandlers: ((e: { payload: unknown }) => void)[];
 };
 
 function defaultState(): MockState {
@@ -169,7 +178,12 @@ function defaultState(): MockState {
 
 const g = globalThis as typeof globalThis & { __orbcatMock?: MockBag };
 if (!g.__orbcatMock) {
-  g.__orbcatMock = { state: defaultState(), calls: [], listeners: [] };
+  g.__orbcatMock = {
+    state: defaultState(),
+    calls: [],
+    listeners: [],
+    dragDropHandlers: [],
+  };
 }
 
 export const bag = g.__orbcatMock;
@@ -693,6 +707,16 @@ export function emitEvent(event: string, payload: unknown): void {
   }
 }
 
+/** 模拟一次窗口拖放事件（测试用） */
+export function emitDragDrop(payload: {
+  type: "enter" | "over" | "drop" | "leave";
+  paths?: string[];
+}): void {
+  for (const h of [...bag.dragDropHandlers]) {
+    h({ payload: { position: { x: 0, y: 0 }, ...payload } });
+  }
+}
+
 export function getCurrentWindow() {
   return {
     setFocus: async () => {},
@@ -700,6 +724,16 @@ export function getCurrentWindow() {
     hide: async () => {},
     setAlwaysOnTop: async () => {},
     close: async () => {},
+    /** 原生拖放开关（真环境里只有创建期选项，这里是空操作） */
+    dragDropEnabled: async (_enabled: boolean) => {},
+    /** 注册窗口拖放监听 —— 真的注册，`emitDragDrop` 能触发 */
+    onDragDropEvent: async (handler: (e: { payload: unknown }) => void) => {
+      bag.dragDropHandlers.push(handler);
+      return () => {
+        const i = bag.dragDropHandlers.indexOf(handler);
+        if (i >= 0) bag.dragDropHandlers.splice(i, 1);
+      };
+    },
     /**
      * 手动拖动窗口（models 窗口整窗拖动用，见 src/models.ts bindWindowDrag）。
      * 记进 calls 里，供测试断言「哪些区域该拖 / 不该拖」。

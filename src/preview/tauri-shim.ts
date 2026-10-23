@@ -54,22 +54,54 @@ export async function listen(
 }
 
 /**
- * 窗口对象 —— 任何方法都是**空操作**。
+ * 窗口对象 —— 什么方法都是**空操作**，但**窗口拖放事件是真能触发的**。
  *
  * 用 Proxy 而不是逐个写方法：以后界面里新增 `getCurrentWindow().xxx()`
  * 也不会在预览里炸（顶多什么都不发生）。
+ *
+ * 唯一做成「真的」的是 `onDragDropEvent`：预览页与 UI 测试都要
+ * **模拟一次拖放**（把文件拖到球上）—— 没有它，这条路径在预览里根本走不到。
  */
+const dragDropHandlers: ((e: { payload: unknown }) => void)[] = [];
+
+/** 模拟一次窗口拖放事件（预览页 / 测试用） */
+export function emitDragDrop(payload: {
+  type: "enter" | "over" | "drop" | "leave";
+  paths?: string[];
+  position?: { x: number; y: number };
+}): void {
+  for (const h of [...dragDropHandlers]) {
+    h({ payload: { position: { x: 0, y: 0 }, ...payload } });
+  }
+}
+
 export function getCurrentWindow(): unknown {
-  return new Proxy(
-    {},
-    {
-      get(_target, prop) {
-        if (prop === "label") return "preview";
-        if (prop === "then") return undefined;
-        return async () => {};
-      },
+  const win = {
+    label: "preview",
+    async startDragging(): Promise<void> {},
+    async setFocus(): Promise<void> {},
+    async show(): Promise<void> {},
+    async hide(): Promise<void> {},
+    async center(): Promise<void> {},
+    async setAlwaysOnTop(): Promise<void> {},
+    /** 原生拖放开关（Tauri v2 里只有创建期选项，没有运行时方法，这里是空操作） */
+    async dragDropEnabled(_enabled: boolean): Promise<void> {},
+    /** 注册拖放监听 —— **真的**注册，预览页可以模拟拖放 */
+    async onDragDropEvent(handler: (e: { payload: unknown }) => void): Promise<() => void> {
+      dragDropHandlers.push(handler);
+      return () => {
+        const i = dragDropHandlers.indexOf(handler);
+        if (i >= 0) dragDropHandlers.splice(i, 1);
+      };
     },
-  );
+  };
+  return new Proxy(win, {
+    get(target, prop) {
+      if (prop in target) return (target as Record<string | symbol, unknown>)[prop as string];
+      if (prop === "then") return undefined;
+      return async () => {};
+    },
+  });
 }
 
 /** 打开外部链接（预览里只记录，不真的跳） */
