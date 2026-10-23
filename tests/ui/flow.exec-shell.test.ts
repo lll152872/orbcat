@@ -175,4 +175,26 @@ describe("执行位置 · 三选一", () => {
     //    用户问「git bash 呢」就是因为它永远显示 pwsh。
     expect(txt).toMatch(/本机 pwsh|本机 Git Bash|后台桌面/);
   });
+
+  /**
+   * ⚠️ 发布包**不带 git**（runtime 只有 node+pi）⇒ 没装 Git for Windows 的机器上
+   * 选「本机 Git Bash」会**直接失败**。设置页必须**提前**提示，
+   * 而不是等用户选完才报错（那时已经落盘了一个跑不起来的值）。
+   */
+  it("⑨ 没装 Git for Windows 时，「本机 Git Bash」那一支要提前警告", async () => {
+    const { state } = await import("./mocks/tauri");
+    state.gitBashAvailable = false;
+    await bootApp();
+    await openPanel();
+    const body = await openBehavior();
+    await waitFor(
+      () => (body.textContent ?? "").includes("Git for Windows"),
+      3000,
+      "Git Bash 不可用警告",
+    );
+    const txt = body.textContent ?? "";
+    expect(txt, "要说明没装 Git for Windows").toContain("没找到 Git for Windows");
+    // 警告只挂在本机 Git Bash 那一支，不影响另外两支
+    expect(txt, "PowerShell 不该被牵连").toContain("本机 pwsh");
+  });
 });

@@ -84,6 +84,12 @@ type MockState = {
    *    默认 "pwsh" = 老用户升级后没有这个字段时的行为（行为不变）。
    */
   execShell: "pwsh" | "gitbash";
+  /**
+   * 这台机器装没装 Git for Windows。
+   *
+   * ⚠️ 默认 true（正常态）。测「没装」的场景把它置 false ⇒ 设置页要出警告。
+   */
+  gitBashAvailable: boolean;
   bootNeedsInit: boolean;
   bootHasModels: boolean;
   windowModes: string[];
@@ -165,6 +171,7 @@ function defaultState(): MockState {
     bgDeskEnabled: false,
     bgDeskSetError: null,
     execShell: "pwsh",
+    gitBashAvailable: true,
     bootNeedsInit: false,
     bootHasModels: true,
     windowModes: [],
@@ -640,11 +647,24 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
     case "set_exec_shell": {
       const shell = String(args?.shell ?? "pwsh").trim().toLowerCase();
       if (shell !== "pwsh" && shell !== "gitbash") {
-        throw new Error(`未知的 shell：${shell}`);
+        throw new Error(`未知执行位置「${shell}」（可用：pwsh / gitbash）`);
       }
       state.execShell = shell;
       return shell as T;
     }
+    /**
+     * 查当前 shell + Git Bash 可用性。
+     *
+     * ⚠️ 发布包不带 git ⇒ 没装 Git for Windows 时 `gitBashAvailable` 为 false，
+     *    设置页要提前提示（别等用户选完才报错）。
+     */
+    case "exec_shell_status":
+      return {
+        execShell: state.execShell,
+        label: state.execShell === "gitbash" ? "本机 Git Bash" : "本机 PowerShell",
+        gitBashAvailable: state.gitBashAvailable,
+        gitBashPath: state.gitBashAvailable ? "C:\\Program Files\\Git\\bin\\bash.exe" : "",
+      } as T;
     /** 执行权限档位（前端要拿返回值更新界面 ⇒ 返回落盘后的档位） */
     case "set_exec_trust": {
       const mode = String(args?.mode ?? "ask");

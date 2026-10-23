@@ -73,6 +73,7 @@ import type {
   SessionsApi,
   SettingsApi,
   SettingsView,
+  ExecShellStatus,
   SystemApi,
 } from "./source";
 import { defaultMockData, scenarioById, type MockData, type MockScenario } from "./mockdata";
@@ -692,11 +693,24 @@ export class MockSource implements DataSource {
       case "set_exec_shell": {
         const shell = String(a.shell ?? "pwsh").trim().toLowerCase();
         if (shell !== "pwsh" && shell !== "gitbash") {
-          throw new Error(`未知的 shell：${shell}`);
+          throw new Error(`未知执行位置「${shell}」（可用：pwsh / gitbash）`);
         }
         d.settings = { ...d.settings, execShell: shell };
         return this.settle<string>(cmd, shell);
       }
+      /**
+       * 查当前 shell + Git Bash 可用性。
+       *
+       * ⚠️ 发布包**不带 git** ⇒ 真实场景里没装 Git for Windows 时是 false。
+       *    mock 默认给 true（演示正常态）；要演示「没装」的失败态可覆盖。
+       */
+      case "exec_shell_status":
+        return this.settle<ExecShellStatus>(cmd, {
+          execShell: d.settings.execShell ?? "pwsh",
+          label: d.settings.execShell === "gitbash" ? "本机 Git Bash" : "本机 PowerShell",
+          gitBashAvailable: true,
+          gitBashPath: "C:\\Program Files\\Git\\bin\\bash.exe",
+        });
       case "set_builtin_tools":
         d.settings = { ...d.settings, builtinToolsEnabled: !!a.enable };
         return this.settle<void>(cmd, undefined as never);
@@ -956,6 +970,7 @@ export class MockSource implements DataSource {
     get: () => this.call<SettingsView>("get_settings"),
     setExecTrust: (args) => this.call<string>("set_exec_trust", args),
     setExecShell: (args) => this.call<string>("set_exec_shell", args),
+    execShellStatus: () => this.call<ExecShellStatus>("exec_shell_status"),
     setBuiltinTools: (args) => this.call<void>("set_builtin_tools", args),
     setBlurCollapse: (args) => this.call<void>("set_blur_collapse", args),
     setProjectDirAutoread: (args) => this.call<void>("set_project_dir_autoread", args),

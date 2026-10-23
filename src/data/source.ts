@@ -105,6 +105,20 @@ export interface ExecShellOption {
   desc: string;
 }
 
+/**
+ * 后端查回来的「当前 shell + Git Bash 是否可用」。
+ *
+ * ⚠️ `gitBashAvailable: false` = 这台机器**没装 Git for Windows**
+ * （发布包不带 git —— runtime 只有 node+pi）⇒ 选了「本机 Git Bash」会直接失败。
+ * ⇒ 设置页要**提前**提示，不能等用户选完才报错。
+ */
+export interface ExecShellStatus {
+  execShell: ExecShell;
+  label: string;
+  gitBashAvailable: boolean;
+  gitBashPath: string;
+}
+
 /** 后台执行状态（`bg_desk_status`） */
 export interface BgDeskStatus {
   enabled: boolean;
@@ -358,6 +372,13 @@ export interface SettingsApi {
    *    后端还没上之前，真后端调用会失败 ⇒ 前端必须有兜底（见 main.ts 的落盘逻辑）。
    */
   setExecShell(args: { shell: string }): Promise<string>;
+  /**
+   * 查当前 shell + **Git Bash 是否可用**。
+   *
+   * ⚠️ 发布包**不带 git**（runtime 只有 node+pi）⇒ 没装 Git for Windows 的机器上
+   *    选「本机 Git Bash」会直接失败 ⇒ 设置页要提前提示。
+   */
+  execShellStatus(): Promise<ExecShellStatus>;
   setBuiltinTools(args: { enable: boolean }): Promise<void>;
   setBlurCollapse(args: { enable: boolean }): Promise<void>;
   setProjectDirAutoread(args: { enable: boolean }): Promise<void>;

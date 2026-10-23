@@ -63,6 +63,7 @@ import type {
   SessionsApi,
   SettingsApi,
   SettingsView,
+  ExecShellStatus,
   SystemApi,
 } from "./source";
 
@@ -193,6 +194,13 @@ export class TauriSource implements DataSource {
      *    **不能静默失败**（用户点了没反应 = 假开关）。
      */
     setExecShell: (args) => this.call<string>("set_exec_shell", args),
+    /**
+     * 查当前 shell + Git Bash 可用性。
+     *
+     * ⚠️ 发布包不带 git ⇒ 这台机器没装 Git for Windows 时 `gitBashAvailable` 为 false
+     *    ⇒ 设置页要提前提示「选了会失败」，不能等用户选完才报错。
+     */
+    execShellStatus: () => this.call<ExecShellStatus>("exec_shell_status"),
     setBuiltinTools: (args) => this.call<void>("set_builtin_tools", args),
     setBlurCollapse: (args) => this.call<void>("set_blur_collapse", args),
     setProjectDirAutoread: (args) => this.call<void>("set_project_dir_autoread", args),

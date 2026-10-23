@@ -2032,6 +2032,17 @@ let execTrust: "ask" | "smart" | "full" = "ask";
  */
 let execShell: "pwsh" | "gitbash" = "pwsh";
 
+/**
+ * 这台机器**有没有装 Git for Windows**（`exec_shell_status` 查回来的）。
+ *
+ * ⚠️ **发布包不带 git**（runtime 只有 node+pi，见用户拍板）⇒
+ *    没装 Git for Windows 的机器上选「本机 Git Bash」会**直接失败**。
+ * ⇒ 设置页要**提前**告诉用户「选了会失败」，不能等选完才报错。
+ *
+ * `null` = 还没查（查不到也按 null 处理 ⇒ 不显示警告，不误报）。
+ */
+let gitBashAvailable: boolean | null = null;
+
 /** 执行位置那一行的文案（后台桌面 / 本机 pwsh / 本机 Git Bash）。 */
 const EXEC_SHELL_LABEL: Record<"pwsh" | "gitbash", { short: string; full: string; desc: string }> = {
   pwsh: {
@@ -5347,6 +5358,12 @@ function renderBody(): void {
           execShell = s.execShell;
         }
       })
+      // ⚠️ 顺带查 Git Bash 能不能用 —— 没装 Git for Windows 的机器上
+      //    选「本机 Git Bash」会直接失败，设置页要提前提示。
+      .then(() => data.settings.execShellStatus().catch(() => null))
+      .then((st) => {
+        if (st) gitBashAvailable = st.gitBashAvailable;
+      })
       .then(() => {
         if (view !== "behavior") return;
         b.innerHTML = renderBehaviorView();
@@ -6748,11 +6765,18 @@ function renderBehaviorView(): string {
       // 当前选中项：后台桌面开着 ⇒ 选「后台桌面」；
       // 否则按 execShell 选本机 pwsh / 本机 Git Bash。
       const selected = id === "bgdesk" ? bgDeskEnabled : !bgDeskEnabled && execShell === id;
+      // ⚠️ 没装 Git for Windows 时，给「本机 Git Bash」那一支加警告
+      //    （发布包不带 git ⇒ 选了会直接失败，得提前说）。
+      const warn =
+        id === "gitbash" && gitBashAvailable === false
+          ? `<div class="ctx-sub" style="color:var(--sem-warn)">⚠️ 这台机器上没找到 Git for Windows —— 选它命令会跑不起来（发布包不自带 git）。</div>`
+          : "";
       return `
       <label class="set-check set-check-row bh-row">
         <input type="radio" name="bh-pos" value="${id}" ${selected ? "checked" : ""}>
         <b>${title}</b>
         <div class="ctx-sub">${desc}</div>
+        ${warn}
       </label>`;
     })
     .join("");
