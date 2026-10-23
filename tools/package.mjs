@@ -72,6 +72,21 @@ export const DIST_ENTRY = "index.html";
  */
 export const RUNTIME_SUBDIR = "runtime";
 
+/**
+ * 内置运行时里**要进包**的组件（2026-10-23 用户拍板）。
+ *
+ * 分发包 = `runtime/{node,pi}`：node 是 PTC run_code + pi 的硬依赖，
+ * pi 是内核本体。**不含 git**（GPLv2 不再分发）、**不含 python**
+ * （不是硬依赖，模型可能调而已，可让用户在设置里指定路径）。
+ *
+ * ⚠️ 这里是**白名单**，不是黑名单：runtime/ 里就算还留着上一轮的
+ * `git/`、`python/`，也不会被带进发布包 —— 决策改了，包必须跟着变。
+ *
+ * ⚠️ 改这里要同步看 `src-tauri/src/pi.rs::bundled_*`：
+ * 那些函数全部返回 `Option<PathBuf>`，组件缺席就是 None ⇒ 回落系统那份。
+ */
+export const RUNTIME_COMPONENTS = ["node", "pi"];
+
 /** 目录存在？ */
 function isDir(p) {
   try {
@@ -179,20 +194,45 @@ export function stageWindowsRelease({
   // ⚠️ 关键一行：dist 是 **子目录**。这里写错就是 2026-10-12 那个事故。
   copyTree(distDir, path.join(outDir, DIST_SUBDIR));
 
-  // ── 内置运行时（node / python / git+bash / pi 内核）──
+  // ── 内置运行时（node / pi 内核）──
   //
   // 位置契约：`pi::runtime_dir(exe)` 找的是 **`<exe 同目录>/runtime/`**。
   // ⚠️ 目录名写错 = pi 内核静默不可用（启动日志会打「未找到内置 runtime/」）。
   //
-  // **可选**：runtime/ 不存在时不报错 —— 开发态（cargo build）本来就没有，
-  // 那时 pi 内核不可用，orbcat 继续用自研内核（AppState 里 pi 字段是 None）。
+  // ⚠️ **runtime 目录不存在 = 当场抛错，不许只 warn 就放过**（审计 F1）。
+  // 旧版只 `console.warn` 然后继续 ⇒ 装配出一个**没有内核**的包，
+  // CI job 还是绿的，坏包就这么发出去了（pi 内核静默失效）。
+  // 「打错了但没人报错」正是 2026-10-12 那次事故的直接成因。
+  //
+  // 例外：`runtimeDir` 传 null = 调用方**明确不要**内置运行时
+  // （开发态 cargo build、单测）。那种情况跳过本段。
   if (runtimeDir) {
-    if (isDir(runtimeDir)) {
-      copyTree(runtimeDir, path.join(outDir, RUNTIME_SUBDIR));
-    } else {
-      console.warn(
-        `[package] ⚠️ runtime 目录不存在，跳过内置运行时：${runtimeDir}\n` +
-          `          （pi 内核将不可用 —— 构建它：node tools/build-runtime-assets.mjs）`
+    if (!isDir(runtimeDir)) {
+      throw new Error(
+        `runtime 目录不存在：${runtimeDir}\n` +
+          `  发布包必须带内置运行时（${RUNTIME_COMPONENTS.join(" + ")}）——` +
+          `缺了 pi 内核在用户机器上静默失效。\n` +
+          `  修法：node tools/build-runtime-assets.mjs（先把源放进 tools/.cache/）`
+      );
+    }
+    // 白名单拷贝：runtime/ 里残留的 git/、python/ 不会被带进包里
+    for (const comp of RUNTIME_COMPONENTS) {
+      const from = path.join(runtimeDir, comp);
+      if (!isDir(from)) {
+        throw new Error(
+          `runtime 里缺 ${comp}/：${from}\n` +
+            `  必查组件是 ${RUNTIME_COMPONENTS.join(" + ")} —— 缺一个这个包就不该发出去。\n` +
+            `  修法：node tools/build-runtime-assets.mjs`
+        );
+      }
+      copyTree(from, path.join(outDir, RUNTIME_SUBDIR, comp));
+    }
+    const skipped = readdirSync(runtimeDir).filter(
+      (f) => isDir(path.join(runtimeDir, f)) && !RUNTIME_COMPONENTS.includes(f)
+    );
+    if (skipped.length > 0) {
+      console.log(
+        `[package] runtime 里还有 ${skipped.join(", ")} —— 本轮不分发，未进包`
       );
     }
   }
@@ -227,7 +267,10 @@ export function stageWindowsRelease({
  *    （首次要自己点一下），而不是发布阻断项。
  *    但带了对的内容也不校验 —— 见 `verifyNoUserData`，那个才是硬闸。
  */
-export function verifyReleaseLayout(dir, { exeName = null, wantSkeleton = false } = {}) {
+export function verifyReleaseLayout(
+  dir,
+  { exeName = null, wantSkeleton = false, wantRuntime = false } = {}
+) {
   const errors = [];
   const notes = [];
 
@@ -281,6 +324,48 @@ export function verifyReleaseLayout(dir, { exeName = null, wantSkeleton = false 
       `${DATA_SUBDIR}/ 存在但里面没有 memory/：骨架不完整，` +
         `启动后仍会走一遍 bootstrap 补缺项。`
     );
+  }
+
+  // ---- 内置运行时：node + pi 必查，python / git 不查 --------------------
+  //
+  // `wantRuntime` 由调用方传入：装配/验发布包时传 true，
+  // 单测与开发态校验（不想带 runtime）不传 ⇒ 不查。
+  //
+  // ⚠️ 契约跟着 2026-10-23 的分发决策走：
+  //   必查 = `runtime/node/node.exe` + `runtime/pi/`
+  //   不查 = `runtime/python/`、`runtime/git/`（不是硬依赖，缺席即回落系统）
+  if (wantRuntime) {
+    const rt = path.join(dir, RUNTIME_SUBDIR);
+    if (!isDir(rt)) {
+      errors.push(
+        `产物里没有 ${RUNTIME_SUBDIR}/：${rt} 不存在。\n` +
+          `        发布包必须内置运行时（${RUNTIME_COMPONENTS.join(" + ")}），` +
+          `否则用户机器上 pi 内核静默失效。\n` +
+          `        修法：node tools/build-runtime-assets.mjs，再重新装配。`
+      );
+    } else {
+      if (!isFile(path.join(rt, "node", "node.exe"))) {
+        errors.push(
+          `${RUNTIME_SUBDIR}/node/node.exe 不存在：node 是硬依赖（PTC run_code + pi 都是 node 路线）。`
+        );
+      }
+      if (!isDir(path.join(rt, "pi"))) {
+        errors.push(
+          `${RUNTIME_SUBDIR}/pi/ 不存在：pi 是内核本体，缺了 pi 内核直接不可用。`
+        );
+      }
+      // 不查的两个：缺席只提示，不算缺件
+      for (const opt of ["python", "git"]) {
+        if (!isDir(path.join(rt, opt))) {
+          notes.push(
+            `${RUNTIME_SUBDIR}/${opt}/ 不在包里 —— 这是**预期**（2026-10-23 决定不分发）：` +
+              (opt === "python"
+                ? `未检测到内置 Python，可在设置里指定路径或自行安装。`
+                : `未分发内置 Git（GPLv2），将使用系统 Git。`)
+          );
+        }
+      }
+    }
   }
 
   if (errors.length > 0) {
@@ -353,8 +438,9 @@ function parseArgs(argv) {
 /**
  * 内置运行时的默认位置：仓库根的 `runtime/`。
  *
- * 找不到就返回 null —— `stageWindowsRelease` 会打警告并跳过
- * （开发态本来就没有 runtime/，那不是错误）。
+ * 找不到就返回 null —— **调用方必须自己决定要不要报错**：
+ * 开发态（cargo build、单测）可以没有 runtime，
+ * 但**发布包必须有**（审计 F1：缺 runtime 的包 = pi 内核静默失效）。
  */
 export function defaultRuntimeDir() {
   const p = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "runtime");
@@ -365,7 +451,11 @@ function main() {
   const args = parseArgs(process.argv.slice(2));
 
   if (args.verify) {
-    const r = verifyReleaseLayout(args.verify, { exeName: args["exe-name"] ?? null });
+    // 验发布包 = 必须有内置运行时（node + pi）—— 与装配时同一套契约
+    const r = verifyReleaseLayout(args.verify, {
+      exeName: args["exe-name"] ?? null,
+      wantRuntime: true,
+    });
     verifyNoUserData(args.verify);
     console.log(`OK: 产物布局合法 ${path.join(args.verify, DIST_SUBDIR, DIST_ENTRY)}`);
     for (const n of r.notes ?? []) console.log(`  提示: ${n}`);
@@ -380,11 +470,28 @@ function main() {
         "                         [--runtime <dir>]\n" +
         "  node tools/package.mjs --verify <dir> [--exe-name <name>]\n" +
         "\n" +
-        "  --runtime   内置运行时目录（node / python / git+bash / pi 内核），\n" +
+        "  --runtime   内置运行时目录（node / pi 内核），\n" +
         "              拷成 <out>/runtime/。缺省找仓库根的 runtime/。\n" +
+        "              **发布包必须有**：找不到会当场报错，不许发出坏包\n" +
+        "              （审计 F1 —— 缺 runtime 的包 = pi 内核静默失效）。\n" +
         "  --skeleton  把空骨架铺进 <out>/agent-data/（三合一分发）。\n" +
         "              只能指向 src-tauri/skeleton —— 铺真实 agent-data/ 会被\n" +
         "              verifyNoUserData 拦下，那等于把 API key 打进发布包。"
+    );
+    process.exit(2);
+  }
+
+  // 内置运行时（node / pi 内核）——
+  // 缺省找仓库根的 runtime/（`node tools/build-runtime-assets.mjs` 的产物）。
+  //
+  // ⚠️ **找不到 = 当场报错**（审计 F1）。旧版是「warn 一下跳过」，
+  // 于是 CI 装配出一个没有内核的包，job 还是绿的，坏包就发出去了。
+  const runtimeDir = args.runtime ?? defaultRuntimeDir();
+  if (!runtimeDir || !isDir(runtimeDir)) {
+    console.error(
+      `找不到内置运行时：${args.runtime ?? "仓库根 runtime/"}\n` +
+        `  发布包必须带 runtime/{${RUNTIME_COMPONENTS.join(",")}} —— 缺了 pi 内核在用户机器上静默失效。\n` +
+        `  修法：node tools/build-runtime-assets.mjs（先把 node.exe 与 pi 包放进 tools/.cache/）`
     );
     process.exit(2);
   }
@@ -395,13 +502,12 @@ function main() {
     outDir: args.out,
     skeletonDir: args.skeleton ?? null,
     files: args.file ?? [],
-    // 内置运行时（node / python / git+bash / pi 内核）——
-    // 缺省就找仓库根的 runtime/（`node tools/build-runtime-assets.mjs` 的产物）。
-    runtimeDir: args.runtime ?? defaultRuntimeDir(),
+    runtimeDir,
   });
   const { notes } = verifyReleaseLayout(args.out, {
     exeName,
     wantSkeleton: !!args.skeleton,
+    wantRuntime: true,
   });
   verifyNoUserData(args.out);
   console.log(

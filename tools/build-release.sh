@@ -103,25 +103,55 @@ if [ "$SRC_EXE" != "$REL/orbcat.exe" ]; then
   cp -f "$SRC_EXE" "$REL/orbcat.exe"
 fi
 
-# ---- 内置运行时（node / python / git+bash / pi 内核）----
-#
-# 为什么要这一段：orbcat 依赖 node（PTC 的 run_code）、python、git+bash。
-# 不内置的话，用户机器上缺一个就残一条功能。构建产物 179.1 MB
-# （node 83 / python 21.4 / git+bash 64.2 / pi 10.5）。
+# ---- 内置运行时（node / pi 内核）----
 #
 # 位置契约：`pi::runtime_dir(exe)` 找 **`<exe 同目录>/runtime/`**。
 # ⚠️ 目录名写错 = pi 内核静默不可用。
 #
-# 没有 runtime/ 也不阻断构建 —— 开发态本来就可能没构建过，
-# 那时 orbcat 继续用自研内核（AppState.pi = None）。
-if [ ! -d "$REL/runtime" ] && [ -d runtime ]; then
-  echo "==> 拷贝内置运行时到 $REL/runtime（node / python / git+bash / pi）"
-  # 先清掉上一轮 —— runtime/ 有 700+ 文件，cp -rf 只增不减会攒垃圾
-  rm -rf "$REL/runtime" 2>/dev/null || true
-  mkdir -p "$REL/runtime"
-  cp -rf runtime/. "$REL/runtime/"
-  echo "  $(du -sh "$REL/runtime" 2>/dev/null | cut -f1)"
+# 分发内容（2026-10-23 用户拍板）：**只带 node + pi**（≈95MB）。
+#   · node —— PTC run_code 的硬依赖，pi 本身也是 node 路线
+#   · pi   —— 内核本体
+#   · **不带 git**（GPLv2 不再分发）、**不带 python**（不是硬依赖，
+#     模型可能调而已 —— `pi::bundled_python()` 返回 Option，缺席即回落系统）
+#
+# ⚠️ **缺 runtime 就当场失败，不许「warn 一下继续」**（审计 F1）：
+# 旧版是「没有也不阻断构建」，于是产出的是**没有内核的包** ——
+# pi 内核在用户机器上静默失效，而构建日志一切正常。
+#
+# ⚠️ 每次都重建 $REL/runtime（不靠「不存在才拷」）：
+# 旧逻辑会把上一轮的旧 runtime 留在那儿 —— 组件清单变了，包没跟着变。
+RUNTIME_SRC=runtime
+RUNTIME_COMPONENTS="node pi"
+
+missing=""
+for c in $RUNTIME_COMPONENTS; do
+  [ -d "$RUNTIME_SRC/$c" ] || missing="$missing $c/"
+done
+if [ -n "$missing" ]; then
+  echo "============================================================"
+  echo " ✗ 缺少内置运行时组件：$missing"
+  echo ""
+  echo "   发布包必须带 runtime/{node,pi} —— 缺了 pi 内核在用户机器上静默失效。"
+  echo "   修法（Git Bash）："
+  echo "     node tools/build-runtime-assets.mjs"
+  echo "   （它需要 tools/.cache/ 里有 node.exe 与 pi 包："
+  echo "     npm pack @earendil-works/pi-coding-agent@1.4.0）"
+  echo "============================================================"
+  exit 1
 fi
+
+echo "==> 拷贝内置运行时到 $REL/runtime（node / pi）"
+# 先清掉上一轮 —— runtime/ 有 700+ 文件，cp -rf 只增不减会攒垃圾
+rm -rf "$REL/runtime" 2>/dev/null || true
+mkdir -p "$REL/runtime"
+for c in $RUNTIME_COMPONENTS; do
+  cp -rf "$RUNTIME_SRC/$c" "$REL/runtime/$c"
+done
+# runtime/ 里残留的 git/、python/ **不进包**（白名单拷贝）
+for c in git python; do
+  [ -d "$RUNTIME_SRC/$c" ] && echo "  （$c/ 本轮不分发，未进包）"
+done
+echo "  $(du -sh "$REL/runtime" 2>/dev/null | cut -f1)"
 
 echo "==> 拷贝前端资源到 $REL/dist（外置：exe 必须与 dist/ 同目录分发）"
 mkdir -p "$REL/dist"
@@ -159,12 +189,23 @@ mkdir -p "$RUNTIME/dist"
 cp -rf "$REL/dist/." "$RUNTIME/dist/"
 
 # 内置运行时同样部署到运行态 —— 位置契约同上（<exe 同目录>/runtime/）
+#
+# ⚠️ 这里也只部署 node + pi（$REL/runtime 里就这两个）——
+# 运行态的 runtime/ 是**启动器判据**的一部分（审计 F2）：
+# 缺 runtime\node\node.exe 或 runtime\pi\ 的运行态会被启动器判为不合格，
+# 双击桌面图标就会去启动别的副本。
 if [ -d "$REL/runtime" ]; then
   echo "==> 部署内置运行时到 $RUNTIME/runtime"
   rm -rf "$RUNTIME/runtime" 2>/dev/null || true
   mkdir -p "$RUNTIME/runtime"
   cp -rf "$REL/runtime/." "$RUNTIME/runtime/"
   echo "  $(du -sh "$RUNTIME/runtime" 2>/dev/null | cut -f1)"
+  for c in node pi; do
+    if [ ! -d "$RUNTIME/runtime/$c" ]; then
+      echo "  ✗ 部署后缺 runtime/$c —— 启动器会判这份运行态不合格！"
+      exit 1
+    fi
+  done
 fi
 
 echo "==> 同步 agent-data（运行态的 init 指引，不覆盖已有内容）"

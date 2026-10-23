@@ -16,12 +16,15 @@
   快捷方式的目标路径自始至终没变。orbcat 没有安装器，所以用这一层把
   「目标永不改变」这个性质补出来。
 
-  ## "能用"的判定（三条缺一不可）
+  ## "能用"的判定（四条缺一不可）
   1. 文件存在、是有效 PE（MZ 头）、体积 > 1 MB（挡掉 0 字节 / 半截文件）
   2. **同目录有 dist\index.html** —— exe 已不自包含（frontendDist 指向 stub-dist，
      真实前端由 disk_assets.rs 从 exe 同目录的 dist\ 读），所以没有 dist 的 exe
      跑起来只会显示占位页，不算"能用"
-  3. 因此 target\release\_old_builds\ 里的归档**天然不合格**（那里没有 dist/），
+  3. **同目录有 runtime\node\node.exe 与 runtime\pi\\** —— pi 内核要靠它们，
+     缺了只会打一行「未找到内置 runtime/」然后静默回落旧内核（审计 F2）。
+     python / git 不在分发包里（2026-10-23 决定），不查。
+  4. 因此 target\release\_old_builds\ 里的归档**天然不合格**（那里没有 dist/），
      不需要额外排除
 
   ## 用法
@@ -69,6 +72,26 @@ function Test-OrbcatBuild {
 
     # exe 不自包含：必须与 dist\index.html 同目录，否则起来只有占位页
     if (-not (Test-Path -LiteralPath (Join-Path $fi.DirectoryName 'dist\index.html') -PathType Leaf)) {
+        return $false
+    }
+
+    # 内置运行时：必须与 exe 同目录有 runtime\node\node.exe 与 runtime\pi\
+    #
+    # 为什么加这条（审计 F2）：
+    #   `pi::runtime_dir(exe)` 找的是 **<exe 同目录>/runtime/**，
+    #   缺了它 —— 或者缺了里面的 node / pi —— 启动日志只会打一行
+    #   「⚠️ 未找到内置 runtime/ —— pi 内核不可用，继续用旧内核」，
+    #   **用户看不出哪里不对**，pi 内核就静默失效了。
+    #   之前 release-fast 没有 runtime/ 却比运行态「新鲜」0.4 秒，
+    #   启动器选中它 → 新内核没启用。判据加上 runtime/ 就没这个雷了。
+    #
+    # ⚠️ 契约跟着 2026-10-23 的分发决策走：必查 node 与 pi；
+    #   python / git 不在分发包里（GPLv2 / 非硬依赖），**不查**。
+    $runtimeDir = Join-Path $fi.DirectoryName 'runtime'
+    if (-not (Test-Path -LiteralPath (Join-Path $runtimeDir 'node\node.exe') -PathType Leaf)) {
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $runtimeDir 'pi') -PathType Container)) {
         return $false
     }
 
@@ -162,10 +185,11 @@ if ($valid.Count -eq 0) {
     }) -join "`n"
     Add-Line '没有找到可用的 orbcat 构建。'
     Add-Line ''
-    Add-Line '判定"能用"的三条（缺一不可）：'
+    Add-Line '判定"能用"的四条（缺一不可）：'
     Add-Line '  1. orbcat.exe 存在且是有效 PE，体积 > 1 MB'
     Add-Line '  2. 与它**同目录**有 dist\index.html'
-    Add-Line '  3. （归档目录 _old_builds\ 里没有 dist\，所以天然不算）'
+    Add-Line '  3. 与它**同目录**有 runtime\node\node.exe 与 runtime\pi\（pi 内核）'
+    Add-Line '  4. （归档目录 _old_builds\ 里没有 dist\，所以天然不算）'
     Add-Line ''
     Add-Line '已检查：'
     Add-Line $checked

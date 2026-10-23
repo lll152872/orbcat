@@ -399,6 +399,43 @@ jobs:
       - name: Frontend build (dist must exist before cargo)
         run: npm run build
 
+      # ---- 内置运行时（node + pi）---------------------------------------
+      # 发布包必须带 runtime/{node,pi}：缺了 pi 内核在用户机器上**静默失效**
+      # （启动日志只打一行「未找到内置 runtime/ —— pi 内核不可用，继续用旧内核」，
+      #  用户看不出哪里不对），而 CI 之前是绿的（审计 F1/F2）。
+      #
+      # 分发内容（2026-10-23 用户拍板）：**只带 node + pi**（≈95MB）
+      #   · node —— PTC run_code 的硬依赖，pi 本身也是 node 路线
+      #   · pi   —— 内核本体
+      #   · **不带 git**（GPLv2 不再分发）、**不带 python**（不是硬依赖，
+      #     模型可能调而已 —— pi::bundled_python() 返回 Option，缺席即回落系统）
+      #
+      # ⚠️ 只在 Windows 装配 zip 时需要。macOS 那条走 tauri bundle 成 .app，
+      #    它的 runtime 归属另议（现在 .app 里没有 runtime/，pi 内核在 macOS 上不可用）。
+      - name: Fetch runtime assets (node + pi)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path tools/.cache | Out-Null
+          # node.exe —— pi 要求 >= 22.19.0
+          $nodeVer = "22.23.4"
+          Invoke-WebRequest -Uri "https://nodejs.org/dist/v$nodeVer/node-v$nodeVer-win-x64.zip" -OutFile node.zip
+          Expand-Archive -Force node.zip
+          Copy-Item "node-v$nodeVer-win-x64/node.exe" tools/.cache/node.exe
+          # pi 内核 —— 公开 npm 包
+          npm pack @earendil-works/pi-coding-agent@1.4.0 --pack-destination tools/.cache
+          tar -xzf "tools/.cache/earendil-works-pi-coding-agent-1.4.0.tgz" -C tools/.cache
+          Move-Item -Force tools/.cache/package tools/.cache/pi-pkg
+          # jiti 是 pi 的依赖 —— runtime-ext/*.ts 是 .ts 扩展，靠它加载
+          npm pack jiti@2.7.0 --pack-destination tools/.cache
+          tar -xzf "tools/.cache/jiti-2.7.0.tgz" -C tools/.cache
+          New-Item -ItemType Directory -Force -Path tools/.cache/pi-pkg/node_modules | Out-Null
+          Move-Item -Force tools/.cache/package tools/.cache/pi-pkg/node_modules/jiti
+
+      - name: Build runtime (node + pi)
+        if: runner.os == 'Windows'
+        run: node tools/build-runtime-assets.mjs
+
       # ---- Windows（x64 / arm64）------------------------------------------
       - name: Build Windows
         if: runner.os == 'Windows'
