@@ -850,6 +850,20 @@ fn to_pi_image(raw: &str) -> Result<Value, String> {
         }))
     } else if s.is_empty() {
         Err("图片内容为空".into())
+    } else if looks_like_path(s) {
+        // 🔴 **响亮地失败**，别静默丢图。
+        //
+        // 传**文件路径**进来 ⇒ 落到下面的「裸 base64」分支 ⇒ pi 拿路径去 base64
+        // 解码 ⇒ 解码失败 ⇒ **图被静默丢掉**（上游只记一条 hint，模型不知道）。
+        //
+        // ⚠️ 这条真的踩过：`chat_pi` 用 `images::save_all` 落盘后，把**路径**
+        // 直接传给了 pi ⇒ 用户带图发消息，图就没了。
+        // 现在生产路径先转 data URL（`lib.rs::chat_pi`），这里再加一道兜底 ——
+        // 万一谁再传路径，**立刻报错**而不是悄悄丢图。
+        Err(format!(
+            "图片内容是**文件路径**而不是 base64：{s}\n\
+             pi 只认 data URL 或裸 base64 —— 请先用 `images::to_data_url(path)` 转成 data URL。"
+        ))
     } else {
         // 裸 base64 —— mimeType 缺省
         Ok(json!({
@@ -858,6 +872,18 @@ fn to_pi_image(raw: &str) -> Result<Value, String> {
             "mimeType": "image/png",
         }))
     }
+}
+
+/// 这个字符串是不是**文件路径**（而不是 data URL / base64）。
+///
+/// 判据：含路径分隔符、或有盘符、或长得像带扩展名的文件名。
+fn looks_like_path(s: &str) -> bool {
+    if s.contains('\\') || s.contains('/') {
+        return true;
+    }
+    let b = s.as_bytes();
+    // Windows 盘符：`C:\...` / `C:/...`
+    b.len() >= 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
 }
 
 /// 从事件里取出「正文增量」。
@@ -1358,6 +1384,39 @@ mod tests {
     fn 空图片要报错而不是变成undefined() {
         assert!(to_pi_images(&["   ".to_string()]).is_err());
         assert!(to_pi_images(&[]).unwrap().is_empty());
+    }
+
+    /// 🔴 回归测试：**文件路径**不许被当成 base64 静默送进去。
+    ///
+    /// 踩过的坑：`chat_pi` 用 `images::save_all` 落盘后把**路径**直接传给 pi
+    /// ⇒ pi 拿路径去 base64 解码 ⇒ 解码失败 ⇒ **图被静默丢掉**
+    /// （上游只记一条 hint，用户看到的就是「我发的图呢」）。
+    ///
+    /// 现在：生产路径先转 data URL；这里再加一道兜底 ——
+    /// 万一谁再传路径，**立刻报错**，不静默丢。
+    #[test]
+    fn 文件路径要报错而不是被当base64() {
+        for p in [
+            r"C:\Users\DELL\AppData\Local\Temp\orbcat\img.png",
+            "/tmp/orbcat/img.png",
+            "D:/orbcat/img.png",
+            r"\\server\share\img.png",
+        ] {
+            let e = to_pi_images(&[p.to_string()]).unwrap_err();
+            assert!(
+                e.contains("文件路径"),
+                "路径输入必须报「这是文件路径」，实际错误: {e}（输入 {p}）"
+            );
+        }
+    }
+
+    /// 回归测试：真正的裸 base64 仍然要能用（别把防线做成误杀）。
+    #[test]
+    fn 裸base64不该被误判成路径() {
+        let out = to_pi_images(&["iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ".to_string()])
+            .expect("裸 base64 应该能用");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "image");
     }
 
     /// 🔴 延迟应答：**调用立即返回**（读循环零阻塞），答复到了才写。
