@@ -344,19 +344,45 @@ const MAX_INBOX: usize = 8;
 /// 单条工具结果回灌给模型时的截断长度
 const TOOL_RESULT_LIMIT: usize = 24 * 1024;
 
-/// 上下文预算的安全水位：用量超过 `maxInputTokens × 这个比例` 就开始裁剪。
-///
-/// 为什么是 0.75 而不是 1.0：① 估算本身有误差（中英混排、代码块的
-/// char→token 比并不恒定）；② 下一轮还要再塞工具结果；③ 留出输出空间。
-/// 宁可早裁，不可撞 413 / context_length_exceeded —— 撞上去就是整轮报废。
-const CONTEXT_SAFE_RATIO: f64 = 0.75;
+// 上下文预算的 **safe 比例**（用量超过 `maxInputTokens × 这个比例` 就开始裁剪）
+// 已不再写死在本文件 —— 它跟 compact 水位一样可配（档位 + 逐模型覆盖，
+// 见 `crate::config::CompactTier`），生效值统一由
+// `crate::config::resolve_context_ratios` 给出。
+//
+// 为什么默认是 0.75 而不是 1.0：① 估算本身有误差（中英混排、代码块的
+// char→token 比并不恒定）；② 下一轮还要再塞工具结果；③ 留出输出空间。
+// 宁可早裁，不可撞 413 / context_length_exceeded —— 撞上去就是整轮报废。
+//
+// 不变式：**safe 必须大于 compact**（compact 是主触发、safe 是兜底闸门；
+// 若 safe ≤ compact，硬裁剪会先把用量压回去 ⇒ 自动压缩永远够不到，变死代码）。
 
 /// 模型没配 `maxInputTokens` 时的保守兜底窗口。
 ///
 /// 为什么必须有兜底：配置里大量模型这个字段是 `null`（用户懒得填），
 /// 没兜底 = 没有预算保护 = 拉高轮数必炸。取 128k 是因为它是当前主流
 /// 模型的**下界**（多数在 256k~1M，但保守取值保证不会误判为"还有空间"）。
-const FALLBACK_CONTEXT_WINDOW: usize = 128 * 1024;
+///
+/// ⚠️ `pub(crate)`：`history.rs` 的水位计算也要用这个兜底 —— **只此一份**，
+/// 两边各写一个 128k 迟早会漂。
+pub(crate) const FALLBACK_CONTEXT_WINDOW: usize = 128 * 1024;
+
+/// **compact 触发点**（绝对 token 数）—— 本模块与 `history.rs` 用的是同一个口径。
+///
+/// ## 为什么两处都要算、还必须算成同一个数
+///
+/// 压缩水位现在**可配**（档位 + 逐模型覆盖，见 [`crate::config::CompactTier`]），
+/// 而判定点有两个：
+/// - 这里：发请求前决定「要不要先压一轮」；
+/// - `history.rs::compact`：压缩函数自己那道「未达水位就跳过」的检查。
+///
+/// 两处各算各的 = 两套口径（一边用覆盖值、一边用默认值），症状隐蔽且极难被测出来。
+/// 所以两处都走 [`crate::config::resolve_context_ratios`] + [`crate::config::ratio_to_tokens`]，
+/// 并且两个模块各自的入口函数由单测锁死相等
+/// （见 `config.rs` 里 `two_call_sites_read_same_ratio_source`）。
+pub(crate) fn compact_waterline(window: usize, cfg: &ModelConfig, data_dir: &Path) -> usize {
+    let ratios = crate::config::resolve_context_ratios(data_dir, &cfg.id);
+    crate::config::ratio_to_tokens(window, ratios.compact)
+}
 
 /// 估算整个 messages 数组的 token 数（含工具定义之外的纯消息部分）。
 ///
@@ -1268,7 +1294,9 @@ pub async fn run(
     // 为什么在"发请求前"而不是"撞到上限时"：撞上限意味着这次请求已经废了
     // （413 / context_length_exceeded），而压缩要额外发一次模型请求 —— 必须在
     // 还有余量时做。摘要**落盘**，所以只在真正超水位时压一次，之后每轮直接读。
-    let compact_trigger = ((context_window as f64) * crate::history::COMPACT_TRIGGER_RATIO) as usize;
+    // 水位口径：**与 history.rs 同一个函数算出来的同一个数**
+    // （比例来源 = config::resolve_context_ratios，见 compact_waterline 的说明）。
+    let compact_trigger = compact_waterline(context_window, cfg, data_dir);
     if !session_id.is_empty() {
         // 判定量 = 上一轮**真实** prompt（有的话）。它就是"现在上下文有多大"，
         // 比任何本地估算都可信；没有真值（新会话 / 网关不透传 usage）才退回估算，
@@ -1363,20 +1391,22 @@ pub async fn run(
     let mut pseudo_nudges = 0usize; // 伪工具调用解析回真调用
     let mut invalid_continues = 0usize; // 回合结束无可用正文 → 注入提醒续跑
 
-    // 上下文预算：模型配了就用，没配走保守兜底。乘安全水位。
+    // 上下文预算：模型配了就用，没配走保守兜底。乘 safe 水位。
     // （`context_window` 已在自动 compact 那一段算过，这里直接复用）
     //
-    // ⚠️ 与 compact 水位的关系（统一口径）：`COMPACT_TRIGGER_RATIO`（0.6）
-    // 低于这里的 `CONTEXT_SAFE_RATIO`（0.75）是**刻意**的 —— compact 在 60% 就把
-    // 历史压掉，循环内的硬裁剪（75%）只是压缩失败时的最后一道闸，正常轮不到它。
-    let context_budget = ((context_window as f64) * CONTEXT_SAFE_RATIO) as usize;
+    // ⚠️ 与 compact 水位的关系（统一口径）：safe 比例**始终大于** compact 比例
+    // （见 config::CompactTier 的不变式说明）—— compact 先压，safe 只是压缩失败时
+    // 的最后一道闸，正常轮不到它。两个比例都来自同一个来源
+    // （config::resolve_context_ratios），不各读各的。
+    let ctx_ratios = crate::config::resolve_context_ratios(data_dir, &cfg.id);
+    let context_budget = crate::config::ratio_to_tokens(context_window, ctx_ratios.safe);
     // 裁剪时至少保留最近这么多条工具结果原文（它们是模型当前最可能依赖的）
     const KEEP_RECENT_TOOL_RESULTS: usize = 4;
     eprintln!(
         "[orbcat] 上下文预算: 窗口 {} tok（{}）× {:.0}% = {} tok{}",
         context_window,
         if cfg.max_input_tokens.is_some() { "模型配置" } else { "兜底默认" },
-        CONTEXT_SAFE_RATIO * 100.0,
+        ctx_ratios.safe * 100.0,
         context_budget,
         if cfg.max_input_tokens.is_some() {
             "".to_string()
@@ -4315,8 +4345,12 @@ mod tests {
         );
 
         let context_window = 1_000_000usize;
-        let compact_trigger =
-            ((context_window as f64) * crate::history::COMPACT_TRIGGER_RATIO) as usize;
+        // 默认档（标准 0.60 / 0.75）⇒ 触发点仍是 60 万（**零回归**）。
+        // 走 config 的换算函数，别在本文件里再写死一个 0.6 —— 那就是「两套口径」。
+        let compact_trigger = crate::config::ratio_to_tokens(
+            context_window,
+            crate::config::CompactTier::Standard.ratios().0,
+        );
         assert_eq!(compact_trigger, 600_000);
 
         // ① 旧口径（未校准）：估算 9 万 << 水位 60 万 → **判不超，闸门放行**

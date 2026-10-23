@@ -16,9 +16,14 @@
 //! （未压缩区间）有什么就回灌什么，顺序与落盘一致 —— 该怎么注入怎么注入。
 //!
 //! 为什么敢全量 —— 预算有两道独立防线兜底：
-//! 1. 自动 compact（0.6 水位，持久化摘要）：`summary_upto` 之前的消息
+//! 1. 自动 compact（compact 水位，持久化摘要）：`summary_upto` 之前的消息
 //!    不再逐条回灌，由摘要顶上（[`SUMMARY_HEADER`]）；
-//! 2. agent loop 内的 75% 硬裁剪（compact 失败时的最后一道闸）。
+//! 2. agent loop 内的 safe 水位硬裁剪（compact 失败时的最后一道闸）。
+//!
+//! ⚠️ 两个水位现在是**可配的**（档位 + 逐模型覆盖，见
+//! [`crate::config::CompactTier`]），但两处判定必须读**同一个来源**
+//! （[`crate::config::resolve_context_ratios`]）—— 一个读常量一个读配置就会造出
+//! 「两套口径」，症状隐蔽且极难被测出来。
 //!
 //! 顺带的收益：时间窗滚动会让回灌前缀逐轮漂移，prompt cache 大面积失配；
 //! 全量注入的历史集合是**单调增长**的，前缀天然稳定。
@@ -612,11 +617,29 @@ pub const COMPACT_KEEP_RECENT: usize = 6;
 /// 打分时进入"原文附录"的条数上限（高分者以原文形式保留在摘要里）。
 const COMPACT_QUOTE_TOP: usize = 5;
 
-/// 触发 compact 的水位（占上下文预算的比例）。
+/// **compact 触发点（绝对 token 数）** —— 本模块与 `agent.rs` 用的是同一个口径。
 ///
-/// 为什么低于 agent loop 的 0.75：compact 本身要发一次模型请求（摘要），
-/// 留出余量避免"刚压缩完又超"。0.6 是"有压力但还宽裕"的位置。
-pub const COMPACT_TRIGGER_RATIO: f64 = 0.6;
+/// ## 为什么单独抽一个函数
+///
+/// 压缩水位现在**可配**（档位 + 逐模型覆盖，见 [`crate::config::CompactTier`]），
+/// 而它在**两个地方**都要算：
+/// - 这里：`compact()` 自己那道「未达水位就跳过」的检查；
+/// - `agent.rs`：发请求前判定「要不要先压一轮」。
+///
+/// 两处各算各的 = 两套口径 ⇒ 一个用覆盖值、一个用默认值，
+/// 症状是「明明配了宽档，却还是老早就压」（或者反过来）。这种不一致极难被测出来，
+/// 所以**两处都走这个函数**，比例来源统一是
+/// [`crate::config::resolve_context_ratios`]。
+pub fn compact_waterline(cfg: &ModelConfig, data_dir: &std::path::Path) -> usize {
+    // 窗口：模型配了就用，没配走**共享**的保守兜底（`agent.rs` 里那个常量，
+    // 不在这儿再抄一份 128k —— 两份兜底迟早会漂）。
+    let window = cfg
+        .max_input_tokens
+        .map(|n| n as usize)
+        .unwrap_or(crate::agent::FALLBACK_CONTEXT_WINDOW);
+    let ratios = crate::config::resolve_context_ratios(data_dir, &cfg.id);
+    crate::config::ratio_to_tokens(window, ratios.compact)
+}
 
 /// 单条消息的打分：分越高越值得保留原文。
 ///
@@ -738,12 +761,9 @@ pub async fn compact(
 
     // 触发水位检查（force 时跳过）
     if !force {
-        // 用模型窗口估算：超 COMPACT_TRIGGER_RATIO 才真压
-        let window = cfg
-            .max_input_tokens
-            .map(|n| n as usize)
-            .unwrap_or(128 * 1024);
-        let budget = ((window as f64) * COMPACT_TRIGGER_RATIO) as usize;
+        // 水位口径：与 agent.rs **同一个函数**算出来的同一个数
+        // （比例来源 = config::resolve_context_ratios，见 compact_waterline 的说明）。
+        let budget = compact_waterline(cfg, data_dir);
         let est: usize = pending
             .iter()
             .map(|m| crate::llm::estimate_tokens(&m.text) + 4)

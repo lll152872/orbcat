@@ -1757,6 +1757,75 @@ fn get_settings(state: State<'_, AppState>) -> config::AgentSettings {
     config::load_settings(&state.data_dir)
 }
 
+/// **上下文压缩水位**的当前状态 + 三档换算值（前端设置页用）。
+///
+/// ## 前端要显示什么
+///
+/// 显示**换算值**（「当前模型 1M ⇒ 约 600k token 时触发」），
+/// **不要绝对值输入框** —— 上下文窗口是逐模型的，写死绝对值没法跨模型复用。
+///
+/// 三档的代价文案用返回里的 `hint` 原文，别自己编：
+/// 说的是「细节丢多少」，**不是**「会不会撞 413」（宽档也不会崩，safe 水位还在）。
+#[tauri::command]
+fn ctx_profile_get(state: State<'_, AppState>) -> config::ContextProfileView {
+    config::context_profile_view(&state.data_dir, agent::FALLBACK_CONTEXT_WINDOW)
+}
+
+/// 设置上下文压缩水位。
+///
+/// - `tier`：`"economy"`（省）/ `"standard"`（标准）/ `"wide"`（宽）。`None` = 不改这一项。
+/// - `model_id` + `compact_ratio` / `safe_ratio`：**逐模型**覆盖（高级用法）。
+///   `model_id` 给了而某个比例是 `None` = **清掉**该模型的这个覆盖。
+///
+/// 比例会被夹回合法区间（compact ≤ 0.90、safe ≤ 0.95），并自动修「safe 必须大于
+/// compact」的不变式 ⇒ 越界不会把自动压缩调死（那会只剩硬裁剪、摘要永不产生）。
+#[tauri::command]
+fn ctx_profile_set(
+    state: State<'_, AppState>,
+    tier: Option<String>,
+    model_id: Option<String>,
+    compact_ratio: Option<f64>,
+    safe_ratio: Option<f64>,
+) -> Result<config::ContextProfileView, String> {
+    let mut s = config::load_settings(&state.data_dir);
+    if let Some(t) = tier.as_deref() {
+        let parsed = config::CompactTier::parse(t)
+            .ok_or_else(|| format!("未知档位「{t}」（可用：economy / standard / wide）"))?;
+        s.compact_tier = parsed;
+    }
+    if let Some(mid) = model_id.as_deref() {
+        match compact_ratio {
+            Some(r) => {
+                s.compact_ratio_overrides
+                    .insert(mid.to_string(), config::clamp_compact_ratio(r));
+            }
+            None => {
+                s.compact_ratio_overrides.remove(mid);
+            }
+        }
+        match safe_ratio {
+            Some(r) => {
+                s.safe_ratio_overrides
+                    .insert(mid.to_string(), config::clamp_safe_ratio(r));
+            }
+            None => {
+                s.safe_ratio_overrides.remove(mid);
+            }
+        }
+    }
+    config::save_settings(&state.data_dir, &s)?;
+    eprintln!(
+        "[orbcat] 压缩水位: 档位={} 模型覆盖={} / {}",
+        s.compact_tier.as_str(),
+        s.compact_ratio_overrides.len(),
+        s.safe_ratio_overrides.len()
+    );
+    Ok(config::context_profile_view(
+        &state.data_dir,
+        agent::FALLBACK_CONTEXT_WINDOW,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Tauri 命令 —— 网页搜索（Tavily / Exa / Brave）
 // ---------------------------------------------------------------------------
@@ -5606,6 +5675,8 @@ pub fn run() {
             mem_files,
             mem_projects,
             get_settings,
+            ctx_profile_get,
+            ctx_profile_set,
             search_status,
             search_set,
             search_test,

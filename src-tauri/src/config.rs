@@ -861,6 +861,29 @@ pub struct AgentSettings {
     /// 存的是物理像素，跨不同 DPI 显示器时也由那道校验兜住。
     #[serde(default)]
     pub orb_pos: Option<OrbPos>,
+    /// **上下文压缩水位档位**（省 / 标准 / 宽）。
+    ///
+    /// 默认「标准」= 旧的硬编码 0.60 / 0.75 ⇒ **零回归**。
+    /// 档位表见 [`CompactTier::ratios`]。
+    #[serde(default)]
+    pub compact_tier: CompactTier,
+    /// **逐模型**的 compact 比例覆盖（模型接口 id → 比例）。
+    ///
+    /// 存**比例**不存绝对 token：上下文窗口是逐模型的（见 `context_lengths`），
+    /// 同一个比例在不同窗口下对应的绝对水位完全不同 —— 写死绝对值没法跨模型复用。
+    ///
+    /// 只在「这个模型要跟别的不一样」时才用；绝大多数情况用 [`compact_tier`] 就够。
+    #[serde(default)]
+    pub compact_ratio_overrides: std::collections::HashMap<String, f64>,
+    /// **逐模型**的 safe 比例覆盖（模型接口 id → 比例）。
+    ///
+    /// ⚠️ 与 [`compact_ratio_overrides`] **联动**：safe 必须始终大于 compact。
+    /// 若 safe ≤ compact，硬裁剪会先把用量压回 safe ⇒ compact 的高水位永远够不到
+    /// ⇒ 自动压缩变成死代码（只剩硬裁剪，摘要永不产生）。
+    ///
+    /// 写入与读取时都会夹回合法区间并修不变式，见 [`ContextRatios::new`]。
+    #[serde(default)]
+    pub safe_ratio_overrides: std::collections::HashMap<String, f64>,
 }
 
 /// 悬浮球位置（物理像素，左上角、不含 pad）。
@@ -897,6 +920,302 @@ impl Default for ModelsWindowCfg {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 上下文压缩水位（compact / safe）
+// ---------------------------------------------------------------------------
+//
+// ## 为什么两个水位必须联动
+//
+// - **compact 水位**：上下文用量超过它 ⇒ 触发自动压缩（发一次模型请求生成摘要，落盘）。
+// - **safe 水位**：用量超过它 ⇒ agent loop 内的硬裁剪（裁掉最旧的工具结果）。
+//
+// 不变式：**compact < safe**。
+//
+// 若 safe ≤ compact，硬裁剪会**先**在 safe 处把用量压回去 ⇒ compact 的高水位
+// 永远够不到 ⇒ 自动压缩变成死代码（只剩硬裁剪，摘要永不产生）。
+// 两个水位各自独立可调 = 用户能把压缩功能调死。
+
+/// pi 的兜底线要预留的 token（pi 自己的压缩触发点是绝对值 `contextWindow - 16384`）。
+///
+/// 为什么比例口径必须向它看齐：pi 是**兜底**、orbcat 的比例是**主触发**。
+/// 若比例算出来的绝对值越过了 pi 的线，就变成 pi 先撞上限、orbcat 的压缩还没来得及做
+/// —— 顺序反了，主触发就废了。
+pub const PI_CONTEXT_RESERVE_TOKENS: usize = 16_384;
+
+/// 默认 compact 比例（旧硬编码 0.6 —— 默认值必须等于现状，保证零回归）。
+pub const DEFAULT_COMPACT_RATIO: f64 = 0.6;
+
+/// 默认 safe 比例（旧硬编码 0.75 —— 崩溃保护线，不是自由旋钮）。
+pub const DEFAULT_SAFE_RATIO: f64 = 0.75;
+
+/// compact 比例上限：任何档位、任何逐模型覆盖都不得超过。
+pub const MAX_COMPACT_RATIO: f64 = 0.90;
+
+/// safe 比例上限。
+pub const MAX_SAFE_RATIO: f64 = 0.95;
+
+/// compact 比例下限。
+pub const MIN_COMPACT_RATIO: f64 = 0.05;
+
+/// safe 比例下限。
+pub const MIN_SAFE_RATIO: f64 = 0.10;
+
+/// 上下文压缩水位档位。
+///
+/// 三档各带一对 (compact, safe) 比例；默认档 = 旧硬编码 = 零回归。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompactTier {
+    /// **省**：压缩更早 ⇒ 摘要更频繁、细节丢得更多，但更省 token、也更不容易撞上限。
+    Economy,
+    /// **标准**：默认档（= 现状 0.60 / 0.75，零回归）。
+    #[default]
+    Standard,
+    /// **宽**：压缩更晚 ⇒ 保留更多细节，但更接近模型上限。
+    Wide,
+}
+
+impl CompactTier {
+    /// 三档全表（前端下拉的顺序 = 这个顺序）。
+    pub const ALL: [CompactTier; 3] = [
+        CompactTier::Economy,
+        CompactTier::Standard,
+        CompactTier::Wide,
+    ];
+
+    /// 落盘 / 传参用的字符串。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CompactTier::Economy => "economy",
+            CompactTier::Standard => "standard",
+            CompactTier::Wide => "wide",
+        }
+    }
+
+    /// 解析字符串；认不出来返回 `None`（调用方决定报错还是回落）。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "economy" | "省" | "saver" | "low" => Some(CompactTier::Economy),
+            "standard" | "标准" | "default" | "normal" | "mid" => Some(CompactTier::Standard),
+            "wide" | "宽" | "high" | "max" => Some(CompactTier::Wide),
+            _ => None,
+        }
+    }
+
+    /// UI 展示名。
+    pub fn label(&self) -> &'static str {
+        match self {
+            CompactTier::Economy => "省",
+            CompactTier::Standard => "标准",
+            CompactTier::Wide => "宽",
+        }
+    }
+
+    /// 一句话代价说明（前端直接用，别自己编文案）。
+    ///
+    /// ⚠️ 措辞是「细节丢多少」，**不是**「会不会撞 413」——
+    /// 413 是崩不崩的事，宽档也不会崩（safe 水位还在），
+    /// 真正的代价是「摘要覆盖的区间更大、细节丢得更多」。
+    pub fn hint(&self) -> &'static str {
+        match self {
+            CompactTier::Economy => {
+                "压缩更早：摘要覆盖的区间更大、细节丢得更多，但省 token 也更不容易撞上限"
+            }
+            CompactTier::Standard => "默认档：上下文用掉六成开始压缩（= 现状）",
+            CompactTier::Wide => "压缩更晚：保留更多细节，但更接近模型上限",
+        }
+    }
+
+    /// 这一档的 (compact, safe) 比例。
+    ///
+    /// ⚠️ 不变式：**compact < safe**（见本节开头的说明）。
+    pub fn ratios(&self) -> (f64, f64) {
+        match self {
+            CompactTier::Economy => (0.40, 0.50),
+            CompactTier::Standard => (0.60, 0.75),
+            CompactTier::Wide => (0.90, 0.95),
+        }
+    }
+}
+
+/// 一对生效的水位比例。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContextRatios {
+    /// 触发自动压缩的比例（占上下文窗口）。
+    pub compact: f64,
+    /// 硬裁剪预算的比例（占上下文窗口）。
+    pub safe: f64,
+}
+
+impl ContextRatios {
+    /// 造一对比例：**先各自夹回合法区间，再修不变式**。
+    ///
+    /// 修法是「safe 抬到 compact 之上」而不是「compact 压到 safe 之下」——
+    /// 因为 compact 是用户显式要的（压低它等于把用户的设置作废），
+    /// 而 safe 只是保护线，抬高一档最坏也就是 0.95。
+    pub fn new(compact: f64, safe: f64) -> Self {
+        let c = clamp_compact_ratio(compact);
+        let mut s = clamp_safe_ratio(safe);
+        if c >= s {
+            s = (c + 0.05).min(MAX_SAFE_RATIO);
+            if s <= c {
+                s = MAX_SAFE_RATIO;
+            }
+        }
+        ContextRatios { compact: c, safe: s }
+    }
+}
+
+/// 把 compact 比例夹回合法区间 `[0.05, 0.90]`。
+///
+/// 非有限值（NaN / inf）回落默认值 —— 配置文件被手改坏了也不该让上下文裸奔。
+pub fn clamp_compact_ratio(r: f64) -> f64 {
+    if !r.is_finite() {
+        return DEFAULT_COMPACT_RATIO;
+    }
+    r.clamp(MIN_COMPACT_RATIO, MAX_COMPACT_RATIO)
+}
+
+/// 把 safe 比例夹回合法区间 `[0.10, 0.95]`。
+pub fn clamp_safe_ratio(r: f64) -> f64 {
+    if !r.is_finite() {
+        return DEFAULT_SAFE_RATIO;
+    }
+    r.clamp(MIN_SAFE_RATIO, MAX_SAFE_RATIO)
+}
+
+/// 比例 → 绝对 token 数：**再向 pi 的兜底线钳一次**。
+///
+/// 实际触发点 = `min(window × ratio, window - 16384)`。
+///
+/// 为什么要这层：pi 的压缩触发点是绝对值 `contextWindow - 16384`，
+/// 比例口径算出来的绝对值不能越过它，否则变成 pi 先撞上限（顺序反了）。
+///
+/// 小窗口会被自动夹下去（如 128k 窗口 ⇒ 宽档只能到 89.6%）—— 这是**正确行为**，
+/// 不是 bug：窗口本来就小，硬按比例压会越过 pi 的线。
+pub fn ratio_to_tokens(window: usize, ratio: f64) -> usize {
+    let abs = (window as f64 * ratio) as usize;
+    abs.min(window.saturating_sub(PI_CONTEXT_RESERVE_TOKENS))
+}
+
+impl AgentSettings {
+    /// 某个模型生效的 (compact, safe) 比例。
+    ///
+    /// 优先级：逐模型覆盖 > 全局档位。
+    /// 未知模型 id ⇒ 落回全局档位（用户没配过就是全局档）。
+    pub fn context_ratios(&self, model_id: &str) -> ContextRatios {
+        let (tc, ts) = self.compact_tier.ratios();
+        let c = self.compact_ratio_overrides.get(model_id).copied().unwrap_or(tc);
+        let s = self.safe_ratio_overrides.get(model_id).copied().unwrap_or(ts);
+        ContextRatios::new(c, s)
+    }
+}
+
+/// **压缩水位的唯一解析入口**。
+///
+/// `agent.rs`（发请求前的 compact 判定）与 `history.rs`（compact 自己的水位检查）
+/// **都调它** —— 这样「一处读常量、一处读配置」造成的两套口径在结构上不可能发生。
+///
+/// （R-025 验收③明令禁止两套口径并存，而这种不一致极难被测出来。）
+pub fn resolve_context_ratios(data_dir: &Path, model_id: &str) -> ContextRatios {
+    load_settings(data_dir).context_ratios(model_id)
+}
+
+/// 一档的对外视图（前端下拉里的一项）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactTierView {
+    /// 档位 id（"economy" / "standard" / "wide"）。
+    pub id: String,
+    /// 档位名（省 / 标准 / 宽）。
+    pub label: String,
+    /// 代价说明（前端直接显示这一句）。
+    pub hint: String,
+    /// compact 比例。
+    pub compact_ratio: f64,
+    /// safe 比例。
+    pub safe_ratio: f64,
+    /// 按**当前模型窗口**换算出的 compact 触发点（绝对 token 数）。
+    pub compact_trigger_tokens: usize,
+    /// 按**当前模型窗口**换算出的 safe 预算（绝对 token 数）。
+    pub safe_budget_tokens: usize,
+}
+
+/// 压缩水位的对外视图（前端设置页用）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextProfileView {
+    /// 当前全局档位（"economy" / "standard" / "wide"）。
+    pub tier: String,
+    /// 当前档位名。
+    pub tier_label: String,
+    /// 当前档位的代价说明。
+    pub tier_hint: String,
+    /// 当前选中模型的接口 id（没选模型 = null）。
+    pub model_id: Option<String>,
+    /// 当前选中模型的上下文窗口（`maxInputTokens`；没配 = null）。
+    pub model_window: Option<usize>,
+    /// 当前模型生效的 compact 比例。
+    pub compact_ratio: f64,
+    /// 当前模型生效的 safe 比例。
+    pub safe_ratio: f64,
+    /// 当前模型生效的 compact 触发点（绝对 token 数）。
+    pub compact_trigger_tokens: usize,
+    /// 当前模型生效的 safe 预算（绝对 token 数）。
+    pub safe_budget_tokens: usize,
+    /// 三档各自的换算值（前端每项要显示「约 xx k token 时触发」）。
+    pub tiers: Vec<CompactTierView>,
+}
+
+/// 组装前端要的视图。
+///
+/// `fallback_window` = 模型没配 `maxInputTokens` 时用的保守窗口
+/// （由调用方传进来 —— 那个常量住在 `agent.rs`，不在这儿复制一份）。
+pub fn context_profile_view(data_dir: &Path, fallback_window: usize) -> ContextProfileView {
+    let s = load_settings(data_dir);
+    let model_id = s.selected_model.clone();
+    let model = model_id.as_ref().and_then(|id| {
+        match s.selected_model_url.as_deref() {
+            Some(u) => find_model_by_url_id(data_dir, u, id)
+                .or_else(|_| find_model(data_dir, id))
+                .ok(),
+            None => find_model(data_dir, id).ok(),
+        }
+    });
+    let model_window = model.as_ref().and_then(|m| m.max_input_tokens).map(|n| n as usize);
+    let window = model_window.unwrap_or(fallback_window);
+    let ratios = s.context_ratios(model_id.as_deref().unwrap_or(""));
+
+    let tiers = CompactTier::ALL
+        .iter()
+        .map(|t| {
+            let (c, sf) = t.ratios();
+            CompactTierView {
+                id: t.as_str().to_string(),
+                label: t.label().to_string(),
+                hint: t.hint().to_string(),
+                compact_ratio: c,
+                safe_ratio: sf,
+                compact_trigger_tokens: ratio_to_tokens(window, c),
+                safe_budget_tokens: ratio_to_tokens(window, sf),
+            }
+        })
+        .collect();
+
+    ContextProfileView {
+        tier: s.compact_tier.as_str().to_string(),
+        tier_label: s.compact_tier.label().to_string(),
+        tier_hint: s.compact_tier.hint().to_string(),
+        model_id,
+        model_window,
+        compact_ratio: ratios.compact,
+        safe_ratio: ratios.safe,
+        compact_trigger_tokens: ratio_to_tokens(window, ratios.compact),
+        safe_budget_tokens: ratio_to_tokens(window, ratios.safe),
+        tiers,
+    }
+}
+
 impl Default for AgentSettings {
     fn default() -> Self {
         Self {
@@ -915,6 +1234,9 @@ impl Default for AgentSettings {
             active_bundle: None,
             selected_model_url: None,
             orb_pos: None,
+            compact_tier: CompactTier::default(),
+            compact_ratio_overrides: Default::default(),
+            safe_ratio_overrides: Default::default(),
         }
     }
 }
@@ -2227,5 +2549,248 @@ mod tests {
             got.len()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // 上下文压缩水位（compact / safe）
+    // -----------------------------------------------------------------------
+
+    /// 造一个只关心 id 与窗口的模型配置。
+    fn ctx_cfg(id: &str, window: Option<u64>) -> ModelConfig {
+        ModelConfig {
+            id: id.to_string(),
+            max_input_tokens: window,
+            ..Default::default()
+        }
+    }
+
+    /// ① 默认档位 ⇒ compact 触发点 = 600_000（**零回归**）。
+    ///
+    /// 这条是整个特性的地基：默认值必须等于旧的硬编码 0.6 / 0.75，
+    /// 否则「把水位做成可配」这件事本身就让所有老用户的行为变了。
+    #[test]
+    fn default_tier_keeps_the_legacy_600k_trigger() {
+        let d = tmp_dir("ctx_default");
+        let s = load_settings(&d);
+        assert_eq!(s.compact_tier, CompactTier::Standard);
+        let r = s.context_ratios("any-model");
+        assert_eq!(r.compact, 0.6, "默认 compact 必须是旧的 0.6");
+        assert_eq!(r.safe, 0.75, "默认 safe 必须是旧的 0.75");
+        assert_eq!(ratio_to_tokens(1_000_000, r.compact), 600_000);
+
+        // 老的 settings.json（没有这些字段）也要回落成标准档，不能解析失败
+        std::fs::write(d.join("settings.json"), r#"{"selectedModel":null}"#).unwrap();
+        let s2 = load_settings(&d);
+        assert_eq!(s2.compact_tier, CompactTier::Standard);
+        assert_eq!(s2.context_ratios("x").compact, 0.6);
+        assert_eq!(s2.context_ratios("x").safe, 0.75);
+    }
+
+    /// ② 三档各自的 (compact, safe) 落表正确。
+    #[test]
+    fn tier_ratio_table_is_exact() {
+        assert_eq!(CompactTier::Economy.ratios(), (0.40, 0.50));
+        assert_eq!(CompactTier::Standard.ratios(), (0.60, 0.75));
+        assert_eq!(CompactTier::Wide.ratios(), (0.90, 0.95));
+        // 字符串 ↔ 枚举要能往返（前端传的就是字符串）
+        for t in CompactTier::ALL {
+            assert_eq!(CompactTier::parse(t.as_str()), Some(t));
+        }
+        assert_eq!(CompactTier::parse("nonsense"), None);
+    }
+
+    /// ③ 不变式：compact < safe 在三档都成立；绝对值上 compact 触发点 ≤ safe 预算。
+    ///
+    /// 若 safe ≤ compact，硬裁剪会先把用量压回去 ⇒ compact 的高水位永远够不到
+    /// ⇒ 自动压缩变成死代码（只剩硬裁剪、摘要永不产生）。
+    #[test]
+    fn compact_watermark_never_exceeds_safe_budget() {
+        for t in CompactTier::ALL {
+            let (c, s) = t.ratios();
+            assert!(c < s, "{} 档必须 compact < safe", t.as_str());
+            for window in [200_000usize, 128 * 1024, 1_000_000] {
+                let ct = ratio_to_tokens(window, c);
+                let st = ratio_to_tokens(window, s);
+                assert!(
+                    ct <= st,
+                    "{} 档在窗口 {window} 下 compact 触发点 {ct} 不能大于 safe 预算 {st}",
+                    t.as_str()
+                );
+            }
+        }
+    }
+
+    /// ④ 越界被夹回：compact=0.99 ⇒ 0.9；safe=0.99 ⇒ 0.95。
+    #[test]
+    fn out_of_range_ratios_are_clamped_back() {
+        assert_eq!(clamp_compact_ratio(0.99), 0.9);
+        assert_eq!(clamp_safe_ratio(0.99), 0.95);
+        assert_eq!(clamp_compact_ratio(0.0), MIN_COMPACT_RATIO);
+        assert_eq!(clamp_safe_ratio(f64::NAN), DEFAULT_SAFE_RATIO);
+        assert_eq!(clamp_compact_ratio(f64::INFINITY), DEFAULT_COMPACT_RATIO);
+
+        // 一对越界值 ⇒ 夹回 + 修不变式（0.9 / 0.95 仍然 compact < safe）
+        let r = ContextRatios::new(0.99, 0.99);
+        assert_eq!(r.compact, 0.9);
+        assert_eq!(r.safe, 0.95);
+        assert!(r.compact < r.safe);
+
+        // 存档里被手改成越界值 ⇒ 生效值仍然是夹过的（不靠"文件没坏"来保证）
+        let d = tmp_dir("ctx_clamp");
+        let mut s = load_settings(&d);
+        s.compact_ratio_overrides.insert("m".into(), 0.99);
+        s.safe_ratio_overrides.insert("m".into(), 0.99);
+        save_settings(&d, &s).unwrap();
+        let eff = load_settings(&d).context_ratios("m");
+        assert_eq!(eff.compact, 0.9);
+        assert_eq!(eff.safe, 0.95);
+        assert!(eff.compact < eff.safe);
+    }
+
+    /// ⑤ 逐模型覆盖生效；未知模型 id 回落到全局档。
+    #[test]
+    fn per_model_override_wins_and_unknown_model_falls_back() {
+        let d = tmp_dir("ctx_override");
+        let mut s = load_settings(&d);
+        s.compact_tier = CompactTier::Economy;
+        s.compact_ratio_overrides.insert("m1".into(), 0.80);
+        s.safe_ratio_overrides.insert("m1".into(), 0.90);
+        save_settings(&d, &s).unwrap();
+
+        let s = load_settings(&d);
+        let m1 = s.context_ratios("m1");
+        assert_eq!(m1.compact, 0.80, "逐模型覆盖必须压过全局档位");
+        assert_eq!(m1.safe, 0.90);
+
+        // 没配过的模型 ⇒ 落回全局档（省档 0.40 / 0.50）
+        let other = s.context_ratios("m-unknown");
+        assert_eq!(other.compact, 0.40);
+        assert_eq!(other.safe, 0.50);
+    }
+
+    /// ⑥ 绝对钳制：实际触发点 = min(window×ratio, window-16384)。
+    #[test]
+    fn absolute_clamp_to_pi_reserve_line() {
+        // 200k 窗口：宽档 safe 0.95 ⇒ 190000 越过了 pi 的线（200000-16384）⇒ 夹回
+        assert_eq!(ratio_to_tokens(200_000, 0.95), 183_616);
+        // 1M 窗口：宽档 compact 0.90 = 900000，没越线（983616）⇒ 不夹
+        assert_eq!(ratio_to_tokens(1_000_000, 0.90), 900_000);
+        // 128k 窗口：宽档 compact 0.90 ⇒ 115200 越过 114688 ⇒ 夹回
+        assert_eq!(ratio_to_tokens(128 * 1024, 0.90), 128 * 1024 - 16_384);
+    }
+
+    /// ⑦ **最重要的一条**：`history.rs` 与 `agent.rs` 必须读到同一个比例。
+    ///
+    /// 这两个模块各有一处 compact 水位判定（一个在压缩函数里、一个在发请求前），
+    /// 各算各的 = 两套口径：一个用覆盖值、一个用默认值 ⇒ 症状是
+    /// 「明明配了宽档却还是老早就压」。这种不一致极难被测出来，
+    /// 所以这里把两个模块各自的入口函数直接对比。
+    #[test]
+    fn two_call_sites_read_same_ratio_source() {
+        let d = tmp_dir("ctx_same_src");
+        let mut s = load_settings(&d);
+        s.compact_tier = CompactTier::Wide;
+        s.compact_ratio_overrides.insert("m1".into(), 0.75);
+        save_settings(&d, &s).unwrap();
+
+        let cfg = ctx_cfg("m1", Some(1_000_000));
+        let window = 1_000_000usize;
+
+        let from_history = crate::history::compact_waterline(&cfg, &d);
+        let from_agent = crate::agent::compact_waterline(window, &cfg, &d);
+        assert_eq!(
+            from_history, from_agent,
+            "history.rs 与 agent.rs 必须算出同一个 compact 触发点"
+        );
+        // 两边都得用**覆盖值**（0.75），不是全局档位的值
+        assert_eq!(from_history, ratio_to_tokens(window, 0.75));
+
+        // 换档位 ⇒ 两边一起变（证明它们读的是同一份配置，而不是各自缓存的常量）
+        let mut s = load_settings(&d);
+        s.compact_tier = CompactTier::Economy;
+        save_settings(&d, &s).unwrap();
+        assert_eq!(
+            crate::history::compact_waterline(&cfg, &d),
+            crate::agent::compact_waterline(window, &cfg, &d),
+            "改了档位后两处仍必须一致"
+        );
+        assert_eq!(
+            crate::history::compact_waterline(&cfg, &d),
+            ratio_to_tokens(window, 0.75),
+            "有逐模型覆盖时，全局档位变化不该影响这个模型"
+        );
+    }
+
+    /// ⑧ `history.rs` 的兜底窗口必须复用 `agent.rs` 那个常量，不留第二份。
+    #[test]
+    fn history_uses_the_shared_fallback_window() {
+        assert_eq!(
+            crate::agent::FALLBACK_CONTEXT_WINDOW,
+            128 * 1024,
+            "兜底窗口只有一个来源（在 agent.rs 里）"
+        );
+        let d = tmp_dir("ctx_fallback");
+        // 没配 maxInputTokens 的模型 ⇒ 两边都走这个兜底
+        let cfg = ctx_cfg("m0", None);
+        let window = crate::agent::FALLBACK_CONTEXT_WINDOW;
+        assert_eq!(
+            crate::history::compact_waterline(&cfg, &d),
+            crate::agent::compact_waterline(window, &cfg, &d)
+        );
+        assert_eq!(
+            crate::history::compact_waterline(&cfg, &d),
+            (window as f64 * 0.6) as usize
+        );
+    }
+
+    /// 档位与覆盖要能落盘并读回来（前端改了设置 → 重启后还在）。
+    #[test]
+    fn compact_profile_round_trips_through_settings_json() {
+        let d = tmp_dir("ctx_persist");
+        let mut s = load_settings(&d);
+        s.compact_tier = CompactTier::Wide;
+        s.compact_ratio_overrides.insert("m1".into(), 0.85);
+        s.safe_ratio_overrides.insert("m1".into(), 0.92);
+        save_settings(&d, &s).unwrap();
+
+        let raw = std::fs::read_to_string(d.join("settings.json")).unwrap();
+        assert!(raw.contains("\"compactTier\""), "落盘键名应为 compactTier：{raw}");
+        assert!(
+            raw.contains("\"compactRatioOverrides\""),
+            "落盘键名应为 compactRatioOverrides：{raw}"
+        );
+        assert!(
+            raw.contains("\"safeRatioOverrides\""),
+            "落盘键名应为 safeRatioOverrides：{raw}"
+        );
+
+        let back = load_settings(&d);
+        assert_eq!(back.compact_tier, CompactTier::Wide);
+        assert_eq!(back.compact_ratio_overrides.get("m1").copied(), Some(0.85));
+        assert_eq!(back.safe_ratio_overrides.get("m1").copied(), Some(0.92));
+        assert_eq!(back.context_ratios("m1").compact, 0.85);
+    }
+
+    /// 视图要给前端能直接显示的**换算值**（不是让用户填绝对 token 数）。
+    #[test]
+    fn profile_view_carries_converted_token_values() {
+        let d = tmp_dir("ctx_view");
+        let mut s = load_settings(&d);
+        s.compact_tier = CompactTier::Standard;
+        save_settings(&d, &s).unwrap();
+
+        // 没选模型 ⇒ 用 128k 兜底窗口换算
+        let v = context_profile_view(&d, 128 * 1024);
+        assert_eq!(v.tier, "standard");
+        assert_eq!(v.tier_label, "标准");
+        assert!(!v.tier_hint.is_empty(), "代价文案要给前端直接用");
+        assert_eq!(v.tiers.len(), 3, "三档都要给前端");
+        for t in &v.tiers {
+            assert!(
+                t.compact_trigger_tokens <= t.safe_budget_tokens,
+                "{} 档的 compact 触发点不能大于 safe 预算",
+                t.id
+            );
+        }
     }
 }
