@@ -4027,6 +4027,7 @@ async fn chat_pi_steer(
     state: State<'_, AppState>,
     message: String,
     session_id: Option<String>,
+    images: Option<Vec<String>>,
 ) -> Result<agent::SteerAck, String> {
     let pool = state.pi.clone().ok_or("pi 内核不可用")?;
     let text = message.trim().to_string();
@@ -4046,7 +4047,7 @@ async fn chat_pi_steer(
         .get(&sid)
         .await
         .ok_or_else(|| format!("会话 {sid} 没有正在运行的 pi 内核"))?;
-    rt.steer(&text).await?;
+    rt.steer(&text, images.unwrap_or_default()).await?;
     Ok(agent::SteerAck {
         id: agent::new_steer_id(),
         queued: 1,
@@ -4386,12 +4387,17 @@ fn perm_request_decide(
     let d = perm_request::Decision::parse(&decision).ok_or_else(|| {
         format!("未知的决定：{decision}（只能是 approve / narrow / prefix / full / always / deny）")
     })?;
-    // id 前缀路由：`pr*` = 文件级（pending），`pc*` / `pm*` / `pa*` = 命令 / MCP / ask_user（pending_cmds）。
+    // id 前缀路由：`pr*` = 文件级（pending），`pc*` / `pm*` / `pa*` / **`pp*`** = 命令 / MCP / ask_user / **pi 确认**（pending_cmds）。
     // ⚠️ `pm*` 必须走 decide_command —— 它登记在 pending_cmds 里；
     //    早先只认 `pc` 打头，MCP 申请被误送进 decide() 后报「不存在或已处理」，
     //    前端还把卡片删了，agent 一直阻塞到 3 分钟超时（用户看到的就是卡死）。
     // `pa*`（ask_user）同理；它的"决定"只有 approve/deny，**回答文本放在 reason 里**。
-    if id.starts_with("pc") || id.starts_with("pm") || id.starts_with("pa") {
+    // ⚠️ **`pp*`（pi 内核的确认框）也必须走 decide_command** —— 它同样登记在
+    //    pending_cmds 里。漏了它 ⇒ 决定被送进 `decide()`（文件级表）⇒ 报
+    //    「不存在或已处理」⇒ **pi 那边等不到答复，卡死到超时**。
+    //    ⇒ **新增 id 前缀时必须同 commit 改这张表**（P3 的硬性条款）。
+    if id.starts_with("pc") || id.starts_with("pm") || id.starts_with("pa") || id.starts_with("pp")
+    {
         state.perm.decide_command(&id, d, reason.unwrap_or_default())
     } else {
         state.perm.decide(&id, d, reason.unwrap_or_default())
@@ -5376,6 +5382,18 @@ pub fn run() {
                 match runtime {
                     Some(rt) => {
                         eprintln!("[orbcat] pi 内核已就绪: {}", rt.display());
+                        // ⚠️ **必须同时落 diag.log** —— 用户自己启动的 exe 是 GUI 程序，
+                        // **没有 stderr 可看**（这条只有从终端起才看得到），
+                        // 而「pi 内核静默回落旧内核」恰恰是最难查的一类问题。
+                        // 落盘后守门/用户直接读 `agent-data/diag.log` 就能判定
+                        // 「这次到底用的哪个内核」。
+                        diag_write(
+                            &data_dir,
+                            &format!(
+                                "pi 内核已就绪: {}（= pi_status.available=true）",
+                                rt.display()
+                            ),
+                        );
                         // ── 会话池：每个会话一个 pi 进程 ──
                         //
                         // pi 的 RPC 模式**一个进程只有一个会话**（`new_session` 是换绑
@@ -5420,6 +5438,39 @@ pub fn run() {
                         );
                         // `set_gate` 是**同步**的（`setup` 闭包没法 await）。
                         pool.set_gate(gate);
+
+                        // ── pi 确认通道（`ctx.ui.confirm()` → orbcat 确认卡）──
+                        //
+                        // 契约见 `docs/10-PI-CONFIRM-CONTRACT.md`（后端 v1 草案）。
+                        // 口径：id 前缀 `pp*` · 3 分钟超时 · fail-closed ·
+                        //       **只认 approve**（Q5：不支持「总是允许」——
+                        //       pi 侧没有对应授权表，硬接会造出第三套口径）。
+                        //
+                        // ⚠️ 这条链路上 pi 的答复**不能**在 stdout 读循环里等
+                        //    （会卡死 pi 写 stdout）⇒ Rust 侧走
+                        //    `PiHostReply::Deferred`（延迟应答，tokio::spawn 写回）。
+                        let perm_for_confirm = perm.clone();
+                        let dd_for_confirm = data_dir.clone();
+                        let confirm_hook: pi_runtime::ConfirmFn = std::sync::Arc::new(
+                            move |title, message, sid_from_runtime: Option<String>| {
+                                let perm = perm_for_confirm.clone();
+                                let dd = dd_for_confirm.clone();
+                                Box::pin(async move {
+                                    let sid = sid_from_runtime.unwrap_or_else(|| {
+                                        sessions::current_id(&dd)
+                                            .unwrap_or_else(|| sessions::ensure_current(&dd).id)
+                                    });
+                                    match perm.ask_pi_confirm(title, message, &sid).await {
+                                        Ok(v) => {
+                                            // 只认「允许」；其余（含超时）一律按拒绝
+                                            matches!(v.decision, perm_request::Decision::Approve)
+                                        }
+                                        Err(_) => false, // fail-closed
+                                    }
+                                })
+                            },
+                        );
+                        pool.set_confirm_hook(confirm_hook);
                         Some(pool)
                     }
                     None => {
@@ -5429,6 +5480,11 @@ pub fn run() {
                             std::env::current_exe()
                                 .map(|e| e.display().to_string())
                                 .unwrap_or_default()
+                        );
+                        // 同样落 diag.log —— **回落**比就绪更该被看见
+                        diag_write(
+                            &data_dir,
+                            "⚠️ 未找到内置 runtime/ —— pi 内核不可用，继续用旧内核",
                         );
                         None
                     }

@@ -57,6 +57,21 @@ pub type GateFn = Arc<
         + Sync,
 >;
 
+/// 宿主确认钩子：pi 问「能不能做 X」（`ctx.ui.confirm()`）时，
+/// 宿主弹一张 orbcat 确认卡等用户。
+///
+/// - 参数：`(标题, 正文, 会话 id)`
+/// - 返回：`true` = 用户允许
+///
+/// ⚠️ **必须是 async** —— 里面要等用户在卡上点（最多 3 分钟）。
+/// 所以宿主回调**不能在 pi 的 stdout 读循环里等**它 ⇒ 必须走
+/// [`crate::pi::PiHostReply::Deferred`]（延迟应答）。
+pub type ConfirmFn = Arc<
+    dyn Fn(String, String, Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// 一轮对话的结果（与 `agent::AgentRun` 同构，便于前端复用现有渲染）。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,7 +145,9 @@ pub struct PiRuntime {
     /// 工具桥
     bridge: tokio::sync::Mutex<Option<Arc<ToolBridge>>>,
     /// 权限裁决回调（宿主提供）
-    gate: tokio::sync::Mutex<Option<GateFn>>,
+    gate: std::sync::Arc<tokio::sync::Mutex<Option<GateFn>>>,
+    /// 宿主确认钩子（pi 的 `ctx.ui.confirm()` → 我们的确认卡）
+    confirm_hook: std::sync::Arc<tokio::sync::Mutex<Option<ConfirmFn>>>,
     /// 强制指定模型（`(provider, model)`）—— 覆盖从 settings 反查的结果。
     ///
     /// ## 什么时候用
@@ -140,7 +157,13 @@ pub struct PiRuntime {
     /// - 前端**临时切模型**而不改 `settings.json`。
     ///
     /// 生产路径不设它 —— 走 `settings.selected_model` 那条反查。
-    model_override: tokio::sync::Mutex<Option<(String, String)>>,
+    /// 覆盖模型：`(模型 id, base URL, 是否声明支持图片)`。
+    ///
+    /// 第三个字段是**图片能力声明** —— pi 会按 `model.input` 决定
+    /// **要不要把图发给模型**（上游 `openai-completions` chunk：
+    /// `hasImages && model.input.includes("image")`）
+    /// ⇒ 声明只有 `["text"]` 的话，**图会被静默丢掉**（不报错）。
+    model_override: tokio::sync::Mutex<Option<(String, String, bool)>>,
     /// 额外注入的 MCP server（**测试专用**）。
     /// 为什么要这个：测「pi 真的能连 MCP、真的能调到 MCP 工具」需要一个
     /// **确定**的 server —— 不能依赖用户本机配的 `1mcp` 网关（它可能没起、
@@ -199,7 +222,8 @@ impl PiRuntime {
             agent_dir,
             client: tokio::sync::Mutex::new(None),
             bridge: tokio::sync::Mutex::new(None),
-            gate: tokio::sync::Mutex::new(None),
+            gate: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            confirm_hook: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             model_override: tokio::sync::Mutex::new(None),
             extra_mcp: tokio::sync::Mutex::new(Vec::new()),
             prompt_ctx: Arc::new(std::sync::Mutex::new(PromptCtx::default())),
@@ -228,7 +252,8 @@ impl PiRuntime {
             agent_dir,
             client: tokio::sync::Mutex::new(None),
             bridge: tokio::sync::Mutex::new(None),
-            gate: tokio::sync::Mutex::new(None),
+            gate: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            confirm_hook: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             model_override: tokio::sync::Mutex::new(None),
             extra_mcp: tokio::sync::Mutex::new(Vec::new()),
             prompt_ctx: Arc::new(std::sync::Mutex::new(PromptCtx::default())),
@@ -286,7 +311,27 @@ impl PiRuntime {
     ///
     /// 只在**测试**和「前端临时切模型」时用。生产路径不设它。
     pub async fn set_model_override(&self, model_id: impl Into<String>, base_url: impl Into<String>) {
-        *self.model_override.lock().await = Some((model_id.into(), base_url.into()));
+        *self.model_override.lock().await = Some((model_id.into(), base_url.into(), false));
+    }
+
+    /// 同 [`PiRuntime::set_model_override`]，但**声明这个模型支持图片**。
+    ///
+    /// ## 为什么需要这一档
+    ///
+    /// pi 按模型的 `input` 能力声明决定**要不要把图发给模型**
+    /// （上游 `openai-completions` chunk：`hasImages && model.input.includes("image")`）
+    /// ⇒ 声明只有 `["text"]` 的话，**图会被静默丢掉** —— 不报错、模型收不到、
+    /// 前端还以为图送出去了。
+    ///
+    /// 注入的临时 provider 默认按 orbcat `models.json` 里**同名模型**的
+    /// `supportsImages` 声明；模型不在清单里（测试用的假模型就是）时，
+    /// 用这个方法显式声明。
+    pub async fn set_model_override_with_images(
+        &self,
+        model_id: impl Into<String>,
+        base_url: impl Into<String>,
+    ) {
+        *self.model_override.lock().await = Some((model_id.into(), base_url.into(), true));
     }
 
     /// 设置本轮的 prompt 上下文（**宿主在开跑前调**）。
@@ -308,14 +353,35 @@ impl PiRuntime {
     /// ## 为什么是**同步**的
     ///
     /// Tauri 的 `setup` 闭包是同步的 —— 里面没法 await。
-    /// 这个回调只在「起桥时」被读一次（存进 `GateHandler`），
-    /// 所以同步设置完全够用。
+    ///
+    /// ⚠️ **不能只 `try_lock`** —— 抢不到就**静默丢**（那就等于没设 gate ⇒ P2 复发：
+    /// 桥会退回静态裁决，MCP 授权静默降级）。抢不到时退到 `blocking_lock`（等一下）。
+    /// 本函数只在**同步**上下文里被调（Tauri setup 闭包 / 池的 set_gate / 测试），
+    /// 不会在 async 上下文里触发 tokio 的 panic。
     ///
     /// ⚠️ 签名第三个参数是**这个 pi 进程自己的会话 id**（`Option<&str>`）——
     /// 多会话并行时不能拿「用户当前正在看的会话」，否则权限裁决会串味。
     pub fn set_gate(&self, f: GateFn) {
-        if let Ok(mut g) = self.gate.try_lock() {
-            *g = Some(f);
+        match self.gate.try_lock() {
+            Ok(mut g) => *g = Some(f),
+            Err(_) => {
+                // ⚠️ `blocking_lock()` 返回 guard（不是 Result）
+                let mut g = self.gate.blocking_lock();
+                *g = Some(f);
+            }
+        }
+    }
+
+    /// 设置宿主确认钩子（pi 的 `ctx.ui.confirm()` → 我们的确认卡）。
+    ///
+    /// 与 [`PiRuntime::set_gate`] 同口径：**已有**的运行时也一起套上。
+    pub fn set_confirm_hook(&self, f: ConfirmFn) {
+        match self.confirm_hook.try_lock() {
+            Ok(mut g) => *g = Some(f),
+            Err(_) => {
+                let mut g = self.confirm_hook.blocking_lock();
+                *g = Some(f);
+            }
         }
     }
 
@@ -364,7 +430,13 @@ impl PiRuntime {
 
         let cfg = self.build_config().await?;
         let gate = self.gate.lock().await.clone();
-        let client = PiClient::spawn(cfg, Self::make_host(gate)).await?;
+        // 宿主确认通道（pi 的 `ctx.ui.confirm()` → 我们的确认卡）
+        let confirm_hook = self.confirm_hook.lock().await.clone();
+        let client = PiClient::spawn(
+            cfg,
+            Self::make_host(confirm_hook, self.session_id.clone()),
+        )
+        .await?;
         *self.client.lock().await = Some(client.clone());
         Ok(client)
     }
@@ -521,7 +593,9 @@ impl PiRuntime {
         let mut providers: std::collections::BTreeMap<String, Value> = Default::default();
         let mut idx: std::collections::BTreeMap<(String, String), String> = Default::default();
 
-        for m in list {
+        // ⚠️ 用**借用**遍历（不是 `for m in list`）——
+        // 下面注入临时 provider 时还要查 `list` 里同名模型的 `supportsImages`。
+        for m in &list {
             let Some(url) = m.get("url").and_then(|x| x.as_str()) else {
                 continue;
             };
@@ -605,11 +679,12 @@ impl PiRuntime {
         // provider 名（`orb1`/`orb6`…）是按 URL 去重后的**插入顺序**生成的，
         // 外部没法预知（2026-10-22 踩到：以为能按名指定，结果错位）。
         let settings = crate::config::load_settings(&self.data_dir);
-        let (want_id, want_url) = match self.model_override.lock().await.clone() {
-            Some((id, url)) => (Some(id), Some(url)),
+        let (want_id, want_url, want_images) = match self.model_override.lock().await.clone() {
+            Some((id, url, images)) => (Some(id), Some(url), images),
             None => (
                 settings.selected_model.clone(),
                 settings.selected_model_url.clone(),
+                false,
             ),
         };
 
@@ -632,6 +707,24 @@ impl PiRuntime {
                         .unwrap_or(false)
             });
             if !exists {
+                // ── 这个覆盖模型**支不支持图片**？──
+                //
+                // pi 按 `model.input` 能力声明决定**要不要把图发给模型**
+                // （上游 `openai-completions` chunk：`hasImages && model.input.includes("image")`）
+                // ⇒ 声明只有 `["text"]` ⇒ **图被静默丢掉**（不报错）。
+                //
+                // 判定顺序：调用方显式声明（测试/临时切模型）→ orbcat 清单里
+                // 同名模型的 `supportsImages` → 都没有就当不支持（保守）。
+                let supports_images = want_images
+                    || list.iter().any(|m| {
+                        m.get("id").and_then(|x| x.as_str()) == Some(wid.as_str())
+                            && m.get("supportsImages").and_then(|x| x.as_bool()) == Some(true)
+                    });
+                let input = if supports_images {
+                    json_arr(&["text", "image"])
+                } else {
+                    json_arr(&["text"])
+                };
                 let pid = format!("orbx{}", providers.len() + 1);
                 providers.insert(
                     pid,
@@ -647,7 +740,7 @@ impl PiRuntime {
                                 ("name", Value::String(wid.clone())),
                                 ("contextWindow", Value::from(128000)),
                                 ("maxTokens", Value::from(16384)),
-                                ("input", json_arr(&["text"])),
+                                ("input", input),
                                 (
                                     "cost",
                                     json_obj(&[
@@ -832,28 +925,48 @@ impl PiRuntime {
     }
 
     /// 造宿主回调（pi 向我们提问时调）。
-    fn make_host(_gate: Option<GateFn>) -> crate::pi::PiHostFn {
+    ///
+    /// `confirm_hook` 是**宿主确认通道**：pi 问「能不能做 X」时，
+    /// 我们弹一张 orbcat 确认卡等用户（最多 3 分钟）。
+    ///
+    /// ⚠️ **绝不在这里等用户** —— 这个回调跑在 pi 的 **stdout 读循环**里
+    /// （`dispatch` → `self.host(req)`），等下去会卡住 pi 写 stdout ⇒ **死锁**。
+    /// ⇒ 立刻返回 [`crate::pi::PiHostReply::Deferred`]，
+    ///    真正的答复由另起的任务异步送来（`tokio::spawn` + oneshot）。
+    fn make_host(
+        confirm_hook: Option<ConfirmFn>,
+        session_id: Option<String>,
+    ) -> crate::pi::PiHostFn {
+        let handle = tokio::runtime::Handle::try_current().ok();
         Arc::new(move |req: PiHostRequest| -> Option<PiHostReply> {
             match req {
-                PiHostRequest::Confirm { id, title, message } => {
-                    // ⚠️ **fail-closed**：这里**不能**返回 true。
-                    //
-                    // orbcat 的授权流程是**一套**：`/gate` → `pi_host_gate`（lib.rs）
-                    // → MCP 确认卡 / 文件网关；orbcat 私有工具走
-                    // `tools::execute` → `authorize()`。
-                    //
-                    // pi 自己的 `ctx.ui.confirm()` 是**第二套**口径 —— 它**不认**
-                    // orbcat 的授权表（`mcp_grants.json` / 命令授权 / 审计链）。
-                    // 自动同意 = 白白开一条旁路。
-                    //
-                    // 正常路径下这里**根本不会被问到**：pi 的内置工具已全部排除
-                    // （`pi::PI_BUILTIN_TOOLS`），我们自己的 extension 也不调
-                    // `ctx.ui.confirm()`。所以「拒绝」是安全的兜底。
-                    let _ = id;
-                    eprintln!(
-                        "[orbcat] ⚠️ pi 请求确认（已按**拒绝**处理，不走 orbcat 授权体系）：{title} / {message}"
-                    );
-                    Some(PiHostReply::Confirm(false))
+                PiHostRequest::Confirm { id: _, title, message } => {
+                    // 没有宿主确认通道 ⇒ fail-closed（拒绝）
+                    let Some(hook) = confirm_hook.clone() else {
+                        eprintln!(
+                            "[orbcat] ⚠️ pi 请求确认（宿主没有确认通道，已按**拒绝**处理）：{title} / {message}"
+                        );
+                        return Some(PiHostReply::Confirm(false));
+                    };
+                    let Some(handle) = handle.clone() else {
+                        eprintln!("[orbcat] ⚠️ pi 请求确认（拿不到 tokio handle，已按**拒绝**处理）：{title}");
+                        return Some(PiHostReply::Confirm(false));
+                    };
+                    // ⚠️ **立即返回** —— 读循环继续跑，答案晚点另路写回。
+                    let (deferred, tx) = crate::pi::DeferredReply::pair();
+                    let sid = session_id.clone();
+                    handle.spawn(async move {
+                        // 3 分钟兜底：钩子自己也有超时，这里再加一层，
+                        // 绝不让 pi 干等（超时就当拒绝 = fail-closed）。
+                        let approved = tokio::time::timeout(
+                            std::time::Duration::from_secs(180),
+                            hook(title, message, sid),
+                        )
+                        .await
+                        .unwrap_or(false);
+                        let _ = tx.send(crate::pi::PiHostReply::Confirm(approved));
+                    });
+                    Some(PiHostReply::Deferred(deferred))
                 }
                 PiHostRequest::Select { id: _, .. } => Some(PiHostReply::Select(Some(String::new()))),
                 PiHostRequest::Input { .. } => Some(PiHostReply::Input(String::new())),
@@ -1085,9 +1198,12 @@ impl PiRuntime {
     }
 
     /// 插话。
-    pub async fn steer(&self, message: &str) -> Result<(), String> {
+    ///
+    /// `images` 是 orbcat 的 data URL 字符串（前端 `pendingImages`），
+    /// 转 pi 形状的活儿在 `pi::to_pi_images` 里做。
+    pub async fn steer(&self, message: &str, images: Vec<String>) -> Result<(), String> {
         let client = self.ensure_running().await?;
-        client.steer(message).await
+        client.steer(message, images).await
     }
 
     /// 中断当前运行。
@@ -1147,28 +1263,20 @@ impl PiRuntime {
             }
         });
         let gate_dir = self.data_dir.clone();
-        // 宿主注入的 gate（**优先**）—— 它能弹确认卡（MCP 授权那套）。
-        let host_gate = self.gate.lock().await.clone();
         // ⚠️ **会话 id 要用「这个 pi 进程自己的」**，不是用户当前正在看的那个。
         // 多会话并行时两者会不一样（用户可能在 B 会话看 A 的 run）。
         let gate_sid = self.session_id.clone();
-        let gate: crate::pi_bridge::GateHandler = Arc::new(move |tool, args| {
-            let real = tool.strip_prefix("orb_").unwrap_or(tool);
-            // 有宿主 gate → 用它（能弹卡、能走真实的 mcp_grants / 确认卡流程）
-            if let Some(g) = host_gate.clone() {
-                let real = real.to_string();
-                let args = args.clone();
-                let sid = gate_sid.clone();
-                // gate 是 async（可能阻塞在确认卡上）→ 桥是同步线程，
-                // 用独立 runtime 把 future 跑完（与工具执行那条路同口径）。
-                return match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => Ok(rt.block_on(async move { g(&real, &args, sid).await })),
-                    Err(e) => Err(format!("起权限裁决 runtime 失败: {e}")),
-                };
-            }
-            // 没有宿主 gate → 退回本地静态裁决（文件网关 + MCP grants）
-            crate::tools::gate_bridge(real, args, &gate_dir)
-        });
+        // ⚠️ **P2 根因：不要在建桥那刻把宿主 gate 抄成快照**。
+        //
+        // 旧写法：`let host_gate = self.gate.lock().await.clone();`（建桥时抄走）
+        // ⇒ `set_gate` 若在**建桥之后**才调用（PiPool 里很常见：先 `acquire`
+        //    建出运行时、之后 `pool.set_gate` 才设），那些运行时的桥**永远拿不到
+        //    宿主 gate** ⇒ 落到静态裁决分支 ⇒ **MCP 授权静默降级**成
+        //    静态拒绝：**用户永远等不到确认卡**，模型只看到「需要授权」，
+        //    而且**没有任何日志**说明降级发生过。
+        //
+        // ⇒ 改成**每次调用现取**（见 `build_gate`）。
+        let gate = build_gate(&self.gate, gate_sid, gate_dir);
         // system prompt 由**宿主**提供 —— pi 自己的默认 prompt 是「coding agent」
         // 那一套，与 orbcat 的「私人助手」定位、人格、记忆体系完全不同。
         //
@@ -1200,6 +1308,46 @@ impl PiRuntime {
         *self.bridge.lock().await = Some(bridge.clone());
         Ok(bridge)
     }
+}
+
+/// 造桥用的**权限裁决器**。
+///
+/// ⚠️ **P2 核心：宿主 gate 必须「每次调用现取」，不能在建桥那刻抄成快照。**
+///
+/// 旧实现（建桥时 `self.gate.lock().await.clone()`）的问题：
+/// `set_gate` 若在**建桥之后**才调用（PiPool 里很常见：先 `acquire` 建出运行时、
+/// 之后 `pool.set_gate` 才设），那些运行时的桥**永远拿不到宿主 gate**
+/// ⇒ 落到静态裁决分支 ⇒ **MCP 授权静默降级**成静态拒绝：
+/// **用户永远等不到确认卡**，模型只看到「需要授权」，而且**没有任何日志**
+/// 说明降级发生过。
+///
+/// 现在：闭包持有 `Arc<Mutex<Option<GateFn>>>`，每次调用现取。
+/// 桥的 handler 跑在**同步线程**里 ⇒ 用 `blocking_lock()`（不是 async 上下文）。
+pub(crate) fn build_gate(
+    gate_cell: &std::sync::Arc<tokio::sync::Mutex<Option<GateFn>>>,
+    gate_sid: Option<String>,
+    gate_dir: std::path::PathBuf,
+) -> crate::pi_bridge::GateHandler {
+    let gate_cell = gate_cell.clone();
+    Arc::new(move |tool, args| {
+        let real = tool.strip_prefix("orb_").unwrap_or(tool);
+        // 每次现取 ⇒ 后设的 gate 也能生效
+        let host_gate = gate_cell.blocking_lock().clone();
+        // 有宿主 gate → 用它（能弹卡、能走真实的 mcp_grants / 确认卡流程）
+        if let Some(g) = host_gate {
+            let real = real.to_string();
+            let args = args.clone();
+            let sid = gate_sid.clone();
+            // gate 是 async（可能阻塞在确认卡上）→ 桥是同步线程，
+            // 用独立 runtime 把 future 跑完（与工具执行那条路同口径）。
+            return match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => Ok(rt.block_on(async move { g(&real, &args, sid).await })),
+                Err(e) => Err(format!("起权限裁决 runtime 失败: {e}")),
+            };
+        }
+        // 没有宿主 gate → 退回本地静态裁决（文件网关 + MCP grants）
+        crate::tools::gate_bridge(real, args, &gate_dir)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1239,6 +1387,8 @@ pub struct PiPool {
     /// Tauri 的 `setup` 闭包是**同步**的，没法 await。
     /// 这里只在启动时写一次、创建运行时时读一次，临界区里没有 await ⇒ 安全。
     gate: std::sync::Arc<std::sync::Mutex<Option<GateFn>>>,
+    /// 宿主确认钩子（pi 的确认框 → 我们的确认卡）
+    confirm_hook: std::sync::Arc<std::sync::Mutex<Option<ConfirmFn>>>,
     /// 最多同时存在几个 pi 进程
     max_live: std::sync::atomic::AtomicUsize,
 }
@@ -1255,16 +1405,64 @@ impl PiPool {
                 std::collections::HashMap::new(),
             )),
             gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            confirm_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_live: std::sync::atomic::AtomicUsize::new(2),
         })
     }
 
-    /// 设置权限裁决回调（池里**新建**的运行时都会套上）。
+    /// 设置权限裁决回调。
     ///
     /// **同步** —— Tauri 的 `setup` 闭包是同步的，没法 await。
+    ///
+    /// ⚠️ **P2：必须同时套到「已经存在」的运行时上** ——
+    /// 旧实现只写池子自己那份（`pool.gate`），而**已经建出来的**运行时
+    /// 各自的 gate 仍是 `None` ⇒ 它们的桥会落到静态裁决分支
+    /// ⇒ **MCP 授权静默降级**（用户永远等不到确认卡，且没有任何日志）。
+    /// 池里的运行时是**懒创建**的（首次对话才建），所以
+    /// 「先 acquire、后 set_gate」是**常见顺序**，不是边角情况。
     pub fn set_gate(&self, f: GateFn) {
         if let Ok(mut g) = self.gate.lock() {
-            *g = Some(f);
+            *g = Some(f.clone());
+        }
+        // 同步套到已有运行时上（它们的 gate 字段是 `try_lock` 写的）
+        let sessions = self.sessions.clone();
+        // ⚠️ 必须把 match 结果**绑到变量** —— 直接写成函数尾表达式的话，
+        //    guard 的临时量活到函数结束，而 `sessions` 先被 drop（E0597）。
+        let applied: usize = match sessions.try_lock() {
+            Ok(map) => {
+                let n = map.len();
+                for rt in map.values() {
+                    rt.set_gate(f.clone());
+                }
+                n
+            }
+            Err(_) => 0,
+        };
+        if applied > 0 {
+            eprintln!("[orbcat] pi 内核：已把宿主权限闸套到 {applied} 个已存在的运行时");
+        }
+    }
+
+    /// 设置宿主确认钩子（池里**新建**的运行时都会套上；已有的也一起套）。
+    ///
+    /// 与 [`PiPool::set_gate`] 同口径。
+    pub fn set_confirm_hook(&self, f: ConfirmFn) {
+        if let Ok(mut g) = self.confirm_hook.lock() {
+            *g = Some(f.clone());
+        }
+        let sessions = self.sessions.clone();
+        let applied: usize = match sessions.try_lock() {
+            Ok(map) => {
+                let n = map.len();
+                for rt in map.values() {
+                    rt.set_confirm_hook(f.clone());
+                }
+                n
+            }
+            Err(_) => 0,
+        };
+        if applied > 0 {
+            eprintln!("[orbcat] pi 内核：已把宿主确认通道套到 {applied} 个已存在的运行时");
         }
     }
 
@@ -1344,6 +1542,13 @@ impl PiPool {
             let gate = self.gate.lock().ok().and_then(|g| g.clone());
             if let Some(gate) = gate {
                 rt.set_gate(gate);
+            }
+        }
+        {
+            // 宿主确认通道同样要套到新运行时上（否则新会话的 pi 确认框没人接）
+            let hook = self.confirm_hook.lock().ok().and_then(|g| g.clone());
+            if let Some(hook) = hook {
+                rt.set_confirm_hook(hook);
             }
         }
         g.insert(session_id.to_string(), rt.clone());
@@ -1548,6 +1753,66 @@ mod tests {
         assert_eq!(sanitize_server_name("my server"), "my_server");
         assert_eq!(sanitize_server_name("a.b"), "a_b");
         assert_eq!(sanitize_server_name("工具组"), "___");
+    }
+
+    /// 🔴 P2 回归测试：**建桥之后**才设的宿主 gate，桥的裁决**必须**用上。
+    ///
+    /// ## 旧实现为什么坏
+    ///
+    /// 旧代码在建桥那刻 `self.gate.lock().await.clone()` 把宿主 gate **抄成快照**。
+    /// 于是「先建桥、后 `set_gate`」的运行时**永远拿不到**宿主 gate
+    /// ⇒ 落到静态裁决分支 ⇒ **MCP 授权静默降级**成静态拒绝：
+    /// **用户永远等不到确认卡**，模型只看到「需要授权」，且**没有任何日志**。
+    ///
+    /// PiPool 的运行时是**懒创建**的（首次对话才建），
+    /// 所以「先 `acquire`、后 `pool.set_gate`」是**常见顺序**，不是边角情况。
+    ///
+    /// ## 判据（副作用式，不是看日志）
+    ///
+    /// 直接问「桥的裁决器」：同一个 MCP 工具名，
+    /// 没设宿主 gate 时被静态拒绝、设了之后被宿主放行 ⇒ 说明它**每次现取**。
+    #[test]
+    fn P2_建桥之后设的宿主gate_桥的裁决也要用上() {
+        let cell = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let dir = std::env::temp_dir().join("orbcat-pi-gate-test");
+        let _ = std::fs::create_dir_all(&dir);
+
+        // ① 先建桥（宿主 gate 还没设）
+        let gate = build_gate(&cell, Some("sess-1".into()), dir.clone());
+
+        // ② 没设宿主 gate ⇒ 静态裁决：MCP 工具没授权 ⇒ 拒绝
+        let (ok, _why) = gate("mcp__probe__tool", &serde_json::json!({}))
+            .expect("裁决不该报错");
+        assert!(
+            !ok,
+            "没设宿主 gate 时，未授权的 MCP 工具应被静态拒绝（回落分支）"
+        );
+
+        // ③ ⚠️ **建桥之后**才设宿主 gate —— 旧实现在这里就露馅了
+        let cell2 = cell.clone();
+        std::thread::spawn(move || {
+            // ⚠️ **不能 `.unwrap()`** —— `blocking_lock()` 返回 guard，
+            //    `.unwrap()` 会被自动 deref 成 `Option::unwrap()` ⇒ 拿到的是
+            //    GateFn 本身（不是 guard）⇒ 后面 `*g = ...` 直接类型错。
+            let mut g = cell2.blocking_lock();
+            // ⚠️ 闭包参数**不要自己标类型** —— 交给 `GateFn` 推断，
+            //    否则 boxed future 的协变推导不上（E0277）。
+            let host: GateFn = std::sync::Arc::new(move |_tool, _args, _sid| {
+                Box::pin(async { (true, "宿主放行".to_string()) })
+            });
+            *g = Some(host);
+        })
+        .join()
+        .expect("设置宿主 gate 的线程不该 panic");
+
+        // ④ 现在必须走宿主裁决 ⇒ 放行
+        let (ok, why) = gate("mcp__probe__tool", &serde_json::json!({}))
+            .expect("裁决不该报错");
+        assert!(
+            ok,
+            "设了宿主 gate 之后，桥的裁决必须走宿主（旧的快照实现这里会被静态拒绝）"
+        );
+        assert_eq!(why, "宿主放行");
     }
 }
 

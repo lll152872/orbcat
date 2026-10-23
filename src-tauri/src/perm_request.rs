@@ -297,6 +297,10 @@ impl PendingCmd {
             "mcp"
         } else if self.id.starts_with("pa") {
             "ask"
+        } else if self.id.starts_with("pp") {
+            // `pp*` = pi 内核自己的确认框（`ctx.ui.confirm`）
+            // ⇒ 前端新开一张 `kind="pi"` 的卡（只「允许 / 拒绝」）
+            "pi"
         } else {
             "command"
         };
@@ -980,6 +984,69 @@ impl PermHub {
         Ok(verdict)
     }
 
+    /// **pi 内核的确认框**（`ctx.ui.confirm()`）：弹一张 `kind="pi"` 的卡并等用户。
+    ///
+    /// ## 口径（与 `pm*` 一致，Chief 拍板）
+    ///
+    /// - id 前缀 **`pp*`** ⇒ 走 `pending_cmds`（与命令/MCP/提问同一张表），
+    ///   所以 `perm_request_decide` 的**前缀路由必须认 `pp`**（否则决定送错表
+    ///   ⇒ agent 卡死到超时 —— `pm*` 踩过的那个坑，见 P3）。
+    /// - 超时 **3 分钟**（`REQUEST_TIMEOUT_MS`，与 `pm*` 一样，用户不用记两套）。
+    /// - **fail-closed**：超时 / 通道出错 ⇒ 拒绝。
+    /// - **不写防骚扰 memo**（同 `ask_user`）：pi 问一次不代表以后都不该问。
+    /// - **不支持「总是允许」**（Q5）：pi 侧没有对应的授权表，
+    ///   硬接会造出第三套口径。这张卡只有「允许 / 拒绝」。
+    pub async fn ask_pi_confirm(
+        &self,
+        title: String,
+        message: String,
+        session_id: &str,
+    ) -> Result<Verdict, String> {
+        let id = format!("pp{}", self.seq.fetch_add(1, Ordering::Relaxed) + 1);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let timeout_ms = REQUEST_TIMEOUT_MS;
+
+        let req = PendingCmd {
+            id: id.clone(),
+            command: String::new(),
+            normalized: String::new(),
+            risk: Risk::Medium,
+            head_fp: String::new(),
+            full_fp: String::new(),
+            reason: "pi 内核请求确认".into(),
+            session_id: session_id.to_string(),
+            created_at: permission::now_ms(),
+            timeout_ms,
+            question: title,
+            options: vec!["允许".into(), "拒绝".into()],
+            tx,
+        };
+        let view = req.view();
+        // kind 由 PendingCmd::view() 按 `pp*` 前缀推出
+        debug_assert_eq!(view.kind, "pi");
+
+        {
+            let mut map = self
+                .pending_cmds
+                .lock()
+                .map_err(|e| format!("待办表锁失败: {e}"))?;
+            map.insert(id.clone(), req);
+        }
+        self.emit_request(&view);
+
+        let verdict = match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(_)) => Verdict::bare(Decision::Deny),
+            Err(_) => Verdict::bare(Decision::Timeout),
+        };
+
+        if let Ok(mut map) = self.pending_cmds.lock() {
+            map.remove(&id);
+        }
+        self.emit_resolved(&id, verdict.decision);
+        Ok(verdict)
+    }
+
     /// 把命令批准结果写进命令授权表，返回写入的授权。
     ///
     /// - `Approve` → 批准**一次**（完整命令指纹，Once 档，**不落盘**）
@@ -1454,5 +1521,50 @@ mod tests {
         assert!(hub.pending_views().is_empty());
         // 取消不是拒绝 —— 不该留下会误伤下次申请的 memo
         assert!(hub.find_denied_cmd("s1", "mcp__ssh__run-command").is_none());
+    }
+
+    /// 🔴 P3 回归测试：pi 确认框（`pp*`）必须走 `pending_cmds` 那张表，
+    /// 且**前缀路由要认 `pp`** —— 否则决定被送进文件级表 ⇒ pi 等不到答复、卡死。
+    ///
+    /// 判据：① 卡的 `kind` 是 `"pi"`（前端据此新开一张卡）；
+    /// ② `decide_command` 能把它唤醒并送达「允许」。
+    #[tokio::test]
+    async fn pi确认走pp前缀_能被decide_command唤醒() {
+        let hub = std::sync::Arc::new(PermHub::new());
+        let hub2 = hub.clone();
+        let waiter = tokio::spawn(async move {
+            hub2.ask_pi_confirm(
+                "pi 要做一件事".to_string(),
+                "允许吗".to_string(),
+                "s1",
+            )
+            .await
+        });
+
+        // 等卡挂上
+        let mut id = String::new();
+        for _ in 0..200 {
+            let views = hub.pending_views();
+            if let Some(v) = views.first() {
+                id = v.id.clone();
+                assert_eq!(v.kind, "pi", "`pp*` 的卡 kind 必须是 pi");
+                assert!(id.starts_with("pp"), "id 必须以 pp 开头，实际 {id}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!id.is_empty(), "pi 确认卡应挂上待办表");
+
+        // 前端点「允许」⇒ 走 `decide_command`（**P3 的前缀路由**）
+        hub.decide_command(&id, Decision::Approve, String::new())
+            .expect("pp* 应能被 decide_command 唤醒");
+
+        let got = tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("确认卡应立刻唤醒")
+            .unwrap()
+            .expect("ask_pi_confirm 不该报错");
+        assert!(got.is_approved());
+        assert_eq!(got.decision, Decision::Approve);
     }
 }
