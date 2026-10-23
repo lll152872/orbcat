@@ -23,15 +23,30 @@
 //!
 //! ⚠️ 假模型**必须说 SSE**（`text/event-stream` + `data:` + `[DONE]`，chunk 带
 //! `choices[0].finish_reason`）—— 否则 pi 抛 "Stream ended without finish_reason"。
+//!
+//! ## 长度上限从哪来
+//!
+//! `≤ 20000 字` 是 Chief 拍板的瘦身目标区间（15000–20000）的上沿。
+//! **本用例量的是真实 agent-data**（`orbcat_data_dir()`）⇒ 数字即真机数字，
+//! 不是夹具数字。阈值留了余量：2026-10-24 实测瘦身后 ≈19.9k 字，
+//! 原始 40706 字。记忆/技能变多时这条会红 —— 那是**该重新瘦身的信号**，不是误报。
 
 #[path = "fake_model.rs"]
 mod fake_model;
 
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use orbcat_lib::agent::ProgressFn;
 use orbcat_lib::pi_runtime::PiRuntime;
+
+/// 内容 hash（8 位 hex）—— 给 dump 文件名做唯一标识。
+fn short_hash(s: &str) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    format!("{:08x}", h.finish() as u32)
+}
 
 fn runtime_dir() -> Option<PathBuf> {
     let mut p = std::env::current_exe().ok()?;
@@ -75,7 +90,13 @@ async fn 合成后_pi原生段_我们的记忆段_执行位置段_都在() {
     let fake = fake_model::simple_text_model("好的")
         .expect("假模型应能起");
 
-    let agent_dir = std::env::temp_dir().join("orbcat-pi-compose-agent");
+    // ⚠️ agent_dir 必须**唯一**：pi 的 agent 目录里会有 mcp.json / settings 等，
+    // 两个会话共用同一个目录会互相串（2026-10-24 实测踩到：另一条线跑测试时
+    // 覆盖了本线的 pi 配置）。
+    let agent_dir = std::env::temp_dir().join(format!(
+        "orbcat-pi-compose-agent-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&agent_dir);
     let _ = std::fs::create_dir_all(&agent_dir);
 
@@ -114,12 +135,29 @@ async fn 合成后_pi原生段_我们的记忆段_执行位置段_都在() {
         })
         .to_string();
 
-    eprintln!("=== 合成后 system prompt 长度 = {} 字 ===", sys.chars().count());
+    let len = sys.chars().count();
+    eprintln!("=== 合成后 system prompt 长度 = {} 字 ===", len);
 
-    // dump 全文到文件（stderr 会被记忆撑爆）
-    let dump = std::env::temp_dir().join("orbcat-pi-prompt-dump.txt");
-    let _ = std::fs::write(&dump, &sys);
-    eprintln!("=== 全文 dump: {} ===", dump.display());
+    // ── dump 全文到文件（stderr 会被记忆撑爆）──
+    //
+    // ⚠️ **固定名会被别的会话 / 别的分支覆盖**（2026-10-24 实测：守门跑发布线时
+    // 覆盖了本分支的产物，字数结论直接对不上）⇒
+    // ① 另写一份**按内容 hash 命名**的：同内容幂等可覆盖、不同内容互不踩；
+    // ② **固定名那份保留**（守门 / 验收脚本在引用，删了会打断别人），
+    //    但注明它只是「最近一次跑的」，**以 hash 名为准**。
+    let fixed_dump = std::env::temp_dir().join("orbcat-pi-prompt-dump.txt");
+    let _ = std::fs::write(&fixed_dump, &sys);
+    let hashed_dump = std::env::temp_dir()
+        .join(format!("orbcat-pi-prompt-dump-{}.txt", short_hash(&sys)));
+    let _ = std::fs::write(&hashed_dump, &sys);
+    eprintln!(
+        "=== 全文 dump（**以这份为准**）: {} ===",
+        hashed_dump.display()
+    );
+    eprintln!(
+        "=== 全文 dump（固定名 = 最近一次跑的，可能被别的会话覆盖）: {} ===",
+        fixed_dump.display()
+    );
 
     // ── 判据 1：我们的人格在，且**pi 的 coding agent 人格已被换掉** ──
     //
@@ -132,23 +170,27 @@ async fn 合成后_pi原生段_我们的记忆段_执行位置段_都在() {
         "🔴 pi 的 coding agent 人格还在 —— 人格打架，模型会以为自己是写代码的助手"
     );
 
-    // ── 判据 2：工具说明没丢 ──
+    // ── 判据 2：模型知道有工具可用、且知道**去哪查** ──
     //
-    // pi 的 `tools` 段（它自己的工具清单）因为 customPrompt 被连带跳过
-    // （上游 if/else：customPrompt 一设，tools/rules/docs 三段都不生成）——
-    // 但那三段是 **coding agent 专用**（pi 文档 / bash 工具规则 / 代码工具清单），
-    // 对「用户的私人助手」无用。我们自己的**外部工具索引**段顶替它。
-    let tools_doc = sys.contains("外部工具索引") || sys.contains("MCP 工具组");
+    // ⚠️ **不能断言「外部工具索引」那段字面在** —— A1 就是「整段移除它」
+    // ⇒ 那样断言必然红。判据的本质是「模型知道有工具、也知道去哪查」。
+    let tools_doc = sys.contains("外部工具（按需查）")
+        || sys.contains("search_tools")
+        || sys.contains("MCP 工具组");
     assert!(
         tools_doc,
-        "🔴 工具说明丢了 —— 模型不知道有哪些工具可用"
+        "🔴 工具说明丢了 —— 模型不知道有哪些工具可用、也不知道去哪查"
+    );
+    assert!(
+        sys.contains("search_tools"),
+        "🔴 缺「工具清单用 `search_tools` 现查」的指针 —— 剔掉索引但不指路 = 静默删除"
     );
 
     // ── 判据 3：我们的记忆/上下文段在 ──
     let memory = sys.contains("# 长期记忆") || sys.contains("# 动态信息");
     assert!(memory, "🔴 我们的记忆/上下文段不在 —— 合成失败");
 
-    // ── 判据 3：执行位置段在 ──
+    // ── 判据 4：执行位置段在 ──
     let exec_loc = sys.contains("# 当前执行位置");
     assert!(
         exec_loc,
@@ -156,8 +198,62 @@ async fn 合成后_pi原生段_我们的记忆段_执行位置段_都在() {
          会照旧写另一种 shell 的命令"
     );
 
+    // ── 判据 5（B1）：RULES.md 的开发规约正文**不在**，但**指针在** ──
+    //
+    // 真实 agent-data 的 RULES.md 里确实有 `# 以下为执行基准` 标题 ⇒
+    // 这条断言走的是真切分路径（不是"本来就没有"的假绿）。
+    assert!(
+        !sys.contains("# 以下为执行基准"),
+        "🔴 RULES.md 的开发规约正文还在 prompt 里 —— B1 没生效"
+    );
+    assert!(
+        sys.contains("开发规约（按需读）") && sys.contains("RULES.md"),
+        "🔴 缺「开发规约全文见 RULES.md」的指针 —— 剔掉但不指路 = 静默删除"
+    );
+
+    // ── 判据 6（A1）：没有逐条 MCP 工具清单常驻 ──
+    //
+    // ⚠️ **不能**用 `contains("外部工具索引")` 判断 —— 指针文案里也可能出现这几个字。
+    // 真正的判据是「**没有几十个具体的 mcp__<组>__<工具> 名字连着出现**」。
+    // 占位写法（`mcp__<组名>__<工具名>` / `mcp__*`）不算具体工具名。
+    let concrete: Vec<&str> = sys
+        .match_indices("mcp__")
+        .map(|(i, _)| {
+            let rest = &sys[i + 5..];
+            let end = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+                .unwrap_or(rest.len());
+            &sys[i..i + 5 + end]
+        })
+        // 具体工具名形如 `mcp__<组>__<工具>` ⇒ **两个** `__` 才算；
+            // `mcp__*` / `mcp__<组名>__<工具名>`（占位写法）只有一个，不算。
+            .filter(|n| n.matches("__").count() >= 2)
+        .collect();
+    assert!(
+        concrete.is_empty(),
+        "🔴 prompt 里出现了 {} 个具体 MCP 工具名（{:?}）—— A1 没生效：\
+         工具清单不该整段常驻，应只留「用 search_tools 现查」的指针",
+        concrete.len(),
+        &concrete[..concrete.len().min(5)]
+    );
+
+    // ── 判据 7：激活词段**原文一字不差** ──
+    //
+    // 激活词是**产品功能**（用户发「寒霜」触发特定行为）⇒ 瘦身时逐字保留。
+    assert!(
+        sys.contains("仅当用户这条消息**有且仅有**“寒霜”两个字")
+            && sys.contains("只回复“已成功”三个字")
+            && sys.contains("## 十、激活词"),
+        "🔴 激活词段原文不在或被改动 —— 激活词是产品功能，必须逐字保留"
+    );
+
+    // ── 判据 8：长度上限 ──
+    assert!(
+        len <= 20_000,
+        "🔴 合成后 prompt = {len} 字，超过 20000 字上限（瘦身目标区间 15000-20000）"
+    );
+
     eprintln!(
-        "✅ 三段都在：pi 原生段 ✓ · 我们的记忆/人格段 ✓ · 执行位置段 ✓（{} 字）",
-        sys.chars().count()
+        "✅ 三段都在：pi 原生段 ✓ · 我们的记忆/人格段 ✓ · 执行位置段 ✓（{len} 字）"
     );
 }
