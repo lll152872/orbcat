@@ -1,0 +1,68 @@
+name: Setup orbcat runtime (node + pi)
+description: |
+  构建 runtime/{node,pi} 并**断言它真的在**。
+
+  为什么要有这个 action：
+  ① 发布包必须带 runtime/ —— 缺了 pi 内核在用户机器上**静默失效**
+     （启动日志只打一行「未找到内置 runtime/ —— pi 内核不可用，继续用旧内核」，
+      用户看不出哪里不对），而 CI 之前是全绿的（审计 F1/F2）。
+  ② `src-tauri/tests/pi_*.rs` 的 `runtime_dir()` 找不到 runtime/ 时是
+     **静默跳过**（打印「跳过：runtime/ 未构建」然后 return）⇒
+     光加一行 `cargo test --tests` 是**假绿**：CI 里没有 runtime/，
+     1811 行 pi e2e 一条都不会真跑。断言这一步就是为了让「跳过」变成「红」。
+
+  分发内容（2026-10-23 用户拍板）：**只带 node + pi**（≈95MB）
+    · node —— PTC run_code 的硬依赖，pi 本身也是 node 路线
+    · pi   —— 内核本体
+    · **不带 git**（GPLv2 不再分发）、**不带 python**（不是硬依赖，
+      模型可能调而已 —— pi::bundled_python() 返回 Option，缺席即回落系统）
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch runtime assets (node + pi)
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path tools/.cache | Out-Null
+        # node.exe —— pi 要求 >= 22.19.0
+        $nodeVer = "22.23.4"
+        Invoke-WebRequest -Uri "https://nodejs.org/dist/v$nodeVer/node-v$nodeVer-win-x64.zip" -OutFile node.zip
+        Expand-Archive -Force node.zip
+        Copy-Item "node-v$nodeVer-win-x64/node.exe" tools/.cache/node.exe
+        # pi 内核 —— 公开 npm 包
+        npm pack @earendil-works/pi-coding-agent@1.4.0 --pack-destination tools/.cache
+        tar -xzf "tools/.cache/earendil-works-pi-coding-agent-1.4.0.tgz" -C tools/.cache
+        Move-Item -Force tools/.cache/package tools/.cache/pi-pkg
+        # jiti 是 pi 的依赖 —— runtime-ext/*.ts 是 .ts 扩展，靠它加载
+        npm pack jiti@2.7.0 --pack-destination tools/.cache
+        tar -xzf "tools/.cache/jiti-2.7.0.tgz" -C tools/.cache
+        New-Item -ItemType Directory -Force -Path tools/.cache/pi-pkg/node_modules | Out-Null
+        Move-Item -Force tools/.cache/package tools/.cache/pi-pkg/node_modules/jiti
+
+    - name: Build runtime (node + pi)
+      shell: bash
+      run: node tools/build-runtime-assets.mjs
+
+    # ⚠️ 这一步是整个 action 的重点：不是「构建成功就算好」，
+    #   而是**产物必须真的在磁盘上**（且结构对），
+    #   否则下面的 `cargo test --tests` 会静默跳过全部 pi e2e。
+    - name: Assert runtime present (else pi e2e tests silently skip)
+      shell: bash
+      run: node .github/actions/setup-runtime/assert-runtime.mjs
+
+    # ---- 假模型配置（第二个「静默跳过」入口）-------------------------
+    #
+    # `src-tauri/tests/pi_*.rs` 的 `orbcat_data_dir()` 是**向上找**一个
+    # 含 `models.json` 的 agent-data/ 目录；找不到就「跳过：找不到 orbcat 的
+    # agent-data/」然后 return ⇒ 集成测试又是一轮「全绿但什么都没跑」。
+    #
+    # CI 是全新 checkout：agent-data/ 整个被 .gitignore 忽略，**不可能有**。
+    # ⇒ 这里放一份**假**模型配置（无真实 key，url 指向不可达端口 ——
+    #    真模型测试要显式设 ORBCAT_REAL_MODEL=1 才会跑，默认不跑）。
+    #
+    # ⚠️ 只在**没有** models.json 时才写：本地跑这个 action 时，
+    #    仓库里的 agent-data/models.json 是用户真配置（带 API key），
+    #    绝不能被覆盖。
+    - name: Provide fixture models.json (only if absent)
+      shell: bash
+      run: node .github/actions/setup-runtime/ensure-fixture-models.mjs

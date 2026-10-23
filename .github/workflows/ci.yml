@@ -100,6 +100,20 @@ jobs:
       - name: Frontend build (dist must exist before cargo)
         run: npm run build
 
+      # ⚠️ **必须在下面那条 `cargo test --tests` 之前跑**，否则集成测试是**假绿**。
+      #
+      #   `src-tauri/tests/pi_*.rs` 的 `runtime_dir()` 找不到 runtime/ 时是
+      #   **静默跳过**（`eprintln!("跳过：runtime/ 未构建")` 然后 return）⇒
+      #   CI 全新 checkout 没有 runtime/ ⇒ 1500+ 行 pi e2e **一条都不跑**，
+      #   而 job 是绿的。（2026-10-23 守门实测：在**有** runtime/ 的树上跑
+      #   `cargo test --tests` = 671 passed / 0 failed 且**无一行「跳过」**；
+      #   没有 runtime/ 时就是全跳过。）
+      #
+      #   这个 action 做两件事：① 构建 runtime/{node,pi}；② **断言产物真的在**
+      #   （否则「构建成功但结构不对」还是会退化成静默跳过）。
+      - name: Setup runtime (node + pi) — required by integration tests
+        uses: ./.github/actions/setup-runtime
+
       - name: Rust check
         run: cargo check --manifest-path src-tauri/Cargo.toml --lib
 
@@ -428,31 +442,16 @@ jobs:
       #   · **不带 git**（GPLv2 不再分发）、**不带 python**（不是硬依赖，
       #     模型可能调而已 —— pi::bundled_python() 返回 Option，缺席即回落系统）
       #
+      # ⚠️ 走**同一个复合 action**（`.github/actions/setup-runtime`），
+      #    不在这里自带一份复制逻辑 —— 判据必须逐字一致，否则三处各判各的
+      #    （CI 装配前 / CI 跑集成测试前 / 本地出包前）。
+      #    action 还会**断言产物真的在**（否则构建成功但结构不对 ⇒ pi e2e 静默跳过 = 假绿）。
+      #
       # ⚠️ 只在 Windows 装配 zip 时需要。macOS 那条走 tauri bundle 成 .app，
       #    它的 runtime 归属另议（现在 .app 里没有 runtime/，pi 内核在 macOS 上不可用）。
-      - name: Fetch runtime assets (node + pi)
+      - name: Setup runtime (node + pi)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path tools/.cache | Out-Null
-          # node.exe —— pi 要求 >= 22.19.0
-          $nodeVer = "22.23.4"
-          Invoke-WebRequest -Uri "https://nodejs.org/dist/v$nodeVer/node-v$nodeVer-win-x64.zip" -OutFile node.zip
-          Expand-Archive -Force node.zip
-          Copy-Item "node-v$nodeVer-win-x64/node.exe" tools/.cache/node.exe
-          # pi 内核 —— 公开 npm 包
-          npm pack @earendil-works/pi-coding-agent@1.4.0 --pack-destination tools/.cache
-          tar -xzf "tools/.cache/earendil-works-pi-coding-agent-1.4.0.tgz" -C tools/.cache
-          Move-Item -Force tools/.cache/package tools/.cache/pi-pkg
-          # jiti 是 pi 的依赖 —— runtime-ext/*.ts 是 .ts 扩展，靠它加载
-          npm pack jiti@2.7.0 --pack-destination tools/.cache
-          tar -xzf "tools/.cache/jiti-2.7.0.tgz" -C tools/.cache
-          New-Item -ItemType Directory -Force -Path tools/.cache/pi-pkg/node_modules | Out-Null
-          Move-Item -Force tools/.cache/package tools/.cache/pi-pkg/node_modules/jiti
-
-      - name: Build runtime (node + pi)
-        if: runner.os == 'Windows'
-        run: node tools/build-runtime-assets.mjs
+        uses: ./.github/actions/setup-runtime
 
       # ---- Windows（x64 / arm64）------------------------------------------
       - name: Build Windows
