@@ -1043,6 +1043,14 @@ export interface MockScenario {
   fail?: string[];
   /** 预览页自动导航到哪一屏（命令面板的命令名） */
   goto?: string;
+  /**
+   * 预览页在 boot 之后**模拟一次窗口拖放**（把文件拖到球上）。
+   *
+   * 为什么用模拟而不是造数据：拖放走的是 Tauri 的**窗口事件**（不是 invoke），
+   * 只有真的发一次事件，前端那条链路才会被走一遍 —— 这才是「可 mock」的正解
+   * （mock 的是**事件源**，不是把结果硬塞进状态）。
+   */
+  simulateDrop?: string[];
 }
 
 /** 空态：什么都没配过 */
@@ -1209,6 +1217,17 @@ export const SCENARIOS: MockScenario[] = [
     desc: "上下文占用 87%，助手问要不要压缩",
     cover: compactCover,
     goto: "chat",
+  },
+  {
+    id: "drop-path",
+    label: "拖入路径（文件/文件夹）",
+    desc: "把文件拖到球上：面板自动展开、路径进输入区、单行中间省略、不自动发送",
+    cover: () => {},
+    goto: "chat",
+    simulateDrop: [
+      "D:\\workplace\\悬浮小agent\\orbcat\\src\\views\\recovery.ts",
+      "D:\\workplace\\悬浮小agent\\orbcat\\docs\\09-FRONTEND-HANDOVER.md",
+    ],
   },
   {
     id: "mcp",

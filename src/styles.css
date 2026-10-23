@@ -157,6 +157,24 @@ body {
   transform: scale(0.95);
 }
 
+/* ---- 拖放悬停反馈（把文件/文件夹拖到球上） ----
+   ⚠️ 为什么必须有状态反馈：球实际只有 76×76，猫头在图上就 30px，
+   「张嘴」那个细节在真球上基本看不见 ⇒ 拖放反馈不能只靠那张图。
+   放大 + 提亮 + 猫白光晕，三者叠加 ⇒ 在最终美术到位之前反馈就已经明确可见；
+   之后有了好图，两者是叠加而不是互相依赖。
+   ⚠️ 用 `.orb.orb--dragover`（两个类）压过 `.orb:hover` 的特异度。 */
+.orb.orb--dragover {
+  transform: scale(1.25);
+  filter: brightness(1.15);
+  box-shadow:
+    0 0 0 4px var(--cat-wash-2),
+    0 0 18px 6px var(--cat-wash-2);
+  transition:
+    transform 200ms ease,
+    filter 200ms ease,
+    box-shadow 200ms ease;
+}
+
 /* 状态帧图层：六帧叠放在同一个圆里，靠 opacity 切换 —— 同一时刻只有一帧可见
    ⚠️ 贴图已裁到球的紧贴包围盒（球占 ~95%），inset 0 时球径 ≈ 76/84 物理像素。
    窗口现在比球大一圈（每边 10 逻辑像素，见 lib.rs::ORB_PAD_LOGICAL），
@@ -1098,6 +1116,64 @@ body {
 
 .thumbs.has {
   display: flex;
+}
+
+/* ---- 拖放进来的路径条（与图片附件同一个待遇） ---- */
+.paths {
+  display: none;
+  gap: 6px;
+  padding: 0 12px 8px;
+  flex-shrink: 0;
+}
+
+.paths.has {
+  display: flex;
+}
+
+.path-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 3px 4px 3px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--cat-wash-2);
+  background: var(--cat-wash);
+  color: var(--g2);
+  font-size: var(--fs-1);
+  line-height: 1.5;
+  flex-shrink: 0;
+}
+
+/* 单行不换行；省略由 JS 做「中间省略」（尾部才是文件名，不能省），
+   这里的 ellipsis 只是兜底（路径再短也不该换行）。 */
+.path-chip code {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* 宽度由容器决定（flex 收缩 + min-width:0）⇒ JS 能量到真实可用宽度，
+     按像素做「中间省略」；CSS 的 ellipsis 只是最后一道兜底。 */
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.path-x {
+  border: none;
+  background: transparent;
+  color: var(--g3);
+  cursor: pointer;
+  font-size: var(--fs-1);
+  line-height: 1;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+
+.path-x:hover {
+  color: var(--g1);
+  background: var(--cat-wash-2);
 }
 
 .thumb {

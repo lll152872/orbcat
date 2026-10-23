@@ -26,7 +26,7 @@
         "shadow": false,
         "center": true,
         "visible": true,
-        "dragDropEnabled": false,
+        "dragDropEnabled": true,
         "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force-renderer-accessibility --disable-gpu-compositing --disable-gpu-rasterization --disable-gpu-vsync --disable-frame-rate-limit"
       }
     ],

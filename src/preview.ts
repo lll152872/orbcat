@@ -20,6 +20,7 @@ import { setDataSource } from "./data";
 import { MockSource } from "./data/mock";
 import { SCENARIOS, scenarioById } from "./data/mockdata";
 import { setInvokeHandler } from "./preview/tauri-shim";
+import { emitDragDrop } from "./preview/tauri-shim";
 
 /** 场景 id（URL 参数 `?scenario=`） */
 function currentScenarioId(): string {
@@ -164,6 +165,18 @@ async function boot(): Promise<void> {
 
   // 状态条/标题条有时是异步补的，等一拍再收尾
   await new Promise((r) => setTimeout(r, 250));
+
+  // 6) 场景要求「拖入路径」时，**模拟一次真正的窗口拖放事件**
+  //    （走的是前端的真链路：hover 反馈 → 展开面板 → 路径进输入区 → 聚焦）
+  if (scenario.simulateDrop?.length) {
+    emitDragDrop({ type: "enter", paths: scenario.simulateDrop });
+    await new Promise((r) => setTimeout(r, 120));
+    emitDragDrop({ type: "over", paths: scenario.simulateDrop });
+    await new Promise((r) => setTimeout(r, 120));
+    emitDragDrop({ type: "drop", paths: scenario.simulateDrop });
+    await new Promise((r) => setTimeout(r, 250));
+  }
+
   document.body.dataset.previewReady = "1";
 }
 
