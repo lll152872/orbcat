@@ -108,4 +108,8 @@ tools/.cache/
 probeN*/
 
 # 纯 HTML 预览件（构建产物：npm run build:preview ⇒ preview/preview.html）
-preview
+# ⚠️ 必须加强前斜杠（`/preview/`）：否则连 **`src/preview/`** 这个
+#    源码目录也会被一起忽略（旧写法 `preview` 匹配任意层级），
+#    导致 `src/preview/tauri-shim.ts` **从来没进过 git** → 合并后 tsc 报
+#    `Cannot find module './preview/tauri-shim'`（2026-10-23 基线合入时被基线验证抓到）。
+/preview/
