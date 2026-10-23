@@ -30,6 +30,27 @@ function currentScenarioId(): string {
   }
 }
 
+/**
+ * 是否隐藏预览侧栏（URL 参数 `?harness=0`）。
+ *
+ * ## 为什么需要
+ *
+ * ① **目视核对要真宽度**：侧栏占 300px，侧栏在场时窗口得让位 ⇒
+ *    整个预览台会被挤窄，看不出真机上的布局。
+ * ② **出视频帧要干净画面**：宣传那侧要的是「只有 orbcat」的素材，
+ *    侧栏是预览工具，不该出现在成片里。
+ *
+ * 默认仍然**显示**侧栏（预览是给人翻场景用的）。
+ */
+function harnessHidden(): boolean {
+  try {
+    const v = new URLSearchParams(location.search).get("harness");
+    return v === "0" || v === "off";
+  } catch {
+    return false;
+  }
+}
+
 const scenarioId = currentScenarioId();
 const scenario = scenarioById(scenarioId);
 
@@ -46,6 +67,11 @@ setDataSource(mock);
 
 /** 预览侧栏（场景清单）—— 纯预览用，不属于应用界面 */
 function renderHarness(): void {
+  // ⚠️ `?harness=0` ⇒ 完全不出侧栏（目视核对真宽度 / 出干净的视频帧）
+  if (harnessHidden()) {
+    document.body.classList.add("pv-noharness");
+    return;
+  }
   const side = document.createElement("aside");
   side.className = "pv-harness";
   const rows = SCENARIOS.map((s) => {
@@ -115,6 +141,7 @@ const SCENARIO_VIEW: Record<string, string> = {
   usage: "usage",
   life: "life",
   settings: "settings",
+  behavior: "behavior",
 };
 
 async function boot(): Promise<void> {

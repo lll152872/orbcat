@@ -76,6 +76,14 @@ type MockState = {
   bgDeskEnabled: boolean;
   /** 开后台失败时的报错（测"建不出桌面要立刻报错"） */
   bgDeskSetError: string | null;
+  /**
+   * 命令用的 shell（`pwsh` / `gitbash`）—— 对应 settings.execShell。
+   *
+   * ⚠️ **必须真的存**：前端选完要把返回的��读回来更新界面，
+   *    mock 若返回 null ⇒ 前端永远显示 pwsh ⇒ 「选了没反应」测不出来。
+   *    默认 "pwsh" = 老用户升级后没有这个字段时的行为（行为不变）。
+   */
+  execShell: "pwsh" | "gitbash";
   bootNeedsInit: boolean;
   bootHasModels: boolean;
   windowModes: string[];
@@ -156,6 +164,7 @@ function defaultState(): MockState {
     modeSetError: null,
     bgDeskEnabled: false,
     bgDeskSetError: null,
+    execShell: "pwsh",
     bootNeedsInit: false,
     bootHasModels: true,
     windowModes: [],
@@ -349,8 +358,7 @@ const emptyOk: Record<string, unknown> = {  set_window_mode: null,
   confirm_panel_opened: null,
   recovery_diagnostic: "C:\\\\mock\\\\agent-data\\\\diagnostics\\\\diag-mock.txt",
   mcp_status: null,
-  get_settings: { selectedModel: "mock-1", lastSession: null, blurCollapse: false },
-  search_status: {
+  get_settings: { selectedModel: "mock-1", lastSession: null, blurCollapse: false },  search_status: {
     provider: "",
     providerLabel: "未配置",
     hasKey: false,
@@ -611,6 +619,36 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
       }
       state.bgDeskEnabled = !!args?.enabled;
       return state.bgDeskEnabled as T;
+    }
+    /**
+     * 设置。
+     *
+     * ⚠️ 必须**带 execShell 回去** —— 前端进行为页时读它来决定选中哪一项。
+     *    静态返回值 ⇒ 永远是默认值 ⇒ 「选了存了但读不回来」测不出来。
+     */
+    case "get_settings":
+      return {
+        ...(emptyOk.get_settings as Record<string, unknown>),
+        execShell: state.execShell,
+      } as T;
+    /**
+     * 切 shell（`pwsh` / `gitbash`）—— **真落盘**。
+     *
+     * ⚠️ 必须返回**落盘后的值**：前端拿返回值更新界面，
+     *    返回 null ⇒ 界面永远停在 pwsh ⇒ 「选了没反应」测不出来。
+     */
+    case "set_exec_shell": {
+      const shell = String(args?.shell ?? "pwsh").trim().toLowerCase();
+      if (shell !== "pwsh" && shell !== "gitbash") {
+        throw new Error(`未知的 shell：${shell}`);
+      }
+      state.execShell = shell;
+      return shell as T;
+    }
+    /** 执行权限档位（前端要拿返回值更新界面 ⇒ 返回落盘后的档位） */
+    case "set_exec_trust": {
+      const mode = String(args?.mode ?? "ask");
+      return mode as T;
     }
     case "chat":
     case "chat_pi": {

@@ -185,6 +185,14 @@ export class TauriSource implements DataSource {
   readonly settings: SettingsApi = {
     get: () => this.call<SettingsView>("get_settings"),
     setExecTrust: (args) => this.call<string>("set_exec_trust", args),
+    /**
+     * 切 shell（`pwsh` / `gitbash`）。
+     *
+     * ⚠️ 后端那条在 `work/backend/exec-shell` 分支实现中 —— 本分支先落前端契约。
+     *    后端未上线时这个调用会失败（unknown command）⇒ 前端要兜住并提示，
+     *    **不能静默失败**（用户点了没反应 = 假开关）。
+     */
+    setExecShell: (args) => this.call<string>("set_exec_shell", args),
     setBuiltinTools: (args) => this.call<void>("set_builtin_tools", args),
     setBlurCollapse: (args) => this.call<void>("set_blur_collapse", args),
     setProjectDirAutoread: (args) => this.call<void>("set_project_dir_autoread", args),

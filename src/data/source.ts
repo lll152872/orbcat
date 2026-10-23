@@ -79,7 +79,30 @@ export interface SettingsView {
   blurCollapse?: boolean;
   projectDirAutoread?: boolean;
   builtinToolsEnabled?: boolean;
+  /**
+   * 命令在**哪个 shell** 里跑（`pwsh` / `gitbash`）。
+   *
+   * ⚠️ 这是**新字段**（2026-10-23 加）—— 老 settings.json 里**没有**它。
+   * ⇒ 后端读不到时必须回落 `"pwsh"`（老用户升级后行为**不变**）。
+   * ⇒ 前端也按同一口径兜底，别让"字段缺失"变成"行为变了"。
+   */
+  execShell?: ExecShell;
   [k: string]: unknown;
+}
+
+/**
+ * 执行用的 shell（`pwsh` = PowerShell，`gitbash` = Git Bash）。
+ *
+ * ⚠️ **不要跟 `execTrust` 混**：那个管"要不要问"（ask/smart/full），
+ * 这个管"用哪个 shell 跑"（pwsh/gitbash）。两个维度互不干涉。
+ */
+export type ExecShell = "pwsh" | "gitbash";
+
+/** 执行位置的三个选项（`bgDeskEnabled` 那一维由前端单独管，不进这里）。 */
+export interface ExecShellOption {
+  id: ExecShell;
+  label: string;
+  desc: string;
 }
 
 /** 后台执行状态（`bg_desk_status`） */
@@ -327,6 +350,14 @@ export interface RecoveryApi {
 export interface SettingsApi {
   get(): Promise<SettingsView>;
   setExecTrust(args: { mode: string }): Promise<string>;
+  /**
+   * 切换命令用的 shell（`pwsh` / `gitbash`）。
+   *
+   * ⚠️ **后端那条正在另开分支实现**（`work/backend/exec-shell`）。
+   *    本轮前端先把契约定死：入参 `{ shell: string }`、返回**落盘后的那个值**。
+   *    后端还没上之前，真后端调用会失败 ⇒ 前端必须有兜底（见 main.ts 的落盘逻辑）。
+   */
+  setExecShell(args: { shell: string }): Promise<string>;
   setBuiltinTools(args: { enable: boolean }): Promise<void>;
   setBlurCollapse(args: { enable: boolean }): Promise<void>;
   setProjectDirAutoread(args: { enable: boolean }): Promise<void>;

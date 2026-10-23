@@ -682,6 +682,21 @@ export class MockSource implements DataSource {
         return this.settle<SettingsView>(cmd, d.settings);
       case "set_exec_trust":
         return this.settle<string>(cmd, "已设为「始终信任」");
+      /**
+       * 切 shell（`pwsh` / `gitbash`）—— **真落盘**（写进 d.settings）。
+       *
+       * ⚠️ 为什么要「真落盘」而不是像 set_exec_trust 那样返回一句文案：
+       *    用户要求「选项要真能选、真能存、界面上真显示」。
+       *    存了之后 `get_settings` 必须能读回来 ⇒ 刷新页面/重开设置仍是同一个值。
+       */
+      case "set_exec_shell": {
+        const shell = String(a.shell ?? "pwsh").trim().toLowerCase();
+        if (shell !== "pwsh" && shell !== "gitbash") {
+          throw new Error(`未知的 shell：${shell}`);
+        }
+        d.settings = { ...d.settings, execShell: shell };
+        return this.settle<string>(cmd, shell);
+      }
       case "set_builtin_tools":
         d.settings = { ...d.settings, builtinToolsEnabled: !!a.enable };
         return this.settle<void>(cmd, undefined as never);
@@ -940,6 +955,7 @@ export class MockSource implements DataSource {
   readonly settings: SettingsApi = {
     get: () => this.call<SettingsView>("get_settings"),
     setExecTrust: (args) => this.call<string>("set_exec_trust", args),
+    setExecShell: (args) => this.call<string>("set_exec_shell", args),
     setBuiltinTools: (args) => this.call<void>("set_builtin_tools", args),
     setBlurCollapse: (args) => this.call<void>("set_blur_collapse", args),
     setProjectDirAutoread: (args) => this.call<void>("set_project_dir_autoread", args),
