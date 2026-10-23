@@ -18,6 +18,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { mdToHtml, splitStable } from "./markdown";
 import { MAX_BUBBLES, splitBubbles } from "./bubble";
 import { clipLines } from "./truncate";
+// 定时器回调的环境守卫（见 dom-alive.ts 头部说明）。
+import { domAlive } from "./dom-alive";
 // 纯格式化/工具函数已抽到 format.ts（拆模块，见该文件头部说明）。
 // 这里集中 re-import，避免散落各处 import 语句。
 import {
@@ -1316,7 +1318,12 @@ function bindSessionsView(root: HTMLElement): void {
  * Playwright 实证：同帧日志 `menu opened → once-close FIRED`。
  */
 function closeOnOutsideClick(close: () => void): void {
-  setTimeout(() => window.addEventListener("click", close, { once: true }), 0);
+  // ⚠️ `domAlive` 守卫：定时器可能活过环境销毁（teardown 后 window 不存在），
+  //   回调里摸 window 会抛 ReferenceError → vitest unhandled error → 退出码 1。
+  setTimeout(() => {
+    if (!domAlive()) return;
+    window.addEventListener("click", close, { once: true });
+  }, 0);
 }
 
 /**
@@ -2456,6 +2463,8 @@ function flashCopied(btn: HTMLElement, ok: boolean): void {
   btn.textContent = ok ? "✓ 已复制" : "复制失败";
   btn.classList.toggle("copied", ok);
   setTimeout(() => {
+    // ⚠️ 守卫：1.2s 后才回头改按钮，可能已经越过环境销毁/teardown。
+    if (!domAlive()) return;
     btn.textContent = old.startsWith("✓") || old.includes("失败") ? "复制" : old;
     btn.classList.remove("copied");
   }, 1200);
@@ -3782,7 +3791,11 @@ function scheduleRunPaint(): void {
     paintRunningNow();
   };
   requestAnimationFrame(flush);
-  window.setTimeout(flush, 250);
+  // ⚠️ 守卫：250ms 看门狗可能落在环境销毁之后，flush 会去摸 DOM。
+  window.setTimeout(() => {
+    if (!domAlive()) return;
+    flush();
+  }, 250);
 }
 
 /** 实际重绘逻辑（rAF / 看门狗共用） */
@@ -5001,6 +5014,8 @@ function renderPanel(): void {
     // 延迟一帧：点面板里的某一项时，blur 会先于 mousedown 触发，
     // 直接关会把用户正在点的那次点击吃掉
     setTimeout(() => {
+      // ⚠️ 守卫：120ms 后才判焦点，可能已经越过环境销毁（document 不存在）。
+      if (!domAlive()) return;
       if (cmdPanel.el && document.activeElement?.id !== "cmd-panel") {
         closeCommandPanel(cmdPanel);
       }
@@ -8753,8 +8768,17 @@ function showToast(text: string, kind: "info" | "error" | "ok" = "info", ms?: nu
 
   const life = ms ?? (kind === "error" ? 7000 : 4500);
   window.setTimeout(() => {
+    // ⚠️ 守卫：定时器活过环境销毁是常态（面板一关它照样在队列里）。
+    //   测试环境 teardown 之后 `window` / `document` 整个不存在，
+    //   下面再摸 window 就是 ReferenceError → vitest 记成 unhandled error →
+    //   **整个文件退出码 1**，哪怕断言全绿（与 models.ts 的 fgTimer 同一个坑）。
+    //   `domAlive` 守卫：无 DOM 时安静退出，不留噪声。
+    if (!domAlive()) return;
     el.classList.remove("in");
-    window.setTimeout(() => el.remove(), 220);
+    window.setTimeout(() => {
+      if (!domAlive()) return;
+      el.remove();
+    }, 220);
   }, life);
 }
 
@@ -9581,10 +9605,26 @@ async function sendSteer(): Promise<void> {
   const imgs = pendingImages.slice();
   if (!text && imgs.length === 0) return;
 
+  // 内核分流：pi 内核走 `chat_pi_steer`（参数名不同：`message` 而非 `input`），
+  // 自研内核走 `chat_steer`。返回结构已对齐（`SteerAck`），渲染逻辑不变。
+  const usePi = usePiKernel && piKernelAvailable;
+
+  // ⚠️ pi 内核的 `chat_pi_steer` **不接收图片**（参数只有 message / session_id；
+  //    对比 `chat_pi` 是带 images 的）。所以 pi 下「插话 + 图」送不过去。
+  //    这里必须**照实说**：图不上气泡（不然用户以为图排上了，其实没送出去），
+  //    图留在附件区等下一轮一起发，并提示一句。
+  //    （pi 侧若后续补上 images 参数，这里改回直接透传即可。）
+  const piDropsImages = usePi && imgs.length > 0;
+  if (piDropsImages) {
+    if (!text) {
+      // 只有图没文字 ⇒ pi 侧必然回「插话内容为空」，别去撞这堵墙
+      showToast("pi 内核的插话暂不支持带图，请先发一轮或切回自研内核", "info");
+      return;
+    }
+    showToast("pi 内核的插话暂不支持带图，图留在附件里等下一轮", "info");
+  }
+
   try {
-    // 内核分流：pi 内核走 `chat_pi_steer`（参数名不同：`message` 而非 `input`），
-    // 自研内核走 `chat_steer`。返回结构已对齐（`SteerAck`），渲染逻辑不变。
-    const usePi = usePiKernel && piKernelAvailable;
     const ack = usePi
       ? await invoke<{ id: string; queued: number }>("chat_pi_steer", {
           message: text,
@@ -9600,10 +9640,11 @@ async function sendSteer(): Promise<void> {
     input.value = "";
     input.style.height = "auto";
     draftInput = "";
-    pendingImages = [];
+    // pi 下图片没送出去 ⇒ 附件留着（下一轮随正文一起发）
+    if (!piDropsImages) pendingImages = [];
     renderPreview();
     // 立刻上屏一条「排队中」的气泡：插到 running **之前**，不要永远垫底
-    pushEntry("user", text || "（仅图片）", undefined, imgs, {
+    pushEntry("user", text || "（仅图片）", undefined, piDropsImages ? [] : imgs, {
       queued: true,
       steerId: ack.id,
       steerQueuePos: ack.queued,
