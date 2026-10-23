@@ -300,6 +300,73 @@ pub enum PiHostReply {
     Confirm(bool),
     Select(Option<String>),
     Input(String),
+    /// **稍后答复** —— 宿主正在弹确认卡（要等用户点，最多 3 分钟）。
+    ///
+    /// ## 为什么必须有这个变体
+    ///
+    /// [`PiHostFn`] 是**同步**签名，而 dispatch 跑在 pi 的 **stdout 读循环**里
+    /// ⇒ 宿主要是就地等用户（几秒到 3 分钟），**读循环就被卡住** ⇒
+    /// pi 写 stdout 会被背压卡住 ⇒ **死锁**（pi.rs 记过同族坑：
+    /// 「等用户绝不能阻塞读循环」）。
+    ///
+    /// ⇒ 宿主拿到这个变体后**立即返回**（读循环继续跑），
+    /// 真正的答复由宿主另起一个任务异步送来（`tokio::spawn` + oneshot）。
+    Deferred(Box<DeferredReply>),
+}
+
+/// 延迟应答的接收端（pi.rs 侧 await 它）。
+///
+/// 宿主侧拿到的是**发送端**（[`DeferredReply::pair`] 的第二个返回值）。
+pub struct DeferredReply {
+    rx: tokio::sync::oneshot::Receiver<PiHostReply>,
+}
+
+impl DeferredReply {
+    /// 造一对「延迟应答」：
+    /// 第一个返回值给 pi.rs（它 await 这个），
+    /// 第二个给宿主（将来把答复 `send` 进去）。
+    pub fn pair() -> (Box<DeferredReply>, tokio::sync::oneshot::Sender<PiHostReply>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Box::new(DeferredReply { rx }), tx)
+    }
+}
+
+/// 宿主答复 → pi 的应答 JSON。
+///
+/// 抽成独立函数：**同步答**与**延迟答**两条路共用同一份格式，
+/// 免得以后改一边忘了另一边。
+pub fn ui_reply_json(id: &str, reply: PiHostReply) -> Value {
+    match reply {
+        PiHostReply::Confirm(v) => {
+            json!({"type": "extension_ui_response", "id": id, "confirmed": v})
+        }
+        PiHostReply::Select(v) => match v {
+            Some(val) => json!({"type": "extension_ui_response", "id": id, "value": val}),
+            None => json!({"type": "extension_ui_response", "id": id, "cancelled": true}),
+        },
+        PiHostReply::Input(v) => json!({"type": "extension_ui_response", "id": id, "value": v}),
+        // ⚠️ 延迟答**不该**走到这里 —— dispatch 会把它交给 spawn 出去的任务。
+        // 兜底按「取消」回，绝不能让 pi 干等。
+        PiHostReply::Deferred(_) => {
+            json!({"type": "extension_ui_response", "id": id, "cancelled": true})
+        }
+    }
+}
+
+/// 延迟应答的后台任务 —— **「读循环零阻塞」这条硬指标的落点**。
+pub fn spawn_deferred_reply<W, F>(id: String, d: Box<DeferredReply>, write: W)
+where
+    W: Fn(Value) -> F + Send + 'static,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let resp = match d.rx.await {
+            Ok(r) => ui_reply_json(&id, r),
+            // 宿主那边掉了（超时 / 取消 / 任务被中止）⇒ 回「取消」
+            Err(_) => json!({"type": "extension_ui_response", "id": id, "cancelled": true}),
+        };
+        write(resp).await;
+    });
 }
 
 /// 宿主回调：pi 向宿主提问。
@@ -518,20 +585,30 @@ impl PiClient {
 
             // 宿主不回答 → pi 会一直等（实测整个 run 挂死）→ **必须回一个取消**
             let reply = (self.host)(req);
-            let resp = match reply {
-                Some(PiHostReply::Confirm(v)) => json!({
-                    "type": "extension_ui_response", "id": id, "confirmed": v
-                }),
-                Some(PiHostReply::Select(v)) => match v {
-                    Some(val) => json!({"type": "extension_ui_response", "id": id, "value": val}),
-                    None => json!({"type": "extension_ui_response", "id": id, "cancelled": true}),
-                },
-                Some(PiHostReply::Input(v)) => json!({
-                    "type": "extension_ui_response", "id": id, "value": v
-                }),
-                None => json!({"type": "extension_ui_response", "id": id, "cancelled": true}),
-            };
-            let _ = self.write_line(&resp).await;
+            match reply {
+                // ⚠️ **延迟答**：宿主正在弹确认卡（要等用户）。
+                // ⇒ **绝不在读循环里等** —— 等下去会卡住 pi 写 stdout ⇒ 死锁。
+                //    另起一个任务等答案，拿到后**另路**写回 pi。
+                Some(PiHostReply::Deferred(d)) => {
+                    let client = self.clone();
+                    spawn_deferred_reply(id.clone(), d, move |resp| {
+                        let c = client.clone();
+                        async move {
+                            let _ = c.write_line(&resp).await;
+                        }
+                    });
+                    return;
+                }
+                Some(r) => {
+                    let resp = ui_reply_json(&id, r);
+                    let _ = self.write_line(&resp).await;
+                }
+                None => {
+                    let resp =
+                        json!({"type": "extension_ui_response", "id": id, "cancelled": true});
+                    let _ = self.write_line(&resp).await;
+                }
+            }
             return;
         }
 
@@ -1281,5 +1358,85 @@ mod tests {
     fn 空图片要报错而不是变成undefined() {
         assert!(to_pi_images(&["   ".to_string()]).is_err());
         assert!(to_pi_images(&[]).unwrap().is_empty());
+    }
+
+    /// 🔴 延迟应答：**调用立即返回**（读循环零阻塞），答复到了才写。
+    ///
+    /// ## 为什么这条是硬指标
+    ///
+    /// `dispatch` 跑在 pi 的 **stdout 读循环**里。等用户（最多 3 分钟）会卡住
+    /// 读循环 ⇒ pi 写 stdout 被背压卡住 ⇒ **死锁**（pi.rs 记过同族坑）。
+    ///
+    /// ## 判据
+    ///
+    /// ① `spawn_deferred_reply` **立即返回**（不 await 任何东西）
+    /// ② 答复送到后，writer 收到 `confirmed:true`
+    /// ③ sender 被丢掉（超时 / 取消）时，writer 收到 `cancelled:true`（pi 不干等）
+    #[tokio::test]
+    async fn 延迟应答_立即返回_答复到了才写_掉了写cancelled() {
+        // ① 立即返回
+        let (d, tx) = DeferredReply::pair();
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let w2 = written.clone();
+        let t0 = std::time::Instant::now();
+        spawn_deferred_reply("ui-1".to_string(), d, move |resp| {
+            let w = w2.clone();
+            async move {
+                w.lock().unwrap().push(resp);
+            }
+        });
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(50),
+            "spawn_deferred_reply 必须立即返回（读循环零阻塞）"
+        );
+        // 还没答复 ⇒ 什么都没写
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(written.lock().unwrap().is_empty(), "没答复就不该写");
+
+        // ② 答复送到 ⇒ 写出 confirmed
+        let _ = tx.send(PiHostReply::Confirm(true));
+        for _ in 0..100 {
+            if !written.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let got = written.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["type"], "extension_ui_response");
+        assert_eq!(got[0]["id"], "ui-1");
+        assert_eq!(got[0]["confirmed"], true);
+
+        // ③ sender 被丢掉 ⇒ 写 cancelled（pi 不干等）
+        let (d2, tx2) = DeferredReply::pair();
+        let written2 = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let w3 = written2.clone();
+        spawn_deferred_reply("ui-2".to_string(), d2, move |resp| {
+            let w = w3.clone();
+            async move {
+                w.lock().unwrap().push(resp);
+            }
+        });
+        drop(tx2);
+        for _ in 0..100 {
+            if !written2.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let got2 = written2.lock().unwrap().clone();
+        assert_eq!(got2.len(), 1, "sender 掉了也要写一条（cancelled）");
+        assert_eq!(got2[0]["cancelled"], true);
+    }
+
+    /// 回归测试：应答 JSON 的三种形态（同步答 / 延迟答兜底）。
+    #[test]
+    fn 应答json三种形态() {
+        let a = ui_reply_json("x", PiHostReply::Confirm(false));
+        assert_eq!(a["confirmed"], false);
+        let b = ui_reply_json("x", PiHostReply::Select(None));
+        assert_eq!(b["cancelled"], true);
+        let c = ui_reply_json("x", PiHostReply::Input("hi".into()));
+        assert_eq!(c["value"], "hi");
     }
 }
