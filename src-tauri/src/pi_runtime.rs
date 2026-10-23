@@ -130,7 +130,7 @@ pub struct PiRuntime {
     /// 工具桥
     bridge: tokio::sync::Mutex<Option<Arc<ToolBridge>>>,
     /// 权限裁决回调（宿主提供）
-    gate: tokio::sync::Mutex<Option<GateFn>>,
+    gate: std::sync::Arc<tokio::sync::Mutex<Option<GateFn>>>,
     /// 强制指定模型（`(provider, model)`）—— 覆盖从 settings 反查的结果。
     ///
     /// ## 什么时候用
@@ -205,7 +205,7 @@ impl PiRuntime {
             agent_dir,
             client: tokio::sync::Mutex::new(None),
             bridge: tokio::sync::Mutex::new(None),
-            gate: tokio::sync::Mutex::new(None),
+            gate: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             model_override: tokio::sync::Mutex::new(None),
             extra_mcp: tokio::sync::Mutex::new(Vec::new()),
             prompt_ctx: Arc::new(std::sync::Mutex::new(PromptCtx::default())),
@@ -234,7 +234,7 @@ impl PiRuntime {
             agent_dir,
             client: tokio::sync::Mutex::new(None),
             bridge: tokio::sync::Mutex::new(None),
-            gate: tokio::sync::Mutex::new(None),
+            gate: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             model_override: tokio::sync::Mutex::new(None),
             extra_mcp: tokio::sync::Mutex::new(Vec::new()),
             prompt_ctx: Arc::new(std::sync::Mutex::new(PromptCtx::default())),
@@ -334,14 +334,22 @@ impl PiRuntime {
     /// ## 为什么是**同步**的
     ///
     /// Tauri 的 `setup` 闭包是同步的 —— 里面没法 await。
-    /// 这个回调只在「起桥时」被读一次（存进 `GateHandler`），
-    /// 所以同步设置完全够用。
+    ///
+    /// ⚠️ **不能只 `try_lock`** —— 抢不到就**静默丢**（那就等于没设 gate ⇒ P2 复发：
+    /// 桥会退回静态裁决，MCP 授权静默降级）。抢不到时退到 `blocking_lock`（等一下）。
+    /// 本函数只在**同步**上下文里被调（Tauri setup 闭包 / 池的 set_gate / 测试），
+    /// 不会在 async 上下文里触发 tokio 的 panic。
     ///
     /// ⚠️ 签名第三个参数是**这个 pi 进程自己的会话 id**（`Option<&str>`）——
     /// 多会话并行时不能拿「用户当前正在看的会话」，否则权限裁决会串味。
     pub fn set_gate(&self, f: GateFn) {
-        if let Ok(mut g) = self.gate.try_lock() {
-            *g = Some(f);
+        match self.gate.try_lock() {
+            Ok(mut g) => *g = Some(f),
+            Err(_) => {
+                // ⚠️ `blocking_lock()` 返回 guard（不是 Result）
+                let mut g = self.gate.blocking_lock();
+                *g = Some(f);
+            }
         }
     }
 
@@ -1197,28 +1205,20 @@ impl PiRuntime {
             }
         });
         let gate_dir = self.data_dir.clone();
-        // 宿主注入的 gate（**优先**）—— 它能弹确认卡（MCP 授权那套）。
-        let host_gate = self.gate.lock().await.clone();
         // ⚠️ **会话 id 要用「这个 pi 进程自己的」**，不是用户当前正在看的那个。
         // 多会话并行时两者会不一样（用户可能在 B 会话看 A 的 run）。
         let gate_sid = self.session_id.clone();
-        let gate: crate::pi_bridge::GateHandler = Arc::new(move |tool, args| {
-            let real = tool.strip_prefix("orb_").unwrap_or(tool);
-            // 有宿主 gate → 用它（能弹卡、能走真实的 mcp_grants / 确认卡流程）
-            if let Some(g) = host_gate.clone() {
-                let real = real.to_string();
-                let args = args.clone();
-                let sid = gate_sid.clone();
-                // gate 是 async（可能阻塞在确认卡上）→ 桥是同步线程，
-                // 用独立 runtime 把 future 跑完（与工具执行那条路同口径）。
-                return match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => Ok(rt.block_on(async move { g(&real, &args, sid).await })),
-                    Err(e) => Err(format!("起权限裁决 runtime 失败: {e}")),
-                };
-            }
-            // 没有宿主 gate → 退回本地静态裁决（文件网关 + MCP grants）
-            crate::tools::gate_bridge(real, args, &gate_dir)
-        });
+        // ⚠️ **P2 根因：不要在建桥那刻把宿主 gate 抄成快照**。
+        //
+        // 旧写法：`let host_gate = self.gate.lock().await.clone();`（建桥时抄走）
+        // ⇒ `set_gate` 若在**建桥之后**才调用（PiPool 里很常见：先 `acquire`
+        //    建出运行时、之后 `pool.set_gate` 才设），那些运行时的桥**永远拿不到
+        //    宿主 gate** ⇒ 落到静态裁决分支 ⇒ **MCP 授权静默降级**成
+        //    静态拒绝：**用户永远等不到确认卡**，模型只看到「需要授权」，
+        //    而且**没有任何日志**说明降级发生过。
+        //
+        // ⇒ 改成**每次调用现取**（见 `build_gate`）。
+        let gate = build_gate(&self.gate, gate_sid, gate_dir);
         // system prompt 由**宿主**提供 —— pi 自己的默认 prompt 是「coding agent」
         // 那一套，与 orbcat 的「私人助手」定位、人格、记忆体系完全不同。
         //
@@ -1250,6 +1250,46 @@ impl PiRuntime {
         *self.bridge.lock().await = Some(bridge.clone());
         Ok(bridge)
     }
+}
+
+/// 造桥用的**权限裁决器**。
+///
+/// ⚠️ **P2 核心：宿主 gate 必须「每次调用现取」，不能在建桥那刻抄成快照。**
+///
+/// 旧实现（建桥时 `self.gate.lock().await.clone()`）的问题：
+/// `set_gate` 若在**建桥之后**才调用（PiPool 里很常见：先 `acquire` 建出运行时、
+/// 之后 `pool.set_gate` 才设），那些运行时的桥**永远拿不到宿主 gate**
+/// ⇒ 落到静态裁决分支 ⇒ **MCP 授权静默降级**成静态拒绝：
+/// **用户永远等不到确认卡**，模型只看到「需要授权」，而且**没有任何日志**
+/// 说明降级发生过。
+///
+/// 现在：闭包持有 `Arc<Mutex<Option<GateFn>>>`，每次调用现取。
+/// 桥的 handler 跑在**同步线程**里 ⇒ 用 `blocking_lock()`（不是 async 上下文）。
+pub(crate) fn build_gate(
+    gate_cell: &std::sync::Arc<tokio::sync::Mutex<Option<GateFn>>>,
+    gate_sid: Option<String>,
+    gate_dir: std::path::PathBuf,
+) -> crate::pi_bridge::GateHandler {
+    let gate_cell = gate_cell.clone();
+    Arc::new(move |tool, args| {
+        let real = tool.strip_prefix("orb_").unwrap_or(tool);
+        // 每次现取 ⇒ 后设的 gate 也能生效
+        let host_gate = gate_cell.blocking_lock().clone();
+        // 有宿主 gate → 用它（能弹卡、能走真实的 mcp_grants / 确认卡流程）
+        if let Some(g) = host_gate {
+            let real = real.to_string();
+            let args = args.clone();
+            let sid = gate_sid.clone();
+            // gate 是 async（可能阻塞在确认卡上）→ 桥是同步线程，
+            // 用独立 runtime 把 future 跑完（与工具执行那条路同口径）。
+            return match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => Ok(rt.block_on(async move { g(&real, &args, sid).await })),
+                Err(e) => Err(format!("起权限裁决 runtime 失败: {e}")),
+            };
+        }
+        // 没有宿主 gate → 退回本地静态裁决（文件网关 + MCP grants）
+        crate::tools::gate_bridge(real, args, &gate_dir)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1309,12 +1349,36 @@ impl PiPool {
         })
     }
 
-    /// 设置权限裁决回调（池里**新建**的运行时都会套上）。
+    /// 设置权限裁决回调。
     ///
     /// **同步** —— Tauri 的 `setup` 闭包是同步的，没法 await。
+    ///
+    /// ⚠️ **P2：必须同时套到「已经存在」的运行时上** ——
+    /// 旧实现只写池子自己那份（`pool.gate`），而**已经建出来的**运行时
+    /// 各自的 gate 仍是 `None` ⇒ 它们的桥会落到静态裁决分支
+    /// ⇒ **MCP 授权静默降级**（用户永远等不到确认卡，且没有任何日志）。
+    /// 池里的运行时是**懒创建**的（首次对话才建），所以
+    /// 「先 acquire、后 set_gate」是**常见顺序**，不是边角情况。
     pub fn set_gate(&self, f: GateFn) {
         if let Ok(mut g) = self.gate.lock() {
-            *g = Some(f);
+            *g = Some(f.clone());
+        }
+        // 同步套到已有运行时上（它们的 gate 字段是 `try_lock` 写的）
+        let sessions = self.sessions.clone();
+        // ⚠️ 必须把 match 结果**绑到变量** —— 直接写成函数尾表达式的话，
+        //    guard 的临时量活到函数结束，而 `sessions` 先被 drop（E0597）。
+        let applied: usize = match sessions.try_lock() {
+            Ok(map) => {
+                let n = map.len();
+                for rt in map.values() {
+                    rt.set_gate(f.clone());
+                }
+                n
+            }
+            Err(_) => 0,
+        };
+        if applied > 0 {
+            eprintln!("[orbcat] pi 内核：已把宿主权限闸套到 {applied} 个已存在的运行时");
         }
     }
 
@@ -1598,6 +1662,66 @@ mod tests {
         assert_eq!(sanitize_server_name("my server"), "my_server");
         assert_eq!(sanitize_server_name("a.b"), "a_b");
         assert_eq!(sanitize_server_name("工具组"), "___");
+    }
+
+    /// 🔴 P2 回归测试：**建桥之后**才设的宿主 gate，桥的裁决**必须**用上。
+    ///
+    /// ## 旧实现为什么坏
+    ///
+    /// 旧代码在建桥那刻 `self.gate.lock().await.clone()` 把宿主 gate **抄成快照**。
+    /// 于是「先建桥、后 `set_gate`」的运行时**永远拿不到**宿主 gate
+    /// ⇒ 落到静态裁决分支 ⇒ **MCP 授权静默降级**成静态拒绝：
+    /// **用户永远等不到确认卡**，模型只看到「需要授权」，且**没有任何日志**。
+    ///
+    /// PiPool 的运行时是**懒创建**的（首次对话才建），
+    /// 所以「先 `acquire`、后 `pool.set_gate`」是**常见顺序**，不是边角情况。
+    ///
+    /// ## 判据（副作用式，不是看日志）
+    ///
+    /// 直接问「桥的裁决器」：同一个 MCP 工具名，
+    /// 没设宿主 gate 时被静态拒绝、设了之后被宿主放行 ⇒ 说明它**每次现取**。
+    #[test]
+    fn P2_建桥之后设的宿主gate_桥的裁决也要用上() {
+        let cell = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let dir = std::env::temp_dir().join("orbcat-pi-gate-test");
+        let _ = std::fs::create_dir_all(&dir);
+
+        // ① 先建桥（宿主 gate 还没设）
+        let gate = build_gate(&cell, Some("sess-1".into()), dir.clone());
+
+        // ② 没设宿主 gate ⇒ 静态裁决：MCP 工具没授权 ⇒ 拒绝
+        let (ok, _why) = gate("mcp__probe__tool", &serde_json::json!({}))
+            .expect("裁决不该报错");
+        assert!(
+            !ok,
+            "没设宿主 gate 时，未授权的 MCP 工具应被静态拒绝（回落分支）"
+        );
+
+        // ③ ⚠️ **建桥之后**才设宿主 gate —— 旧实现在这里就露馅了
+        let cell2 = cell.clone();
+        std::thread::spawn(move || {
+            // ⚠️ **不能 `.unwrap()`** —— `blocking_lock()` 返回 guard，
+            //    `.unwrap()` 会被自动 deref 成 `Option::unwrap()` ⇒ 拿到的是
+            //    GateFn 本身（不是 guard）⇒ 后面 `*g = ...` 直接类型错。
+            let mut g = cell2.blocking_lock();
+            // ⚠️ 闭包参数**不要自己标类型** —— 交给 `GateFn` 推断，
+            //    否则 boxed future 的协变推导不上（E0277）。
+            let host: GateFn = std::sync::Arc::new(move |_tool, _args, _sid| {
+                Box::pin(async { (true, "宿主放行".to_string()) })
+            });
+            *g = Some(host);
+        })
+        .join()
+        .expect("设置宿主 gate 的线程不该 panic");
+
+        // ④ 现在必须走宿主裁决 ⇒ 放行
+        let (ok, why) = gate("mcp__probe__tool", &serde_json::json!({}))
+            .expect("裁决不该报错");
+        assert!(
+            ok,
+            "设了宿主 gate 之后，桥的裁决必须走宿主（旧的快照实现这里会被静态拒绝）"
+        );
+        assert_eq!(why, "宿主放行");
     }
 }
 
