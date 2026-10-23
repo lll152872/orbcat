@@ -859,7 +859,9 @@ async function resendPrompt(text: string, imgs: string[]): Promise<void> {
     // 选内核：pi 可用就走 pi，否则走自研的。
     // ⚠️ 两个方法的**参数名与返回结构完全一致**（PiRun 是 AgentRun 的同构体），
     //    所以这里只有一行分流，渲染逻辑一行都不用改。
-    const run = usePiKernel && piKernelAvailable
+    const runPi = usePiKernel && piKernelAvailable;
+    runKernel = runPi ? "pi" : "own";
+    const run = runPi
       ? await data.chat.sendPi({ input: text, images: imgs })
       : await data.chat.send({ input: text, images: imgs });
     // 用户可能在等的时候切走了 → 别动当前视图（结果后端已落回它自己的会话）
@@ -8996,6 +8998,23 @@ let piKernelAvailable = false;
 let piStatusChecked = false;
 
 /**
+ * **当前正在跑的那一轮用的是哪个内核**（"pi" | "own"）。
+ *
+ * ## 为什么要有它（2026-10-23 查出来的真缺陷）
+ *
+ * 插话（`sendSteer`）必须投到**正在跑的那一轮**所用的内核上 ——
+ * 否则会出现「插话投给 A、轮次跑在 B」：
+ * - 轮次跑在自研内核 → 该会话**没有 pi 运行时**
+ *   （`PiPool::get` 明确**不新建**，见 `pi_runtime.rs`）⇒ `chat_pi_steer` 直接回
+ *   「会话 X 没有正在运行的 pi 内核」⇒ **插话在 pi 可用时必然失败**
+ * - 轮次跑在 pi → 投给自研内核同样落空
+ *
+ * 所以这里**记住每一轮实际用的内核**（发一轮 / 重新生成时写），
+ * 插话时按它分流 —— **跟着「正在跑的那个」走，而不是跟着「pi 可不可用」走**。
+ */
+let runKernel: "pi" | "own" = "own";
+
+/**
  * 查 pi 内核是否可用（启动时调一次）。
  *
  * 可用 = exe 旁边有 `runtime/`（内置 node + pi bundle）。
@@ -9097,6 +9116,9 @@ async function send(): Promise<void> {
   permMuteThisTurn = false;
 
   try {
+    // ⚠️ 这里**恒走自研内核**（`chat`）—— pi 分流只在「重新生成」里。
+    //    插话按 `runKernel` 投（见上面 runKernel 的注释），所以这里要如实记下来。
+    runKernel = "own";
     const run = await data.chat.send( { input: text, images: imgs });
     // ⚠️ 用户可能在等待期间切走了。切走后 entries 已经是**别的会话**的内容，
     //    所以清气泡 / 重载 / 提示一律不动 —— 这一轮的结果后端已经落回它自己的
@@ -9221,29 +9243,23 @@ async function sendSteer(): Promise<void> {
   const imgs = pendingImages.slice();
   if (!text && imgs.length === 0) return;
 
-  // 内核分流：pi 内核走 `chat_pi_steer`（参数名不同：`message` 而非 `input`），
-  // 自研内核走 `chat_steer`。返回结构已对齐（`SteerAck`），渲染逻辑不变。
-  const usePi = usePiKernel && piKernelAvailable;
+  // 内核分流：插话必须投到**正在跑的那一轮**所用的内核（`runKernel`），
+  // 不是「pi 可不可用」—— 见 runKernel 的注释（投错内核 = 插话直接落空）。
+  // 参数名也不同：pi 走 `chat_pi_steer`（`message`），自研走 `chat_steer`（`input`）。
+  // 返回结构已对齐（`SteerAck`），渲染逻辑不变。
+  const usePi = runKernel === "pi";
 
-  // ⚠️ pi 内核的 `chat_pi_steer` **不接收图片**（参数只有 message / session_id；
-  //    对比 `chat_pi` 是带 images 的）。所以 pi 下「插话 + 图」送不过去。
-  //    这里必须**照实说**：图不上气泡（不然用户以为图排上了，其实没送出去），
-  //    图留在附件区等下一轮一起发，并提示一句。
-  //    （pi 侧若后续补上 images 参数，这里改回直接透传即可。）
-  const piDropsImages = usePi && imgs.length > 0;
-  if (piDropsImages) {
-    if (!text) {
-      // 只有图没文字 ⇒ pi 侧必然回「插话内容为空」，别去撞这堵墙
-      showToast("pi 内核的插话暂不支持带图，请先发一轮或切回自研内核", "info");
-      return;
-    }
-    showToast("pi 内核的插话暂不支持带图，图留在附件里等下一轮", "info");
-  }
+  // ⚠️ 图**两边都透传**：
+  //    - 自研内核 `chat_steer` 收 images（后端落盘成文件路径）
+  //    - pi 内核 `chat_pi_steer` 自 2026-10-23 fix002 起**也收 images**
+  //      （收 orbcat 的 data URL 字符串，Rust 侧 `pi::to_pi_images` 转成 pi 形状）
+  //    ⇒ 插话带图在两个内核下行为一致，不用再给用户「pi 不支持带图」的提示。
 
   try {
     const ack = usePi
-      ? await data.chat.steerPi( {
+      ? await data.chat.steerPi({
           message: text,
+          images: imgs,
           sessionId: currentSessionId,
         })
       : await data.chat.steer( {
@@ -9256,11 +9272,10 @@ async function sendSteer(): Promise<void> {
     input.value = "";
     input.style.height = "auto";
     draftInput = "";
-    // pi 下图片没送出去 ⇒ 附件留着（下一轮随正文一起发）
-    if (!piDropsImages) pendingImages = [];
+    pendingImages = [];
     renderPreview();
     // 立刻上屏一条「排队中」的气泡：插到 running **之前**，不要永远垫底
-    pushEntry("user", text || "（仅图片）", undefined, piDropsImages ? [] : imgs, {
+    pushEntry("user", text || "（仅图片）", undefined, imgs, {
       queued: true,
       steerId: ack.id,
       steerQueuePos: ack.queued,

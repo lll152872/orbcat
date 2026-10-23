@@ -108,4 +108,7 @@ tools/.cache/
 probeN*/
 
 # 纯 HTML 预览件（构建产物：npm run build:preview ⇒ preview/preview.html）
-preview
+# ⚠️ 必须带前导斜杠 `/preview/` —— 光写 `preview` 会匹配**任意层级**的同名目录，
+#    连源码目录 `src/preview/` 一起被忽略 ⇒ 那两个文件从没进过 git
+#    （2026-10-23 Pi内核 在合基线时抓到：基线 tsc 报 3 个错）。
+/preview/

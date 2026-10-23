@@ -171,8 +171,17 @@ export interface ChatApi {
   cancel(args?: { sessionId?: string | null }): Promise<void>;
   /** 自研内核插话 */
   steer(args: { input: string; images?: string[] | null; sessionId?: string | null }): Promise<SteerAck>;
-  /** pi 内核插话（参数名是 `message`，不是 `input` —— 两边刻意对齐过） */
-  steerPi(args: { message: string; sessionId?: string | null }): Promise<SteerAck>;
+  /**
+   * pi 内核插话（参数名是 `message`，不是 `input` —— 两边刻意对齐过）。
+   *
+   * ⚠️ `images` 是 orbcat 的 **data URL 字符串**（前端 `pendingImages`），
+   * 转成 pi 形状的活儿在 Rust 侧 `pi::to_pi_images` 里做（2026-10-23 fix002 起）。
+   */
+  steerPi(args: {
+    message: string;
+    images?: string[] | null;
+    sessionId?: string | null;
+  }): Promise<SteerAck>;
 }
 
 /** 模型：列表、选择、增删改、远端导入、连通测试 */

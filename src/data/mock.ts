@@ -346,6 +346,8 @@ export class MockSource implements DataSource {
       case "chat_pi_steer": {
         const text = (cmd === "chat_steer" ? (a.input as string) : (a.message as string)) ?? "";
         if (!text.trim()) throw new Error("插话内容为空");
+        // 图：自研内核与 pi 内核都收（data URL 字符串），mock 原样记下
+        const imgs = (a.images as string[] | undefined) ?? [];
         const id = `st${++this.steerSeq}`;
         const now = Date.now();
         d.session = {
@@ -355,6 +357,7 @@ export class MockSource implements DataSource {
             {
               role: "user" as const,
               text,
+              images: imgs.length ? imgs : undefined,
               steerId: id,
               at: now,
             },

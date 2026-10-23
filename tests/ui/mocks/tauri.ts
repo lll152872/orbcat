@@ -384,6 +384,11 @@ const emptyOk: Record<string, unknown> = {  set_window_mode: null,
   session_delete: null,
   session_truncate: null,
   chat_steer: { id: "steer-1", queued: 1 },
+  // pi 内核通道（2026-10-23 fix002 起 chat_pi_steer 也收 images）
+  // ⚠️ `pi_status` **不放默认表** —— 放进去等于所有用例都切到 pi 内核
+  //    （发一轮会走 chat_pi 而不是 chat），存量断言会集体失真。
+  //    要测 pi 路径的用例自己 setMock("pi_status", { available: true })。
+  chat_pi_steer: { id: "steer-pi-1", queued: 1 },
   bootstrap_data: { ok: true },
   pmem_list: [],
   pmem_get_active: null,
@@ -607,7 +612,8 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
       state.bgDeskEnabled = !!args?.enabled;
       return state.bgDeskEnabled as T;
     }
-    case "chat": {
+    case "chat":
+    case "chat_pi": {
       if (state.chatDelayMs > 0) {
         await new Promise((r) => setTimeout(r, state.chatDelayMs));
       }
