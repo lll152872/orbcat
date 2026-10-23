@@ -4,9 +4,60 @@
 >
 > **v1.1.0** · Windows（x64 / arm64）+ macOS（Apple Silicon）
 >
-> 下载见 [Releases](https://github.com/lll152872/orbcat/releases)。zip 是**三件套**
-> （`orbcat.exe` + `dist/` + `agent-data/`），**解压即用，但首次启动要点一次
+> 下载见 [Releases](https://github.com/lll152872/orbcat/releases)。zip 是**四件套**
+> （`orbcat.exe` + `dist/` + `runtime/` + `agent-data/`），**解压即用，但首次启动要点一次
 > [「建出目录结构」](#首次运行两段式初始化)**。
+
+---
+
+## 📍 现在在干什么（给接手的人 / 看仓库的人）
+
+> **这一段是活页的静态快照**，权威版在 `../allmemory/STATUS.md` 顶部的「📍 当前状态摘要」—— 那边才是活的。
+
+| | |
+|---|---|
+| **项目** | 悬浮小agent = 屏幕上的一颗球，点开是能干活的面板。Tauri 2（Rust + WebView2/TS） |
+| **当前主线** | **agent 内核从自研迁到 pi**（`earendil-works/pi` 1.4.0，MIT）—— 代码已落地并测试通过，**还没真机取证** |
+| **当前分支** | `work/pi-kernel/pi-security-and-parallel`（HEAD `e02de99`） |
+| **成品标准** | ① 改动 commit + push 到 `work/` 分支 ② 出包部署到 `D:\orbcat`，**exe + dist/ + runtime/{node,pi} + agent-data/ 四件套齐全**（缺 `runtime/` ⇒ pi 内核静默失效）③ 真机验收全过：`diag.log` 命中「pi 内核已就绪」+ `pi_status.available=true`、对话跑通、权限卡正常、多会话并行不串 ④ 打成 zip 交付 |
+| **下一步 3 条** | ① 出包 + 真机验收 ② mode 工具可见性 + 上下文压缩口径 ③ ~~修发布契约（zip 补 `runtime/`）~~ ✅ 已修（2026-10-23 · `work/qa/runtime-slim`） |
+
+### 怎么跑 / 怎么出包
+
+```bash
+# 开发：Rust 用 cargo build（dev 增量 ~37s，release 5min）；前端改完必须 npm run build
+cd orbcat && cargo build            # → src-tauri/target/debug/orbcat.exe
+cd orbcat && npm run build          # 前端资源写仓库根 dist/（不是运行态那份！）
+
+# 出包（必须在 Git Bash 里跑，PATH 上的 bash 是 WSL 会炸）
+bash tools/build-release.sh --fast  # → target/release-fast/，并部署到 D:\orbcat
+```
+
+### 文档地图
+
+| 想知道的 | 去哪看 |
+|---|---|
+| **现在在干什么 / 最新进度** | [`../allmemory/STATUS.md`](../allmemory/STATUS.md)（顶部有状态摘要） |
+| 长期约定（跨会话仍成立） | [`../allmemory/MEMORY.md`](../allmemory/MEMORY.md) |
+| **文档地图（逐份属性表）** | [`../docs/INDEX.md`](../docs/INDEX.md) → [`DOC-MAP.md`](../docs/DOC-MAP.md) |
+| **接下来做什么 / 什么明确不做** | [`../docs/ROADMAP.md`](../docs/ROADMAP.md) |
+| 需求台账（50 条，R-xxx） | [`../docs/REQUIREMENTS.md`](../docs/REQUIREMENTS.md) |
+| 为什么这么设计（16 项决策） | [`../docs/00-CONCEPT.md`](../docs/00-CONCEPT.md) |
+| pi 内核原理 / 交接 | [`../docs/07-PI-KERNEL.md`](../docs/07-PI-KERNEL.md) · [`../docs/08-PI-HANDOVER.md`](../docs/08-PI-HANDOVER.md) |
+| 前端设计稿 → 落地 | [`../docs/09-FRONTEND-HANDOVER.md`](../docs/09-FRONTEND-HANDOVER.md) |
+
+### 交接铁律（给在仓库里干活的人）
+
+- 临时文件一律写 `tmp/`；删文件走归档（`.trash/` / `_archived/`），**不硬删**。
+- 分支一律 `work/<域>/<任务>`，commit message 带 `[skip ci]`；**不推 master、不打 v\* tag**。
+  ⚠️ 推 `feat/**` / `fix/**` 会**直接触发 `ci.yml` 的 3 个 runner 真编译**。
+- 改前端色值**照抄 Ardot 设计稿节点**，别自己发挥（唯一色值来源 = `src/styles.css` 顶部 `:root`）。
+- 收工往 **`../allmemory/STATUS-2026-10.md`（当月流水文件）末尾追加**一条交接日志，
+  并在 **`../allmemory/STATUS.md` 的索引表加一行** + 刷新顶部摘要页。
+  ⚠️ 旧的「往 `STATUS.md` 追加」已过时 —— 那个文件现在只放摘要 + 索引。
+- ⚠️ `docs/` 与 `allmemory/` **在 git 仓库外**（仓库根 = `orbcat/`）⇒ 文档改动无法走分支提交，如实说明即可。
+
+---
 
 orbcat 平时是屏幕上的一颗球，点一下才展开成一个能干活的面板。
 
@@ -205,7 +256,7 @@ bash tools/build-release.sh --fast   # 快速档，给人真机测试用
 
 代价：**`orbcat.exe` 必须和 `dist/` 同目录分发**，不能只拷一个 exe 走。
 
-### 发布 zip 是**三件套**，不是两个文件
+### 发布 zip 是**四件套**，不是两个文件
 
 ```
 发布目录/
@@ -215,6 +266,9 @@ bash tools/build-release.sh --fast   # 快速档，给人真机测试用
 │   ├── models.html
 │   ├── orb/...
 │   └── assets/...
+├── runtime/                 ← 内置运行时（缺了 pi 内核静默失效）
+│   ├── node/                ← node v22.22.2（PTC run_code + pi 都要它）
+│   └── pi/                  ← pi 内核 bundle
 ├── agent-data/              ← 空骨架，解压即有内置技能与记忆模板
 │   ├── manifest.json
 │   ├── memory/MEMORY.md
@@ -224,11 +278,12 @@ bash tools/build-release.sh --fast   # 快速档，给人真机测试用
 └── README.md
 ```
 
-三个目录各有各的硬契约，少任何一个都会静默降级：
+四个目录各有各的硬契约，少任何一个都会静默降级：
 
 | 缺什么 | 后果 |
 |---|---|
 | `dist/` | 回退到编译期嵌入的占位页。启动 stderr 打 `[orbcat] 未找到外部 dist/，使用内置占位页（stub-dist）`；`diag.log` 里记 `前端资源: 未找到外部 dist/，回退内置占位页` |
+| `runtime/` | **pi 内核静默失效、自动退回自研内核**（`pi.rs::runtime_dir()` = `<exe 同目录>/runtime/`；找不到只打一行 `⚠️ 未找到内置 runtime/`）。⚠️ 用户拿到的是「旧内核 + 新界面」，**界面全对、功能全在，看着却像新版本** |
 | `agent-data/` | exe 会在同侧**自动创建**，但骨架要用户点一次「建出目录结构」才铺 |
 | 目录被**平铺**（`index.html` 跑到根目录） | `compute_dist_dir()` 找不到 `<exe 同目录>/dist/index.html`，同样退化成占位页 |
 
@@ -237,6 +292,19 @@ bash tools/build-release.sh --fast   # 快速档，给人真机测试用
 > CI 全绿、Release 照发，只有真跑 exe 的用户看见占位页。
 > 现在装配与布局校验**只有 `tools/package.mjs` 这一份实现**，
 > 且 `tests/tools/package.test.ts` 把布局锁住。
+
+> ✅ **`runtime/` 这一条已在 2026-10-23 修掉**（审计 F1/F2，分支 `work/qa/runtime-slim`）：
+> `tools/package.mjs` 现在**找不到 runtime/ 就当场报错**（旧版只 warn 就放过 ⇒ 坏包放行），
+> 装配按**白名单只拷 `node/` 与 `pi/`**，`verifyReleaseLayout()` 增了 runtime 契约
+> （`runtime/node/node.exe` + `runtime/pi/` 必查，python / git 不查），
+> CI release job 也改成先构建内置运行时再装配。
+> ⇒ **本机 `D:\orbcat\runtime\` 有什么 ≠ 发布的包有什么** —— 这两件事仍然别混。
+
+> ℹ️ **runtime 里没有 git / python 是有意的**（2026-10-23 用户拍板）：
+> · **git 不分发**（GPLv2）⇒ 需要 git 的功能走**系统 Git**；系统没装 Git 就没有这些功能。
+> · **python 不分发**（不是 orbcat 的硬依赖，模型可能调而已）⇒ 可在**设置里指定路径**或自行安装。
+> 两者在代码侧都是 `Option`（`pi::bundled_git()` / `bundled_bash()` / `bundled_python()`），
+> 缺席就是回落系统那份，**不会导致启动失败**。
 
 ### 装配由一个脚本统一，CI 不自带复制逻辑
 
@@ -251,6 +319,12 @@ node tools/package.mjs --verify pkg --exe-name orbcat.exe
 
 `--skeleton` **只能指向 `src-tauri/skeleton`** —— 那是编译期固定的空骨架。
 铺真实的 `agent-data/` 会被 `verifyNoUserData()` 拦下（那等于把 API key 打进发布包）。
+
+> ⚠️ **runtime 是必带的**（2026-10-23 起，审计 F1/F2）：
+> `package.mjs` 找不到 `runtime/` 会**当场报错**，不再只 warn 就放过
+> （旧行为 = 装配出一个**没有内核**的包，CI 全绿、坏包照发，用户那边 pi 内核静默失效）。
+> 缺省取仓库根的 `runtime/`（`node tools/build-runtime-assets.mjs` 的产物），
+> 也可以 `--runtime <dir>` 指到别处；包里**只带 `node/` 与 `pi/`**。
 
 > **`models.json` 刻意不进 zip**：用户填了 key 的那个在 `<exe 旁>/agent-data/models.json`。
 > zip 里放同名文件的话，**更新时覆盖解压会把用户的 key 冲掉**。
@@ -442,12 +516,16 @@ orbcat/
 
 ```bash
 npm test              # 防夹带闸门 + 前端 + Rust 全跑
-npm run test:ui       # vitest（19 文件 / 140 用例：tests/ui 17 + tests/tools 2）
-npm run test:rust     # cargo test --lib（541 用例）
+npm run test:ui       # vitest（UI 27 文件 / 225 用例；另有 tests/tools 2 个文件一起跑）
+npm run test:rust     # cargo test --lib（652 用例）
 npx tsc --noEmit      # 类型检查
 npm run check:no-user-data   # 防夹带闸门：用户数据不进产物
 ```
 
+> ⚠️ 数字是 2026-10-23 实测值（旧文档写 19 文件/140 用例、541 用例，已过期）。
+> `npm run test:ui` 是裸 `vitest run`（**不限定 project**），会连 `tests/tools/` 那两个一起跑。
+> `cargo test --lib` 实测 **652 passed / 0 failed**。
+>
 > `tests/tools/` 下那两个（`package.test.ts` / `line-endings.test.ts`）不是 UI 测试：
 > 前者把发布产物的目录布局锁死（dist 必须是子目录、agent-data 只能是空骨架），
 > 后者锁行尾规范 —— 两者都是 2026-10-12 那次「zip 里没有前端」事故补的闸门。
