@@ -3886,6 +3886,26 @@ async fn chat_pi(
     // 图片先落盘（与旧内核同一条路）
     let imgs = images::save_all(&state.data_dir, &images.unwrap_or_default());
 
+    // ⚠️ **给 pi 的图必须转成 data URL** ——
+    //
+    // `imgs` 是**文件路径**（`save_all` 的返回值），而 pi 侧的 `to_pi_images`
+    // 只认两种形状：data URL 字符串 / 裸 base64。
+    // 传**文件路径** ⇒ 落到「裸 base64」那个分支 ⇒ pi 拿路径去 base64 解码
+    // ⇒ 解码失败 ⇒ **图被静默丢掉**（只记一条 hint，模型根本不知道）。
+    //
+    // ⚠️ 这条测试没覆盖到：`tests/pi_image_e2e.rs` 直接喂 data URL，
+    // 绕过了 `save_all` ⇒ 生产路径的这个洞在测试里是绿的。
+    let imgs_for_pi: Vec<String> = imgs
+        .iter()
+        .filter_map(|p| match images::to_data_url(p) {
+            Ok(u) => Some(u),
+            Err(e) => {
+                eprintln!("[orbcat] ⚠️ 图转 data URL 失败（pi 内核下这张图会丢）: {e}");
+                None
+            }
+        })
+        .collect();
+
     // 当前会话 id
     let session_id = sessions::current_id(&state.data_dir)
         .unwrap_or_else(|| sessions::ensure_current(&state.data_dir).id);
@@ -3951,9 +3971,9 @@ async fn chat_pi(
         imgs.len()
     );
 
-    // imgs 要留给落盘 → 先 clone 一份给 run
+    // imgs 要留给落盘（路径）→ 给 pi 的是 data URL 版（见上面 imgs_for_pi 的说明）
     let result = rt
-        .run_with_checkpoint(&input, imgs.clone(), progress, Some(on_checkpoint))
+        .run_with_checkpoint(&input, imgs_for_pi, progress, Some(on_checkpoint))
         .await?;
 
     // 收尾落盘（与旧内核**完全同一条路**：`TurnRecord` + `append_run_in`）
