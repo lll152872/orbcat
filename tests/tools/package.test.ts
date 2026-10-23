@@ -20,6 +20,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -342,4 +343,110 @@ describe("三合一：agent-data 空骨架进 zip", () => {
     expect(() => verifyNoUserData(out)).not.toThrow();
   });
 });
+});
+
+
+// ---------------------------------------------------------------------------
+// 内置运行时契约（2026-10-23）
+// ---------------------------------------------------------------------------
+//
+// ## 这组测试为什么存在
+//
+// 审计 F1：`package.mjs` 找不到 runtime/ 时**只 warn 就放过** ⇒ 装配出一个
+// 没有内核的包，CI job 照样是绿的，坏包就这么发出去了。
+// 用户那边只看到「未找到内置 runtime/ —— pi 内核不可用，继续用旧内核」，
+// 根本不知道发生了什么。
+//
+// 审计 F2 + 2026-10-23 用户拍板：分发包 runtime = **node + pi**，
+// **不含 git**（GPLv2）、**不含 python**（不是硬依赖）。
+// 契约跟着决策走，所以这几条必须被测试锁住 ——
+// 否则下次谁改回「整个 runtime/ 一起拷」，包会悄悄胖回去。
+// ---------------------------------------------------------------------------
+
+/** 造一个假的 runtime/（只放要分发的那两个组件） */
+function makeRuntime(base = tmp, comps = ["node", "pi"], name = "runtime"): string {
+  const dir = path.join(base, name);
+  mkdirSync(dir, { recursive: true });
+  for (const c of comps) {
+    mkdirSync(path.join(dir, c), { recursive: true });
+    if (c === "node") writeFileSync(path.join(dir, "node", "node.exe"), "MZ fake node");
+    else writeFileSync(path.join(dir, "pi", "index.js"), "// pi");
+  }
+  return dir;
+}
+
+describe("内置运行时契约 —— 坏包不许放行（F1/F2）", () => {
+  it("runtime 目录不存在时**当场报错**（旧版只 warn 就放过 ⇒ 坏包放行）", () => {
+    expect(() =>
+      stageWindowsRelease({
+        exePath: makeExe(),
+        distDir: makeDist(),
+        outDir: path.join(tmp, "out"),
+        runtimeDir: path.join(tmp, "no-such-runtime"),
+      })
+    ).toThrow(/runtime 目录不存在/);
+  });
+
+  it("runtime 缺 node/ 或 pi/ 时报错 —— 这两个是必查组件", () => {
+    expect(() =>
+      stageWindowsRelease({
+        exePath: makeExe(),
+        distDir: makeDist(),
+        outDir: path.join(tmp, "out-node-missing"),
+        runtimeDir: makeRuntime(tmp, ["pi"], "rt-no-node"),
+      })
+    ).toThrow(/缺 node\//);
+    expect(() =>
+      stageWindowsRelease({
+        exePath: makeExe(),
+        distDir: makeDist(),
+        outDir: path.join(tmp, "out-pi-missing"),
+        runtimeDir: makeRuntime(tmp, ["node"], "rt-no-pi"),
+      })
+    ).toThrow(/缺 pi\//);
+  });
+
+  it("只把 node/ 与 pi/ 拷进包：runtime 里残留的 git/、python/ 不进包", () => {
+    const rt = makeRuntime(tmp, ["node", "pi"]);
+    // 模拟「上一轮构建过 git/python，本轮决定不分发」
+    mkdirSync(path.join(rt, "git"), { recursive: true });
+    writeFileSync(path.join(rt, "git", "git.exe"), "MZ fake git");
+    mkdirSync(path.join(rt, "python"), { recursive: true });
+    writeFileSync(path.join(rt, "python", "python.exe"), "MZ fake python");
+
+    const out = path.join(tmp, "out");
+    stageWindowsRelease({
+      exePath: makeExe(),
+      distDir: makeDist(),
+      outDir: out,
+      runtimeDir: rt,
+    });
+    expect(existsSync(path.join(out, "runtime", "node", "node.exe"))).toBe(true);
+    expect(existsSync(path.join(out, "runtime", "pi", "index.js"))).toBe(true);
+    expect(existsSync(path.join(out, "runtime", "git"))).toBe(false);
+    expect(existsSync(path.join(out, "runtime", "python"))).toBe(false);
+  });
+
+  it("verifyReleaseLayout({wantRuntime:true})：缺 runtime 报错，缺 python/git 只出提示", () => {
+    // 没有 runtime 的产物 —— 验发布包时必须报错
+    const bare = path.join(tmp, "bare");
+    stageWindowsRelease({ exePath: makeExe(), distDir: makeDist(), outDir: bare });
+    expect(() =>
+      verifyReleaseLayout(bare, { exeName: "orbcat.exe", wantRuntime: true })
+    ).toThrow(/runtime/);
+
+    // 有 node+pi ⇒ 通过；python/git 缺席只进 notes，**不算缺件**
+    const rt = makeRuntime(tmp, ["node", "pi"]);
+    const out = path.join(tmp, "out");
+    stageWindowsRelease({
+      exePath: makeExe(),
+      distDir: makeDist(),
+      outDir: out,
+      runtimeDir: rt,
+    });
+    const r = verifyReleaseLayout(out, { exeName: "orbcat.exe", wantRuntime: true });
+    expect(r.ok).toBe(true);
+    expect(r.notes.join(" ")).toMatch(/python/);
+    expect(r.notes.join(" ")).toMatch(/git/);
+  });
 });

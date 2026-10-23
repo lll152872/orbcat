@@ -1,39 +1,53 @@
 #!/usr/bin/env node
 /**
- * orbcat 运行时资产构建 —— 把 pi 内核 / node / python / git+bash 装到 `runtime/`。
+ * orbcat 运行时资产构建 —— 把 pi 内核 / node 装到 `runtime/`。
  *
  * ## 为什么要这个
  *
- * orbcat 现在**依赖系统装了 node**（PTC 的 `run_code` 靠它）、依赖系统有 git
- * （`git` 工具 + 快照回滚）、依赖系统有 python（模型可能调）。
+ * orbcat 依赖系统装了 node**（PTC 的 `run_code` 靠它）**、依赖 pi 内核本身。
  * 用户机器上只要缺一个，功能就残一条。
  *
- * 这个脚本把四个组件**全部内置进包里**，用户零安装。
+ * 这个脚本把这两个组件**内置进包里**，用户零安装。
+ *
+ * ## 分发内容决策（2026-10-23 用户拍板）
+ *
+ * | 组件 | 决定 | 理由 |
+ * |---|---|---|
+ * | node | **必带** | PTC `run_code` 的硬依赖，pi 本身也是 node 路线 |
+ * | pi | **必带** | 内核本体，缺了 pi 内核直接不可用 |
+ * | python | **不带**（可选） | 本文件原来的注释自己写着 python 是「依赖系统有 python（模型可能调）」⇒ **不是 orbcat 的硬依赖**。`pi::bundled_python()` 返回 `Option<PathBuf>`，没有就是 None，**绝不能因此启动失败** |
+ * | git+bash | **不带**（可选） | **GPLv2 不再分发**。`pi::bundled_git()` / `bundled_bash()` 同样返回 Option，没有就回落到系统 git/bash |
+ *
+ * ⇒ **默认只构建 node + pi（约 95 MB）**；要带上 python / git 用
+ * `--with-python` / `--with-git` 显式开（本地开发想要完整运行时可以开）。
  *
  * ## 体积账（2026-10-22 实测）
  *
- * | 组件 | 原始 | 内置后 | 做法 |
- * |---|---|---|---|
- * | node | 87.2 MB | 83.0 MB | 只取 node.exe（不要 npm/corepack/lib） |
- * | python | **2,516.7 MB** | **21.4 MB** | embeddable 版（完整版的 Lib/ 就 2.4 GB） |
- * | git+bash | **410.4 MB** | **64.2 MB** | 砍 scalar/Skia/Tcl-Tk/curl/svn dll + vim/perl/doc |
- * | pi | 106.2 MB（pi.exe）| **10.5 MB** | 精简 dist/bundle + jiti（node 路线，不用 Bun） |
- * | **合计** | | **179.1 MB** | |
+ * | 组件 | 原始 | 内置后 | 做法 | 分发？ |
+ * |---|---|---|---|---|
+ * | node | 87.2 MB | 83.0 MB | 只取 node.exe（不要 npm/corepack/lib） | ✅ 必带 |
+ * | pi | 106.2 MB（pi.exe）| **10.5 MB** | 精简 dist/bundle + jiti（node 路线，不用 Bun） | ✅ 必带 |
+ * | python | 2,516.7 MB | 21.4 MB | embeddable 版（完整版的 Lib/ 就 2.4 GB） | ❌ 默认不带 |
+ * | git+bash | 410.4 MB | 64.2 MB | 砍 scalar/Skia/Tcl-Tk/curl/svn dll + vim/perl/doc | ❌ 默认不带 |
+ * | **默认合计** | | **≈ 95 MB** | node + pi | |
  *
  * ## 用法
  *
  * ```sh
- * node tools/build-runtime-assets.mjs            # 构建到 runtime/
- * node tools/build-runtime-assets.mjs --verify   # 只验证现有 runtime/ 是否可用
+ * node tools/build-runtime-assets.mjs               # 构建 node + pi 到 runtime/
+ * node tools/build-runtime-assets.mjs --with-python # 额外带上 python
+ * node tools/build-runtime-assets.mjs --with-git    # 额外带上 git+bash
+ * node tools/build-runtime-assets.mjs --out <dir>   # 构建到别的目录（测试用）
+ * node tools/build-runtime-assets.mjs --verify      # 只验证现有 runtime/ 是否可用
  * ```
  *
  * ## 依赖
  *
  * 需要先把这些源下载到 `tools/.cache/`（脚本不自动下载，理由见下）：
- * - `pi-coding-agent-1.4.0.tgz`（npm registry）
- * - `python-3.12.8-embed-amd64.zip`（python.org）
- * - `Git-2.52.0-64-bit.zip` 或本机 `C:\Program Files\Git`（作为裁剪源）
+ * - `pi-coding-agent-1.4.0.tgz`（npm registry：@earendil-works/pi-coding-agent）
  * - `node.exe`（nodejs.org）
+ * - `python-3.12.8-embed-amd64.zip`（仅 `--with-python` 时需要）
+ * - `Git-2.52.0-64-bit.zip` 或本机 `C:\Program Files\Git`（仅 `--with-git` 时需要）
  *
  * ⚠️ **为什么脚本不自动下载**：本机火绒会拦截 `bun build --compile` 的临时文件操作，
  * 而且大文件下载在受限网络下极慢。**下载与裁剪分离**，失败时能定位到具体环节。
@@ -46,10 +60,33 @@ import { execFileSync } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
-const RUNTIME = path.join(ROOT, "runtime");
 const CACHE = path.join(__dirname, ".cache");
 
 const VERIFY_ONLY = process.argv.includes("--verify");
+
+/**
+ * 是否额外构建 python / git+bash。
+ *
+ * ⚠️ **默认关**（2026-10-23 用户拍板：分发包只带 node + pi）：
+ * python 不是 orbcat 的硬依赖（模型可能调而已），
+ * git 是 GPLv2 不再分发。
+ * 两个都是「有就用，没有就回落系统」，不是「缺了就不许跑」。
+ */
+const WITH_PYTHON = process.argv.includes("--with-python");
+const WITH_GIT = process.argv.includes("--with-git");
+
+/**
+ * 输出目录。默认仓库根 `runtime/`。
+ * `--out <dir>` 改到别处 —— 测试时不必动用户真实的 runtime/。
+ */
+function argValue(flag) {
+  const i = process.argv.indexOf(flag);
+  if (i < 0) return null;
+  const v = process.argv[i + 1];
+  return v && !v.startsWith("--") ? v : null;
+}
+const OUT_ARG = argValue("--out");
+const RUNTIME = OUT_ARG ? path.resolve(OUT_ARG) : path.join(ROOT, "runtime");
 
 // ─────────────────────────────────────────────────────────────
 // 工具
@@ -486,6 +523,22 @@ function buildPi() {
 // 验证
 // ─────────────────────────────────────────────────────────────
 
+/**
+ * 验证 runtime/ 的可用性。
+ *
+ * ## 契约（2026-10-23 用户拍板后改过）
+ *
+ * - **必查**：`node/node.exe`（PTC run_code + pi 都是 node 路线）、
+ *   `pi/dist/bundle/cli.js`（内核本体）。
+ *   这两个缺一个 ⇒ 这个 runtime 是坏的 ⇒ **fail**。
+ * - **不查**：`python/`、`git/`。它们**不是 orbcat 的硬依赖**
+ *   （`pi::bundled_python()` / `bundled_git()` / `bundled_bash()`
+ *   全部返回 `Option<PathBuf>`，没有就是 None，回落到系统）。
+ *   缺了就给一句提示（告诉用户能在哪指定），**绝不 fail**。
+ *
+ * ⚠️ 旧版把 python / git 也算进必查，于是「按新决策瘦身」的 runtime
+ * 会被自己的校验判死 —— 那种 fail 是自相矛盾。
+ */
 function verify() {
 	log("验证 ...");
 	const node = path.join(RUNTIME, "node/node.exe");
@@ -494,20 +547,9 @@ function verify() {
 	const bashCmd = path.join(RUNTIME, "git/bash.cmd");
 	const pi = path.join(RUNTIME, "pi/dist/bundle/cli.js");
 
-	const checks = [];
-	const nodeVer = tryExec(node, ["--version"]);
-	checks.push(["node", nodeVer?.trim()]);
-
-	const pyVer = tryExec(py, ["-c", "import sys,json,ssl,sqlite3;print(sys.version.split()[0]+' stdlib-ok')"]);
-	checks.push(["python", pyVer?.trim()]);
-
-	const gitVer = tryExec(git, ["--version"]);
-	checks.push(["git", gitVer?.trim()]);
-
-	// bash 必须走 wrapper（PATH 问题）
-	// ⚠️ Windows 上 `execFileSync` 不能直接跑 .cmd（EINVAL）→ 必须经 cmd.exe /c
-	const bashOut = tryExec("cmd.exe", ["/d", "/c", bashCmd, "-c", "echo bash-ok; ls -1 >/dev/null && echo ls-ok; echo 中文"]);
-	checks.push(["bash", bashOut?.trim().replace(/\s+/g, " ")]);
+	// ── 必查 ──
+	const required = [];
+	required.push(["node", tryExec(node, ["--version"])?.trim()]);
 
 	// pi 冒烟：发一条 get_state，看有没有 response
 	if (fs.existsSync(pi) && fs.existsSync(node)) {
@@ -517,15 +559,70 @@ function verify() {
 			timeout: 20000,
 		});
 		const ok = out && out.includes('"command":"get_state"') && out.includes('"success":true');
-		checks.push(["pi rpc", ok ? "get_state success ✓" : "❌ 无响应"]);
+		required.push(["pi rpc", ok ? "get_state success ✓" : "❌ 无响应"]);
+	} else {
+		required.push(["pi rpc", `❌ 缺 ${pi}`]);
 	}
 
-	for (const [k, v] of checks) {
+	for (const [k, v] of required) {
 		log(`  ${v ? "✓" : "❌"} ${k.padEnd(8)} ${v ?? "(失败)"}`);
 	}
-	if (checks.some(([, v]) => !v)) {
-		fail("验证未通过");
+	if (required.some(([, v]) => !v)) {
+		fail("验证未通过（node / pi 是必查项）");
 	}
+
+	// ── 不查（缺了只提示，不 fail）──
+	log("");
+	if (fs.existsSync(path.join(RUNTIME, "python"))) {
+		const pyVer = tryExec(py, ["-c", "import sys,json,ssl,sqlite3;print(sys.version.split()[0]+' stdlib-ok')"]);
+		log(`  ${pyVer ? "✓" : "⚠️"} ${"python".padEnd(8)} ${pyVer?.trim() ?? "(存在但跑不起来 —— 不影响发布)"}`);
+	} else {
+		log("  ℹ️ python    未检测到内置 Python —— 可在设置里指定路径，或直接安装系统 Python。");
+		log("               （不是硬依赖：模型要调 python 时会走系统那份）");
+	}
+	if (fs.existsSync(path.join(RUNTIME, "git"))) {
+		const gitVer = tryExec(git, ["--version"]);
+		// bash 必须走 wrapper（PATH 问题）
+		// ⚠️ Windows 上 `execFileSync` 不能直接跑 .cmd（EINVAL）→ 必须经 cmd.exe /c
+		const bashOut = tryExec("cmd.exe", ["/d", "/c", bashCmd, "-c", "echo bash-ok; ls -1 >/dev/null && echo ls-ok; echo 中文"]);
+		log(`  ${gitVer ? "✓" : "⚠️"} ${"git".padEnd(8)} ${gitVer?.trim() ?? "(存在但跑不起来 —— 不影响发布)"}`);
+		log(`  ${bashOut ? "✓" : "⚠️"} ${"bash".padEnd(8)} ${bashOut?.trim().replace(/\s+/g, " ") ?? "(存在但跑不起来)"}`);
+	} else {
+		log("  ℹ️ git       未分发内置 Git（GPLv2）—— 将使用系统 Git；没有 Git 的功能不可用。");
+	}
+}
+
+/**
+ * 把一个组件从输出目录里**移走**（本轮不分发它）。
+ *
+ * ## 为什么要真的删
+ *
+ * `build-runtime-assets.mjs` 只在构建时覆盖它自己管的子目录，
+ * 不会清理别的组件 —— 于是「上一轮构建过 python，本轮决定不分发」时，
+ * 旧的 `runtime/python/` 会**原地留下来**，照样被打进发布包。
+ * 决策改了，产物就必须跟着变，否则「用户拍板了但包没瘦」= 白拍。
+ *
+ * 删法沿用 `commitDir` 的那套：先改名挪到 `<name>.trash-<ts>`（可回滚），
+ * 再真删（safe-delete 钩子会拦 rmSync ⇒ 退到 PowerShell 的 .NET API）。
+ */
+function dropComponent(name, why) {
+	const final = path.join(RUNTIME, name);
+	if (!fs.existsSync(final)) return;
+	const trash = path.join(RUNTIME, `${name}.trash-${Date.now()}`);
+	try {
+		fs.renameSync(final, trash);
+	} catch {
+		log(`  ⚠️ 挪不动 ${name}/ —— 手动清：${final}`);
+		return;
+	}
+	clearReadonly(trash);
+	try {
+		fs.rmSync(trash, { recursive: true, force: true, maxRetries: 2, retryDelay: 50 });
+	} catch {
+		tryExec("powershell", ["-NoProfile", "-Command",
+			`[System.IO.Directory]::Delete('${trash.replace(/'/g, "''")}', $true)`]);
+	}
+	log(`  ✓ 已移除 ${name}/（${why}）`);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -536,8 +633,16 @@ if (VERIFY_ONLY) {
 	log(`输出目录: ${RUNTIME}`);
 	fs.mkdirSync(RUNTIME, { recursive: true });
 	buildNode();
-	buildPython();
-	buildGit();
+	if (WITH_PYTHON) {
+		buildPython();
+	} else {
+		dropComponent("python", "本轮不分发：模型可能调，不是硬依赖");
+	}
+	if (WITH_GIT) {
+		buildGit();
+	} else {
+		dropComponent("git", "本轮不分发：GPLv2");
+	}
 	buildPi();
 	verify();
 	log("");
