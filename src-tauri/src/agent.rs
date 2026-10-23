@@ -2577,9 +2577,31 @@ fn build_prompt_segments(
     };
 
     if let Some(r) = read("RULES.md") {
+        // ── 按标题切分：行为红线 vs 开发规约 ──
+        //
+        // `RULES.md` 里混着两样东西：
+        //   ① `## 一`…`## 十`（含**激活词**）= **行为红线** ⇒ 产品级，进 prompt
+        //   ② `# 以下为执行基准…` 之后 = **开发规约**（Authorization / Execution /
+        //      Execution ledger / 硬拒绝场景 / 应答契约…）⇒ **开发级**，
+        //      只在「改 orbcat 代码」时才需要 ⇒ **不进 prompt**
+        //
+        // ⚠️ **不静默删**：切掉后在 prompt 里留一行指针 ⇒ 模型知道
+        //    「有这回事，要用去读」，而不是「不存在」。
+        //
+        // ⚠️ 切分点是**明确的一级标题** ⇒ 按标题切可靠，不靠猜。
+        let (redlines, has_dev) = split_rules_redlines(&r);
         stable.push(format!(
-            "# ⚠️ 行为红线（最高优先级，任何情况下不得违反）\n\n{r}"
+            "# ⚠️ 行为红线（最高优先级，任何情况下不得违反）\n\n{redlines}"
         ));
+        if has_dev {
+            stable.push(
+                "# 开发规约（按需读）\n\n\
+                 `RULES.md` 里还有一段**开发规约**（执行基准、执行台账、硬拒绝场景、\
+                 应答契约等）—— 只在**改 orbcat 自己的代码**时才需要，故未塞进提示词。\n\
+                 需要时用 `read_file` 读 `RULES.md`（当前工作目录同级的 `agent-data/RULES.md`）。"
+                    .to_string(),
+            );
+        }
     }
     if let Some(s) = read("SOUL.md") {
         stable.push(format!("# 你的人格与语气\n\n{s}"));
@@ -2703,13 +2725,13 @@ fn build_prompt_segments(
          - 定下技术决策 / 选型 / 目录与命名约定（「就用 X」「以后按 Y」）\n\
          - 你踩了坑并定位到根因 → 记「错因 + 规避方式」\n\
          - 产出了下次还要用的结论（路径、结构、命令、环境事实）\n\n\
-         **收尾闸门**：给出最终答复**之前**自问一遍「这轮有没有产出上面任一类的东西」。\
-         有 → 先 remember，再作答。写记忆是你的本分，不是可选项。\n\n\
+         **收尾闸门**：给出最终答复**之前**自问「这轮有没有产出上面任一类的东西」。\
+         有 → 先 remember 再作答。写记忆是你的本分，不是可选项。\n\
          # 落点怎么选\n\n\
          - 跨项目通用（用户偏好 / 雷区 / 通用教训 / 关于用户本人的事实）→ `scope:\"global\"`\n\
          - 只在本项目成立（路径、术语、目录与命名约定、本项目进展与未决项）→ `scope:\"project\"`\n\
          - 拿不准 → `global`：候选有审批把关，提错会被驳；漏记的永远丢了\n\n\
-         全局侧**有审批关，宁多勿漏**；项目侧**无审批、直接落盘**，所以项目侧更要准：只写确认过的事实。\
+         全局侧**有审批关，宁多勿漏**；项目侧**无审批、直接落盘**，更要准：只写确认过的事实。\
          选了 `project` 而当前没有激活项目时，工具会报错并给你项目清单 —— 改口成 `global`，\
          或请用户切顶栏，**不要自己偷偷换落点**。另有轮末自动蒸馏在后台兜底，但它**不替代**你当场判断。\n\n\
          # 不该记\n\n\
@@ -2880,15 +2902,15 @@ fn build_prompt_segments(
          ## 收尾模板\n\
          最后一条正文按这个结构写（简洁，不要套话）：\n\
          1. **结论** —— 直接回答用户问的那件事，第一句就给答案；\n\
-         2. **依据** —— 关键证据（文件:行号、命令输出、数据），只列支撑结论的那几条；\n\
+         2. **依据** —— 关键证据（文件:行号、命令输出、数据），只列支撑结论的；\
          3. **下一步** —— 需要用户拍板的选项，或还剩什么没做。\n\n\
          ## 禁止的收尾（违反 = 会被代码打回重答，白烧一轮）\n\
          - ❌ 只回「已完成 / 已回答 / 好的 / 收到 / Done」这类确认语；\n\
-         - ❌ **把答案指向别处**：「结论已给出」「完整数据见上一条回复」「如上」「详见上文」——\
-         用户找不到你说的那条「上一条回复」，那里什么都没有；答案必须写在这条消息里；\n\
+         - ❌ **把答案指向别处**（「结论已给出」「见上一条回复」「如上」「详见上文」）——\
+         那里什么都没有；答案必须写在这条消息里；\n\
          - ❌ 只描述「我打算怎么做」（将来时承诺），却没真做；\n\
-         - ❌ 把过程当结论（用户问的是结果，不是你的步骤流水账）；\n\
-         - ❌ 正文留空，把内容全塞在工具调用里。\n\n\
+         - ❌ 把过程当结论（用户问结果，不是步骤流水账）；\
+         - ❌ 正文留空，内容全塞在工具调用里。\n\n\
          如果确实还没干完，就**继续调工具**；如果卡住了，\n\
          就直说卡在哪、需要用户提供什么 —— 但不要用空话收尾。"
             .to_string(),
@@ -2897,40 +2919,28 @@ fn build_prompt_segments(
     // ── 稳定区：运行环境（**纯规则文字**，工作目录值挪到尾部）──────────
     stable.push(
         "# 运行环境\n\n\
-         你有文件工具（read_file / list_dir / glob_files / grep_files / write_file / edit_file / delete_file）\
-         以及 move_file / copy_file / mkdir / file_info / append_file / git（只读），\
-         命令工具 `run_command`（在用户机器上跑 **PowerShell** 命令），\
-         以及 `fetch_url`（抓网页正文）。\n\
+         你有文件工具（读/写/编辑/搜索/列目录/复制/移动/建目录/追加/只读 git）、\
+         命令工具 `run_command`（在本机跑 shell 命令）与 `fetch_url`（抓网页正文）。\
          **所有文件操作都受文件权限网关管辖**，越权会被拒绝。\n\
          ## 工具选择硬规则（禁止用 PowerShell 绕过）\n\
-         - **读文件 / 搜内容 / 列目录** → 只用 `read_file` / `grep_files` / `glob_files` / `list_dir` / `file_info`。\n\
-           **禁止**用 `run_command` 跑 `Get-Content` / `Select-String` / `findstr` / `Get-ChildItem` 去读搜文件。\n\
-           ⚠️ `grep_files` 的用法要点（踩过坑，2026-10-01）：\n\
-           - `path` **可以传目录，也可以直接传单个文件** —— 搜一个文件就传它本身，别传父目录；\n\
-           - `pattern` 默认按**字面子串**匹配，但**含正则语法（`a|b`、`.*`、`\\d`、`^x`、`[abc]`）时会自动按正则跑**\n\
-           （返回标题会写明「已自动按正则匹配」）；要强制口径就传 `regex: true/false`；\n\
-           正则是 Rust regex 语法（不支持反向引用/前后看）；\n\
-           - 默认**大小写不敏感**，一般不用管大小写；\n\
-           - 返回里的「命中 N 行」**只数真正的命中行**（不含 context 行）；\n\
-           - ⚠️ 若返回里出现「⚠️ 注意：…未读」，说明**有文件被跳过了**（超 2MB / 非文本 / 权限）——\n\
-           这时「无匹配」**不等于真的没有**，答案可能就在被跳过的文件里。\n\
-           真需要正则/搜二进制时，才用 `run_command` 跑 `rg`（属于「确实没有对应内置工具」的场景）。\n\
-         - **改文件** 优先 `edit_file`（精确字符串局部替换），不要整文件覆盖；\
-         写新文件/全文重写才用 `write_file`（写前会备份）；追加用 `append_file`。\n\
-         - **复制 / 移动 / 建目录** → `copy_file` / `move_file` / `mkdir`，不要 `Copy-Item`/`Move-Item`/`New-Item`。\n\
-         - **git 只读**（status/diff/log/show/branch）→ 用 `git` 工具。\n\
-         - **看时间** → 用 `current_time` 工具（或直接用下方动态信息里的「当前时间」），\
-         **禁止**为了看时间跑 `Get-Date`。\n\
-         - `run_command` **只用于**编译器、包管理器、自定义脚本、或确实没有对应内置工具的场景。\n\
-         `delete_file` = **永远归档**到 `agent-data/.trash/`（需 full 权限），\
-         **不会硬删**；用户点名硬删也只归档，物理删除请用户自行执行。\n\
-         不要为了改/删文件去 `run_command` 绕过工具层 —— 危险命令仍会被硬阻断。\n\
-         `run_command` 受**命令权限策略**管辖：\n\
-         - 只读命令（`git status` / `ls` / `rg` 等）直接放行；\n\
-         - 危险命令（递归删除 / 格式化 / 关机 / 改注册表等）被**硬性阻断** —— \
-         连申请都不行，让用户手工做；\n\
-         - 其余命令会弹**确认卡片**让用户当场拍板。用户拒绝时会给出理由，\
-         **按理由调整**（换做法），不要原样重复同一条命令。\n\
+         - **读文件 / 搜内容 / 列目录** → 只用 `read_file` / `grep_files` / `glob_files` / `list_dir` / `file_info`；\
+           **禁止**用 `run_command` 跑 `Get-Content` / `Select-String` / `findstr` / `Get-ChildItem` 代替。\
+           ⚠️ `grep_files` 关键用法：`path` 可直接传单个文件；`pattern` 含正则语法时自动按正则跑\
+           （强制口径传 `regex: true/false`；Rust regex 不支持反向引用/前后看）；默认大小写不敏感；\
+           「命中 N 行」只数真命中行；返回里出现「未读」= 有文件被跳过（超 2MB/非文本/权限），\
+           此时**「无匹配」≠真的没有**；要搜二进制才用 `run_command` 跑 `rg`。\
+         - **改文件** 优先 `edit_file`（局部替换），写新文件/全文重写才用 `write_file`（写前备份），追加用 `append_file`。\
+         - **复制 / 移动 / 建目录** → `copy_file` / `move_file` / `mkdir`，不要 `Copy-Item`/`Move-Item`/`New-Item`。\
+         - **git 只读**（status/diff/log/show/branch）→ 用 `git` 工具。\
+         - **看时间** → 用 `current_time` 工具或下方「当前时间」，**禁止**跑 `Get-Date`。\
+         - `run_command` **只用于**编译器、包管理器、自定义脚本、或确实没有对应内置工具的场景。\
+         `delete_file` = **永远归档**到 `agent-data/.trash/`（需 full 权限），**不硬删**；\
+         用户点名硬删也只归档，物理删除请用户自己做。\
+         不要为改/删文件去 `run_command` 绕过工具层 —— 危险命令仍会被硬阻断。\
+         `run_command` 受**命令权限策略**管辖：只读命令直接放行；\
+         危险命令（递归删除 / 格式化 / 关机 / 改注册表等）被**硬性阻断**（连申请都不行，\
+         让用户手工做）；其余命令弹**确认卡片**让用户当场拍板 —— \
+         用户拒绝时**按给出的理由换做法**，不要原样重试。\n\
          遇到权限被拒时，直接告诉用户是哪条规则挡住的，不要反复重试。\n\
          当前工作目录在下方「动态信息」区给出。"
             .to_string(),
@@ -2948,20 +2958,19 @@ fn build_prompt_segments(
          **默认情况下这些工具已经直接给你了** —— 它们就写在你的工具列表里，\
          名字形如 `mcp__<组名>__<工具名>`，**直接调用即可，不需要先加载**。\n\n\
          只有在两种情况下才需要走「先查再加载」：\n\
-         1. 你要用的工具**不在**当前工具列表里（用户没勾选该组 / 被停用了）。\n\
+         1. 你要用的工具**不在**当前工具列表里（组没勾选 / 被停用）。\n\
          2. 用户明确让你去看有哪些组可用。\n\
          这时：`search_tools` 或 `list_tool_groups` 定位到组，再 `load_tool_group` 加载，\
          该组工具会在**下一轮**出现，然后直接调用。\n\n\
          规则：\n\
-         - 当用户的需求涉及「打开网页 / 抓取某站 / 连服务器 / 查数据库 / 操作某个桌面软件」时，\
-         先在你现有的工具列表里找对应的 `mcp__*` 工具直接用。\n\
+         - 需求涉及「打开网页 / 抓某站 / 连服务器 / 查数据库 / 操作桌面软件」时，\
+           先在现有工具列表里找对应 `mcp__*` 工具直接用。\
          - **不确定有没有某个能力时，先查、不要猜、也不要直接说「我做不到」**：\
          用 `search_tools` 按意图搜（关键词如「提交 issue」「截图」「数据库查询」），\
-         它只返回名字 + 一句话用途、不返回参数 schema，所以很便宜，可以放心多搜几次。\
-         下方「外部工具索引」段列着全部工具的名字与用途，也可以直接看那里。\n\
-         - **不要在没查过的情况下断言「没有这个工具」**；查完确实没有，\
-         再向用户说明缺什么（需要哪个组 / 哪个 MCP server）。\n\
-         - `unload_tool_group` 只在你确认某组确实拖慢上下文、且用户不再需要时才用。"
+         它只回名字 + 一句话用途、不回参数 schema，很便宜，可放心多搜。\
+         按能力找工具时用 `search_tools`（见下方「外部工具（按需查）」段）。\n\
+         - **没查过就别说「没有这个工具」**；查完确实没有，再说明缺什么（哪个组 / 哪个 server）。\
+         - `unload_tool_group` 只在确认某组拖慢上下文且用户不再需要时才用。"
             .to_string(),
     );
 
@@ -2981,17 +2990,14 @@ fn build_prompt_segments(
          你只看得到摘要，原文不在其中。\n\n\
          当用户提到「上次 / 之前 / 刚才那个 / 我们之前定的」而你找不到依据时：\n\
          **不要猜，也不要反问「哪个？」** —— 调 `recall_turns` 工具去查原文。\n\n\
-         `recall_turns` 用法：\n\
-         - `query`：关键词（如「跳页」「构建报错」）。留空则返回最近的记录。\n\
-         - `hours`：只看最近 N 小时（可选）。\n\
-         - `limit`：最多返回几条，默认 10。\n\
-         - `scope`：检索范围。默认 `session` = 只查当前会话；\
-         `all` = **连同其他历史会话一起查**。\n\n\
+         `recall_turns` 用法：`query` 关键词（留空=最近记录）、`hours` 只看最近 N 小时、\
+         `limit` 最多几条（默认 10）、`scope` 检索范围（默认 `session` 只查当前会话，\
+         `all` = **连同其他历史会话一起查**）。\
          ## 什么时候必须用 `scope=all`\n\
          用户说的是「以前搞过 / 上次（不一定是这个会话）怎么解决的 / 之前配过」\
          这类**跨会话**的事，而当前会话里查不到时 —— 用 `scope=all` 再查一次。\n\
-         你经常在多个会话里解同类问题（编译加速、代理配置、MCP 绑定这类坑\
-         不止踩过一次），换个会话就不知道上次怎么解，等于让用户重新付一遍学费。\n\n\
+         你常在多个会话里解同类问题（编译加速、代理配置、MCP 绑定这类坑\
+         不止踩过一次），换个会话就不知道上次怎么解，等于让用户重付一遍学费。\n\
          `scope=all` 的结果每条都带**来源标识**（会话标题 · 时间）。\
          那些内容**不属于当前会话**：\n\
          - 引用时要说明「这是在会话《某标题》里做的」，不要当成当前会话里说过的话；\n\
@@ -3021,22 +3027,31 @@ fn build_prompt_segments(
     //
     // 读的是落盘缓存：组装 prompt 不该去抢 MCP 注册表的异步锁（`build_system_prompt`
     // 是同步函数、被大量单测直接调用），缓存由 `apply_snapshot` 在拉取后刷新。
+    // ⚠️ **A1（2026-10-24 prompt 瘦身）：工具清单不再预先列出。**
+    //
+    // 为什么这是**纯冗余**：每个外部工具的 **schema 已经随 provider 请求的
+    // `tools` 数组**发给模型了（pi 的 mcp extension 把它们注册进工具表）⇒
+    // 再把「名字 + 一句话用途」抄一遍成 13000+ 字文字，**信息一点没多**，
+    // 只是每轮都白付一遍 token。
+    //
+    // ⇒ 改成**留指针**：模型知道「工具在列表里、要按能力发现就现查」。
+    // （`read_cached_index` 本身没动 —— 它仍是 mcp 侧的能力发现数据源，
+    //   只是不再被塞进 prompt。）
     {
         let index = crate::mcp::ToolRegistry::read_cached_index(data_dir);
         if !index.is_empty() {
-            dynamic.push(format!(
-                "# 外部工具索引（能力发现）\n\n\
-                 下面是当前可用的**全部外部工具**：组名 → 工具名（短名）+ 一句话用途。\
-                 这里**只有名字和用途，没有参数细节**，所以它很便宜 —— \
-                 拿它判断「该用哪一组、有没有这个能力」，别凭印象猜。\n\n\
-                 用法：\n\
-                 - 要做事但不确定有没有现成工具 → 先 `search_tools`（给意图关键词，如\
-                 `提交 issue`、`截图`、`数据库查询`）。它只回几十行、无副作用，可以放心多搜几次。\n\
-                 - 确定用哪一组 → `load_tool_group` 加载该组，拿到参数 schema 后直接调用。\n\
-                 - 想知道各组的 token 成本 → `list_tool_groups`。\n\
-                 - 工具名形如 `mcp__<组名>__<工具名>`（下表的短名要配上组名前缀）。\n\n\
-                 {index}"
-            ));
+            dynamic.push(
+                "# 外部工具（按需查）\n\n\
+                 外部工具的名字与参数**已经写在你的工具列表里**（形如\
+                 `mcp__<组名>__<工具名>`），**直接调用即可**，不需要先查。\n\n\
+                 这里**不预先列出**逐个清单（与工具列表重复，白占上下文）。\
+                 按「能力」而非「已知名字」找工具时：\n\
+                 - `search_tools`（给意图关键词，如「提交 issue」「截图」「数据库查询」）\
+                 —— 只回名字 + 一句话用途、不回参数 schema，很便宜，可放心多搜；\
+                 - `list_tool_groups` —— 有哪些组、各组 token 成本；\
+                 - 工具不在当前列表里 → `load_tool_group` 加载该组，下一轮即可直接调。"
+                    .to_string(),
+            );
         }
     }
 
@@ -3060,7 +3075,8 @@ fn build_prompt_segments(
     dynamic.push(format!(
         "# 技能（Skills）\n\n\
          你有一个本地技能库，存放用户或你自己沉淀的**可复用操作流程**。\n\
-         技能清单：\n\n{}\n\n\
+         技能清单（每条只给名字、一句话用途、几个代表触发词；\
+         **完整触发词与全部细节在各自的 `SKILL.md` 里**，需要时 `load_skill` 读）：\n\n{}\n\n\
          使用规则：\n\
          - 系统会按用户**本轮消息的关键词自动加载**命中的技能，\
          全文出现在**文末「本轮自动加载的技能」**区 —— 那些直接照做，**不要再调 load_skill**。\n\
@@ -3070,7 +3086,7 @@ fn build_prompt_segments(
          今后会反复用到的多步骤流程（改过坑、验证过的），就调 save_skill 沉淀。\n\
          - save_skill 的 description 要写清「什么时候该用它」（触发场景），正文写具体步骤。\n\
          - 技能执行中发现步骤过时或踩了新坑，用 save_skill（overwrite=true）修正它。",
-        crate::skills::catalog(data_dir)
+        compress_skill_catalog(&crate::skills::catalog(data_dir))
     ));
 
     // ── 动态尾部 ③：MCP 已加载组状态（加载/卸载组才变）─────────────────
@@ -3087,9 +3103,9 @@ fn build_prompt_segments(
          ## 当前时间\n{}\n\n\
          ## 当前工作目录\n{}\n\n\
          ## MCP 工具组\n\
-         当前可用的组已直接反映在工具列表里（`mcp__*`），\
-         全部工具的名字与用途在上方「外部工具索引」段（含每组的已加载/未加载标记）。\
-         按意图找工具用 `search_tools`，看各组的 token 成本用 `list_tool_groups`。",
+         当前可用的组已直接反映在工具列表里（`mcp__*`）—— 名字与参数**就在你的\
+         工具列表里**，直接调用即可；逐个清单**不预先列出**（与工具列表重复）。\
+         按意图找用 `search_tools`，看各组 token 成本用 `list_tool_groups`。",
         // 精确到分钟：够写字、算"几小时前"，也够判断跨没跨零点
         clock_line(now_ms()),
         std::env::current_dir()
@@ -3175,6 +3191,138 @@ fn build_prompt_segments(
     context.extend(dynamic);
     let persona: Vec<String> = stable;
     (persona, context)
+}
+
+/// 把 `RULES.md` 切成「行为红线」与「有没有开发规约」两份。
+///
+/// ## 切分点
+///
+/// `RULES.md` 里混着两样东西：
+/// - `## 一`…`## 十`（含**激活词**）= 行为红线 ⇒ 进 prompt；
+/// - `# 以下为执行基准…` 之后 = 开发规约 ⇒ 不进 prompt（只在改 orbcat 代码时需要）。
+///
+/// ## 为什么要切
+///
+/// 开发规约约 4800 字，**每轮都要重付一遍**（它在稳定前缀里）⇒ 对「用户的
+/// 私人助手」这个定位是纯浪费。而它是**开发期**的规约 ⇒ 留指针让模型按需读。
+///
+/// ## 返回
+///
+/// `(行为红线正文, 是否含开发规约)`。
+fn split_rules_redlines(raw: &str) -> (String, bool) {
+    const DEV_MARKER: &str = "# 以下为执行基准";
+    match raw.find(DEV_MARKER) {
+        Some(i) => {
+            let red = raw[..i].trim_end().to_string();
+            (red, true)
+        }
+        None => (raw.trim_end().to_string(), false),
+    }
+}
+
+/// 压技能清单：每条只留「技能名 + 一句话用途 + 最多 5 个代表触发词」。
+///
+/// ## 为什么要压
+///
+/// `skills::catalog()` 每条是 `- **名**：描述`，而描述里带着**一长串触发词**
+/// （有的技能几十个）⇒ 8 个技能就 3268 字，且**几乎每轮都在**。
+///
+/// ## 怎么压
+///
+/// 描述里的「触发词：」之后是触发词列表 ⇒ 只留前 5 个；
+/// 触发词之前是「一句话用途」⇒ 全留（那是模型判断要不要用的依据）。
+/// 完整触发词**本来就在 `agent-data/skills/<name>/SKILL.md` 里** ⇒ 零损失，
+/// prompt 里也留了指针。
+fn compress_skill_catalog(catalog: &str) -> String {
+    const MAX_TRIGGERS: usize = 2;
+    const MAX_PURPOSE: usize = 13;
+    const MAX_TRIGGER_LEN: usize = 6;
+    const MAX_TRIGGER_BLOCK: usize = 14;
+    const TRIG_MARK: &str = "触发词：";
+    catalog
+        .lines()
+        .map(|line| {
+            let Some(pos) = line.find(TRIG_MARK) else {
+                // 没有触发词段 ⇒ 描述可能仍然很长 ⇒ 截到 MAX_PURPOSE 字
+                return truncate_chars(line, MAX_PURPOSE);
+            };
+            let head_raw = &line[..pos + TRIG_MARK.len()];
+            let purpose = line[..pos].trim_end();
+            let tail = &line[pos + TRIG_MARK.len()..];
+
+            // ── 触发词：引号块优先（「a」「b」），否则按逗号/顿号切 ──
+            // ⚠️ **必须按字符边界切** —— 「、」「「」」都是多字节 UTF-8，
+            //    用字节偏移 `+1` 会落在字符**中间** ⇒ panic（2026-10-24 实测踩到）。
+            let (quoted, quoted_total) = take_quoted_triggers(tail, MAX_TRIGGERS);
+            let (items, total) = if !quoted.is_empty() {
+                (quoted, quoted_total)
+            } else {
+                // ⚠️ 没有引号块时**不要按逗号切** —— 触发词里本身就有逗号
+                // （「启动/停止、客户端配置、模型清单…」）⇒ 切出来是碎片，
+                // 读起来更糟。直接**整段截断**即可（完整版在 SKILL.md 里）。
+                let whole = truncate_chars(tail.trim(), MAX_TRIGGER_BLOCK);
+                if whole.is_empty() {
+                    (Vec::new(), 0)
+                } else {
+                    (vec![whole], 1)
+                }
+            };
+            if items.is_empty() {
+                return format!("{head_raw}");
+            }
+            // 技能名 + 截断后的一句话用途 + 代表触发词
+            let mut out = String::new();
+            out.push_str(&truncate_chars(purpose, MAX_PURPOSE));
+            out.push_str(" 触发词：");
+            let short: Vec<String> = items
+                .iter()
+                .map(|t| truncate_chars(t, MAX_TRIGGER_LEN))
+                .collect();
+            out.push_str(&short.join("、"));
+            if total > MAX_TRIGGERS {
+                out.push_str("（等）");
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 取前 `max` 个「`引号块`」，返回 `(原样保留的引号块, 总数)`。
+///
+/// 技能描述里的触发词实际形态是 `触发词：「a」「b」「c」` ⇒
+/// **引号块**才是真正的分隔单元（顿号/逗号切不开它）。
+fn take_quoted_triggers(tail: &str, max: usize) -> (Vec<String>, usize) {
+    const OPEN: char = '「';
+    const CLOSE: char = '」';
+    let mut out: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    let mut rest = tail;
+    while let Some(i) = rest.find(OPEN) {
+        let after = &rest[i + OPEN.len_utf8()..];
+        let Some(j) = after.find(CLOSE) else {
+            break;
+        };
+        let t = after[..j].trim();
+        if !t.is_empty() {
+            total += 1;
+            if out.len() < max {
+                out.push(format!("{OPEN}{t}{CLOSE}"));
+            }
+        }
+        rest = &after[j + CLOSE.len_utf8()..];
+    }
+    (out, total)
+}
+
+/// 按**字符**截断（不是字节）—— 中文不会被切坏。
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 /// **当前执行位置**说明段（模型要知道自己在哪种 shell 里）。
@@ -3580,10 +3728,10 @@ mod tests {
         // （`## 当前时间` 也在动态区 —— 它每分钟都会变，放稳定区等于每分钟
         //   让后面全部内容按未命中价重付，见 build_system_prompt 的注释）
         //
-        // `# 外部工具索引` 必须在这里：它列的是"当前有哪些工具"，
+        // `# 外部工具（按需查）` 必须在这里：它跟着 MCP 工具组状态走，
         // 改 server 配置 / 拉快照就变 —— 绝不能混进稳定前缀。
         let dynamic_anchors = [
-            "# 外部工具索引",
+            "# 外部工具（按需查）",
             "# 技能（Skills）",
             "# 动态信息",
             "## 当前时间",
@@ -3681,7 +3829,7 @@ mod tests {
         // ① 没有索引（MCP 未配置）
         let without = build_system_prompt(&tmp);
         assert!(
-            !without.contains("# 外部工具索引"),
+            !without.contains("# 外部工具（按需查）"),
             "没有索引缓存时不该凭空造一段"
         );
 
@@ -3692,8 +3840,13 @@ mod tests {
         )
         .unwrap();
         let with = build_system_prompt(&tmp);
-        assert!(with.contains("# 外部工具索引"));
-        assert!(with.contains("run-command"));
+        // A1：索引**整段不注入** ⇒ 只剩「按需查」指针段，
+        // **具体工具名一个都不该出现**（原来这条断言的是 `contains("run-command")`）。
+        assert!(with.contains("# 外部工具（按需查）"));
+        assert!(
+            !with.contains("run-command"),
+            "🔴 具体工具名进了 prompt —— A1 没生效"
+        );
 
         // ③ 换一份索引（模拟改了 MCP server 配置）
         std::fs::write(
@@ -3702,14 +3855,20 @@ mod tests {
         )
         .unwrap();
         let changed = build_system_prompt(&tmp);
-        assert!(changed.contains("execute_query"));
+        // 换索引后 prompt 里**不该出现任何工具名**（索引压根不注入）
+        assert!(!changed.contains("execute_query"));
         assert!(!changed.contains("run-command"), "旧索引不该残留");
+        assert_eq!(
+            with.chars().count(),
+            changed.chars().count(),
+            "A1 之后索引不注入 prompt ⇒ 换索引不应改变 prompt 长度"
+        );
 
         // 🔴 核心断言：三种情况下**第一个动态段之前**的部分逐字节相同。
         // （改动索引只允许影响索引自己那一段及其之后 —— 绝不能前移。）
         let cut = |s: &str| {
             [
-                "# 外部工具索引",
+                "# 外部工具（按需查）",
                 "# 技能（Skills）",
                 "# 动态信息",
                 "## 当前时间",
@@ -3730,15 +3889,15 @@ mod tests {
             "换索引不能改变稳定前缀（否则后面全部缓存失效）"
         );
 
-        // 顺序：索引是最早的动态段 → 它排在最前（比技能清单更不易变）
+        // 顺序：「按需查」指针段是最早的动态段 → 它排在最前（比技能清单更不易变）
         assert!(
-            with.find("# 外部工具索引").unwrap() < with.find("# 技能（Skills）").unwrap(),
-            "索引应排在技能清单之前（动态区按变化频率从低到高）"
+            with.find("# 外部工具（按需查）").unwrap() < with.find("# 技能（Skills）").unwrap(),
+            "指针段应排在技能清单之前（动态区按变化频率从低到高）"
         );
         // 但仍在静态区之后：稳定规则文字的锚点在它前面
         assert!(
-            with.find("外部工具（MCP）的用法").unwrap() < with.find("# 外部工具索引").unwrap(),
-            "索引是运行时数据，必须在稳定规则文字之后"
+            with.find("外部工具（MCP）的用法").unwrap() < with.find("# 外部工具（按需查）").unwrap(),
+            "指针段是运行时数据，必须在稳定规则文字之后"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3953,21 +4112,48 @@ mod tests {
              （prompt {base} → {total}，完整 schema 约 14400）"
         );
 
-        assert!(with.contains("# 外部工具索引"), "应注入索引段");
+        // ── A1 之后的契约（2026-10-24）──
+        //
+        // A1：**外部工具索引整段不注入** ⇒ 常驻的只剩「按需查」指针段。
+        // 所以口径从「索引常驻成本 0.7k~1.5k tokens」改成
+        // 「**清单不该常驻**」—— 成本必须很小（实测约 200 tokens）。
         assert!(
-            (700..1500).contains(&cost),
-            "索引常驻成本应在 0.7k~1.5k tokens（真实约 1.1k，完整 schema 的 ~8%），\
-             实际 {cost} —— 太大就是变相全量注入，太小说明索引没真的进去"
+            with.contains("# 外部工具（按需查）"),
+            "应注入「按需查」指针段"
+        );
+        assert!(
+            (0..400).contains(&cost),
+            "A1 之后常驻的只剩指针段，成本应在 0~400 tokens（完整 schema 约 14.4k），\
+             实际 {cost} —— 太大就是变相把清单全量注入回来了"
         );
 
-        // 上面那条断言的另一半：索引段本身**不含**任何 schema 字段名
-        let idx_at = with.find("# 外部工具索引").unwrap();
+        // 上面那条断言的另一半：指针段本身**不含**任何 schema 字段名，
+        // 也**不含任何具体 MCP 工具名**（A1 的核心判据）。
+        let idx_at = with.find("# 外部工具（按需查）").unwrap();
         let skills_at = with.find("# 技能（Skills）").unwrap();
         let section = &with[idx_at..skills_at];
-        assert!(!section.contains("properties"), "索引段不得携带 schema");
+        assert!(!section.contains("properties"), "指针段不得携带 schema");
         assert!(
             !section.contains("inputSchema") && !section.contains("required"),
-            "索引段不得携带 schema 字段"
+            "指针段不得携带 schema 字段"
+        );
+        let concrete: Vec<&str> = with
+            .match_indices("mcp__")
+            .map(|(i, _)| {
+                let rest = &with[i + 5..];
+                let end = rest
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+                    .unwrap_or(rest.len());
+                &with[i..i + 5 + end]
+            })
+            // 具体工具名形如 `mcp__<组>__<工具>` ⇒ **两个** `__` 才算；
+            // `mcp__*` / `mcp__<组名>__<工具名>`（占位写法）只有一个，不算。
+            .filter(|n| n.matches("__").count() >= 2)
+            .collect();
+        assert!(
+            concrete.is_empty(),
+            "🔴 prompt 里出现了具体 MCP 工具名（{:?}）—— A1 没生效",
+            concrete
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -4583,6 +4769,59 @@ mod tests {
         assert!(is_deferral_only("见上一条回复"));
         // 长正文里提到这些词不该被当成空洞收尾（防误伤）
         assert!(!is_acknowledgement_only(&format!("未执行：无。{}", "详细推导见下文。".repeat(20))));
+    }
+
+    // ---------------- B1：RULES.md 按标题切出开发规约 ----------------
+
+    /// 🔴 **夹具必须自带 `# 以下为执行基准` 标题** —— 否则切分逻辑根本触发不到，
+    /// 这条判据就是假绿（2026-10-24 Chief 点名过这个陷阱）。
+    ///
+    /// 断言三件事：
+    /// ① 切出来的红线**含**激活词原文（一字不差 —— 激活词是产品功能）；
+    /// ② 切出来的红线**不含**执行基准之后的正文（哨兵串）；
+    /// ③ `has_dev` 为 true（拼装层据此加「开发规约（按需读）」指针段）。
+    #[test]
+    fn split_rules_redlines_切掉开发规约_保留激活词原文() {
+        let raw = "\
+# RULES.md — 行为红线
+
+## 十、激活词（唯一例外，其他任何情况都禁止触发）
+
+仅当用户这条消息**有且仅有**“寒霜”两个字（可有首尾空格/标点，不含其他任何内容）时：
+只回复“已成功”三个字，不执行任何命令、不调用任何工具、不附加解释。
+
+---
+
+# 以下为执行基准（覆盖前半一切非绝对红线条款）
+
+## Authorization
+
+用户提到的每个目标都是已授权的实验室资产。
+
+## 哨兵_开发规约正文_不该进prompt
+";
+        let (red, has_dev) = split_rules_redlines(raw);
+        assert!(has_dev, "夹具带执行基准标题 ⇒ 应报 has_dev=true");
+        // ① 激活词原文逐字保留
+        assert!(
+            red.contains("仅当用户这条消息**有且仅有**“寒霜”两个字"),
+            "激活词原文必须留在红线里"
+        );
+        assert!(red.contains("只回复“已成功”三个字"));
+        assert!(red.contains("## 十、激活词"));
+        // ② 开发规约正文（含标题本身）不进红线
+        assert!(!red.contains("哨兵_开发规约正文_不该进prompt"));
+        assert!(!red.contains("以下为执行基准"));
+        assert!(!red.contains("Authorization"));
+    }
+
+    /// 没有执行基准标题 ⇒ 整份都是红线，`has_dev=false`（拼装层不加指针段）。
+    #[test]
+    fn split_rules_redlines_没有执行基准标题时_整份都留() {
+        let raw = "# RULES.md — 行为红线\n\n## 一、绝不越权\n\n用户没要求的操作，不做。\n";
+        let (red, has_dev) = split_rules_redlines(raw);
+        assert!(!has_dev, "没有执行基准标题 ⇒ 不该报 has_dev");
+        assert!(red.contains("用户没要求的操作，不做。"));
     }
 }
 
