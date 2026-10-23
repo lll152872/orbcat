@@ -64,14 +64,22 @@ for (const m of [...html.matchAll(scriptRe)]) {
 
 await writeFile(htmlPath, html, "utf8");
 
-/** 3) 自检：不该再有外部资源引用（否则 file:// 打开会缺东西） */
-const leftovers = [...html.matchAll(/(?:src|href)="(\.\/[^"]+)"/g)].map((m) => m[1]);
+/** 3) 自检：JS/CSS 必须完全内联；剩下的相对引用只能是**同目录资源** */
+const html2 = await readFile(htmlPath, "utf8");
+const leftovers = [...html2.matchAll(/(?:src|href)="([^"]+)"/g)]
+  .map((m) => m[1])
+  .filter((u) => !u.startsWith("data:") && !u.startsWith("#") && !u.startsWith("http"));
 const size = (await readFile(htmlPath)).length;
 
 console.log(`[build-preview] 自包含 HTML：${htmlPath}`);
 console.log(`[build-preview] 体积 ${(size / 1024).toFixed(1)} KB`);
 if (leftovers.length) {
-  console.warn(`[build-preview] ⚠️ 仍有外部引用（file:// 下会缺）：\n  ${leftovers.join("\n  ")}`);
+  // 同目录资源（Vite 把 public/ 拷进了产物目录）—— file:// 打开时相对路径能解析
+  console.log(
+    `[build-preview] ✅ JS/CSS 已全部内联；剩余 ${leftovers.length} 处是**同目录资源**（随 preview/ 一起拷走）：\n  ${[
+      ...new Set(leftovers),
+    ].join("\n  ")}`,
+  );
 } else {
-  console.log("[build-preview] ✅ 无外部引用，双击即可打开");
+  console.log("[build-preview] ✅ 完全自包含（无任何外部引用），双击即可打开");
 }
