@@ -157,7 +157,13 @@ pub struct PiRuntime {
     /// - 前端**临时切模型**而不改 `settings.json`。
     ///
     /// 生产路径不设它 —— 走 `settings.selected_model` 那条反查。
-    model_override: tokio::sync::Mutex<Option<(String, String)>>,
+    /// 覆盖模型：`(模型 id, base URL, 是否声明支持图片)`。
+    ///
+    /// 第三个字段是**图片能力声明** —— pi 会按 `model.input` 决定
+    /// **要不要把图发给模型**（上游 `openai-completions` chunk：
+    /// `hasImages && model.input.includes("image")`）
+    /// ⇒ 声明只有 `["text"]` 的话，**图会被静默丢掉**（不报错）。
+    model_override: tokio::sync::Mutex<Option<(String, String, bool)>>,
     /// 额外注入的 MCP server（**测试专用**）。
     /// 为什么要这个：测「pi 真的能连 MCP、真的能调到 MCP 工具」需要一个
     /// **确定**的 server —— 不能依赖用户本机配的 `1mcp` 网关（它可能没起、
@@ -305,7 +311,27 @@ impl PiRuntime {
     ///
     /// 只在**测试**和「前端临时切模型」时用。生产路径不设它。
     pub async fn set_model_override(&self, model_id: impl Into<String>, base_url: impl Into<String>) {
-        *self.model_override.lock().await = Some((model_id.into(), base_url.into()));
+        *self.model_override.lock().await = Some((model_id.into(), base_url.into(), false));
+    }
+
+    /// 同 [`PiRuntime::set_model_override`]，但**声明这个模型支持图片**。
+    ///
+    /// ## 为什么需要这一档
+    ///
+    /// pi 按模型的 `input` 能力声明决定**要不要把图发给模型**
+    /// （上游 `openai-completions` chunk：`hasImages && model.input.includes("image")`）
+    /// ⇒ 声明只有 `["text"]` 的话，**图会被静默丢掉** —— 不报错、模型收不到、
+    /// 前端还以为图送出去了。
+    ///
+    /// 注入的临时 provider 默认按 orbcat `models.json` 里**同名模型**的
+    /// `supportsImages` 声明；模型不在清单里（测试用的假模型就是）时，
+    /// 用这个方法显式声明。
+    pub async fn set_model_override_with_images(
+        &self,
+        model_id: impl Into<String>,
+        base_url: impl Into<String>,
+    ) {
+        *self.model_override.lock().await = Some((model_id.into(), base_url.into(), true));
     }
 
     /// 设置本轮的 prompt 上下文（**宿主在开跑前调**）。
@@ -566,7 +592,9 @@ impl PiRuntime {
         let mut providers: std::collections::BTreeMap<String, Value> = Default::default();
         let mut idx: std::collections::BTreeMap<(String, String), String> = Default::default();
 
-        for m in list {
+        // ⚠️ 用**借用**遍历（不是 `for m in list`）——
+        // 下面注入临时 provider 时还要查 `list` 里同名模型的 `supportsImages`。
+        for m in &list {
             let Some(url) = m.get("url").and_then(|x| x.as_str()) else {
                 continue;
             };
@@ -650,11 +678,12 @@ impl PiRuntime {
         // provider 名（`orb1`/`orb6`…）是按 URL 去重后的**插入顺序**生成的，
         // 外部没法预知（2026-10-22 踩到：以为能按名指定，结果错位）。
         let settings = crate::config::load_settings(&self.data_dir);
-        let (want_id, want_url) = match self.model_override.lock().await.clone() {
-            Some((id, url)) => (Some(id), Some(url)),
+        let (want_id, want_url, want_images) = match self.model_override.lock().await.clone() {
+            Some((id, url, images)) => (Some(id), Some(url), images),
             None => (
                 settings.selected_model.clone(),
                 settings.selected_model_url.clone(),
+                false,
             ),
         };
 
@@ -677,6 +706,24 @@ impl PiRuntime {
                         .unwrap_or(false)
             });
             if !exists {
+                // ── 这个覆盖模型**支不支持图片**？──
+                //
+                // pi 按 `model.input` 能力声明决定**要不要把图发给模型**
+                // （上游 `openai-completions` chunk：`hasImages && model.input.includes("image")`）
+                // ⇒ 声明只有 `["text"]` ⇒ **图被静默丢掉**（不报错）。
+                //
+                // 判定顺序：调用方显式声明（测试/临时切模型）→ orbcat 清单里
+                // 同名模型的 `supportsImages` → 都没有就当不支持（保守）。
+                let supports_images = want_images
+                    || list.iter().any(|m| {
+                        m.get("id").and_then(|x| x.as_str()) == Some(wid.as_str())
+                            && m.get("supportsImages").and_then(|x| x.as_bool()) == Some(true)
+                    });
+                let input = if supports_images {
+                    json_arr(&["text", "image"])
+                } else {
+                    json_arr(&["text"])
+                };
                 let pid = format!("orbx{}", providers.len() + 1);
                 providers.insert(
                     pid,
@@ -692,7 +739,7 @@ impl PiRuntime {
                                 ("name", Value::String(wid.clone())),
                                 ("contextWindow", Value::from(128000)),
                                 ("maxTokens", Value::from(16384)),
-                                ("input", json_arr(&["text"])),
+                                ("input", input),
                                 (
                                     "cost",
                                     json_obj(&[
@@ -1150,9 +1197,12 @@ impl PiRuntime {
     }
 
     /// 插话。
-    pub async fn steer(&self, message: &str) -> Result<(), String> {
+    ///
+    /// `images` 是 orbcat 的 data URL 字符串（前端 `pendingImages`），
+    /// 转 pi 形状的活儿在 `pi::to_pi_images` 里做。
+    pub async fn steer(&self, message: &str, images: Vec<String>) -> Result<(), String> {
         let client = self.ensure_running().await?;
-        client.steer(message).await
+        client.steer(message, images).await
     }
 
     /// 中断当前运行。

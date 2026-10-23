@@ -29,7 +29,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -52,6 +53,15 @@ pub struct FakeModel {
     prefix_orb: bool,
     /// 最后一次收到的请求体（测试用来检查 prompt 接管）
     last_req: Arc<std::sync::Mutex<Option<Value>>>,
+    /// **请求体落盘路径**（副作用判据用）。
+    ///
+    /// 为 `None` 时不落盘（默认），不影响任何既有测试。
+    trace_file: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    /// 回包前的延迟（毫秒）。
+    ///
+    /// 给「agent 还在 streaming 时插话」的场景用 —— 模型慢一点，
+    /// 测试才有窗口把 steer 插进去。
+    delay_ms: Arc<AtomicU64>,
 }
 
 impl FakeModel {
@@ -94,6 +104,8 @@ impl FakeModel {
             final_text: final_text.into(),
             prefix_orb,
             last_req: Arc::new(std::sync::Mutex::new(None)),
+            trace_file: Arc::new(std::sync::Mutex::new(None)),
+            delay_ms: Arc::new(AtomicU64::new(0)),
         });
 
         let me2 = me.clone();
@@ -123,6 +135,46 @@ impl FakeModel {
     /// 最后一次收到的请求体。
     pub fn last_request(&self) -> Option<Value> {
         self.last_req.lock().unwrap().clone()
+    }
+
+    /// 让假模型把**每个**收到的请求体追加写到这个文件（JSONL，一行一个）。
+    ///
+    /// ## 为什么要落盘，而不是用 [`FakeModel::last_request`] 读内存
+    ///
+    /// **副作用判据**：断言要落在「**外部进程留下的痕迹**」上，
+    /// 而不是测试进程自己内存里的状态 ——
+    /// 这样「模型到底收到了什么」是**独立证据**，
+    /// 不依赖被测代码路径本身有没有把状态记对。
+    ///
+    /// （同一个思路：`fake_mcp_server.cjs` 的 `MCP_TRACE_FILE`。
+    /// 上一轮测「pi 内置 bash 绕权限」也是用**探针文件**判成败，
+    /// 而不是看模型说了什么。）
+    pub fn set_trace_file(&self, path: impl Into<PathBuf>) {
+        *self.trace_file.lock().unwrap() = Some(path.into());
+    }
+
+    /// 回包前先等这么久（毫秒）。
+    ///
+    /// 给「agent 还在 streaming 时插话」的测试留窗口。
+    pub fn set_delay_ms(&self, ms: u64) {
+        self.delay_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// 把请求体追加进 trace 文件。
+    fn append_trace(&self, req: &Value) {
+        let Some(p) = self.trace_file.lock().unwrap().clone() else {
+            return;
+        };
+        let Ok(line) = serde_json::to_string(req) else {
+            return;
+        };
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+        {
+            let _ = writeln!(f, "{line}");
+        }
     }
 
     /// 最后一次请求里的 **system 消息内容**。
@@ -199,9 +251,10 @@ impl FakeModel {
         if path.contains("/chat/completions") {
             self.calls.fetch_add(1, Ordering::Relaxed);
             let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            // 副作用判据：请求体落盘（测试从文件读，不读内存态）
+            self.append_trace(&req);
             return self.stream_chat(&mut stream, &req);
-        }
-        if path.contains("/models") {
+        }        if path.contains("/models") {
             let body = json!({
                 "object": "list",
                 "data": [{"id": "fake-model", "object": "model"}]
@@ -216,6 +269,11 @@ impl FakeModel {
     /// 按 OpenAI 流式协议回一个回复。
     fn stream_chat(&self, stream: &mut TcpStream, req: &Value) -> std::io::Result<()> {
         *self.last_req.lock().unwrap() = Some(req.clone());
+        // 延迟：给「agent 还在 streaming 时插话」留窗口
+        let d = self.delay_ms.load(Ordering::Relaxed);
+        if d > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(d));
+        }
         // 数一下对话里已经有多少条 tool 角色的消息 —— 有 = 工具已经跑过了
         let has_tool_result = req
             .get("messages")
