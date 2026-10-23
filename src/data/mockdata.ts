@@ -725,6 +725,12 @@ const settings: SettingsView = {
   blurCollapse: true,
   projectDirAutoread: false,
   builtinToolsEnabled: true,
+  /**
+   * 演示用「非默认」值 —— 让预览件里三选一默认选中「本机 Git Bash」，
+   * 这样一眼能看出"选中项"长什么样（而不是永远停在 pwsh 那条）。
+   * ⚠️ 真机老用户升级后没有这个字段 ⇒ 回落 pwsh（行为不变）。
+   */
+  execShell: "gitbash",
 };
 
 const lifeSources: LifeSourceView[] = [
@@ -1238,6 +1244,18 @@ export const SCENARIOS: MockScenario[] = [
     desc: "3 个源：1 正常、1 陈旧、1 报错",
     cover: () => {},
     goto: "life",
+  },
+  {
+    id: "behavior",
+    label: "行为页（执行位置三选一）",
+    desc: "执行位置 = 后台桌面 / 本机 pwsh / 本机 Git Bash 三选一",
+    // ⚠️ 这个场景**要看到「本机 Git Bash」被选中** ⇒ shell 存 gitbash。
+    //    （默认 fixture 里就是 gitbash；这里显式写一遍，防止以后改默认值时
+    //     这个场景的演示效果被悄悄改掉。）
+    cover: (d: MockData) => {
+      d.settings = { ...d.settings, execShell: "gitbash" };
+    },
+    goto: "behavior",
   },
 ];
 

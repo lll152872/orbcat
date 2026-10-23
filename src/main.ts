@@ -2009,6 +2009,64 @@ let cmdPolicyCounts = { allow: 0, hard: 0 };
  */
 let execTrust: "ask" | "smart" | "full" = "ask";
 
+/**
+ * 命令在**哪个 shell** 里跑（settings.execShell）。
+ *
+ * ## 为什么需要它
+ *
+ * 设置里原来的「执行位置」只有一个布尔 —— `bgDeskEnabled ? "后台桌面" : "本机 pwsh"`，
+ * 那个 **"本机 pwsh" 是写死的字面量**，Git Bash 根本不存在。
+ * 而后端 `command_policy.rs` **已经能识别 `bash -c "..."` 形态**
+ * （那 116 条规则 / 11 条硬阻断就来自这）⇒ **管控做了、UI 没给入口**。
+ *
+ * ## 与另外两维的关系（别混）
+ *
+ * | 维度 | 管什么 | 落哪 |
+ * | --- | --- | --- |
+ * | `bgDeskEnabled` | 命令跑在**哪张桌面**（后台隐形桌面 vs 本机前台） | **进程级**，不落盘 |
+ * | `execShell` | 本机前台时用**哪个 shell** | 落盘（settings.json） |
+ * | `execTrust` | 要不要**弹卡问你** | 落盘（settings.json） |
+ *
+ * ⚠️ **默认必须是 `"pwsh"`** —— 老用户升级后 settings.json 里**没有**这个字段，
+ * 读不到就回落 pwsh ⇒ **行为完全不变**（他们一直是 pwsh）。
+ */
+let execShell: "pwsh" | "gitbash" = "pwsh";
+
+/**
+ * 这台机器**有没有装 Git for Windows**（`exec_shell_status` 查回来的）。
+ *
+ * ⚠️ **发布包不带 git**（runtime 只有 node+pi，见用户拍板）⇒
+ *    没装 Git for Windows 的机器上选「本机 Git Bash」会**直接失败**。
+ * ⇒ 设置页要**提前**告诉用户「选了会失败」，不能等选完才报错。
+ *
+ * `null` = 还没查（查不到也按 null 处理 ⇒ 不显示警告，不误报）。
+ */
+let gitBashAvailable: boolean | null = null;
+
+/** 执行位置那一行的文案（后台桌面 / 本机 pwsh / 本机 Git Bash）。 */
+const EXEC_SHELL_LABEL: Record<"pwsh" | "gitbash", { short: string; full: string; desc: string }> = {
+  pwsh: {
+    short: "本机 pwsh",
+    full: "本机 PowerShell",
+    desc: "命令跑在 PowerShell 里（默认）。Windows 上一等公民，路径与管道语法都是 PowerShell 的。",
+  },
+  gitbash: {
+    short: "本机 Git Bash",
+    full: "本机 Git Bash",
+    desc: "命令跑在 Git Bash 里。适合 <code>grep</code> / <code>sed</code> / <code>awk</code> 这类 Unix 工具链，以及带正斜杠的路径写法。",
+  },
+};
+
+/**
+ * 「执行位置」这一行当前显示的文案。
+ *
+ * ⚠️ **顺序有讲究**：后台桌面**优先于** shell（后台桌面时压根不用本机 shell）。
+ */
+function execPositionLabel(): string {
+  if (bgDeskEnabled) return "后台桌面";
+  return EXEC_SHELL_LABEL[execShell]?.short ?? "本机 pwsh";
+}
+
 const EXEC_TRUST_LABEL: Record<string, { icon: string; short: string; full: string }> = {
   ask: { icon: "🛡", short: "询问", full: "每次询问" },
   smart: { icon: "⚡", short: "智能", full: "智能放行（高风险仍问）" },
@@ -5185,6 +5243,10 @@ function renderBody(): void {
         autostartOn = autoOn;
         blurCollapse = settings?.blurCollapse ?? true;
         projectDirAutoread = settings?.projectDirAutoread ?? true;
+        // ⚠️ 老 settings.json 里**没有** execShell ⇒ 保持默认 "pwsh"（行为不变）
+        if (settings?.execShell === "gitbash" || settings?.execShell === "pwsh") {
+          execShell = settings.execShell;
+        }
         searchInfo = search;
         projectInfo = proj;
         lifeInfo = life;
@@ -5285,12 +5347,29 @@ function renderBody(): void {
 
   if (view === "behavior") {
     const keep = b.scrollTop;
-    void loadModes().then(() => loadBgDesk()).then(() => {
-      if (view !== "behavior") return;
-      b.innerHTML = renderBehaviorView();
-      b.scrollTop = keep;
-      bindBehaviorView(b);
-    });
+    // ⚠️ 也要拉 settings —— 「执行位置」里的 execShell 存在 settings.json 里，
+    //    不拉的话**直接进这一页**会显示默认值而不是用户存的那份（假开关）。
+    //    老 settings.json 没这个字段 ⇒ 保持 "pwsh"（行为不变）。
+    void loadModes()
+      .then(() => loadBgDesk())
+      .then(() => data.settings.get().catch(() => null))
+      .then((s) => {
+        if (s?.execShell === "gitbash" || s?.execShell === "pwsh") {
+          execShell = s.execShell;
+        }
+      })
+      // ⚠️ 顺带查 Git Bash 能不能用 —— 没装 Git for Windows 的机器上
+      //    选「本机 Git Bash」会直接失败，设置页要提前提示。
+      .then(() => data.settings.execShellStatus().catch(() => null))
+      .then((st) => {
+        if (st) gitBashAvailable = st.gitBashAvailable;
+      })
+      .then(() => {
+        if (view !== "behavior") return;
+        b.innerHTML = renderBehaviorView();
+        b.scrollTop = keep;
+        bindBehaviorView(b);
+      });
     return;
   }
 
@@ -6194,7 +6273,7 @@ function renderSettingsMenu(
         null,
         "",
         `
-        ${row("执行位置", bgDeskEnabled ? "后台桌面" : "本机 pwsh", "behavior")}
+        ${row("执行位置", execPositionLabel(), "behavior")}
         ${row(
           "内核",
           "",
@@ -6666,18 +6745,45 @@ function renderStatusBar(): void {
 function renderBehaviorView(): string {
   const trust = EXEC_TRUST_LABEL[execTrust] ?? EXEC_TRUST_LABEL.ask;
 
-  // ── 执行位置 ──
+  // ── 执行位置（三选一：后台桌面 / 本机 pwsh / 本机 Git Bash）──
+  //
+  // 为什么做成**三选一 radio** 而不是「一个后台桌面开关 + 一个 shell 下拉」：
+  // 这三个是**互斥的**（后台桌面时压根不用本机 shell），
+  // 拆成两个控件会出现「后台桌面开着、shell 选了 Git Bash」这种自相矛盾的中间态。
+  //
+  // ⚠️ 选中即落盘的是 **execShell**（本机那一支的 shell）；
+  //    「后台桌面」这一支是**进程级**的（bgDeskEnabled 不落盘，重启回前台）——
+  //    这跟原来那个 checkbox 的语义完全一致，没变。
+  const posRows = (
+    [
+      ["bgdesk", "后台桌面", "命令跑在一张你看不见的桌面上 —— 不闪窗口、不抢焦点。⚠️ 那张桌面没有合成键鼠，只能驱动有自动化接口（COM / 命令行）的程序。这是进程级开关，不落盘，重启回到前台。"],
+      ["pwsh", "本机 pwsh", EXEC_SHELL_LABEL.pwsh.desc],
+      ["gitbash", "本机 Git Bash", EXEC_SHELL_LABEL.gitbash.desc],
+    ] as const
+  )
+    .map(([id, title, desc]) => {
+      // 当前选中项：后台桌面开着 ⇒ 选「后台桌面」；
+      // 否则按 execShell 选本机 pwsh / 本机 Git Bash。
+      const selected = id === "bgdesk" ? bgDeskEnabled : !bgDeskEnabled && execShell === id;
+      // ⚠️ 没装 Git for Windows 时，给「本机 Git Bash」那一支加警告
+      //    （发布包不带 git ⇒ 选了会直接失败，得提前说）。
+      const warn =
+        id === "gitbash" && gitBashAvailable === false
+          ? `<div class="ctx-sub" style="color:var(--sem-warn)">⚠️ 这台机器上没找到 Git for Windows —— 选它命令会跑不起来（发布包不自带 git）。</div>`
+          : "";
+      return `
+      <label class="set-check set-check-row bh-row">
+        <input type="radio" name="bh-pos" value="${id}" ${selected ? "checked" : ""}>
+        <b>${title}</b>
+        <div class="ctx-sub">${desc}</div>
+        ${warn}
+      </label>`;
+    })
+    .join("");
+
   const bgRows = `
-    <label class="set-check set-check-row">
-      <input type="checkbox" id="bh-bgdesk" ${bgDeskEnabled ? "checked" : ""}>
-      后台执行（命令跑在隐形桌面上）
-    </label>
-    <div class="set-hint">
-      开着：命令与 GUI 程序跑在一张<b>用户看不见的桌面</b>上 —— 不闪窗口、不抢焦点。<br>
-      ⚠️ 隐形桌面上<b>没有合成键鼠</b>，所以只能驱动有自动化接口（COM / 命令行）的程序；
-      要「点界面」的老软件请关掉它。<br>
-      这是<b>进程级</b>开关，不落盘，重启回到前台。
-      ${bgDeskError ? `<br><span style="color:var(--sem-danger)">⚠️ ${esc(bgDeskError)}</span>` : ""}
+    <div class="set-check-list">
+      ${posRows}
     </div>
     ${
       bgDeskEnabled && bgDeskWindows.length
@@ -6686,7 +6792,16 @@ function renderBehaviorView(): string {
             .map((w) => `· ${esc(w.title)}（${w.width}×${w.height}）`)
             .join("<br>")}</div>`
         : ""
-    }`;
+    }
+    ${
+      bgDeskError
+        ? `<div class="set-hint"><span style="color:var(--sem-danger)">⚠️ ${esc(bgDeskError)}</span></div>`
+        : ""
+    }
+    <div class="set-hint">
+      后端对 <b>PowerShell</b> 与 <b>Git Bash</b> 的命令都会做同一套策略判定
+      （白名单 / 硬阻断），换 shell <b>不会</b>绕过任何一条管控。
+    </div>`;
 
   // ── 执行权限 ──
   const trustRows = (
@@ -6709,9 +6824,10 @@ function renderBehaviorView(): string {
   return (
     subHeader("行为") +
     `<div class="set-hint" style="margin-bottom:8px">
-       两个维度互不干涉：<b>执行位置</b>管窗口开在哪张桌面、<b>执行权限</b>管调用工具时问不问。
+       两个维度互不干涉：<b>执行位置</b>管命令在哪张桌面、用哪个 shell 跑；
+       <b>执行权限</b>管调用工具时问不问。
      </div>` +
-    `<div class="mem-head">🖥 执行位置</div>${bgRows}` +
+    `<div class="mem-head">🖥 执行位置（当前：${esc(execPositionLabel())}）</div>${bgRows}` +
     `<div class="mem-head">${trust.icon} 执行权限（当前：${esc(trust.full)}）</div>${trustRows}` +
     `<div class="set-hint">文件权限申请不受这一档影响（那是 permissions.json 三层闸门）。</div>` +
     `<div class="set-hint">
@@ -6734,11 +6850,39 @@ function bindBehaviorView(root: HTMLElement): void {
   //    第二遍撞上它的 toggle 逻辑（再点同一个非 chat 视图 → 回对话），
   //    表现出来就是"点了返回却回到了对话页"。
 
-  root.querySelector<HTMLInputElement>("#bh-bgdesk")?.addEventListener("change", async (e) => {
-    const on = (e.currentTarget as HTMLInputElement).checked;
-    await setBgDesk(on);
-    renderBody(); // 重绘：要刷新摘要行与"正在跑什么"列表
-  });
+  // ── 执行位置：三选一（后台桌面 / 本机 pwsh / 本机 Git Bash）──
+  //
+  // ⚠️ **三支的落盘口径不同**，别搞混：
+  //  · 「后台桌面」→ 进程级（bgDeskEnabled，**不落盘**，重启回前台）
+  //  · 「本机 pwsh / 本机 Git Bash」→ **落盘**（settings.execShell）
+  //
+  // 选「本机那一支」时**必须把后台桌面关掉**（它们互斥）——
+  // 否则会出现「后台桌面开着、界面却显示本机 Git Bash」的矛盾中间态。
+  root.querySelectorAll<HTMLInputElement>('input[name="bh-pos"]').forEach((el) =>
+    el.addEventListener("change", async () => {
+      if (!el.checked) return;
+      const picked = el.value;
+      try {
+        if (picked === "bgdesk") {
+          // ⚠️ `setBgDesk` 自己会弹 toast（"已切到后台执行"）⇒ 这条**不要再弹一次**，
+          //    否则用户看到两条意思相近的提示。
+          await setBgDesk(true);
+        } else {
+          // 先退出后台桌面（进程级）⇒ 再落盘 shell
+          if (bgDeskEnabled) await setBgDesk(false);
+          const shell = picked === "gitbash" ? "gitbash" : "pwsh";
+          // ⚠️ 真落盘（后端 `set_exec_shell`，另一路分支在实现）
+          const saved = await data.settings.setExecShell({ shell });
+          execShell = saved === "gitbash" ? "gitbash" : "pwsh";
+          showToast(`执行位置：${EXEC_SHELL_LABEL[execShell].full}`, "ok");
+        }
+      } catch (err) {
+        // ⚠️ 失败必须**报出来**并把界面改回去 —— 不能让 radio 停在一个没落盘的假状态。
+        showToast(`切换执行位置失败：${err}`, "error");
+      }
+      renderBody(); // 重画：摘要行 / 组头「当前：」/ 选中态都要跟着变
+    }),
+  );
 
   // ⚠️ 原来这里还有一坨 'input[name="bh-mode"]' 的 change 监听
   //    （勾模式 → `applyModeChange`）。模式搬进「＋」菜单后**整块删掉**：
@@ -9854,10 +9998,15 @@ function boot(): void {
   }, 5000);
 
   // 执行权限档位：启动拉一次（chip 默认 ask，拉到什么显什么）
+  // ⚠️ 同一个请求里顺带取 execShell —— 老 settings.json 里**没有**这个字段，
+  //    取不到就保持默认 "pwsh"（老用户升级后行为不变）。
   void data.settings.get()
     .then((s) => {
       if (s?.execTrust) {
         execTrust = s.execTrust as typeof execTrust;
+      }
+      if (s?.execShell === "gitbash" || s?.execShell === "pwsh") {
+        execShell = s.execShell;
       }
     })
     .catch(() => {});

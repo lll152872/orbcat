@@ -30,7 +30,9 @@ async function openBehavior(): Promise<HTMLElement> {
   );
   if (!entry) throw new Error("设置里找不到「行为」入口");
   entry.click();
-  await waitFor(() => !!document.getElementById("bh-bgdesk"), 3000, "行为页渲染");
+  // ⚠️ 「执行位置」现在是**三选一 radio**（2026-10-23 改成后台桌面 / 本机 pwsh /
+  //    本机 Git Bash），不再是那个单独的 `#bh-bgdesk` checkbox。
+  await waitFor(() => !!document.querySelector('input[name="bh-pos"]'), 3000, "行为页渲染");
   return document.getElementById("panel-body")!;
 }
 
@@ -90,7 +92,7 @@ describe("输入行只剩输入相关的东西", () => {
     );
     expect(heads, "设置入口页缺「行为与安全」分组标题").toContain("行为与安全");
     beh!.click();
-    await waitFor(() => !!document.getElementById("bh-bgdesk"), 3000, "行为页渲染");
+    await waitFor(() => !!document.querySelector('input[name="bh-pos"]'), 3000, "行为页渲染");
   });
 });
 
@@ -104,10 +106,10 @@ describe("设置 › 行为页", () => {
       (b) => b.dataset.act === "behavior",
     )!;
     // 2026-10-23：这一行按设计稿 04 只显示「执行位置」的值
-    // （本机 pwsh / 后台桌面）。执行**权限档位**在行为子页里（改设计稿没这一行）。
+    // （本机 pwsh / 本机 Git Bash / 后台桌面）。执行**权限档位**在行为子页里。
     const txt = entry.textContent ?? "";
     expect(txt).toContain("执行位置");
-    expect(txt).toMatch(/本机 pwsh|后台桌面/);
+    expect(txt).toMatch(/本机 pwsh|本机 Git Bash|后台桌面/);
     // ⚠️ 模式**必须**从这一行消失 —— 它归「新建会话」菜单管。
     // 留着的话用户会以为"设置里能改模式"，而改了对当前会话根本无效。
     expect(txt, "模式不该再出现在行为摘要里").not.toContain("标准模式");
@@ -117,7 +119,8 @@ describe("设置 › 行为页", () => {
     await bootApp();
     await openPanel();
     const body = await openBehavior();
-    expect(body.querySelector("#bh-bgdesk"), "缺执行位置").toBeTruthy();
+    // ⚠️ 执行位置现在是**三选一**（后台桌面 / 本机 pwsh / 本机 Git Bash）
+    expect(body.querySelectorAll('input[name="bh-pos"]').length, "执行位置应是三选一").toBe(3);
     expect(body.querySelectorAll('input[name="bh-trust"]').length, "缺权限选项").toBe(3);
     // 回归闸门：模式 radio 一旦回来，说明有人把设置页的旧代码恢复了
     expect(
@@ -156,9 +159,12 @@ describe("设置 › 行为页", () => {
     await bootApp();
     await openPanel();
     const body = await openBehavior();
-    const cb = body.querySelector<HTMLInputElement>("#bh-bgdesk")!;
-    cb.checked = true;
-    cb.dispatchEvent(new Event("change", { bubbles: true }));
+    // ⚠️ 「后台桌面」现在是三选一里的**一支**（不是单独的 checkbox）
+    const radio = body.querySelector<HTMLInputElement>(
+      'input[name="bh-pos"][value="bgdesk"]',
+    )!;
+    radio.checked = true;
+    radio.dispatchEvent(new Event("change", { bubbles: true }));
     await waitFor(
       () => callsOf("bg_desk_set").some((c) => c.args?.enabled === true),
       2000,
