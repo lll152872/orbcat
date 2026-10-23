@@ -364,13 +364,34 @@ describe("三合一：agent-data 空骨架进 zip", () => {
 // ---------------------------------------------------------------------------
 
 /** 造一个假的 runtime/（只放要分发的那两个组件） */
-function makeRuntime(base = tmp, comps = ["node", "pi"], name = "runtime"): string {
+/**
+ * 造一个假的 runtime/（只放要分发的那两个组件）。
+ *
+ * ⚠️ `withPhoton` 默认 true —— **photon 是必查件**（pi 的图片处理库）：
+ * 缺了它用户带图发消息，模型只收到文字、图直接不见，而构建日志全绿
+ * （2026-10-23 Chief 点名的硬伤）。⇒ 造的 runtime 默认带 photon，
+ * 免得每个用例都被「缺 photon」绊倒；要测缺件时显式传 false。
+ */
+function makeRuntime(
+  base = tmp,
+  comps = ["node", "pi"],
+  name = "runtime",
+  withPhoton = true
+): string {
   const dir = path.join(base, name);
   mkdirSync(dir, { recursive: true });
   for (const c of comps) {
     mkdirSync(path.join(dir, c), { recursive: true });
     if (c === "node") writeFileSync(path.join(dir, "node", "node.exe"), "MZ fake node");
     else writeFileSync(path.join(dir, "pi", "index.js"), "// pi");
+  }
+  if (withPhoton && comps.includes("pi")) {
+    // ⚠️ 路径是 **scoped 包名**：@silvia-odwyer/photon-node —— 不是 photon-node
+    // ⚠️ 只有 comps 含 pi 时才造 —— 否则会**顺带把 pi/ 目录建出来**，
+    //    把「runtime 里缺 pi/」那条用例顶掉（2026-10-23 守门自己踩过）。
+    const ph = path.join(dir, "pi", "node_modules", "@silvia-odwyer", "photon-node");
+    mkdirSync(ph, { recursive: true });
+    writeFileSync(path.join(ph, "photon_rs_bg.wasm"), "fake wasm");
   }
   return dir;
 }
@@ -448,5 +469,137 @@ describe("内置运行时契约 —— 坏包不许放行（F1/F2）", () => {
     expect(r.ok).toBe(true);
     expect(r.notes.join(" ")).toMatch(/python/);
     expect(r.notes.join(" ")).toMatch(/git/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// photon 契约（2026-10-23 Chief 复查点名的硬伤）
+//
+// ## 硬伤是什么
+//
+// pi 的图片归一化链路（`_normalizePromptImages` → `processImage` → `resizeImage`）
+// 靠 `loadPhoton()` = `import("@silvia-odwyer/photon-node")` 里的
+// `photon_rs_bg.wasm` 做图像编解码。**缺了它**：
+//   resizeImage 返回 null ⇒ processImage 返回 ok:false ⇒
+//   **图被丢掉，正文里只留一句 `[Image omitted: ...]`** ——
+//   不报错、最难查，用户看到的就是「我发的图，模型说没收到」。
+//
+// ## 为什么这组测试值钱
+//
+// ① 这是一次**「构建日志全绿、线上必坏」**的故障 —— 所有常规闸门都拦不住它，
+//    只有「包里有这个文件吗」这一条硬校验能拦。
+// ② 本轮还踩了一个**路径误读**：photon 在 **scoped** 路径
+//    `node_modules/@silvia-odwyer/photon-node/`，不是 `node_modules/photon-node/`；
+//    按后者去查会得出「包里没有 photon」的假结论。
+//    ⇒ 下面这些用例把**完整相对路径**都钉死，顺带把 CI / 启动器 / 构建脚本
+//    三处的 photon 判据一并锁住。
+// ---------------------------------------------------------------------------
+
+describe("photon 契约 —— 带图对话的图不能被静默丢掉", () => {
+  it("装配时 runtime/pi 缺 photon ⇒ 当场报错（不许 warn 就放过）", () => {
+    expect(() =>
+      stageWindowsRelease({
+        exePath: makeExe(),
+        distDir: makeDist(),
+        outDir: path.join(tmp, "out-no-photon"),
+        runtimeDir: makeRuntime(tmp, ["node", "pi"], "rt-no-photon", false),
+      })
+    ).toThrow(/photon/);
+  });
+
+  it("报错信息里带**完整相对路径**（scoped 包名）—— 免得下一次又查错路径", () => {
+    let msg = "";
+    try {
+      stageWindowsRelease({
+        exePath: makeExe(),
+        distDir: makeDist(),
+        outDir: path.join(tmp, "out-no-photon-2"),
+        runtimeDir: makeRuntime(tmp, ["node", "pi"], "rt-no-photon-2", false),
+      });
+    } catch (e) {
+      msg = String((e as Error).message ?? e);
+    }
+    expect(msg).toContain("@silvia-odwyer/photon-node");
+    expect(msg).toContain("photon_rs_bg.wasm");
+  });
+
+  it("验包时缺 photon ⇒ 判不合格（verifyReleaseLayout 缺件时**抛错**）", () => {
+    const out = path.join(tmp, "out-verify-no-photon");
+    // 先用「有 photon」的 runtime 装配出合法包，再把 photon 删掉 → 模拟坏包
+    const rtOk = makeRuntime(tmp, ["node", "pi"], "rt-verify-ok");
+    stageWindowsRelease({
+      exePath: makeExe(),
+      distDir: makeDist(),
+      outDir: out,
+      runtimeDir: rtOk,
+    });
+    rmSync(path.join(out, "runtime", "pi", "node_modules", "@silvia-odwyer"), {
+      recursive: true,
+      force: true,
+    });
+    // ⚠️ verifyReleaseLayout 在有 errors 时是**抛错**（不是返回 ok:false）
+    let msg = "";
+    try {
+      verifyReleaseLayout(out, { exeName: "orbcat.exe", wantRuntime: true });
+    } catch (e) {
+      msg = String((e as Error).message ?? e);
+    }
+    expect(msg).toMatch(/photon/);
+    expect(msg).toContain("@silvia-odwyer/photon-node");
+  });
+
+  it("photon 在位 ⇒ 装配与验包都过（正向）", () => {
+    const out = path.join(tmp, "out-photon-ok");
+    stageWindowsRelease({
+      exePath: makeExe(),
+      distDir: makeDist(),
+      outDir: out,
+      runtimeDir: makeRuntime(tmp, ["node", "pi"], "rt-photon-ok"),
+    });
+    expect(
+      existsSync(
+        path.join(
+          out,
+          "runtime",
+          "pi",
+          "node_modules",
+          "@silvia-odwyer",
+          "photon-node",
+          "photon_rs_bg.wasm"
+        )
+      )
+    ).toBe(true);
+    const r = verifyReleaseLayout(out, { exeName: "orbcat.exe", wantRuntime: true });
+    expect(r.ok).toBe(true);
+  });
+
+  it("启动器判据也查 photon（否则会选中一个带图必坏的安装）", () => {
+    const ps = readFileSync(
+      path.join(REPO_ROOT, "tools", "orbcat-launch.ps1"),
+      "utf8"
+    );
+    expect(ps).toContain("@silvia-odwyer");
+    expect(ps).toContain("photon_rs_bg.wasm");
+  });
+
+  it("CI 的复合 action 会下载 photon 并断言它（否则 CI 上的 runtime 是残的）", () => {
+    const action = readFileSync(
+      path.join(REPO_ROOT, ".github", "actions", "setup-runtime", "action.yml"),
+      "utf8"
+    );
+    expect(action).toMatch(/photon-node/);
+    const assert = readFileSync(
+      path.join(REPO_ROOT, ".github", "actions", "setup-runtime", "assert-runtime.mjs"),
+      "utf8"
+    );
+    expect(assert).toContain("photon_rs_bg.wasm");
+  });
+
+  it("构建脚本断言 wasm 真落地（拷目录成功 ≠ wasm 在里面）", () => {
+    const src = readFileSync(
+      path.join(REPO_ROOT, "tools", "build-runtime-assets.mjs"),
+      "utf8"
+    );
+    expect(src).toContain("photon_rs_bg.wasm");
   });
 });

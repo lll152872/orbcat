@@ -87,6 +87,40 @@ export const RUNTIME_SUBDIR = "runtime";
  */
 export const RUNTIME_COMPONENTS = ["node", "pi"];
 
+/**
+ * pi 的图片处理库 **photon** 在 runtime/pi/ 里的**确切位置**（相对 runtime/）。
+ *
+ * ## 为什么它是「必查件」
+ *
+ * pi 打包后的 bundle 里，`resizeImage` 走 `loadPhoton()`：
+ * `await import("@silvia-odwyer/photon-node")`（见
+ * `runtime/pi/dist/bundle/chunks/chunk-*.js`），而这个包里的 wasm
+ * （`photon_rs_bg.wasm`）才是真正干活的图像编解码器。
+ *
+ * **缺了它**：pi 加载图片失败 ⇒ **用户带图发消息，模型只收到文字，图直接不见**，
+ * 而启动日志与构建日志**一切正常** —— 典型的「构建绿、线上坏」。
+ * 这就是 2026-10-23 Chief 复查时点名的硬伤。
+ *
+ * ## ⚠️ 路径是 **scoped 包名**，最容易看错
+ *
+ * 它在 `node_modules/@silvia-odwyer/photon-node/`（**带 scope 目录**），
+ * **不是** `node_modules/photon-node/`。本轮就有人按后者去查，
+ * 得出「包里没有 photon」的**误判**（实际 7 个条目都在包里）。
+ * ⇒ 下面的报错信息把**完整相对路径**写出来，就是为了让下一次不用再猜。
+ */
+export const PHOTON_REL = [
+  "pi",
+  "node_modules",
+  "@silvia-odwyer",
+  "photon-node",
+  "photon_rs_bg.wasm",
+];
+
+/** photon wasm 的绝对路径（相对 runtime/ 根） */
+export function photonWasmPath(runtimeRoot) {
+  return path.join(runtimeRoot, ...PHOTON_REL);
+}
+
 /** 目录存在？ */
 function isDir(p) {
   try {
@@ -235,6 +269,23 @@ export function stageWindowsRelease({
         `[package] runtime 里还有 ${skipped.join(", ")} —— 本轮不分发，未进包`
       );
     }
+
+    // ── photon（pi 的图片处理库）必查 ──
+    //
+    // ⚠️ 这条是 2026-10-23 Chief 点名的硬伤：**缺 photon ⇒ 用户带图发消息，
+    //    模型只收到文字，图直接不见**，而构建日志一切正常。
+    // ⇒ 缺了当场抛错，绝不只 warn（warn = 又一次「构建绿、线上坏」）。
+    const photon = photonWasmPath(path.join(outDir, RUNTIME_SUBDIR));
+    if (!isFile(photon)) {
+      throw new Error(
+        `runtime 里缺 photon（pi 的图片处理库）：${photon}\n` +
+          `  期望的**完整相对路径**是 runtime/${PHOTON_REL.join("/")}\n` +
+          `  ⚠️ 它是 **scoped 包名**（@silvia-odwyer/photon-node），\n` +
+          `     不是 node_modules/photon-node/ —— 别查错路径下结论。\n` +
+          `  缺它的后果：用户带图发消息，模型只收到文字，图直接不见（构建日志仍全绿）。\n` +
+          `  修法：node tools/build-runtime-assets.mjs（源放在 tools/.cache/photon-pkg/）`
+      );
+    }
   }
 
   // 三合一：空骨架也进 zip（不含 models.json，见 stageSkeleton 的说明）
@@ -352,6 +403,22 @@ export function verifyReleaseLayout(
       if (!isDir(path.join(rt, "pi"))) {
         errors.push(
           `${RUNTIME_SUBDIR}/pi/ 不存在：pi 是内核本体，缺了 pi 内核直接不可用。`
+        );
+      }
+      // photon（pi 的图片处理库）—— 必查
+      //
+      // ⚠️ 缺它的后果不是「功能差一点」，而是**用户带图发消息，模型只收到文字、
+      //    图直接不见**，而构建日志与启动日志一切正常（2026-10-23 Chief 点名的硬伤）。
+      // ⇒ 验包阶段就必须红，不许放过。
+      const photon = photonWasmPath(rt);
+      if (!isFile(photon)) {
+        errors.push(
+          `${RUNTIME_SUBDIR}/ 里缺 photon（pi 的图片处理库）：${photon}\n` +
+            `        期望的**完整相对路径**是 ${RUNTIME_SUBDIR}/${PHOTON_REL.join("/")}\n` +
+            `        ⚠️ 它是 **scoped 包名**（@silvia-odwyer/photon-node），\n` +
+            `           不是 node_modules/photon-node/ —— 别查错路径下结论。\n` +
+            `        后果：用户带图发消息，模型只收到文字，图直接不见。\n` +
+            `        修法：node tools/build-runtime-assets.mjs，再重新装配。`
         );
       }
       // 不查的两个：缺席只提示，不算缺件

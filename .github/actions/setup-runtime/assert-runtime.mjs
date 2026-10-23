@@ -28,6 +28,10 @@ const RT = path.join(ROOT, "runtime");
 const NEED_FILES = [
   ["node/node.exe", "node —— PTC run_code 与 pi 的硬依赖"],
   ["pi/dist/bundle/cli.js", "pi 内核本体（自包含 bundle）"],
+  [
+    "pi/node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm",
+    "photon —— pi 的图片处理库（缺了用户带图 ⇒ 模型只收到文字，图直接不见）",
+  ],
 ];
 
 /**

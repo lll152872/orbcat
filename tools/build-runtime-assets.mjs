@@ -516,6 +516,24 @@ function buildPi() {
 	fs.mkdirSync(path.dirname(photonDst), { recursive: true });
 	copyDir(photon, photonDst);
 
+	// ⚠️ **断言 wasm 真落地** —— 「目录拷过去了」不等于「wasm 在里面」。
+	//   npm 包布局一变（改名 / 挪位 / 少打文件），带图对话的图又会被静默丢掉，
+	//   而构建日志一路绿灯 ⇒ 这道断言是唯一的兜底。
+	const photonWasm = path.join(photonDst, "photon_rs_bg.wasm");
+	if (!fs.existsSync(photonWasm)) {
+		fail(
+			"photon-node 拷进去了，但里面**没有 photon_rs_bg.wasm**：\n" +
+				`    ${photonWasm}\n` +
+				"  pi 的 resizeImage 靠这个 wasm 做图像编解码 ⇒ 缺了它，带图对话的图会被**静默丢掉**\n" +
+				"  （模型只收到文字，构建日志仍全绿）。\n" +
+				"  修法：确认 npm 包 @silvia-odwyer/photon-node@0.3.4 里确实有 photon_rs_bg.wasm",
+		);
+	}
+	log(
+		`  ✓ photon（wasm ${(fs.statSync(photonWasm).size / 1024 / 1024).toFixed(2)} MB，` +
+			`路径 runtime/pi/node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm）`,
+	);
+
 	const pkg = path.join(src, "package.json");
 	if (fs.existsSync(pkg)) fs.copyFileSync(pkg, path.join(dst, "package.json"));
 

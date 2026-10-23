@@ -38,6 +38,16 @@ runs:
         tar -xzf "tools/.cache/jiti-2.7.0.tgz" -C tools/.cache
         New-Item -ItemType Directory -Force -Path tools/.cache/pi-pkg/node_modules | Out-Null
         Move-Item -Force tools/.cache/package tools/.cache/pi-pkg/node_modules/jiti
+        # photon —— pi 的图片处理库（WASM）。
+        # ⚠️ **必须有**：pi 的 resizeImage 靠 `import("@silvia-odwyer/photon-node")`
+        #    里的 photon_rs_bg.wasm 做图像编解码；缺了它，用户带图发消息，
+        #    **模型只收到文字，图直接不见**，而构建日志一路绿灯。
+        #    pi 的 package.json 把它列为运行时依赖，但 npm 包不附带依赖 ⇒ 要显式下。
+        #    落地路径必须是 **scoped** 的：tools/.cache/photon-pkg/package
+        #    （build-runtime-assets.mjs 按这个路径读）。
+        npm pack @silvia-odwyer/photon-node@0.3.4 --pack-destination tools/.cache
+        New-Item -ItemType Directory -Force -Path tools/.cache/photon-pkg | Out-Null
+        tar -xzf "tools/.cache/silvia-odwyer-photon-node-0.3.4.tgz" -C tools/.cache/photon-pkg
 
     - name: Build runtime (node + pi)
       shell: bash

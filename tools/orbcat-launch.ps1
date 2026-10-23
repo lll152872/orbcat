@@ -94,6 +94,16 @@ function Test-OrbcatBuild {
     if (-not (Test-Path -LiteralPath (Join-Path $runtimeDir 'pi') -PathType Container)) {
         return $false
     }
+    # photon —— pi 的图片处理库（WASM）。
+    # ⚠️ 缺它的后果：用户带图发消息，**模型只收到文字，图直接不见**，
+    #    而启动日志与构建日志一切正常（2026-10-23 Chief 点名的硬伤）。
+    # ⚠️ 路径是 **scoped 包名**：runtime\pi\node_modules\@silvia-odwyer\photon-node\
+    #    —— 不是 node_modules\photon-node\（本轮就有人按后者查，得出「包里没有 photon」
+    #    的**误判**，实际 7 个条目都在包里）。
+    $photon = Join-Path $runtimeDir 'pi\node_modules\@silvia-odwyer\photon-node\photon_rs_bg.wasm'
+    if (-not (Test-Path -LiteralPath $photon -PathType Leaf)) {
+        return $false
+    }
 
     return $true
 }
@@ -189,6 +199,8 @@ if ($valid.Count -eq 0) {
     Add-Line '  1. orbcat.exe 存在且是有效 PE，体积 > 1 MB'
     Add-Line '  2. 与它**同目录**有 dist\index.html'
     Add-Line '  3. 与它**同目录**有 runtime\node\node.exe 与 runtime\pi\（pi 内核）'
+    Add-Line '     且 runtime\pi\node_modules\@silvia-odwyer\photon-node\ 在（pi 的图片处理库，'
+    Add-Line '     缺了它用户带图发消息会只收到文字、图直接不见）'
     Add-Line '  4. （归档目录 _old_builds\ 里没有 dist\，所以天然不算）'
     Add-Line ''
     Add-Line '已检查：'
