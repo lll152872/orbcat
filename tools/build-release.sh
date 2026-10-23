@@ -153,6 +153,43 @@ for c in git python; do
 done
 echo "  $(du -sh "$REL/runtime" 2>/dev/null | cut -f1)"
 
+# ── 🔴 extension 副本防漂移闸门（2026-10-25 守门加）────────────────────
+#
+# 背景：`runtime/pi/extensions/*.ts` 是 `runtime-ext/*.ts` 的**拷贝**
+# （runtime/ 整个是构建产物，被 .gitignore 忽略）。
+# ⇒ **改了 runtime-ext/ 的源码但没重建 runtime/** ⇒ 包里带的是**旧 extension**。
+#
+# 实测踩到：prompt 合成那笔（runtime-ext/orbcat-prompt.ts 从「整段替换」改成
+# 「合成模式」）合进基线后，`runtime/pi/extensions/orbcat-prompt.ts` 还是旧的
+# （72 行 vs 源码 108 行）⇒ 宿主已按「拆分」返回 prompt、扩展还按「整串」处理
+# ⇒ **契约不配 ⇒ 真机上的 prompt 合成是坏的**，而构建日志一片绿。
+#
+# ⇒ 这里**当场断言副本 == 源码**，不一致就**当场失败**，不许带着旧 extension 出包。
+#   修法：node tools/build-runtime-assets.mjs（会重新把 runtime-ext/ 拷进 runtime/）
+if [ -d runtime-ext ] && [ -d "$RUNTIME_SRC/pi/extensions" ]; then
+  stale=""
+  for f in runtime-ext/*.ts; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f")
+    if ! cmp -s "$f" "$RUNTIME_SRC/pi/extensions/$base"; then
+      stale="$stale $base"
+    fi
+  done
+  if [ -n "$stale" ]; then
+    echo "============================================================"
+    echo " ✗ runtime/pi/extensions 与 runtime-ext/ 源码不一致：$stale"
+    echo ""
+    echo "   runtime/ 是构建产物，extensions/ 是 runtime-ext/ 的拷贝 ——"
+    echo "   改了源码没重建 runtime ⇒ **包里带的是旧 extension**（真机上功能是坏的，"
+    echo "   而构建日志全绿）。2026-10-25 实测：prompt 合成就是这样漏出去的。"
+    echo ""
+    echo "   修法（Git Bash）：node tools/build-runtime-assets.mjs"
+    echo "============================================================"
+    exit 1
+  fi
+  echo "  ✓ extension 副本与 runtime-ext/ 源码一致（防漂移闸门通过）"
+fi
+
 echo "==> 拷贝前端资源到 $REL/dist（外置：exe 必须与 dist/ 同目录分发）"
 mkdir -p "$REL/dist"
 # 先清掉上一轮的 hash 产物：`cp -rf` 只增不减，dist/assets 会攒下十几次

@@ -603,3 +603,43 @@ describe("photon 契约 —— 带图对话的图不能被静默丢掉", () => {
     expect(src).toContain("photon_rs_bg.wasm");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 🔴 runtime/pi/extensions 防漂移闸门（2026-10-25 守门实测踩到后加）
+//
+// `runtime/pi/extensions/*.ts` 是 `runtime-ext/*.ts` 的**拷贝**（runtime/ 是构建产物、
+// 被 .gitignore 忽略）⇒ **改了 runtime-ext/ 的源码但没重建 runtime/** ⇒
+// **包里带的是旧 extension**，真机上功能是坏的，而构建日志全绿。
+//
+// 实测：prompt 合成那笔（orbcat-prompt.ts 从「整段替换」改成「合成模式」）
+// 合进基线后，runtime 里的副本还是旧的（72 行 vs 源码 108 行）⇒
+// 宿主已按「拆分」返回 prompt、扩展还按「整串」处理 ⇒ 契约不配、真机 prompt 合成坏的。
+//
+// ⇒ build-release.sh 必须**当场断言副本 == 源码**，不一致就失败，不许带着旧 extension 出包。
+// ---------------------------------------------------------------------------
+
+describe("runtime extension 防漂移闸门", () => {
+  const sh = readFileSync(path.join(REPO_ROOT, "tools", "build-release.sh"), "utf8");
+
+  it("build-release.sh 会比对 runtime-ext/ 与 runtime/pi/extensions/ 的每个 .ts", () => {
+    expect(sh).toContain("runtime-ext");
+    expect(sh).toMatch(/cmp -s/);
+  });
+
+  it("不一致时**当场失败**（不许 warn 后继续出包）", () => {
+    expect(sh).toMatch(/不一致/);
+    // 失败分支必须 exit 1
+    const idx = sh.indexOf("不一致");
+    const tail = sh.slice(idx, idx + 1200);
+    expect(tail).toMatch(/exit 1/);
+  });
+
+  it("给出可复现的修法（重建 runtime）", () => {
+    expect(sh).toContain("build-runtime-assets.mjs");
+  });
+
+  it("构建脚本本身也得有「runtime/ 是构建产物」的认知（别把 runtime/ 提交进 git）", () => {
+    const ignore = readFileSync(path.join(REPO_ROOT, ".gitignore"), "utf8");
+    expect(ignore).toMatch(/^runtime\//m);
+  });
+});
