@@ -1328,7 +1328,7 @@ impl PiRuntime {
                 .ok()
                 .map(|g| (*g).clone())
                 .unwrap_or_default();
-            crate::agent::build_system_prompt_full(
+            crate::agent::build_system_prompt_parts(
                 &prompt_dir,
                 user_text,
                 ctx.ptc_sdk.as_deref(),

@@ -76,7 +76,21 @@ pub type GateHandler = Arc<dyn Fn(&str, &Value) -> Result<(bool, String), String
 /// ⚠️ **必须由宿主提供**：pi 自己的默认 prompt 是「coding agent」那一套，
 /// 与 orbcat 的「私人助手」定位、人格、记忆体系**完全不同**。
 /// 不接这条 → pi 内核下的助手不知道你是谁、也不记得任何事。
-pub type PromptHandler = Arc<dyn Fn(&str) -> String + Send + Sync>;
+///
+/// ## 为什么是**两份**而不是一整段
+///
+/// pi 的 system prompt 是**分段构造**的（上游 `buildSystemPromptSections`）：
+/// `preamble`（默认 coding agent 人格）+ `tools` + `rules` + `docs` +
+/// `project_context` + `skills` + 各 extension 写进 `sections` 的段。
+///
+/// 我们要的是：
+/// - `persona` → 上游的 **`customPrompt`**（替换掉 coding agent 人格 ⇒ 我们的占主导）；
+/// - `context` → 上游的 **`sections["orbcat_context"]`**（追加段）；
+/// - pi 原生那些段**全部保留** ⇒ 变成「工具用法 / 环境信息」的补充资料。
+///
+/// ⚠️ 旧的 extension（只认 `prompt` 字段）仍能工作 ⇒ `/prompt` 端点
+/// **同时**返回 `prompt`（= 两份拼起来）作兼容。
+pub type PromptHandler = Arc<dyn Fn(&str) -> crate::agent::PromptParts + Send + Sync>;
 
 /// 正在运行的桥服务。
 pub struct ToolBridge {
@@ -236,8 +250,15 @@ fn handle_conn(
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
         };
-        let p = prompt(user_text);
-        json!({"ok": true, "prompt": p})
+        let parts = prompt(user_text);
+        // ⚠️ `prompt` 字段保留（= 两份拼起来）⇒ 旧 extension 仍能用（退化成整段替换）。
+        let full = format!("{}\n\n---\n\n{}", parts.persona, parts.context);
+        json!({
+            "ok": true,
+            "prompt": full,
+            "persona": parts.persona,
+            "context": parts.context,
+        })
     } else if is_gate {
         // 裁决：调用方给的是"允许吗"的函数
         match gate(&req.tool, &req.args) {
@@ -289,7 +310,10 @@ mod tests {
 
     /// 默认 prompt 提供者（测试用）。
     fn dummy_prompt() -> PromptHandler {
-        Arc::new(|user: &str| format!("PROMPT[{}]", user))
+        Arc::new(|user: &str| crate::agent::PromptParts {
+            persona: format!("PROMPT[{}]", user),
+            context: String::new(),
+        })
     }
 
     #[test]
