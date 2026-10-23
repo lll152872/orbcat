@@ -48,6 +48,11 @@
  * - `node.exe`（nodejs.org）
  * - `python-3.12.8-embed-amd64.zip`（仅 `--with-python` 时需要）
  * - `Git-2.52.0-64-bit.zip` 或本机 `C:\Program Files\Git`（仅 `--with-git` 时需要）
+ * - **`photon-pkg/`（npm registry：@silvia-odwyer/photon-node@0.3.4，解包后的目录）**
+ *   —— pi 的**图片处理库**（WASM）。缺它 ⇒ pi 的 `resizeImage` 必失败 ⇒
+ *   **带图对话的图会被静默丢掉**（prompt 里变成 `[Image omitted: could not be
+ *   resized below the inline image size limit.]`）。所以这项**缺了就直接构建失败**，
+ *   不给"能跑但图全丢"的包。
  *
  * ⚠️ **为什么脚本不自动下载**：本机火绒会拦截 `bun build --compile` 的临时文件操作，
  * 而且大文件下载在受限网络下极慢。**下载与裁剪分离**，失败时能定位到具体环节。
@@ -482,6 +487,35 @@ function buildPi() {
 	} else {
 		log("  ⚠️ 没找到 jiti —— .ts 扩展将无法加载（如果只用 .js 扩展可忽略）");
 	}
+
+	// ── photon-node（pi 的图片处理库，WASM）──
+	//
+	// ⚠️ **缺了它，带图对话的图会被静默丢掉** ——
+	//
+	// pi 的图片归一化链路（`dist/core/agent-session.js`）：
+	//   prompt 路径 → `_normalizePromptImages` → `processImage` → `resizeImage`
+	//   `resizeImage` 靠 `loadPhoton()`（`import("@silvia-odwyer/photon-node")`）
+	//   ⇒ 装不上 ⇒ 返回 null ⇒ processImage 返回 `ok:false` ⇒
+	//   **图被丢掉，正文里只留一句 `[Image omitted: ...]`**（不报错、最难查）。
+	//
+	// pi 的 package.json 把它列为**运行时依赖**（不是 optional），
+	// 但 npm 包里不附带依赖 ⇒ 必须显式带上（我们曾经漏了，2026-10-23 实测）。
+	//
+	// 体积 2.16 MB（含 1.88 MB WASM），零传递依赖。
+	const photon = path.join(CACHE, "photon-pkg", "package");
+	if (!fs.existsSync(photon)) {
+		fail(
+			"找不到 photon-node（pi 的图片处理库）—— " +
+				"请先下载并解包到 tools/.cache/photon-pkg/：\n" +
+				"    npm pack @silvia-odwyer/photon-node@0.3.4 --pack-destination tools/.cache\n" +
+				"    mkdir tools/.cache/photon-pkg && tar -xzf tools/.cache/silvia-odwyer-photon-node-0.3.4.tgz -C tools/.cache/photon-pkg\n" +
+				"⚠️ 不带它的话，带图对话的图会被**静默丢掉**（pi 报 'could not be resized'）",
+		);
+	}
+	const photonDst = path.join(dst, "node_modules", "@silvia-odwyer", "photon-node");
+	fs.mkdirSync(path.dirname(photonDst), { recursive: true });
+	copyDir(photon, photonDst);
+
 	const pkg = path.join(src, "package.json");
 	if (fs.existsSync(pkg)) fs.copyFileSync(pkg, path.join(dst, "package.json"));
 
@@ -550,6 +584,22 @@ function verify() {
 	// ── 必查 ──
 	const required = [];
 	required.push(["node", tryExec(node, ["--version"])?.trim()]);
+
+	// photon（pi 的图片处理库，WASM）
+	//
+	// ⚠️ 缺它 **不会** 让 pi 报错 —— pi 只是把图丢掉，正文里留一句
+	// `[Image omitted: could not be resized below the inline image size limit.]`。
+	// ⇒ 这是**静默功能缺失**，只能靠发包前的硬校验拦住。
+	const photonWasm = path.join(
+		RUNTIME,
+		"pi/node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm",
+	);
+	required.push([
+		"photon",
+		fs.existsSync(photonWasm)
+			? "图片处理库 ✓"
+			: "❌ 缺 photon-node ⇒ 带图对话的图会被静默丢掉",
+	]);
 
 	// pi 冒烟：发一条 get_state，看有没有 response
 	if (fs.existsSync(pi) && fs.existsSync(node)) {

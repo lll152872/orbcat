@@ -4027,6 +4027,7 @@ async fn chat_pi_steer(
     state: State<'_, AppState>,
     message: String,
     session_id: Option<String>,
+    images: Option<Vec<String>>,
 ) -> Result<agent::SteerAck, String> {
     let pool = state.pi.clone().ok_or("pi 内核不可用")?;
     let text = message.trim().to_string();
@@ -4046,7 +4047,7 @@ async fn chat_pi_steer(
         .get(&sid)
         .await
         .ok_or_else(|| format!("会话 {sid} 没有正在运行的 pi 内核"))?;
-    rt.steer(&text).await?;
+    rt.steer(&text, images.unwrap_or_default()).await?;
     Ok(agent::SteerAck {
         id: agent::new_steer_id(),
         queued: 1,

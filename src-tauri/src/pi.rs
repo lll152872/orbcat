@@ -600,16 +600,26 @@ impl PiClient {
     pub async fn prompt(&self, message: &str, images: Vec<String>) -> Result<(), String> {
         let mut cmd = json!({"type": "prompt", "message": message});
         if !images.is_empty() {
-            cmd["images"] = json!(images);
+            // ⚠️ **必须转成 pi 的 ImageContent** —— 直接送 data URL 字符串会让
+            // 整条 prompt 被 pi 拒（实测：success:false，模型收到 0 次请求）。
+            // 见 [`to_pi_images`]。
+            cmd["images"] = json!(to_pi_images(&images)?);
         }
         self.command(cmd, 30_000).await.map(|_| ())
     }
 
     /// 插入一条插话（排队，不打断当前轮）。
-    pub async fn steer(&self, message: &str) -> Result<(), String> {
-        self.command(json!({"type": "steer", "message": message}), 10_000)
-            .await
-            .map(|_| ())
+    ///
+    /// `images` 传 orbcat 的 data URL 字符串，这里统一转成 pi 的形状。
+    /// ⚠️ 上游 steer 路径**不归一化**（`_queueSteer` 直接 `content.push`），
+    /// 形状错了**不报错**，只会让模型收到 `data:undefined;base64,undefined`
+    /// —— 静默坏图（实测）。见 [`to_pi_images`]。
+    pub async fn steer(&self, message: &str, images: Vec<String>) -> Result<(), String> {
+        let mut cmd = json!({"type": "steer", "message": message});
+        if !images.is_empty() {
+            cmd["images"] = json!(to_pi_images(&images)?);
+        }
+        self.command(cmd, 10_000).await.map(|_| ())
     }
 
     /// 追问（排队，下一轮之后执行）。
@@ -707,6 +717,71 @@ impl Drop for PiClient {
 // ---------------------------------------------------------------------------
 // 事件辅助
 // ---------------------------------------------------------------------------
+
+/// 把 orbcat 的图片格式（**data URL 字符串**）转成 pi 要的形状
+/// （`{type:"image", data:<纯 base64>, mimeType:"image/png"}`）。
+///
+/// ## 为什么必须转（2026-10-23 活体实测，不是猜的）
+///
+/// pi 侧**不认** data URL 字符串，两条通道的表现还不一样：
+///
+/// | 通道 | 上游代码 | 传字符串的后果（实测） |
+/// |---|---|---|
+/// | `prompt` | `core/agent-session.js:1604-1617` `_normalizePromptImages` 取 `image.data` / `image.mimeType` | **整条 prompt 被拒**：`success:false`，错误 `The first argument must be of type string or an instance of Buffer... Received undefined`，模型收到 **0 次**请求 |
+/// | `steer` | `core/agent-session.js:1795-1800` `_queueSteer` 直接 `content.push(...images)`，**不归一化** | **不报错**，但模型收到 `{"image_url":{"url":"data:undefined;base64,undefined"}}` —— 静默坏图，最难查的那种 |
+///
+/// 而 orbcat 这边图片一直是 data URL 字符串（前端 `pendingImages.push(dataUrl)`，
+/// Rust 侧 `images: Option<Vec<String>>`）⇒ **pi 内核下带图对话原本是坏的**。
+///
+/// ## 形状（上游 `dist/modes/rpc/rpc-types.d.ts:20-25`）
+///
+/// ```text
+/// type:"prompt" | type:"steer" | message:string | images?:ImageContent[]
+/// ImageContent = { type:"image", data:<纯 base64，不含 data: 前缀>, mimeType:string }
+/// ```
+///
+/// 自研内核不受影响 —— 那边走 OpenAI 兼容的 `image_url`，data URL 是对的（`llm.rs:114`）。
+pub fn to_pi_images(images: &[String]) -> Result<Vec<Value>, String> {
+    let mut out = Vec::with_capacity(images.len());
+    for raw in images {
+        out.push(to_pi_image(raw)?);
+    }
+    Ok(out)
+}
+
+/// 单张图的 data URL → `ImageContent`。
+///
+/// 支持两种输入：
+/// - `data:image/png;base64,AAA`（orbcat 前端给的就是这个）
+/// - 裸 base64（没有 data: 前缀）→ mimeType 缺省 `image/png`
+fn to_pi_image(raw: &str) -> Result<Value, String> {
+    let s = raw.trim();
+    if let Some(rest) = s.strip_prefix("data:") {
+        // `data:<mime>;base64,<payload>` —— 也容忍 `data:<mime>,<payload>`（非 base64）
+        let (mime, payload) = match rest.split_once(";base64,") {
+            Some((m, p)) => (m, p),
+            None => match rest.split_once(',') {
+                Some((m, p)) => (m, p),
+                None => return Err(format!("图片 data URL 解析失败: {}", s)),
+            },
+        };
+        let mime = if mime.is_empty() { "image/png" } else { mime };
+        Ok(json!({
+            "type": "image",
+            "data": payload,
+            "mimeType": mime,
+        }))
+    } else if s.is_empty() {
+        Err("图片内容为空".into())
+    } else {
+        // 裸 base64 —— mimeType 缺省
+        Ok(json!({
+            "type": "image",
+            "data": s,
+            "mimeType": "image/png",
+        }))
+    }
+}
 
 /// 从事件里取出「正文增量」。
 pub fn text_delta(ev: &PiEvent) -> Option<String> {
@@ -1173,5 +1248,38 @@ mod tests {
             cfg.argv().contains(&"--approve".to_string()),
             "必须带 --approve —— 否则 pi 的项目信任提问会永久阻塞 RPC"
         );
+    }
+
+    /// 回归测试：data URL 字符串必须转成 pi 的 `ImageContent`。
+    ///
+    /// 这条不是形式检查 —— 2026-10-23 **活体实测**（随包 node 直接驱动 pi 的 RPC）：
+    /// - 送 data URL 字符串 → `success:false`，错误
+    ///   `The first argument must be of type string or an instance of Buffer... Received undefined`，
+    ///   模型收到 **0 次**请求（上游 `Buffer.from(image.data,...)` 里 `image.data` 是 undefined）
+    /// - 送 `{type:"image",data,mimeType}` → `success:true`，模型真收到图
+    #[test]
+    fn 图片要转成pi的ImageContent形状() {
+        let out = to_pi_images(&["data:image/png;base64,AAA".to_string()]).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "image");
+        assert_eq!(out[0]["data"], "AAA", "data 必须剥掉 data: 前缀，只留纯 base64");
+        assert_eq!(out[0]["mimeType"], "image/png");
+        // ⚠️ 绝不能带 data: 前缀 —— pi 会拿整串去 base64 解码
+        assert!(!out[0]["data"].as_str().unwrap().contains("data:"));
+    }
+
+    /// 回归测试：裸 base64 也要能用（mimeType 缺省 png）。
+    #[test]
+    fn 裸base64图片缺省mimeType() {
+        let out = to_pi_images(&["BBB".to_string()]).unwrap();
+        assert_eq!(out[0]["data"], "BBB");
+        assert_eq!(out[0]["mimeType"], "image/png");
+    }
+
+    /// 回归测试：空图不许悄悄变成 `data:undefined`（那是最难查的静默失败）。
+    #[test]
+    fn 空图片要报错而不是变成undefined() {
+        assert!(to_pi_images(&["   ".to_string()]).is_err());
+        assert!(to_pi_images(&[]).unwrap().is_empty());
     }
 }
