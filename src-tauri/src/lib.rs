@@ -5377,6 +5377,18 @@ pub fn run() {
                 match runtime {
                     Some(rt) => {
                         eprintln!("[orbcat] pi 内核已就绪: {}", rt.display());
+                        // ⚠️ **必须同时落 diag.log** —— 用户自己启动的 exe 是 GUI 程序，
+                        // **没有 stderr 可看**（这条只有从终端起才看得到），
+                        // 而「pi 内核静默回落旧内核」恰恰是最难查的一类问题。
+                        // 落盘后守门/用户直接读 `agent-data/diag.log` 就能判定
+                        // 「这次到底用的哪个内核」。
+                        diag_write(
+                            &data_dir,
+                            &format!(
+                                "pi 内核已就绪: {}（= pi_status.available=true）",
+                                rt.display()
+                            ),
+                        );
                         // ── 会话池：每个会话一个 pi 进程 ──
                         //
                         // pi 的 RPC 模式**一个进程只有一个会话**（`new_session` 是换绑
@@ -5430,6 +5442,11 @@ pub fn run() {
                             std::env::current_exe()
                                 .map(|e| e.display().to_string())
                                 .unwrap_or_default()
+                        );
+                        // 同样落 diag.log —— **回落**比就绪更该被看见
+                        diag_write(
+                            &data_dir,
+                            "⚠️ 未找到内置 runtime/ —— pi 内核不可用，继续用旧内核",
                         );
                         None
                     }
