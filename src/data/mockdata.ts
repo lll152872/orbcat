@@ -906,6 +906,27 @@ const piStatus: PiStatus = {
   runtimeDir: "D:\\orbcat\\runtime\\pi",
   agentDir: "C:\\Users\\DELL\\.minimax\\agents\\mavis",
   bridgePort: 41_517,
+  liveSessions: ["sess-main"],
+  maxLive: 4,
+  currentSession: "sess-main",
+  /**
+   * 运行时组件状态 —— **演示 pi 真的在用**的那份数据。
+   *
+   * node ✓ / pi ✓ / python ✗（默认包不含）/ git ✓（用系统的）——
+   * 这正是用户能一眼看出「缺什么」的样子。
+   */
+  runtime: {
+    runtimeDir: "D:\\orbcat\\runtime",
+    ready: true,
+    node: "D:\\orbcat\\runtime\\node\\node.exe",
+    piBundle: "D:\\orbcat\\runtime\\pi",
+    python: null,
+    git: "C:\\Program Files\\Git\\cmd\\git.exe",
+    gitSource: "system",
+    bash: "C:\\Program Files\\Git\\bin\\bash.exe",
+    bashSource: "system",
+    notes: ["python 不在发布包里（需要时用系统装的或自行指定路径）"],
+  },
 };
 
 const bootState: BootState = {
@@ -1273,6 +1294,38 @@ export const SCENARIOS: MockScenario[] = [
     //     这个场景的演示效果被悄悄改掉。）
     cover: (d: MockData) => {
       d.settings = { ...d.settings, execShell: "gitbash" };
+    },
+    goto: "behavior",
+  },
+  {
+    id: "kernel",
+    label: "内核状态（pi 运行时）",
+    desc: "pi 内核就绪 + node/pi/git/python 组件状态；掉一个组件看缺了谁",
+    /**
+     * 这个场景演示**组件缺失**的形态：python 与 git 都缺。
+     *
+     * ⚠️ 为什么专门造一个场景：用户实机问过「这个对得上吗」——
+     *    「pi 没起来」最常见的原因就是**运行时缺组件**（node/pi bundle 没打进去）。
+     *    只演示全绿的话，这个界面看起来永远是好的 ⇒ 看不出价值。
+     *    ⇒ 这里让 git 与 python 缺失，能看到 ✕ 的样子。
+     */
+    cover: (d: MockData) => {
+      d.pi = {
+        ...d.pi,
+        available: true,
+        runtime: {
+          runtimeDir: "D:\\orbcat\\runtime",
+          ready: true,
+          node: "D:\\orbcat\\runtime\\node\\node.exe",
+          piBundle: "D:\\orbcat\\runtime\\pi",
+          python: null,
+          git: null,
+          gitSource: "missing",
+          bash: "C:\\Program Files\\Git\\bin\\bash.exe",
+          bashSource: "system",
+          notes: ["git 不在发布包里 —— Git Bash 与 git 命令会不可用"],
+        },
+      };
     },
     goto: "behavior",
   },

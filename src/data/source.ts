@@ -46,6 +46,7 @@ import type {
   ModeView,
   PendingPerm,
   PermRule,
+  PiStatus,
   ProjectListView,
   ProjectMemoryView,
   ProjectRow,
@@ -127,12 +128,17 @@ export interface BgDeskStatus {
   windows: { title: string; width: number; height: number; pid: number }[];
 }
 
+/**
+ * pi 内核的**运行时组件状态**（`pi_status.runtime`，Rust `pi::RuntimeStatus`）。
+ *
+ * ⚠️ 类型的**唯一来源是 `types.ts`**（那是数据契约的归处）——
+ *    这里只做 re-export，避免同一份契约有两个定义、改一处漏一处。
+ */
+export type { PiRuntimeStatus, PiStatus } from "./types";
+
 /** pi 内核状态（`pi_status`） */
-export interface PiStatus {
+export interface PiStatusShape {
   available: boolean;
-  runtimeDir?: string;
-  agentDir?: string;
-  bridgePort?: number;
 }
 
 /** 压缩结果（`session_compact`） */

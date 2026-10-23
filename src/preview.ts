@@ -143,6 +143,15 @@ const SCENARIO_VIEW: Record<string, string> = {
   life: "life",
   settings: "settings",
   behavior: "behavior",
+  /**
+   * 内核状态场景有两个落点：
+   * - `settings` = 设置**入口页**（那行「内核」旁边显示实际在跑的是什么 —— 一眼可见）
+   * - `behavior` = 设置›行为页的「内核与运行时」明细（组件状态 + 回落警告）
+   *
+   * ⚠️ 场景只能给一个 goto ⇒ 这里默认给 `behavior`（明细更全），
+   *    入口页那一行在预览侧栏点「设置入口页」也能看到。
+   */
+  kernel: "behavior",
 };
 
 async function boot(): Promise<void> {

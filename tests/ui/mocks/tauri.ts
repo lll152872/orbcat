@@ -109,6 +109,19 @@ type MockState = {
    */
   invokeOverrides: Record<string, unknown>;
   /**
+   * 让某条命令**抛错**（命令名 → 错误文案）。
+   *
+   * ## 为什么需要
+   *
+   * 前端的错误路径必须能被测到 —— 特别是「后端还没有这条命令」这种情况：
+   * 例如 `set_exec_shell` 在后端那条合入前会回 unknown command，
+   * 那时界面**必须弹一个看得见的错误 toast，不能静默**。
+   * 没有这个注入器，这条路径就只能靠人眼在真机上点。
+   *
+   * ⚠️ 与 `invokeOverrides` 的区别：那个是**换返回值**，这个是**让命令失败**。
+   */
+  failures: Map<string, string>;
+  /**
    * 数据源页的返回（`life_status`）。
    *
    * 默认空表（没配源是正常状态）；测试塞一个"已接学习通"的形态来验
@@ -185,6 +198,7 @@ function defaultState(): MockState {
     bootHasModels: true,
     windowModes: [],
     invokeOverrides: {},
+    failures: new Map<string, string>(),
     lifeStatus: {
       path: "C:\\mock\\agent-data\\life.json",
       sources: [],
@@ -442,6 +456,13 @@ export function setMock(cmd: string, value: unknown): void {
 
 export async function invoke<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   bag.calls.push({ cmd, args });
+
+  // ⚠️ 强制失败优先（见 `MockState.failures`）——
+  //    用来测「后端还没有这条命令」这类错误路径。
+  const forced = state.failures.get(cmd);
+  if (forced !== undefined) {
+    throw new Error(forced);
+  }
 
   // 逐命令覆盖优先（见 `MockState.invokeOverrides` 的说明）
   if (cmd in state.invokeOverrides) {
