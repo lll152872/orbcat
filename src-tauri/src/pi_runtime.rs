@@ -57,6 +57,21 @@ pub type GateFn = Arc<
         + Sync,
 >;
 
+/// 宿主确认钩子：pi 问「能不能做 X」（`ctx.ui.confirm()`）时，
+/// 宿主弹一张 orbcat 确认卡等用户。
+///
+/// - 参数：`(标题, 正文, 会话 id)`
+/// - 返回：`true` = 用户允许
+///
+/// ⚠️ **必须是 async** —— 里面要等用户在卡上点（最多 3 分钟）。
+/// 所以宿主回调**不能在 pi 的 stdout 读循环里等**它 ⇒ 必须走
+/// [`crate::pi::PiHostReply::Deferred`]（延迟应答）。
+pub type ConfirmFn = Arc<
+    dyn Fn(String, String, Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// 一轮对话的结果（与 `agent::AgentRun` 同构，便于前端复用现有渲染）。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,8 +145,10 @@ pub struct PiRuntime {
     /// 工具桥
     bridge: tokio::sync::Mutex<Option<Arc<ToolBridge>>>,
     /// 权限裁决回调（宿主提供）
-    gate: tokio::sync::Mutex<Option<GateFn>>,
-    /// 强制指定模型（`(provider, model)`）—— 覆盖从 settings 反查的结果。
+
+    gate: std::sync::Arc<tokio::sync::Mutex<Option<GateFn>>>,
+    /// 宿主确认钩子（pi 的 `ctx.ui.confirm()` → 我们的确认卡）
+    confirm_hook: std::sync::Arc<tokio::sync::Mutex<Option<ConfirmFn>>>,
     ///
     /// ## 什么时候用
     ///
@@ -199,8 +216,9 @@ impl PiRuntime {
             agent_dir,
             client: tokio::sync::Mutex::new(None),
             bridge: tokio::sync::Mutex::new(None),
-            gate: tokio::sync::Mutex::new(None),
-            model_override: tokio::sync::Mutex::new(None),
+
+            gate: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            confirm_hook: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             extra_mcp: tokio::sync::Mutex::new(Vec::new()),
             prompt_ctx: Arc::new(std::sync::Mutex::new(PromptCtx::default())),
             session_id: None,
@@ -228,8 +246,9 @@ impl PiRuntime {
             agent_dir,
             client: tokio::sync::Mutex::new(None),
             bridge: tokio::sync::Mutex::new(None),
-            gate: tokio::sync::Mutex::new(None),
-            model_override: tokio::sync::Mutex::new(None),
+
+            gate: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            confirm_hook: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             extra_mcp: tokio::sync::Mutex::new(Vec::new()),
             prompt_ctx: Arc::new(std::sync::Mutex::new(PromptCtx::default())),
             session_id: Some(session_id.to_string()),
@@ -319,6 +338,19 @@ impl PiRuntime {
         }
     }
 
+    /// 设置宿主确认钩子（pi 的 `ctx.ui.confirm()` → 我们的确认卡）。
+    ///
+    /// 与 [`PiRuntime::set_gate`] 同口径：**已有**的运行时也一起套上。
+    pub fn set_confirm_hook(&self, f: ConfirmFn) {
+        match self.confirm_hook.try_lock() {
+            Ok(mut g) => *g = Some(f),
+            Err(_) => {
+                let mut g = self.confirm_hook.blocking_lock();
+                *g = Some(f);
+            }
+        }
+    }
+
     /// 内置 runtime 目录。
     pub fn runtime_dir(&self) -> &Path {
         &self.runtime
@@ -364,7 +396,13 @@ impl PiRuntime {
 
         let cfg = self.build_config().await?;
         let gate = self.gate.lock().await.clone();
-        let client = PiClient::spawn(cfg, Self::make_host(gate)).await?;
+        // 宿主确认通道（pi 的 `ctx.ui.confirm()` → 我们的确认卡）
+        let confirm_hook = self.confirm_hook.lock().await.clone();
+        let client = PiClient::spawn(
+            cfg,
+            Self::make_host(confirm_hook, self.session_id.clone()),
+        )
+        .await?;
         *self.client.lock().await = Some(client.clone());
         Ok(client)
     }
@@ -832,28 +870,48 @@ impl PiRuntime {
     }
 
     /// 造宿主回调（pi 向我们提问时调）。
-    fn make_host(_gate: Option<GateFn>) -> crate::pi::PiHostFn {
+    ///
+    /// `confirm_hook` 是**宿主确认通道**：pi 问「能不能做 X」时，
+    /// 我们弹一张 orbcat 确认卡等用户（最多 3 分钟）。
+    ///
+    /// ⚠️ **绝不在这里等用户** —— 这个回调跑在 pi 的 **stdout 读循环**里
+    /// （`dispatch` → `self.host(req)`），等下去会卡住 pi 写 stdout ⇒ **死锁**。
+    /// ⇒ 立刻返回 [`crate::pi::PiHostReply::Deferred`]，
+    ///    真正的答复由另起的任务异步送来（`tokio::spawn` + oneshot）。
+    fn make_host(
+        confirm_hook: Option<ConfirmFn>,
+        session_id: Option<String>,
+    ) -> crate::pi::PiHostFn {
+        let handle = tokio::runtime::Handle::try_current().ok();
         Arc::new(move |req: PiHostRequest| -> Option<PiHostReply> {
             match req {
-                PiHostRequest::Confirm { id, title, message } => {
-                    // ⚠️ **fail-closed**：这里**不能**返回 true。
-                    //
-                    // orbcat 的授权流程是**一套**：`/gate` → `pi_host_gate`（lib.rs）
-                    // → MCP 确认卡 / 文件网关；orbcat 私有工具走
-                    // `tools::execute` → `authorize()`。
-                    //
-                    // pi 自己的 `ctx.ui.confirm()` 是**第二套**口径 —— 它**不认**
-                    // orbcat 的授权表（`mcp_grants.json` / 命令授权 / 审计链）。
-                    // 自动同意 = 白白开一条旁路。
-                    //
-                    // 正常路径下这里**根本不会被问到**：pi 的内置工具已全部排除
-                    // （`pi::PI_BUILTIN_TOOLS`），我们自己的 extension 也不调
-                    // `ctx.ui.confirm()`。所以「拒绝」是安全的兜底。
-                    let _ = id;
-                    eprintln!(
-                        "[orbcat] ⚠️ pi 请求确认（已按**拒绝**处理，不走 orbcat 授权体系）：{title} / {message}"
-                    );
-                    Some(PiHostReply::Confirm(false))
+                PiHostRequest::Confirm { id: _, title, message } => {
+                    // 没有宿主确认通道 ⇒ fail-closed（拒绝）
+                    let Some(hook) = confirm_hook.clone() else {
+                        eprintln!(
+                            "[orbcat] ⚠️ pi 请求确认（宿主没有确认通道，已按**拒绝**处理）：{title} / {message}"
+                        );
+                        return Some(PiHostReply::Confirm(false));
+                    };
+                    let Some(handle) = handle.clone() else {
+                        eprintln!("[orbcat] ⚠️ pi 请求确认（拿不到 tokio handle，已按**拒绝**处理）：{title}");
+                        return Some(PiHostReply::Confirm(false));
+                    };
+                    // ⚠️ **立即返回** —— 读循环继续跑，答案晚点另路写回。
+                    let (deferred, tx) = crate::pi::DeferredReply::pair();
+                    let sid = session_id.clone();
+                    handle.spawn(async move {
+                        // 3 分钟兜底：钩子自己也有超时，这里再加一层，
+                        // 绝不让 pi 干等（超时就当拒绝 = fail-closed）。
+                        let approved = tokio::time::timeout(
+                            std::time::Duration::from_secs(180),
+                            hook(title, message, sid),
+                        )
+                        .await
+                        .unwrap_or(false);
+                        let _ = tx.send(crate::pi::PiHostReply::Confirm(approved));
+                    });
+                    Some(PiHostReply::Deferred(deferred))
                 }
                 PiHostRequest::Select { id: _, .. } => Some(PiHostReply::Select(Some(String::new()))),
                 PiHostRequest::Input { .. } => Some(PiHostReply::Input(String::new())),
@@ -1239,6 +1297,8 @@ pub struct PiPool {
     /// Tauri 的 `setup` 闭包是**同步**的，没法 await。
     /// 这里只在启动时写一次、创建运行时时读一次，临界区里没有 await ⇒ 安全。
     gate: std::sync::Arc<std::sync::Mutex<Option<GateFn>>>,
+    /// 宿主确认钩子（pi 的确认框 → 我们的确认卡）
+    confirm_hook: std::sync::Arc<std::sync::Mutex<Option<ConfirmFn>>>,
     /// 最多同时存在几个 pi 进程
     max_live: std::sync::atomic::AtomicUsize,
 }
@@ -1255,6 +1315,7 @@ impl PiPool {
                 std::collections::HashMap::new(),
             )),
             gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            confirm_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_live: std::sync::atomic::AtomicUsize::new(2),
         })
     }
@@ -1265,6 +1326,29 @@ impl PiPool {
     pub fn set_gate(&self, f: GateFn) {
         if let Ok(mut g) = self.gate.lock() {
             *g = Some(f);
+        }
+    }
+
+    /// 设置宿主确认钩子（池里**新建**的运行时都会套上；已有的也一起套）。
+    ///
+    /// 与 [`PiPool::set_gate`] 同口径。
+    pub fn set_confirm_hook(&self, f: ConfirmFn) {
+        if let Ok(mut g) = self.confirm_hook.lock() {
+            *g = Some(f.clone());
+        }
+        let sessions = self.sessions.clone();
+        let applied: usize = match sessions.try_lock() {
+            Ok(map) => {
+                let n = map.len();
+                for rt in map.values() {
+                    rt.set_confirm_hook(f.clone());
+                }
+                n
+            }
+            Err(_) => 0,
+        };
+        if applied > 0 {
+            eprintln!("[orbcat] pi 内核：已把宿主确认通道套到 {applied} 个已存在的运行时");
         }
     }
 
@@ -1344,6 +1428,13 @@ impl PiPool {
             let gate = self.gate.lock().ok().and_then(|g| g.clone());
             if let Some(gate) = gate {
                 rt.set_gate(gate);
+            }
+        }
+        {
+            // 宿主确认通道同样要套到新运行时上（否则新会话的 pi 确认框没人接）
+            let hook = self.confirm_hook.lock().ok().and_then(|g| g.clone());
+            if let Some(hook) = hook {
+                rt.set_confirm_hook(hook);
             }
         }
         g.insert(session_id.to_string(), rt.clone());
