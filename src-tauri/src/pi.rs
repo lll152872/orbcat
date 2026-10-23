@@ -169,12 +169,26 @@ pub fn bundled_python(exe: &Path) -> Option<PathBuf> {
 
 /// bash —— **内置优先，回落系统装的**（Git for Windows 自带）。
 ///
-/// ⚠️ 内置那份走 `bash.cmd` wrapper（显式设 PATH）；
-/// **系统那份没有 wrapper** ⇒ 用它时 PATH 必须自己带上 `usr\bin`，
-/// 否则 `ls`/`head`/`cat` 会 `command not found`（bash 继承 Windows PATH，
-/// `/usr/bin` 的映射不保证排在前面）。
+/// ## ⚠️ 2026-10-23 实测更正：系统那份**不需要 wrapper**
 ///
-/// 优先返回 `bin\bash.exe`（MSYS2 的 launcher，PATH 处理比 `usr\bin` 那份更稳）。
+/// 旧注释写「系统 bash 没有 wrapper ⇒ 必须自己带 `usr\bin`，否则
+/// `ls`/`head`/`cat` 会 command not found」—— **实测不成立**：
+///
+/// | 场景 | 结果 |
+/// |---|---|
+/// | 继承完整 Windows PATH，`bash -c` | `/usr/bin/ls` ✅ |
+/// | 继承完整 Windows PATH，`bash -lc` | `/usr/bin/ls` ✅ |
+/// | 继承完整 Windows PATH，`usr\bin\bash.exe -c` | `/usr/bin/ls` ✅ |
+/// | `env -i`（PATH 只剩 System32），`bash -lc` | `/usr/bin/ls` ✅ |
+/// | `env -i`（PATH 只剩 System32），`bash -c` | `/usr/bin/ls` ✅ |
+///
+/// ⇒ Git for Windows 的 bash **自己**就把 `/usr/bin` 放进 PATH
+/// （MSYS2 启动时设默认 PATH），**`-l` 不是必需**。
+/// 但**调用方仍建议带 `-l`**（login shell 会再读一遍 `/etc/profile`，
+/// 更稳；后端那条 `bash.exe -lc "<cmd>"` 的路径就是这么调的）——
+/// 也就是说：**要不要 wrapper 是调用方的事，这里只给路径**。
+///
+/// 优先返回 `bin\bash.exe`（MSYS2 的 launcher）。
 pub fn bundled_bash(exe: &Path) -> Option<PathBuf> {
     // 1) 内置（带 wrapper）
     if let Some(root) = runtime_root(exe) {
