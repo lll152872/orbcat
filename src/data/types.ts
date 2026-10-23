@@ -565,3 +565,66 @@ export interface UsageRecord {
   /** 该轮的 token 用量 */
   usage: TokenUsage;
 }
+
+// ---------------- pi 内核 ----------------
+
+/**
+ * pi 运行时**组件状态**（`pi_status.runtime`，Rust `pi::RuntimeStatus`）。
+ *
+ * ## 为什么前端要它
+ *
+ * ① **可观测性**：用户实机问过「这个对得上吗」—— 界面上能直接看到
+ *    「现在跑的是 pi 内核还是自研内核」，比让用户翻 `diag.log` 强得多
+ *    （普通用户不会去翻日志）。
+ * ② **发现静默回落**：pi 没起来时前端会**静默退回自研内核**
+ *    （`usePiKernel` 被改成 false），用户却以为在用 pi ⇒ 这是**有问题的情况**，
+ *    界面上必须显眼。
+ * ③ **缺什么一眼看到**：node ✓ / pi ✓ / python ✗ / git ✓（用系统的）——
+ *    不用猜「为什么 pi 起不来」。
+ *
+ * ⚠️ 字段名是 Rust 端 serde 的 camelCase（`runtime_dir` → `runtimeDir`）。
+ */
+export interface PiRuntimeStatus {
+  /** runtime 目录（存在就填）。 */
+  runtimeDir?: string | null;
+  /** pi 内核是否**可用**（node + pi bundle 都在）。 */
+  ready: boolean;
+  /** 内置 node 路径 */
+  node?: string | null;
+  /** 内置 pi bundle 路径 */
+  piBundle?: string | null;
+  /** 内置 python 路径（默认包不含 ⇒ 通常是 null） */
+  python?: string | null;
+  /** git 路径 */
+  git?: string | null;
+  /** git 来源：`builtin` / `system` / `missing` */
+  gitSource: string;
+  /** bash 路径 */
+  bash?: string | null;
+  /** bash 来源：`builtin` / `system` / `missing` */
+  bashSource: string;
+  /** 人话提示（后端写好的，直接可展示给用户）。 */
+  notes?: string[];
+}
+
+/** pi 内核状态（`pi_status`） */
+export interface PiStatus {
+  /** pi 内核是否可用（能起 runtime）。 */
+  available: boolean;
+  runtimeDir?: string;
+  agentDir?: string;
+  bridgePort?: number;
+  /** 正在跑的会话（多会话并行时可能有多个）。 */
+  liveSessions?: string[];
+  /** 同时最多能跑几个会话。 */
+  maxLive?: number;
+  /** 当前有 pi 运行时的那条会话。 */
+  currentSession?: string | null;
+  /**
+   * 运行时组件状态（node / pi / python / git / bash）。
+   *
+   * ⚠️ **可能缺**：老后端没有这个字段 ⇒ 读不到就是 `undefined`
+   *    ⇒ 前端按「未知」处理，**不误报**。
+   */
+  runtime?: PiRuntimeStatus;
+}

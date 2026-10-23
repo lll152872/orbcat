@@ -197,4 +197,33 @@ describe("执行位置 · 三选一", () => {
     // 警告只挂在本机 Git Bash 那一支，不影响另外两支
     expect(txt, "PowerShell 不该被牵连").toContain("本机 pwsh");
   });
+
+  /**
+   * ⚠️ 后端那条（`work/backend/exec-shell`）**未合入基线前**，
+   * 调 `set_exec_shell` 会失败（unknown command）。
+   * ⇒ 界面必须**弹一个看得见的错误 toast**，**不能静默**。
+   *
+   * 用户 2026-10-23 明确要求确认这一点。
+   */
+  it("⑩ 后端没这条命令时 → 必须弹**可见的错误 toast**（不静默）+ 界面回滚", async () => {
+    const { state } = await import("./mocks/tauri");
+    // 模拟后端没有 set_exec_shell（真后端未合入时的真实情况）
+    state.failures.set("set_exec_shell", "unknown command: set_exec_shell");
+    await bootApp();
+    await openPanel();
+    const body = await openBehavior();
+    pick(body, "gitbash");
+    // ⚠️ 等那个错误 toast 出现（可见、不是静默）
+    await waitFor(
+      () => (document.body.textContent ?? "").includes("切换执行位置失败"),
+      3000,
+      "错误 toast 可见",
+    );
+    expect(
+      document.body.textContent ?? "",
+      "错误文案要说明是切换失败",
+    ).toContain("切换执行位置失败");
+    // ⚠️ 失败后 radio **不能**停在没落盘的假状态 ⇒ 要回到真实值（pwsh）
+    await waitFor(() => picked(body) === "pwsh", 3000, "失败后界面回滚到真实值");
+  });
 });

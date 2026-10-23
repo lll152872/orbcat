@@ -39,6 +39,7 @@ import type {
   ModelView,
   PendingPerm,
   PermRule,
+  PiRuntimeStatus,
   ProgressEvent,
   ProjectListView,
   ProjectMemoryView,
@@ -441,6 +442,9 @@ async function switchSession(id: string): Promise<void> {
  * 不给提示的话，用户在 B 里看不到 A 的动静会以为任务停了。点这条切过去看。
  */
 function updateBgRunBanner(): void {
+  // ⚠️ 同 `setBusyUi`：这条也在异步链上（markRunEnd → syncBusyUi → 这里），
+  //   teardown 之后 `document` 不存在 ⇒ ReferenceError ⇒ unhandled error。
+  if (!domAlive()) return;
   const el = document.getElementById("bg-run");
   if (!el) return;
   const others = [...runningSessions].filter((id) => id !== currentSessionId);
@@ -2399,6 +2403,13 @@ function renderOrb(): void {
  * 球不在场（面板态 / 菜单态）时静默跳过；下次 `renderOrb()` 会带上正确状态。
  */
 function applyOrbState(): void {
+  // ⚠️ `domAlive` 守卫：这一行会在**异步链**里被调到
+  //   （发一轮 → markRunEnd → setThinking → 走到这里）。
+  //   若那一轮在测试环境 teardown 之后才回来，`document` 已经不存在
+  //   ⇒ `document.getElementById` 直接 ReferenceError
+  //   ⇒ vitest 记成 unhandled error ⇒ **整个文件退出码 1**（哪怕断言全绿）。
+  //   （与 showToast 的自删链同一个坑，见 dom-alive.ts 头部说明。）
+  if (!domAlive()) return;
   const el = document.getElementById("orb");
   if (!el) return;
   const s = currentOrbState();
@@ -6248,16 +6259,32 @@ function renderSettingsMenu(
     valClass = "",
     swId?: string,
     swOn?: boolean,
+    /**
+     * 行内 id（给「值」元素用）。
+     *
+     * ⚠️ 为什么需要它：默认 `valHtml` 与开关是**二选一**的
+     * （有 swId 就只画开关、没有就只画值）。
+     * 但「内核」这一行**两个都要** —— 左边开关是「我要用 pi」，
+     * 右边那个值是「**实际在跑的是什么**」（可能是回落了的自研）。
+     * ⇒ 这两件事必须同时可见，否则用户看到开关是开的、实际跑的是自研却不知道。
+     */
+    valId?: string,
+    rowId?: string,
   ): string => {
     const tag = act ? "button" : "div";
-    const right = swId
+    const sw = swId
       ? `<button type="button" class="sw${swOn ? " on" : ""}" id="${swId}" role="switch"
                 aria-checked="${swOn}" title="${esc(name)}"><i></i></button>`
-      : `<span class="set-row-val ${valClass}">${valHtml}</span>`;
+      : "";
+    // 值：有开关时也画（两者并存），否则只画值
+    const val = valHtml
+      ? `<span class="set-row-val ${valClass}"${valId ? ` id="${valId}"` : ""}>${valHtml}</span>`
+      : "";
+    const right = sw && val ? `<span class="set-row-right">${val}${sw}</span>` : sw || val;
     return `
     <${tag} class="set-row${act ? "" : " set-row-static"}"${act ? ` data-act="${act}"` : ""}${
       swId ? ` data-sw="${swId}"` : ""
-    }>
+    }${rowId ? ` id="${rowId}"` : ""}>
       <span class="set-row-name">${esc(name)}</span>
       ${right}
     </${tag}>`;
@@ -6345,11 +6372,16 @@ function renderSettingsMenu(
         ${row("执行位置", execPositionLabel(), "behavior")}
         ${row(
           "内核",
-          "",
+          // ⚠️ 这行同时给「开关」和「实际在跑的是什么」——
+          //    开关开着但实际回落成自研的情况，**必须一眼看出来**。
+          //    （id 由 row() 的 valId 参数加在外层 span 上，这里不要再套 span。）
+          esc(kernelStateLabel()),
           undefined,
           "",
           "sw-kernel",
           usePiKernel,
+          "kernel-state-val",
+          "kernel-state-row",
         )}
         ${row("项目目录自动读写", "", undefined, "", "sw-dir", projectDirAutoread)}
         ${row(
@@ -6811,6 +6843,83 @@ function renderStatusBar(): void {
 //    一句话：模式跟会话走、**建完不能改**，所以它不是"设置"而是"建会话的参数"。
 //    这里只剩执行位置与执行权限两维。别再往这儿加模式选择器。
 
+/**
+ * 「内核与运行时」明细块（设置›行为页 + 设置入口页共用）。
+ *
+ * ## 为什么要有这块（用户实机问过「这个对得上吗」）
+ *
+ * ① **可观测性**：用户能直接看到「现在跑的是 pi 内核还是自研内核」，
+ *    不用去翻 `diag.log`（普通用户不会翻日志）。
+ * ② **发现静默回落**：pi 没起来时前端会**静默退回自研内核** ——
+ *    用户以为在用 pi、实际不是，这是**有问题的情况**，必须显眼。
+ * ③ **组件状态**：node ✓ / pi ✓ / python ✗ / git ✓(用系统的) ——
+ *    缺什么一眼看到，不用猜「为什么 pi 起不来」。
+ *
+ * ⚠️ **不放在聊天区**（对话流是用户自己在改的地方）—— 放设置页。
+ */
+function renderKernelRuntimeHtml(): string {
+  const rt = piRuntimeStatus;
+  const fell = piFellBack();
+
+  // 顶部：实际在跑的内核 + 回落警告
+  const head = fell
+    ? `<div class="kernel-warn">
+         ⚠️ <b>已从 pi 内核回落到自研内核</b> —— 你想要的是 pi，但 pi 内核在这台机器上
+         不可用（下面会写缺什么）。<b>对话现在跑的是自研内核</b>，不是 pi。
+       </div>`
+    : `<div class="kernel-now">
+         现在跑的是 <b>${actualKernel() === "pi" ? "pi 内核" : "自研内核"}</b>
+         ${
+           actualKernel() === "pi"
+             ? "（agent harness）"
+             : "（项目自研的 agent loop）"
+         }
+       </div>`;
+
+  // 组件表：node / pi / python / git / bash
+  //
+  // ⚠️ 「来源」标签（builtin/system/missing）紧跟在**组件名后面**，
+  //   不放在路径右边 —— 路径可能很长、还带省略号，
+  //   标签飘到最右会跟路径断成两截（截图里看着像两列不相干的东西）。
+  const comp = (name: string, path: string | null | undefined, source?: string) => {
+    const ok = !!path;
+    return `
+      <div class="kernel-comp">
+        <span class="kernel-comp-dot ${ok ? "ok" : "no"}">${ok ? "✓" : "✕"}</span>
+        <span class="kernel-comp-name">${name}</span>
+        ${source ? `<span class="kernel-comp-src">${esc(source)}</span>` : ""}
+        <span class="kernel-comp-path" title="${esc(path ?? "")}">${
+          ok ? esc(path!) : "缺失"
+        }</span>
+      </div>`;
+  };
+
+  const comps = rt
+    ? comp("node", rt.node) +
+      comp("pi", rt.piBundle) +
+      comp("python", rt.python) +
+      comp("git", rt.git, rt.gitSource) +
+      comp("bash", rt.bash, rt.bashSource)
+    : `<div class="set-hint">运行时组件状态未知（后端未返回）。</div>`;
+
+  const notes = rt?.notes?.length
+    ? `<div class="set-hint">${rt.notes.map((n: string) => `· ${esc(n)}`).join("<br>")}</div>`
+    : "";
+
+  const live = piStatusLiveSessions.length
+    ? `<div class="set-hint">正在跑的 pi 会话：${piStatusLiveSessions.length} 个${
+        piStatusMaxLive ? `（最多 ${piStatusMaxLive} 个并行）` : ""
+      }</div>`
+    : "";
+
+  return head + comps + notes + live;
+}
+
+/** 正在跑的 pi 会话数（设置页展示用）。 */
+let piStatusLiveSessions: string[] = [];
+/** 同时最多能跑几个 pi 会话。 */
+let piStatusMaxLive = 0;
+
 function renderBehaviorView(): string {
   const trust = EXEC_TRUST_LABEL[execTrust] ?? EXEC_TRUST_LABEL.ask;
 
@@ -6896,6 +7005,13 @@ function renderBehaviorView(): string {
        两个维度互不干涉：<b>执行位置</b>管命令在哪张桌面、用哪个 shell 跑；
        <b>执行权限</b>管调用工具时问不问。
      </div>` +
+    // ⚠️ `.mem-head` 是 `display:flex; justify-content:space-between`
+    //    ⇒ 图标（元素）与文字（匿名 flex 项）会被撑到两端。
+    //    ⇒ 必须把「图标 + 文字」包进**同一个** span，当成单个 flex 项。
+    `<div class="mem-head"><span class="mem-head-l"><span class="mem-head-ico">${setIcon(
+      "behavior",
+    )}</span> 内核与运行时（当前：${esc(kernelStateLabel())}）</span></div>` +
+    `<div id="kernel-runtime-box">${renderKernelRuntimeHtml()}</div>` +
     `<div class="mem-head">🖥 执行位置（当前：${esc(execPositionLabel())}）</div>${bgRows}` +
     `<div class="mem-head">${trust.icon} 执行权限（当前：${esc(trust.full)}）</div>${trustRows}` +
     `<div class="set-hint">文件权限申请不受这一档影响（那是 permissions.json 三层闸门）。</div>` +
@@ -9395,6 +9511,11 @@ let runKernel: "pi" | "own" = "own";
  *
  * 可用 = exe 旁边有 `runtime/`（内置 node + pi bundle）。
  * 不可用就静默退回自研内核 —— 用户不该看到一个不能用的选项。
+ *
+ * ⚠️ **静默回落是「有问题的情况」**（用户实机问过「这个对得上吗」）：
+ *    用户以为在用 pi、实际跑的是自研内核，他**不知道**。
+ *    ⇒ 这里把完整的 `pi_status` 存下来（`piRuntimeStatus`），
+ *    让设置页能把「回落了 + 缺什么」**摆出来**，而不是只写在 diag.log 里。
  */
 async function refreshPiStatus(): Promise<void> {
   if (piStatusChecked) return;
@@ -9402,6 +9523,9 @@ async function refreshPiStatus(): Promise<void> {
   try {
     const st = await data.system.piStatus();
     piKernelAvailable = !!st.available;
+    piRuntimeStatus = st.runtime ?? null;
+    piStatusLiveSessions = st.liveSessions ?? [];
+    piStatusMaxLive = st.maxLive ?? 0;
     if (!piKernelAvailable) {
       usePiKernel = false;
     }
@@ -9410,6 +9534,73 @@ async function refreshPiStatus(): Promise<void> {
     usePiKernel = false;
   }
   updateKernelChip();
+  paintKernelState();
+}
+
+/**
+ * pi 运行时组件状态（node / pi / python / git / bash）。
+ *
+ * `null` = 还没查到（启动早期）或后端没给这个字段 ⇒ UI 按「未知」处理，**不误报**。
+ */
+let piRuntimeStatus: PiRuntimeStatus | null = null;
+
+/**
+ * **实际在跑的内核** —— 用户最该知道的一件事。
+ *
+ * ⚠️ 这里刻意**不用 `usePiKernel`**：那是「用户想要哪个」，
+ *    而 `piKernelAvailable === false` 时它会被静默改成 false ⇒ 两者永远一致，
+ *    就看不出「本来想用 pi、结果回落了」。
+ * ⇒ 这里另存一份「用户选的」（`piKernelPreferred`），与「实际生效的」对照。
+ */
+let piKernelPreferred = true;
+
+/**
+ * 当前**实际**会用哪个内核跑对话。
+ *
+ * - pi 可用且用户选了 pi ⇒ "pi"
+ * - 否则 ⇒ "own"（自研）
+ */
+function actualKernel(): "pi" | "own" {
+  return piKernelAvailable && usePiKernel ? "pi" : "own";
+}
+
+/**
+ * 是否发生了**静默回落**：用户想要 pi、但 pi 不可用 ⇒ 实际跑的是自研。
+ *
+ * 这是「有问题的情况」—— 界面上必须**显眼**，不能只写进日志。
+ */
+function piFellBack(): boolean {
+  return piKernelPreferred && !piKernelAvailable;
+}
+
+/** 内核状态的一行文案（设置入口页那行 + 行为页组头都用它）。 */
+function kernelStateLabel(): string {
+  if (piFellBack()) return "已回落自研";
+  return actualKernel() === "pi" ? "pi 内核" : "自研内核";
+}
+
+/**
+ * 重画「内核状态」那几行（设置入口页 + 行为页共用）。
+ *
+ * ⚠️ 两个页面可能同时在 DOM 里（设置入口页的「内核」行 + 行为页的明细），
+ * 所以按 id 分别更新，别假设只有一个。
+ */
+function paintKernelState(): void {
+  const label = kernelStateLabel();
+  const fell = piFellBack();
+
+  // 设置入口页那行：值 + 危险态描边
+  const val = document.getElementById("kernel-state-val");
+  if (val) {
+    val.textContent = label;
+    val.classList.toggle("kernel-bad", fell);
+  }
+  const row = document.getElementById("kernel-state-row");
+  if (row) row.classList.toggle("kernel-row-bad", fell);
+
+  // 行为页的明细块
+  const box = document.getElementById("kernel-runtime-box");
+  if (box) box.innerHTML = renderKernelRuntimeHtml();
 }
 
 /**
@@ -9430,7 +9621,12 @@ function updateKernelChip(): void {
 async function toggleKernel(): Promise<void> {
   if (!piKernelAvailable) return;
   usePiKernel = !usePiKernel;
+  // ⚠️ 记住「用户想要哪个」—— 回落判定要拿它跟「实际生效的」对照
+  //    （见 piKernelPreferred 的注释）。
+  piKernelPreferred = usePiKernel;
   updateKernelChip();
+  // 状态行要跟着变（切到自研 / 切回 pi）
+  paintKernelState();
   pushEntry(
     "system",
     usePiKernel
@@ -9827,6 +10023,12 @@ async function stopRun(): Promise<void> {
 
 /** 忙碌态下的按钮布局：显示 ■、输入框提示改成"插话" */
 function setBusyUi(on: boolean): void {
+  // ⚠️ `domAlive` 守卫：这一行也在**异步链**上
+  //   （markRunEnd → syncBusyUi → 走到这里）——
+  //   若那一轮在测试环境 teardown 之后才回来，`document` 已经不存在
+  //   ⇒ `document.getElementById` 直接 ReferenceError ⇒ vitest 记成 unhandled error
+  //   ⇒ **整个文件退出码 1**（哪怕断言全绿）。
+  if (!domAlive()) return;
   const stop = document.getElementById("btn-stop") as HTMLButtonElement | null;
   const sendBtn = document.getElementById("btn-send") as HTMLButtonElement | null;
   const input = document.getElementById("input") as HTMLTextAreaElement | null;

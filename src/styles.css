@@ -6651,6 +6651,125 @@ details.run-reason > summary::before,
 .set-row-val.ok {
   color: var(--sem-ok);
 }
+
+/* ---- 内核状态（pi 内核 / 自研内核 + 运行时组件） ----
+   ⚠️ 为什么单独一套：这块的核心价值是**可观测性** ——
+   用户实机问过「这个对得上吗」，界面上要能一眼看到
+   「现在跑的是 pi 内核还是自研内核」，以及**静默回落**时的那条警告。
+   ⚠️ 色值全部走 :root 变量（文字只用 --g1..--g4，
+   彩色只给状态点这种图形元素）。 */
+
+/* 值 + 开关并排（「内核」那一行：左边开关是「我要用 pi」，
+   右边是「实际在跑的是什么」） */
+.set-row-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  margin-left: auto;
+}
+
+/* 静默回落 ⇒ 这一行用危险色描边 + 值变红 */
+.set-row.kernel-row-bad {
+  border-color: rgba(224, 138, 124, 0.45);
+  background: rgba(224, 138, 124, 0.08);
+}
+
+.set-row-val.kernel-bad {
+  color: var(--sem-danger);
+}
+
+/* 「现在跑的是 X」那行 */
+.kernel-now {
+  font-size: 12px;
+  color: var(--g2);
+  margin-bottom: 8px;
+}
+.kernel-now b {
+  color: var(--g1);
+}
+
+/* 组头前置的单色描边图标（⚠️ 不用 emoji ——
+   Windows 会把 🧠 渲染成**彩色**圆点，和面板冷暖统一的底色打架） */
+.mem-head-l {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+.mem-head-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  margin-right: 5px;
+  color: var(--g3);
+  flex: none;
+}
+.mem-head-ico svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* 静默回落的警告块 —— 必须显眼（这是「有问题的情况」） */
+.kernel-warn {
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--sem-danger);
+  background: rgba(224, 138, 124, 0.1);
+  border: 1px solid rgba(224, 138, 124, 0.35);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+
+/* 组件表：node / pi / python / git / bash */
+.kernel-comp {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  line-height: 1.8;
+  color: var(--g3);
+}
+.kernel-comp-dot {
+  flex: none;
+  width: 14px;
+  text-align: center;
+  font-size: 11px;
+}
+/* ✓ 用语义绿、✕ 用危险色 —— 彩色只给图形元素（状态点），不给文字 */
+.kernel-comp-dot.ok {
+  color: var(--sem-ok);
+}
+.kernel-comp-dot.no {
+  color: var(--sem-danger);
+}
+.kernel-comp-name {
+  flex: none;
+  width: 44px;
+  color: var(--g2);
+  font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+}
+.kernel-comp-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--g4);
+  font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+}
+/* 来源标签（builtin / system / missing）—— 紧跟组件名，不飘到最右 */
+.kernel-comp-src {
+  flex: none;
+  color: var(--g4);
+  font-size: 10px;
+  padding: 0 5px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  margin-right: 2px;
+}
 .set-val-badge {
   background: var(--sem-warn);
   color: var(--bg-1);
