@@ -74,11 +74,8 @@ pub const PI_BUILTIN_TOOLS: &[&str] = &[
 // 运行期资产定位
 // ---------------------------------------------------------------------------
 
-/// 内置运行时资产目录（`runtime/`）。
-///
-/// 位置规则：**exe 同级**的 `runtime/`（与 `agent-data/` 同一套规则）。
-/// 开发态是 `target/debug/runtime/`，发布态是 exe 旁 `runtime/`。
-pub fn runtime_dir(exe: &Path) -> Option<PathBuf> {
+/// runtime 目录（**只看目录在不在**）—— 各组件自己判自己的文件。
+pub fn runtime_root(exe: &Path) -> Option<PathBuf> {
     let dir = exe.parent()?.join("runtime");
     if dir.is_dir() {
         Some(dir)
@@ -87,9 +84,48 @@ pub fn runtime_dir(exe: &Path) -> Option<PathBuf> {
     }
 }
 
+/// 内置运行时是否**可用**（内容校验）。
+///
+/// ## 为什么不能只看「目录在不在」
+///
+/// 目录在、内容缺（node 缺 / pi bundle 缺）⇒ 要等到启动 pi 时才炸，
+/// 用户看到的是「点了没反应 / 默默退回旧内核」。
+///
+/// 打包侧与启动器都是**内容校验**口径，这里必须**逐字对齐**：
+/// - `tools/package.mjs:347-354` → 查 `runtime/node/node.exe` + `runtime/pi/`
+/// - `tools/orbcat-launch.ps1:91-95` → 查 `runtime\node\node.exe` + `runtime\pi\`
+///
+/// 否则会出现「启动器认为包是好的、orbcat 认为不是」这种两边打架。
+pub fn runtime_ready(exe: &Path) -> Option<PathBuf> {
+    let dir = runtime_root(exe)?;
+    let node_ok = dir.join("node").join("node.exe").is_file();
+    let pi_ok = dir
+        .join("pi")
+        .join("dist")
+        .join("bundle")
+        .join("cli.js")
+        .is_file();
+    if node_ok && pi_ok {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// 内置运行时目录（**内容校验**：node + pi bundle 都要在）。
+///
+/// ⚠️ 位置契约不变（`<exe 同目录>/runtime/`），只是**判据**从「目录在」升级成
+/// 「目录在 **且** `node/node.exe` 与 `pi/dist/bundle/cli.js` 都在」。
+///
+/// 各组件找自己那个文件时用 [`runtime_root`]（不要用这个）——
+/// 否则「有 node 没 pi」会把 node 也判成不可用。
+pub fn runtime_dir(exe: &Path) -> Option<PathBuf> {
+    runtime_ready(exe)
+}
+
 /// 内置的 node.exe。
 pub fn bundled_node(exe: &Path) -> Option<PathBuf> {
-    let p = runtime_dir(exe)?.join("node").join("node.exe");
+    let p = runtime_root(exe)?.join("node").join("node.exe");
     if p.is_file() {
         Some(p)
     } else {
@@ -97,19 +133,33 @@ pub fn bundled_node(exe: &Path) -> Option<PathBuf> {
     }
 }
 
-/// 内置的 git.exe。
+/// git.exe —— **内置优先，回落系统装的**。
+///
+/// ## 为什么要有系统回落
+///
+/// 2026-10-23 用户拍板：**发布包不再分发 git**（GPLv2）⇒ `runtime/git/` 不存在。
+/// 但用户自装的 git 仍要能用（orbcat 的 git 相关工具是只读查询，
+/// 用哪份 git 不影响安全边界）。
+///
+/// ⚠️ **Git 不再分发** 与 **bash 仍要管控** 是两件事，不矛盾。
 pub fn bundled_git(exe: &Path) -> Option<PathBuf> {
-    let p = runtime_dir(exe)?.join("git").join("cmd").join("git.exe");
-    if p.is_file() {
-        Some(p)
-    } else {
-        None
+    // 1) 内置（老的发布包可能还带着）
+    if let Some(root) = runtime_root(exe) {
+        let p = root.join("git").join("cmd").join("git.exe");
+        if p.is_file() {
+            return Some(p);
+        }
     }
+    // 2) 系统装的
+    system_git()
 }
 
 /// 内置的 python.exe。
+///
+/// ⚠️ 默认发布包**不含 python**（不是硬依赖，模型可能调而已）⇒ 缺席即 `None`。
+/// 提示语见 [`RuntimeStatus`]。
 pub fn bundled_python(exe: &Path) -> Option<PathBuf> {
-    let p = runtime_dir(exe)?.join("python").join("python.exe");
+    let p = runtime_root(exe)?.join("python").join("python.exe");
     if p.is_file() {
         Some(p)
     } else {
@@ -117,18 +167,193 @@ pub fn bundled_python(exe: &Path) -> Option<PathBuf> {
     }
 }
 
-/// 内置的 bash（**必须走 wrapper**，见 docs/06 §坑 1）。
+/// bash —— **内置优先，回落系统装的**（Git for Windows 自带）。
 ///
-/// 直接跑 `usr/bin/bash.exe` 时 `ls`/`head`/`cat` 会 `command not found`
-/// —— bash 继承 Windows PATH，`/usr/bin` 的映射不保证排在前面。
-/// `bash.cmd` 显式设了 PATH。
+/// ⚠️ 内置那份走 `bash.cmd` wrapper（显式设 PATH）；
+/// **系统那份没有 wrapper** ⇒ 用它时 PATH 必须自己带上 `usr\bin`，
+/// 否则 `ls`/`head`/`cat` 会 `command not found`（bash 继承 Windows PATH，
+/// `/usr/bin` 的映射不保证排在前面）。
+///
+/// 优先返回 `bin\bash.exe`（MSYS2 的 launcher，PATH 处理比 `usr\bin` 那份更稳）。
 pub fn bundled_bash(exe: &Path) -> Option<PathBuf> {
-    let p = runtime_dir(exe)?.join("git").join("bash.cmd");
-    if p.is_file() {
-        Some(p)
-    } else {
-        None
+    // 1) 内置（带 wrapper）
+    if let Some(root) = runtime_root(exe) {
+        let p = root.join("git").join("bash.cmd");
+        if p.is_file() {
+            return Some(p);
+        }
+        // 内置 git 目录在、但没有 wrapper ⇒ 也给它一次机会
+        let p2 = root.join("git").join("bin").join("bash.exe");
+        if p2.is_file() {
+            return Some(p2);
+        }
     }
+    // 2) 系统装的
+    system_bash()
+}
+
+/// 找**系统装**的 `git.exe`（PATH 搜索 + 常见安装位置）。
+fn system_git() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in ["git.exe", "git"] {
+                let cand = dir.join(name);
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    // Git for Windows 默认装这里
+    for base in [
+        r"C:\Program Files\Git",
+        r"C:\Program Files (x86)\Git",
+        r"C:\Program Files\Git\mingw64",
+    ] {
+        let cand = Path::new(base).join("cmd").join("git.exe");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// 找**系统装**的 `bash.exe`（Git for Windows 自带）。
+fn system_bash() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in ["bash.exe", "bash"] {
+                let cand = dir.join(name);
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    // Git for Windows 常见位置：**优先 bin**（launcher，PATH 处理更稳）
+    for base in [
+        r"C:\Program Files\Git\bin",
+        r"C:\Program Files\Git\usr\bin",
+        r"C:\Program Files (x86)\Git\bin",
+        r"C:\Program Files (x86)\Git\usr\bin",
+    ] {
+        let cand = Path::new(base).join("bash.exe");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// 运行时组件状态（给设置页 / 诊断看）
+// ---------------------------------------------------------------------------
+
+/// 内置运行时的**组件状态** —— 让用户看得见「pi 到底有没有在用」。
+///
+/// ## 为什么需要
+///
+/// 以前只在 stderr 打一行「pi 内核已就绪」⇒ **用户看不到**。
+/// 用户在设置页/诊断里应该能一眼看到：
+/// `node ✓ · pi ✓ · python ✗（未检测到内置 Python，可在设置里指定路径或自行安装）· git ✗（用系统）`。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeStatus {
+    /// runtime 目录（存在就填）
+    pub runtime_dir: Option<String>,
+    /// pi 内核是否**可用**（node + pi bundle 都在）
+    pub ready: bool,
+    /// 内置 node 路径
+    pub node: Option<String>,
+    /// 内置 pi bundle 路径
+    pub pi_bundle: Option<String>,
+    /// 内置 python 路径（默认包不含 ⇒ 通常是 None）
+    pub python: Option<String>,
+    /// git 路径
+    pub git: Option<String>,
+    /// git 来源：`builtin` / `system` / `missing`
+    pub git_source: String,
+    /// bash 路径
+    pub bash: Option<String>,
+    /// bash 来源：`builtin` / `system` / `missing`
+    pub bash_source: String,
+    /// 人话提示（直接可展示给用户）
+    pub notes: Vec<String>,
+}
+
+/// 探测内置运行时的各组件状态。
+pub fn runtime_status(exe: &Path) -> RuntimeStatus {
+    let mut st = RuntimeStatus::default();
+
+    let root = runtime_root(exe);
+    st.runtime_dir = root.as_ref().map(|p| p.display().to_string());
+
+    // node / pi bundle：只认内置（系统装的 node 不够 —— pi bundle 还是内置的）
+    if let Some(r) = &root {
+        let n = r.join("node").join("node.exe");
+        if n.is_file() {
+            st.node = Some(n.display().to_string());
+        }
+        let b = r.join("pi").join("dist").join("bundle").join("cli.js");
+        if b.is_file() {
+            st.pi_bundle = Some(b.display().to_string());
+        }
+    }
+    st.ready = st.node.is_some() && st.pi_bundle.is_some();
+
+    // python：默认包不含 ⇒ 缺席是**正常**的，不是错误
+    st.python = bundled_python(exe).map(|p| p.display().to_string());
+    if st.python.is_none() {
+        st.notes.push(
+            "未检测到内置 Python，可在设置里指定路径或自行安装（不影响 pi 内核使用）".into(),
+        );
+    }
+
+    // git / bash：内置优先，回落系统
+    let (git, git_src) = match bundled_git(exe) {
+        Some(p) => {
+            let builtin = root
+                .as_ref()
+                .map(|r| r.join("git").join("cmd").join("git.exe").is_file())
+                .unwrap_or(false);
+            (Some(p), if builtin { "builtin" } else { "system" }.to_string())
+        }
+        None => (None, "missing".to_string()),
+    };
+    st.git = git.map(|p| p.display().to_string());
+    st.git_source = git_src;
+    if st.git_source == "missing" {
+        st.notes
+            .push("未检测到 git，相关工具不可用（发布包不再分发 git）".into());
+    } else if st.git_source == "system" {
+        st.notes
+            .push("未检测到内置 git，改用系统已装的 git".into());
+    }
+
+    let (bash, bash_src) = match bundled_bash(exe) {
+        Some(p) => {
+            let builtin = root
+                .as_ref()
+                .map(|r| r.join("git").join("bash.cmd").is_file())
+                .unwrap_or(false);
+            (Some(p), if builtin { "builtin" } else { "system" }.to_string())
+        }
+        None => (None, "missing".to_string()),
+    };
+    st.bash = bash.map(|p| p.display().to_string());
+    st.bash_source = bash_src;
+    if st.bash_source == "missing" {
+        st.notes
+            .push("未检测到 bash，Git Bash 相关能力不可用（发布包不再分发 git）".into());
+    }
+
+    if !st.ready {
+        st.notes.push(
+            "内置运行时不完整（需要 runtime/node/node.exe 与 runtime/pi/dist/bundle/cli.js）——              pi 内核不可用，会退回自研内核"
+                .into(),
+        );
+    }
+    st
 }
 
 // ---------------------------------------------------------------------------
@@ -426,13 +651,43 @@ impl PiClient {
             cmd.env("ORB_BRIDGE_PORT", cfg.bridge_port.to_string());
             cmd.env("ORB_TOOL_SPECS", cfg.tool_specs.to_string());
         }
-        // ⚠️ 把内置 git/bash 挂到 PATH —— pi 的 bash 工具要用
-        let git_bin = cfg.runtime.join("git");
-        if git_bin.is_dir() {
-            let usr = git_bin.join("usr").join("bin");
-            let cmd_dir = git_bin.join("cmd");
-            let mingw = git_bin.join("mingw64").join("bin");
-            let new_path = format!("{};{};{};{}", usr.display(), cmd_dir.display(), mingw.display(), std::env::var("PATH").unwrap_or_default());
+        // ⚠️ 把 git/bash 挂到 PATH —— pi 的 bash 工具要用
+        //
+        // ⚠️ 2026-10-23 起**发布包不再分发 git**（GPLv2，用户拍板）⇒
+        //    `runtime/git/` 不存在 ⇒ 这段以前**整个不生效**。
+        //    ⇒ 改成：内置 git 在就用内置的，**否则用系统装的**（把它的
+        //    `cmd`/`bin`/`usr\bin` 加到 PATH 前面）。
+        //
+        //    注意：pi 的内置 bash 工具已被 `--exclude-tools` 排掉（安全闸），
+        //    这里只是让「用户自装的 git」在 pi 的子进程里可用。
+        let git_dirs: Vec<std::path::PathBuf> = {
+            let git_bin = cfg.runtime.join("git");
+            if git_bin.is_dir() {
+                vec![
+                    git_bin.join("usr").join("bin"),
+                    git_bin.join("cmd"),
+                    git_bin.join("mingw64").join("bin"),
+                ]
+            } else {
+                // 系统 git：把它的各个 bin 目录加到前面
+                let mut v = Vec::new();
+                if let Some(g) = system_git() {
+                    let root = g.parent().and_then(|p| p.parent()).unwrap_or(&g);
+                    v.push(root.join("usr").join("bin"));
+                    v.push(root.join("cmd"));
+                    v.push(root.join("bin"));
+                }
+                v
+            }
+        };
+        if !git_dirs.is_empty() {
+            let mut parts: Vec<String> = git_dirs
+                .iter()
+                .filter(|d| d.is_dir())
+                .map(|d| d.display().to_string())
+                .collect();
+            parts.push(std::env::var("PATH").unwrap_or_default());
+            let new_path = parts.join(";");
             cmd.env("PATH", new_path);
         }
         cmd.stdin(std::process::Stdio::piped());
@@ -1333,6 +1588,106 @@ mod tests {
                 !entry.starts_with('+') && !entry.starts_with('-'),
                 "白名单里不该有 +/- 修饰符（上游会直接报错），实际: {list:?}"
             );
+        }
+    }
+
+    // ---------------- 内置运行时的定位与组件状态 ----------------
+
+    /// 造一个假的 exe 目录，返回 `(exe 路径, runtime 目录)`。
+    fn fake_exe(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("orbcat_rt_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let exe = base.join("orbcat.exe");
+        let rt = base.join("runtime");
+        std::fs::create_dir_all(&rt).expect("应能建 runtime 目录");
+        (exe, rt)
+    }
+
+    fn touch(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("应能建父目录");
+        }
+        std::fs::write(path, b"x").expect("应能写占位文件");
+    }
+
+    /// 🔴 回归测试：**目录在但内容缺** ⇒ 不许当成「运行时可用」。
+    ///
+    /// 打包侧（`tools/package.mjs`）与启动器（`tools/orbcat-launch.ps1`）
+    /// 都是内容校验口径 ⇒ orbcat 这边必须**逐字对齐**，
+    /// 否则会出现「启动器认为包是好的、orbcat 认为不是」两边打架。
+    #[test]
+    fn runtime目录在但内容缺_不算可用() {
+        let (exe, rt) = fake_exe("missing");
+        // 只有 runtime 目录，什么都没有
+        assert!(runtime_root(&exe).is_some(), "目录在就该认得 runtime_root");
+        assert!(
+            runtime_dir(&exe).is_none(),
+            "内容缺（无 node / 无 pi bundle）时 runtime_dir 必须返回 None"
+        );
+
+        // 补上 node，还是不够（pi bundle 缺）
+        touch(&rt.join("node").join("node.exe"));
+        assert!(
+            runtime_dir(&exe).is_none(),
+            "只有 node 没有 pi bundle 时仍不该算可用"
+        );
+
+        // 补上 pi bundle ⇒ 才算可用
+        touch(&rt.join("pi").join("dist").join("bundle").join("cli.js"));
+        assert!(
+            runtime_dir(&exe).is_some(),
+            "node + pi bundle 都在时才算可用"
+        );
+    }
+
+    /// 回归测试：组件状态要**说清缺什么**（用户能看懂）。
+    #[test]
+    fn runtime状态要报出各组件与缺什么() {
+        let (exe, rt) = fake_exe("status");
+        touch(&rt.join("node").join("node.exe"));
+        touch(&rt.join("pi").join("dist").join("bundle").join("cli.js"));
+
+        let st = runtime_status(&exe);
+        assert!(st.ready, "node + pi bundle 都在 ⇒ ready");
+        assert!(st.node.is_some(), "node 路径要报出来");
+        assert!(st.pi_bundle.is_some(), "pi bundle 路径要报出来");
+        assert!(
+            st.python.is_none(),
+            "默认包不含 python ⇒ 缺席是正常的"
+        );
+        assert!(
+            st.notes.iter().any(|n| n.contains("Python")),
+            "python 缺席要有提示，实际: {:?}",
+            st.notes
+        );
+        // git / bash 的来源必须**明确**（builtin / system / missing），不许空
+        assert!(
+            ["builtin", "system", "missing"].contains(&st.git_source.as_str()),
+            "git_source 必须是三态之一，实际: {:?}",
+            st.git_source
+        );
+        assert!(
+            ["builtin", "system", "missing"].contains(&st.bash_source.as_str()),
+            "bash_source 必须是三态之一，实际: {:?}",
+            st.bash_source
+        );
+    }
+
+    /// 回归测试：git / bash 找不到时**必须能回落系统那份**。
+    ///
+    /// 2026-10-23 用户拍板：发布包**不再分发 git**（GPLv2）⇒
+    /// `runtime/git/` 不存在 ⇒ 必须回落系统已装的 git/bash。
+    ///
+    /// ⚠️ 不断言「本机一定有 git」（CI runner 上可能没有）⇒
+    /// 只断言「返回的路径若存在，那它必须**真的存在**」。
+    #[test]
+    fn git与bash要能回落系统那份() {
+        let (exe, _rt) = fake_exe("fallback");
+        if let Some(g) = bundled_git(&exe) {
+            assert!(g.is_file(), "回落的 git 路径必须真的存在: {}", g.display());
+        }
+        if let Some(b) = bundled_bash(&exe) {
+            assert!(b.is_file(), "回落的 bash 路径必须真的存在: {}", b.display());
         }
     }
 
