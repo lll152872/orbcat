@@ -145,15 +145,10 @@ pub struct PiRuntime {
     /// 工具桥
     bridge: tokio::sync::Mutex<Option<Arc<ToolBridge>>>,
     /// 权限裁决回调（宿主提供）
-<<<<<<< HEAD
-
-    gate: std::sync::Arc<tokio::sync::Mutex<Option<GateFn>>>,
+    gate: std::sync::Arc<std::sync::Mutex<Option<GateFn>>>,
     /// 宿主确认钩子（pi 的 `ctx.ui.confirm()` → 我们的确认卡）
-    confirm_hook: std::sync::Arc<tokio::sync::Mutex<Option<ConfirmFn>>>,
-=======
-    gate: std::sync::Arc<tokio::sync::Mutex<Option<GateFn>>>,
+    confirm_hook: std::sync::Arc<std::sync::Mutex<Option<ConfirmFn>>>,
     /// 强制指定模型（`(provider, model)`）—— 覆盖从 settings 反查的结果。
->>>>>>> cd32a23 (fix(pi): P2 · 宿主权限闸改为**每次调用现取**，修 MCP 授权静默降级 [skip ci])
     ///
     /// ## 什么时候用
     ///
@@ -221,14 +216,9 @@ impl PiRuntime {
             agent_dir,
             client: tokio::sync::Mutex::new(None),
             bridge: tokio::sync::Mutex::new(None),
-<<<<<<< HEAD
-
-            gate: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            confirm_hook: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-=======
-            gate: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            confirm_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             model_override: tokio::sync::Mutex::new(None),
->>>>>>> cd32a23 (fix(pi): P2 · 宿主权限闸改为**每次调用现取**，修 MCP 授权静默降级 [skip ci])
             extra_mcp: tokio::sync::Mutex::new(Vec::new()),
             prompt_ctx: Arc::new(std::sync::Mutex::new(PromptCtx::default())),
             session_id: None,
@@ -256,14 +246,9 @@ impl PiRuntime {
             agent_dir,
             client: tokio::sync::Mutex::new(None),
             bridge: tokio::sync::Mutex::new(None),
-<<<<<<< HEAD
-
-            gate: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            confirm_hook: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-=======
-            gate: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            confirm_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             model_override: tokio::sync::Mutex::new(None),
->>>>>>> cd32a23 (fix(pi): P2 · 宿主权限闸改为**每次调用现取**，修 MCP 授权静默降级 [skip ci])
             extra_mcp: tokio::sync::Mutex::new(Vec::new()),
             prompt_ctx: Arc::new(std::sync::Mutex::new(PromptCtx::default())),
             session_id: Some(session_id.to_string()),
@@ -351,27 +336,19 @@ impl PiRuntime {
     /// ⚠️ 签名第三个参数是**这个 pi 进程自己的会话 id**（`Option<&str>`）——
     /// 多会话并行时不能拿「用户当前正在看的会话」，否则权限裁决会串味。
     pub fn set_gate(&self, f: GateFn) {
-        match self.gate.try_lock() {
-            Ok(mut g) => *g = Some(f),
-            Err(_) => {
-                // ⚠️ `blocking_lock()` 返回 guard（不是 Result）
-                let mut g = self.gate.blocking_lock();
-                *g = Some(f);
-            }
-        }
+        // std Mutex + into_inner()：两个坑一起堵 ——
+        //  1) 原来用 tokio::sync::Mutex::blocking_lock() 兜底：它在 **async 上下文里会 panic**
+        //     （tokio: cannot block the current thread from within a runtime）。
+        //  2) poison 也要继续用（into_inner）—— 静默跳过 = 等于没设 gate ⇒ P2 静默降级复发。
+        *self.gate.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
     }
 
     /// 设置宿主确认钩子（pi 的 `ctx.ui.confirm()` → 我们的确认卡）。
     ///
     /// 与 [`PiRuntime::set_gate`] 同口径：**已有**的运行时也一起套上。
     pub fn set_confirm_hook(&self, f: ConfirmFn) {
-        match self.confirm_hook.try_lock() {
-            Ok(mut g) => *g = Some(f),
-            Err(_) => {
-                let mut g = self.confirm_hook.blocking_lock();
-                *g = Some(f);
-            }
-        }
+        // 同 set_gate：不走 blocking_lock（async 里会 panic），poison 也继续用。
+        *self.confirm_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
     }
 
     /// 内置 runtime 目录。
@@ -418,9 +395,16 @@ impl PiRuntime {
         }
 
         let cfg = self.build_config().await?;
-        let gate = self.gate.lock().await.clone();
+        // 权限闸（gate）**不在这里传** —— 它由 `build_gate` 做成「每次调用现取」的
+        // 闭包（P2 的核心：不能在建桥那刻抄成快照）。
+        // 旧代码这里有一行 `let gate = self.gate.lock().await.clone();` ——
+        // 抄了快照却**根本没被用**（死变量），只会误导下一个人以为闸门是快照的。
         // 宿主确认通道（pi 的 `ctx.ui.confirm()` → 我们的确认卡）
-        let confirm_hook = self.confirm_hook.lock().await.clone();
+        let confirm_hook = self
+            .confirm_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let client = PiClient::spawn(
             cfg,
             Self::make_host(confirm_hook, self.session_id.clone()),
@@ -1289,7 +1273,7 @@ impl PiRuntime {
 /// 现在：闭包持有 `Arc<Mutex<Option<GateFn>>>`，每次调用现取。
 /// 桥的 handler 跑在**同步线程**里 ⇒ 用 `blocking_lock()`（不是 async 上下文）。
 pub(crate) fn build_gate(
-    gate_cell: &std::sync::Arc<tokio::sync::Mutex<Option<GateFn>>>,
+    gate_cell: &std::sync::Arc<std::sync::Mutex<Option<GateFn>>>,
     gate_sid: Option<String>,
     gate_dir: std::path::PathBuf,
 ) -> crate::pi_bridge::GateHandler {
@@ -1297,7 +1281,7 @@ pub(crate) fn build_gate(
     Arc::new(move |tool, args| {
         let real = tool.strip_prefix("orb_").unwrap_or(tool);
         // 每次现取 ⇒ 后设的 gate 也能生效
-        let host_gate = gate_cell.blocking_lock().clone();
+        let host_gate = gate_cell.lock().unwrap_or_else(|e| e.into_inner()).clone();
         // 有宿主 gate → 用它（能弹卡、能走真实的 mcp_grants / 确认卡流程）
         if let Some(g) = host_gate {
             let real = real.to_string();
@@ -1401,7 +1385,15 @@ impl PiPool {
                 }
                 n
             }
-            Err(_) => 0,
+            Err(_) => {
+                // ⚠️ **不能静默跳过**（契约 C5：宿主 gate 未接线 ⇒ 阻断 + **显式报错**，
+                //    不许当成「允许」）。抢不到锁 ⇒ 至少要留下一行日志。
+                eprintln!(
+                    "[orbcat] ⚠️ pi 内核：宿主权限闸**没套到**已有运行时上（会话表锁被占）—— \
+                     那些会话的 MCP 授权会退化成静态拒绝。"
+                );
+                0
+            }
         };
         if applied > 0 {
             eprintln!("[orbcat] pi 内核：已把宿主权限闸套到 {applied} 个已存在的运行时");
@@ -1424,7 +1416,15 @@ impl PiPool {
                 }
                 n
             }
-            Err(_) => 0,
+            Err(_) => {
+                // ⚠️ **不能静默跳过**（契约 C5：宿主 gate 未接线 ⇒ 阻断 + **显式报错**，
+                //    不许当成「允许」）。抢不到锁 ⇒ 至少要留下一行日志。
+                eprintln!(
+                    "[orbcat] ⚠️ pi 内核：宿主确认通道**没套到**已有运行时上（会话表锁被占）—— \
+                     那些会话的 pi 确认框会恒拒绝。"
+                );
+                0
+            }
         };
         if applied > 0 {
             eprintln!("[orbcat] pi 内核：已把宿主确认通道套到 {applied} 个已存在的运行时");
@@ -1504,14 +1504,14 @@ impl PiPool {
         );
         {
             // std Mutex 的 guard 在这个语句结束就drop —— 临界区里没有 await。
-            let gate = self.gate.lock().ok().and_then(|g| g.clone());
+            let gate = self.gate.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if let Some(gate) = gate {
                 rt.set_gate(gate);
             }
         }
         {
             // 宿主确认通道同样要套到新运行时上（否则新会话的 pi 确认框没人接）
-            let hook = self.confirm_hook.lock().ok().and_then(|g| g.clone());
+            let hook = self.confirm_hook.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if let Some(hook) = hook {
                 rt.set_confirm_hook(hook);
             }
@@ -1738,7 +1738,7 @@ mod tests {
     /// 没设宿主 gate 时被静态拒绝、设了之后被宿主放行 ⇒ 说明它**每次现取**。
     #[test]
     fn P2_建桥之后设的宿主gate_桥的裁决也要用上() {
-        let cell = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(None));
         let dir = std::env::temp_dir().join("orbcat-pi-gate-test");
         let _ = std::fs::create_dir_all(&dir);
 
@@ -1759,7 +1759,7 @@ mod tests {
             // ⚠️ **不能 `.unwrap()`** —— `blocking_lock()` 返回 guard，
             //    `.unwrap()` 会被自动 deref 成 `Option::unwrap()` ⇒ 拿到的是
             //    GateFn 本身（不是 guard）⇒ 后面 `*g = ...` 直接类型错。
-            let mut g = cell2.blocking_lock();
+            let mut g = cell2.lock().unwrap_or_else(|e| e.into_inner());
             // ⚠️ 闭包参数**不要自己标类型** —— 交给 `GateFn` 推断，
             //    否则 boxed future 的协变推导不上（E0277）。
             let host: GateFn = std::sync::Arc::new(move |_tool, _args, _sid| {
