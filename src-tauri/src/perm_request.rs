@@ -215,6 +215,21 @@ pub struct PendingView {
     pub question: String,
     /// 快捷选项（用户点一下即回答；空 = 自由输入）
     pub options: Vec<String>,
+
+    // ---- pi 确认框字段（kind = "pi"）----
+    /// pi 问的**正文**（`ctx.ui.confirm(title, message)` 的 `message`）。
+    ///
+    /// ## 为什么单列一个字段
+    ///
+    /// pi 的确认载荷只有 **title + message 两个字符串**
+    /// （`rpc-types.d.ts:407-415`），其中 `message` 才是问题的实质
+    /// （「允许执行 rm -rf ~/project 吗？」在 message 里，不在 title 里）。
+    ///
+    /// 不落进 `normalized`（那是「归一化后的命令」）、也不塞 `question`
+    /// （那是 ask_user 的问题正文）—— 两处语义都不对，
+    /// 复用会让前端在「命令卡 / 提问卡 / pi 卡」三种语义间猜字段。
+    /// 另两种 kind 恒为空串。
+    pub message: String,
 }
 
 /// 申请范围比被拒路径宽了几层。
@@ -262,6 +277,7 @@ impl PendingRequest {
             created_at: self.created_at,
             timeout_ms: self.timeout_ms,
             question: String::new(),
+            message: String::new(),
             options: Vec::new(),
         }
     }
@@ -285,6 +301,8 @@ pub struct PendingCmd {
     /// ask_user 专用：问题正文与快捷选项（命令/MCP 申请为空）
     pub question: String,
     pub options: Vec<String>,
+    /// pi 确认框专用：pi 问的正文（其它 kind 为空串，见 [`PendingView::message`]）
+    pub message: String,
     tx: tokio::sync::oneshot::Sender<Verdict>,
 }
 
@@ -325,6 +343,7 @@ impl PendingCmd {
             timeout_ms: self.timeout_ms,
             question: self.question.clone(),
             options: self.options.clone(),
+            message: self.message.clone(),
         }
     }
 }
@@ -833,6 +852,7 @@ impl PermHub {
             created_at: permission::now_ms(),
             timeout_ms,
             question: String::new(),
+            message: String::new(),
             options: Vec::new(),
             tx,
         };
@@ -893,6 +913,7 @@ impl PermHub {
             created_at: permission::now_ms(),
             timeout_ms,
             question: String::new(),
+            message: String::new(),
             options: Vec::new(),
             tx,
         };
@@ -958,6 +979,7 @@ impl PermHub {
             timeout_ms,
             question,
             options,
+            message: String::new(),
             tx,
         };
         let view = req.view();
@@ -1019,6 +1041,10 @@ impl PermHub {
             timeout_ms,
             question: title,
             options: vec!["允许".into(), "拒绝".into()],
+            // ⚠️ **pi 的正文必须落进来** —— title 只是「问题是什么」，
+            // message 才是「到底要批什么」（例如「允许执行 rm -rf ~/project 吗？」）。
+            // 漏掉它 = 用户只看到一句没头没尾的标题，只能盲点「允许」。
+            message,
             tx,
         };
         let view = req.view();
@@ -1549,6 +1575,10 @@ mod tests {
                 id = v.id.clone();
                 assert_eq!(v.kind, "pi", "`pp*` 的卡 kind 必须是 pi");
                 assert!(id.starts_with("pp"), "id 必须以 pp 开头，实际 {id}");
+                // ⚠️ **正文不许丢**：title 只是「问题是什么」，
+                // message 才是「到底要批什么」—— 丢了它用户只能盲点「允许」。
+                assert_eq!(v.question, "pi 要做一件事", "title 应落在 question");
+                assert_eq!(v.message, "允许吗", "pi 的 message 必须落在 message 字段");
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1566,5 +1596,47 @@ mod tests {
             .expect("ask_pi_confirm 不该报错");
         assert!(got.is_approved());
         assert_eq!(got.decision, Decision::Approve);
+    }
+
+    /// 🟡 `message` 字段**只属于 pi 卡** —— 其它 kind 恒为空串。
+    ///
+    /// ## 为什么也要锁
+    ///
+    /// `message` 是为「pi 的确认正文」单开的字段。前端在渲染时按 `kind`
+    /// 分叉（命令卡 / 提问卡 / MCP 卡 / pi 卡 各一套），
+    /// 所以**别的卡绝不能**往这个字段里塞东西 ——
+    /// 否则命令卡的正文会突然出现在 pi 卡的位置上（串卡）。
+    #[tokio::test]
+    async fn 非pi卡的message恒为空() {
+        let hub = std::sync::Arc::new(PermHub::new());
+        let hub2 = hub.clone();
+        let waiter = tokio::spawn(async move {
+            hub2.ask_command(
+                "rm -rf x".to_string(),
+                "rm -rf x".to_string(),
+                "rm".to_string(),
+                "rm -rf x".to_string(),
+                Risk::High,
+                "要删东西".to_string(),
+                "s1",
+            )
+            .await
+        });
+
+        let mut id = String::new();
+        for _ in 0..200 {
+            let views = hub.pending_views();
+            if let Some(v) = views.first() {
+                id = v.id.clone();
+                assert_eq!(v.kind, "command");
+                assert_eq!(v.message, "", "命令卡不许往 message 里塞东西");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!id.is_empty(), "命令卡应挂上待办表");
+        hub.decide_command(&id, Decision::Deny, "不删".to_string())
+            .expect("命令卡应能被 decide_command 唤醒");
+        let _ = tokio::time::timeout(Duration::from_millis(500), waiter).await;
     }
 }
