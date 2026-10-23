@@ -1,42 +1,43 @@
 /**
- * orbcat system prompt 接管 extension。
+ * orbcat system prompt 接管 extension —— **合成模式**（pi 原生 + 我们的记忆）。
  *
- * ## 为什么需要
+ * ## 为什么改成「合成」而不是「整段替换」
  *
- * pi 自己的默认 system prompt 是「coding agent」那一套：
- * "You are an expert coding assistant operating inside pi, a coding agent harness."
+ * pi 的 system prompt 是**分段构造**的（上游 `buildSystemPromptSections`）：
+ * `preamble`（默认是 coding agent 人格）+ `tools` + `rules` + `docs` +
+ * `project_context` + `skills` + 各 extension 写进 `sections` 的段。
  *
- * 而 orbcat 的定位是**用户的私人助手** —— 有自己的：
- * - 人格与语气（`SOUL.md`）
- * - 身份（`IDENTITY.md`）
- * - 对用户的了解（`USER.md`）
- * - 行为红线（`RULES.md`）
- * - 长期记忆（`memory/MEMORY.md`）
- * - 项目记忆 + 记忆使用规则
+ * 我们以前返回 `{ systemPrompt: p }` ⇒ 上游设 `forceSystemPrompt`
+ * ⇒ **整段替换** ⇒ pi 原生那些段（工具说明 / 规则 / cwd / 项目上下文 / MCP 清单）**全丢**。
  *
- * **不接这条 → pi 内核下的助手不知道你是谁、也不记得任何事**，
- * 而且用户会以为「切内核把我的记忆弄丢了」。
+ * 现在改成（与 pi 自己的 mcp extension 同法 —— 直接写同一个对象）：
  *
- * ## 怎么接
+ * - `event.systemPromptOptions.customPrompt` = 我们的人格 / 红线 / 身份 / 用户
+ *   ⇒ **替换**掉 pi 的 coding agent 人格 ⇒ **我们的身份占主导**，pi 那份退位；
+ * - `event.systemPromptOptions.sections["orbcat_context"]` = 长期记忆 / 项目 /
+ *   模式 / 技能 / **当前执行位置** ⇒ **追加**一段；
+ * - pi 原生的 tools / rules / docs / project_context / MCP 清单 **全部保留**
+ *   ⇒ 它们自然变成「工具用法 / 环境信息」的补充资料。
  *
- * `before_agent_start` 事件的 `systemPrompt` 是**当前**的 prompt，
- * 返回 `{ systemPrompt }` 就**完全替换**它（实测有效，见 tmp/PI-PROBE-RESULTS.md）。
+ * ⚠️ **关键：不能返回 `{ systemPrompt }`** —— 返回了就会设 `forceSystemPrompt`
+ * ⇒ 又变回整段替换 ⇒ 上面这一切白做。
  *
- * 我们向宿主要一份 —— 宿主的 `/prompt` 端点内部调的是
- * `agent::build_system_prompt_full()`，**与自研内核那条拼装路逐字同源**，
- * 所以两个内核看到的 prompt 完全一致。
- *
- * ## 为什么不是 `SYSTEM.md`
- *
- * pi 支持 `<agent-dir>/SYSTEM.md` 直接替换 prompt。但那是**静态文件** ——
- * 装在 `agent-data/pi/` 下，而 orbcat 的 prompt 是**动态**的
- * （技能命中、项目上下文、当前消息都会影响它）。走 HTTP 才能拿到实时的。
+ * ⚠️ 段名必须匹配上游 `/^[a-z][a-z0-9_-]*$/`，否则上游直接 throw
+ * （`Invalid system prompt section name`）⇒ 整轮 prompt 构建失败。
  */
 
 const BRIDGE_PORT = process.env.ORB_BRIDGE_PORT || "";
 
-/** 拿宿主的 system prompt。失败时返回 null（不替换，让 pi 用自己的默认）。 */
-async function fetchPrompt(userText: string): Promise<string | null> {
+/** 宿主给的两段。 */
+interface PromptParts {
+	/** 人格 / 红线 / 身份 / 用户 —— 进 `customPrompt` */
+	persona: string;
+	/** 长期记忆 / 项目 / 模式 / 技能 / 执行位置 —— 进 `sections` */
+	context: string;
+}
+
+/** 向宿主要 prompt 的两份。 */
+async function fetchParts(userText: string): Promise<PromptParts | null> {
 	if (!BRIDGE_PORT) return null;
 	try {
 		const ctrl = new AbortController();
@@ -50,9 +51,15 @@ async function fetchPrompt(userText: string): Promise<string | null> {
 		clearTimeout(timer);
 		const j: any = await res.json();
 		if (!j.ok) return null;
-		const p = typeof j.prompt === "string" ? j.prompt : null;
-		// 空 prompt 不替换 —— pi 的默认 prompt 至少还有基本工具说明
-		return p && p.trim().length > 0 ? p : null;
+
+		const persona = typeof j.persona === "string" ? j.persona : "";
+		const context = typeof j.context === "string" ? j.context : "";
+		if (!persona && !context) {
+			// 旧宿主（只回 `prompt` 字段）⇒ 退回整段替换（老行为，不至于没 prompt 用）
+			const p = typeof j.prompt === "string" ? j.prompt : "";
+			return p.trim().length > 0 ? { persona: p, context: "" } : null;
+		}
+		return { persona, context };
 	} catch {
 		return null;
 	}
@@ -61,12 +68,41 @@ async function fetchPrompt(userText: string): Promise<string | null> {
 export default function (pi: any) {
 	pi.on("before_agent_start", async (event: any) => {
 		const userText = String(event?.prompt ?? "");
-		const p = await fetchPrompt(userText);
-		if (!p) {
+		const parts = await fetchParts(userText);
+		if (!parts) {
 			console.error("[orbcat-prompt] 拿不到宿主 prompt，沿用 pi 默认");
 			return undefined;
 		}
-		console.error(`[orbcat-prompt] 已接管 system prompt (${p.length} 字)`);
-		return { systemPrompt: p };
+
+		const opts = event?.systemPromptOptions;
+		const canSection =
+			!!opts && typeof opts === "object" && !!opts.sections && typeof opts.sections === "object";
+
+		if (!canSection) {
+			// 兜底：拿不到 `sections` ⇒ 退回整段替换（老行为）
+			const full = parts.context ? `${parts.persona}\n\n---\n\n${parts.context}` : parts.persona;
+			console.error(`[orbcat-prompt] 整段替换 system prompt (${full.length} 字)`);
+			return { systemPrompt: full };
+		}
+
+		// ── 合成：人格进 customPrompt，其余进 sections ──
+		if (parts.persona) opts.customPrompt = parts.persona;
+		if (parts.context) opts.sections["orbcat_context"] = parts.context;
+
+		// 读一次合成后的**完整** prompt（getter 会用当前 options 重建）⇒ 诊断用
+		let full = "";
+		try {
+			full = String(event?.systemPrompt ?? "");
+		} catch {
+			full = "";
+		}
+		console.error(
+			`[orbcat-prompt] 已合成 system prompt (${full.length} 字)：` +
+				`人格 ${parts.persona.length}（customPrompt，替换掉 pi 的 coding agent 人格）+ ` +
+				`上下文 ${parts.context.length}（sections）+ pi 其它段保留（extension 段/project_context/skills）`,
+		);
+
+		// ⚠️ **不要返回 `{ systemPrompt }`** —— 那会让上游设 forceSystemPrompt ⇒ 整段替换。
+		return undefined;
 	});
 }

@@ -154,7 +154,7 @@ fn start_bridge() -> (Arc<ToolBridge>, Arc<std::sync::atomic::AtomicU64>) {
         }))
     });
     let gate: GateHandler = Arc::new(|_n, _a| Ok((true, String::new())));
-    let prompt: PromptHandler = Arc::new(|u: &str| format!("PROMPT[{u}]"));
+    let prompt: PromptHandler = Arc::new(|u: &str| orbcat_lib::agent::PromptParts { persona: format!("PROMPT[{u}]"), context: String::new() });
     let b = ToolBridge::start(handler, gate, prompt).expect("桥应能起");
     (b, calls)
 }
@@ -187,7 +187,7 @@ async fn 桥能收到工具调用并返回结果() {
 async fn gate端点能裁决() {
     let handler: ToolHandler = Arc::new(|_n, _a| Ok(json!({})));
     let gate: GateHandler = Arc::new(|_n, _a| Ok((false, "被拒绝了".to_string())));
-    let prompt: PromptHandler = Arc::new(|u: &str| format!("PROMPT[{u}]"));
+    let prompt: PromptHandler = Arc::new(|u: &str| orbcat_lib::agent::PromptParts { persona: format!("PROMPT[{u}]"), context: String::new() });
     let b = ToolBridge::start(handler, gate, prompt).expect("桥应能起");
     let port = b.port();
 
@@ -222,7 +222,7 @@ async fn gate端点能裁决() {
 async fn prompt端点能拿到宿主拼的prompt() {
     let handler: ToolHandler = Arc::new(|_n, _a| Ok(json!({})));
     let gate: GateHandler = Arc::new(|_n, _a| Ok((true, String::new())));
-    let prompt: PromptHandler = Arc::new(|u: &str| format!("HOST-PROMPT[{u}]"));
+    let prompt: PromptHandler = Arc::new(|u: &str| orbcat_lib::agent::PromptParts { persona: format!("HOST-PROMPT[{u}]"), context: String::new() });
     let b = ToolBridge::start(handler, gate, prompt).expect("桥应能起");
     let port = b.port();
 
