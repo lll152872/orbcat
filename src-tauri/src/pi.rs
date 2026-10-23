@@ -627,9 +627,25 @@ pub struct PiClient {
     child: tokio::sync::Mutex<Option<Child>>,
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
     seq: AtomicU64,
-    /// 事件广播
-    events_tx: mpsc::UnboundedSender<PiEvent>,
-    events_rx: Mutex<Option<mpsc::UnboundedReceiver<PiEvent>>>,
+    /// 事件订阅者列表（**每轮一个**）。
+    ///
+    /// ## 为什么不是「单个 receiver + take」
+    ///
+    /// 旧实现是 `events_rx: Mutex<Option<Receiver>>` + `take_events()`（**take 移走语义**）
+    /// ⇒ 唯一调用点取走后就**再没人归还** ⇒ 同会话第二轮取不到通道
+    /// ⇒ 硬错「事件通道已被占用」⇒ **用户第一条有回复、第二条就炸**
+    /// （2026-10-23 22:16 守门 CDP 实测，部署态真 app）。
+    ///
+    /// 现在：**每轮订阅一个独立通道**，轮结束退订 ⇒
+    /// ① 第二轮一定能拿到通道；② **新通道是空的 ⇒ 不吃上一轮残留**。
+    ///
+    /// ⚠️ 用 `std::sync::Mutex`（不是 tokio 的）——
+    /// `dispatch` 跑在 pi 的 **stdout 读循环**里，`.lock().await` 会挂起读循环
+    /// ⇒ 那是同族死锁坑（`pi.rs` 里记过「宿主不回答 → pi 整个 run 挂死」）。
+    /// 临界区只有 push/pop/send，无界通道 send 不阻塞 ⇒ 读循环零阻塞。
+    event_subs: std::sync::Mutex<Vec<(u64, Arc<mpsc::UnboundedSender<PiEvent>>)>>,
+    /// 订阅者 id 分配（单调递增）
+    next_sub_id: AtomicU64,
     /// 命令 id → 一次性响应通道
     pending: Arc<tokio::sync::Mutex<HashMap<String, mpsc::UnboundedSender<Value>>>>,
     /// 已收到的响应（按 id）
@@ -724,7 +740,6 @@ impl PiClient {
         let stdout = child.stdout.take().ok_or("拿不到 pi 的 stdout")?;
         let stderr = child.stderr.take().ok_or("拿不到 pi 的 stderr")?;
 
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
         let pending: Arc<tokio::sync::Mutex<HashMap<String, mpsc::UnboundedSender<Value>>>> =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let responses: Arc<tokio::sync::Mutex<HashMap<String, Value>>> =
@@ -734,8 +749,8 @@ impl PiClient {
             child: tokio::sync::Mutex::new(Some(child)),
             stdin: tokio::sync::Mutex::new(Some(stdin)),
             seq: AtomicU64::new(0),
-            events_tx,
-            events_rx: Mutex::new(Some(events_rx)),
+            event_subs: std::sync::Mutex::new(Vec::new()),
+            next_sub_id: AtomicU64::new(0),
             pending: pending.clone(),
             responses: responses.clone(),
             aborted: Arc::new(AtomicBool::new(false)),
@@ -886,7 +901,10 @@ impl PiClient {
         }
 
         // ── 其它都是事件 ──
-        let _ = self.events_tx.send(v);
+        //
+        // 广播给**所有**当前订阅者（通常只有一个 = 正在跑的那一轮）。
+        // 没有订阅者（轮与轮之间的间隙）⇒ 直接丢弃，这是对的：没人跑时不需要事件。
+        self.broadcast_event(&v);
     }
 
     /// 写一行 JSONL 到 pi 的 stdin。
@@ -941,9 +959,37 @@ impl PiClient {
         }
     }
 
-    /// 订阅事件流。
-    pub fn take_events(&self) -> Option<mpsc::UnboundedReceiver<PiEvent>> {
-        self.events_rx.lock().unwrap().take()
+    /// **订阅**事件流（每轮一个独立通道）。
+    ///
+    /// ## 返回值
+    ///
+    /// `(订阅 id, receiver)` —— **用完必须调 [`PiClient::unsubscribe_events`] 退订**，
+    /// 否则订阅者列表会一直涨。
+    ///
+    /// ## 为什么是「订阅」而不是「取走」
+    ///
+    /// 旧接口是 `take_events()`（take 移走语义）⇒ 取走后再没人归还
+    /// ⇒ 同会话第二轮直接报错。见 struct 里 `event_subs` 的注释。
+    pub fn subscribe_events(&self) -> (u64, mpsc::UnboundedReceiver<PiEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
+        let mut subs = self.event_subs.lock().unwrap_or_else(|e| e.into_inner());
+        subs.push((id, Arc::new(tx)));
+        (id, rx)
+    }
+
+    /// 退订（轮结束时必须调）。
+    pub fn unsubscribe_events(&self, id: u64) {
+        let mut subs = self.event_subs.lock().unwrap_or_else(|e| e.into_inner());
+        subs.retain(|(i, _)| *i != id);
+    }
+
+    /// 把一个事件发给所有订阅者（**同步** —— 读循环零阻塞）。
+    fn broadcast_event(&self, v: &PiEvent) {
+        let subs = self.event_subs.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, tx) in subs.iter() {
+            let _ = tx.send(v.clone());
+        }
     }
 
     /// 发一条 prompt（不等它跑完 —— 跑完靠 `agent_settled` 事件）。
