@@ -218,31 +218,49 @@ fn system_git() -> Option<PathBuf> {
     None
 }
 
-/// 找**系统装**的 `bash.exe`（Git for Windows 自带）。
-fn system_bash() -> Option<PathBuf> {
+/// **系统装的 bash 候选清单**（单一来源）。
+///
+/// ## 为什么公开出来
+///
+/// 后端的 `shell.rs::git_bash_candidates` 也在维护一份 bash 候选
+/// （执行位置选 Git Bash 时用）⇒ 两份会漂移。
+///
+/// ⇒ **以这一份为准**：`shell.rs` 那侧改成
+/// `runtime 候选 + crate::pi::system_bash_candidates()`，
+/// 不要自己再列一遍路径。
+///
+/// 顺序有意义：**优先 `bin`**（MSYS2 的 launcher，PATH 处理比 `usr\bin` 那份稳），
+/// 其次 `usr\bin`（有 coreutils，但 PATH 映射要自己配）。
+pub fn system_bash_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    // PATH 搜索（用户自装的、装在别处的）
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
             for name in ["bash.exe", "bash"] {
                 let cand = dir.join(name);
                 if cand.is_file() {
-                    return Some(cand);
+                    out.push(cand);
                 }
             }
         }
     }
-    // Git for Windows 常见位置：**优先 bin**（launcher，PATH 处理更稳）
+    // Git for Windows 常见位置：**优先 bin**
     for base in [
         r"C:\Program Files\Git\bin",
         r"C:\Program Files\Git\usr\bin",
         r"C:\Program Files (x86)\Git\bin",
         r"C:\Program Files (x86)\Git\usr\bin",
     ] {
-        let cand = Path::new(base).join("bash.exe");
-        if cand.is_file() {
-            return Some(cand);
-        }
+        out.push(Path::new(base).join("bash.exe"));
     }
-    None
+    out
+}
+
+/// 找**系统装**的 `bash.exe`（Git for Windows 自带）。
+///
+/// 候选见 [`system_bash_candidates`]（单一来源）。
+pub fn system_bash() -> Option<PathBuf> {
+    system_bash_candidates().into_iter().find(|p| p.is_file())
 }
 
 // ---------------------------------------------------------------------------
