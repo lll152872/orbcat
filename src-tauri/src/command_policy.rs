@@ -62,6 +62,14 @@ use std::path::{Path, PathBuf};
 
 use crate::permission::{now_ms, GrantTier};
 
+/// **bash 侧的词法归一化 + 硬阻断**（决策 9 的第二套命令形态）。
+///
+/// ⚠️ 放在 `command_policy/` 子目录而不是平铺成一个顶层模块，是为了让本文件
+/// **不需要在 `lib.rs` 里加一行 `mod` 声明** —— `lib.rs` 是「Pi内核」Bot 主写的
+/// 共享文件，能不改就不改（模块路径 `command_policy/bash_policy.rs` 是
+/// Rust 2018 的标准布局，`mod bash_policy;` 在本文件内即可解析）。
+mod bash_policy;
+
 // ---------------------------------------------------------------------------
 // 风险等级
 // ---------------------------------------------------------------------------
@@ -496,6 +504,21 @@ fn expand_alias(name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
+/// 按 **PowerShell 别名**归一后的命令形态（`exe arg arg`）。
+///
+/// 用途：白名单是**用 PS cmdlet 名表达的**（`get-childitem *` / `write-output *`），
+/// bash 侧匹配白名单时需要一个「Unix 名 → PS cmdlet 名」的映射，
+/// 才能让 `ls -la` 命中白名单里已有的 `get-childitem *` 那一条
+/// （而不是往白名单里另开 Unix 名 —— 那会让 `find . -delete` 之类借同名的危险开关打穿）。
+pub(crate) fn ps_alias_form(exe: &str, args: &[String]) -> String {
+    let expanded = expand_alias(exe);
+    if args.is_empty() {
+        expanded
+    } else {
+        format!("{} {}", expanded, args.join(" "))
+    }
+}
+
 fn expand_param(p: &str) -> String {
     // 形如 `-fo:` / `-fo=` 的值也一起归一化
     for &(abbr, full) in PARAM_ALIASES {
@@ -606,6 +629,15 @@ fn default_allow() -> Vec<String> {
         "cargo --version", "rustc --version", "python --version", "pip --version",
         "python3 --version", "py --version", "dotnet --version",
         "pwsh --version", "java -version", "go version",
+        // ---- bash 侧的只读命令（2026-10-23 补）----
+        //
+        // 只补**没有危险开关**的纯只读命令。
+        // ⚠️ 刻意**不补** `find *` —— `find . -delete` / `find . -exec rm` 会
+        // 借着"白名单里有 find"直接免问。所以 find 一律走确认卡。
+        // ⚠️ 也**不补** `sed *` / `awk *` / `tee *` —— 它们能写文件。
+        // （`ls` / `cat` / `pwd` 其实不用补：bash 侧匹配白名单时会回退到
+        //   PowerShell 别名形态，`ls -la` → `get-childitem -la` → 命中已有那条。）
+        "diff *", "jq *", "printf *", "printenv", "date",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -665,12 +697,55 @@ pub fn save_policy(data_dir: &Path, policy: &CommandPolicy) -> Result<PathBuf, S
 // ---------------------------------------------------------------------------
 
 /// 对一条命令做策略判定（不执行、不申请，只看策略）。
+///
+/// ## 两套词法，取最严
+///
+/// 一条命令**同时**过 PowerShell 词法（[`evaluate_ps_depth`]）与 bash 词法
+/// （[`bash_policy::evaluate_bash`]），两边的结论取**更严**的那个：
+/// 硬阻断 > 需确认 > 免问。
+///
+/// 为什么不是「先判断是哪种 shell 再走一套」：
+/// 判断错了的代价不对称 —— 判成 bash 却按 ps 评 = 放过危险命令；
+/// 判成 ps 却按 bash 评 = 多弹一张卡。所以**两套都跑、取最严**，
+/// 判错最多是「多问一句」，不会是「漏放」。
+///
+/// 🔴 补 bash 词法的直接原因：这台机器上装着 Git for Windows，
+/// `rm -rf /` / `dd of=/dev/sda` / `curl … | sh` 在 bash 下**真能跑出来**，
+/// 而原来的归一化只认 PowerShell 的别名与参数缩写 —— 一个都认不出来。
 pub fn evaluate(policy: &CommandPolicy, raw: &str) -> CmdVerdict {
     evaluate_depth(policy, raw, 0)
 }
 
 /// [`evaluate`] 的带深度版本。`depth` 用于限制 shell 内联命令的递归层数。
 fn evaluate_depth(policy: &CommandPolicy, raw: &str, depth: usize) -> CmdVerdict {
+    let ps = evaluate_ps_depth(policy, raw, depth);
+    let bash = bash_policy::evaluate_bash(policy, raw, depth);
+    most_restrictive(ps, bash)
+}
+
+/// 两个结论里取**更严**的那个。
+///
+/// 硬阻断 > 需确认（风险等级取高） > 免问。
+fn most_restrictive(a: CmdVerdict, b: CmdVerdict) -> CmdVerdict {
+    match (a, b) {
+        (CmdVerdict::HardBlock { reason }, _) => CmdVerdict::HardBlock { reason },
+        (_, CmdVerdict::HardBlock { reason }) => CmdVerdict::HardBlock { reason },
+        (CmdVerdict::Ask { reason, risk }, CmdVerdict::Ask { risk: k2, .. }) => CmdVerdict::Ask {
+            reason,
+            risk: if risk >= k2 { risk } else { k2 },
+        },
+        (CmdVerdict::Ask { reason, risk }, CmdVerdict::Allow { .. }) => {
+            CmdVerdict::Ask { reason, risk }
+        }
+        (CmdVerdict::Allow { .. }, CmdVerdict::Ask { reason, risk }) => {
+            CmdVerdict::Ask { reason, risk }
+        }
+        (CmdVerdict::Allow { reason }, CmdVerdict::Allow { .. }) => CmdVerdict::Allow { reason },
+    }
+}
+
+/// PowerShell 侧的判定（原有实现，逐字保留）。
+fn evaluate_ps_depth(policy: &CommandPolicy, raw: &str, depth: usize) -> CmdVerdict {
     let norm = normalize(raw);
 
     // 混淆 → 归一化不可信。EncodedCommand 硬阻断；其余降级为确认（高风险）。
@@ -1222,6 +1297,16 @@ pub struct AuditRecord {
     pub cwd: String,
     pub session_id: String,
     pub risk: String,
+    /// **走的哪种 shell 形态**（`"pwsh"` / `"bash"` / `""` = 旧记录/未知）。
+    ///
+    /// 为什么要单独记一条：同一段命令文本在两种 shell 下**语义不同**
+    /// （`rm -rf /` 在 pwsh 下是无效参数、在 bash 下是整机报废）。
+    /// 只记命令文本看不出当时到底按哪种 shell 跑的，事后复盘就断了线。
+    ///
+    /// ⚠️ 本字段**进了哈希链**（见 [`chain_hash`]）—— 改了它就改链，对不上就是被改过。
+    /// 老记录没有这个字段 → `serde(default)` 读成空串，不影响解析。
+    #[serde(default)]
+    pub shell: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
 }
@@ -1265,6 +1350,7 @@ fn chain_hash(rec: &AuditRecord) -> String {
     rec.cwd.hash(&mut h);
     rec.session_id.hash(&mut h);
     rec.risk.hash(&mut h);
+    rec.shell.hash(&mut h);
     rec.exit_code.hash(&mut h);
     format!("{:016x}", h.finish())
 }
@@ -1657,6 +1743,7 @@ mod tests {
             cwd: "D:\\".into(),
             session_id: "s1".into(),
             risk: "low".into(),
+            shell: "pwsh".into(),
             exit_code: None,
         };
 
@@ -1675,6 +1762,56 @@ mod tests {
         assert_eq!(recs[0].prev_hash, "");
         assert_eq!(recs[1].prev_hash, recs[0].hash, "第二条的 prev 应指向第一条");
         assert!(!recs[0].hash.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_chain_distinguishes_shell() {
+        // 同一条命令、只差「走的哪种 shell」⇒ 链上必须能分辨出来
+        // （`rm -rf /` 在 pwsh 下是无效参数，在 bash 下是整机报废）。
+        let dir = std::env::temp_dir().join("orbcat_audit_shell_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mk = |shell: &str| AuditRecord {
+            ts: 1,
+            sequence: 0,
+            prev_hash: String::new(),
+            hash: String::new(),
+            event: "executed".into(),
+            source: "whitelist".into(),
+            command: "rm -rf /".into(),
+            normalized: "rm --recursive --force /".into(),
+            cwd: "D:\\".into(),
+            session_id: "s1".into(),
+            risk: "low".into(),
+            shell: shell.into(),
+            exit_code: None,
+        };
+
+        audit_append(&dir, mk("pwsh")).unwrap();
+        audit_append(&dir, mk("bash")).unwrap();
+
+        let txt = std::fs::read_to_string(audit_path(&dir)).unwrap();
+        let recs: Vec<AuditRecord> = txt
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].shell, "pwsh");
+        assert_eq!(recs[1].shell, "bash");
+        assert_ne!(
+            recs[0].hash, recs[1].hash,
+            "不同 shell 的记录哈希必须不同（shell 进了链哈希）"
+        );
+        assert_eq!(recs[1].prev_hash, recs[0].hash, "第二条仍要指向第一条");
+
+        // 老记录（没有 shell 字段）照样能解析 —— serde(default) 读成空串
+        let legacy = r#"{"ts":1,"sequence":1,"prev_hash":"","hash":"x","event":"executed","source":"s","command":"c","normalized":"c","cwd":"D:\\","session_id":"s1","risk":"low"}"#;
+        let old: AuditRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(old.shell, "");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
