@@ -35,20 +35,27 @@ use crate::pi_bridge::{specs_to_json, ToolBridge, ToolHandler};
 
 /// 权限裁决回调（宿主提供）。
 ///
-/// 签名：`(工具名, 参数)` → `(允许?, 理由)`。
+/// 签名：`(工具名, 参数, 会话 id)` → `(允许?, 理由)`。
 ///
-/// ## 为什么是**异步**的
+/// ## 为什么多一个「会话 id」
 ///
-/// MCP 工具的授权要**弹确认卡**给用户（Cline 式三档：
-/// 允许一次 / 总是允许 / 拒绝）—— 那条路是 async 的
-/// （`PermHub::ask_mcp_tool` 阻塞在 oneshot 上等前端回话）。
+/// 多会话并行时，**每个会话一个 pi 进程**，每个进程的权限裁决必须用
+/// **它自己那个会话**的上下文（`mcp_grants` 是按项目+会话算的、
+/// 审计链要写对会话）。
 ///
-/// 所以这里必须是 async，而不是同步的 `bool`。
+/// 以前这个 id 是在回调里现取 `sessions::current_id()` —— 那拿到的是
+/// **用户当前正在看的那个会话**，不是这个 pi 进程所属的会话 ⇒ 并行时串味。
 ///
-/// ⚠️ 早期实现是 `Fn(&str, &Value) -> bool`（同步）——
-/// 那样 MCP 授权就**没法问用户**，只能一刀切放行或拒绝。
-pub type GateFn =
-    Arc<dyn Fn(&str, &Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = (bool, String)> + Send>> + Send + Sync>;
+/// `None` = 拿不到会话（测试路径）⇒ 宿主自己兜底。
+///
+/// ⚠️ 第三个参数是**拥有所有权**的 `Option<String>`，不是 `Option<&str>` ——
+/// 返回的 boxed future 是 `'static` 的，借来的 `&str` 传不进去（编译期就报
+/// "lifetime may not live long enough"）。
+pub type GateFn = Arc<
+    dyn Fn(&str, &Value, Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = (bool, String)> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// 一轮对话的结果（与 `agent::AgentRun` 同构，便于前端复用现有渲染）。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -83,6 +90,33 @@ pub struct PiRun {
     pub token_scale: Option<f64>,
 }
 
+/// 本轮的 prompt 上下文（**宿主在开跑前算好**再塞进来）。
+///
+/// ## 为什么宿主算好再传
+///
+/// `agent::build_system_prompt_full` 需要两样东西：
+///
+/// 1. **`session_id`** —— 决定 **per-session mode**
+///    （`agent.rs` 里 `effective_mode(data_dir, session_id)`，
+///    不能读全局 `settings.activeMode`）；
+/// 2. **`ptc_sdk`** —— PTC 模式下的「程序内可用工具声明」。
+///
+/// 而第 2 样要读 MCP 注册表（`tools::ptc_sdk_tools`）—— 那是 **async** 的，
+/// 桥的 prompt 回调却是**同步**闭包（`Fn(&str) -> String`），拿不到 await。
+///
+/// 所以：**宿主（`lib.rs::chat_pi`）在开跑前算好 → 存进这里 → 同步闭包直接读**。
+///
+/// ⚠️ 2026-10-23 修：pi 内核以前传的是 `(None, None)` ⇒ **丢了 per-session mode
+/// 与 PTC SDK 声明**；自研内核（`agent.rs`）传的是 `(Some(session_id), ptc_sdk)`。
+/// ⇒ 同一个会话在两个内核下看到的 prompt **不一样**。
+#[derive(Debug, Clone, Default)]
+pub struct PromptCtx {
+    /// 当前会话 id（决定 per-session mode）
+    pub session_id: Option<String>,
+    /// PTC 模式下的工具声明（`None` = 非 PTC 模式）
+    pub ptc_sdk: Option<String>,
+}
+
 /// pi 运行时（全局单例）。
 pub struct PiRuntime {
     /// 数据目录（`agent-data/`）
@@ -108,12 +142,20 @@ pub struct PiRuntime {
     /// 生产路径不设它 —— 走 `settings.selected_model` 那条反查。
     model_override: tokio::sync::Mutex<Option<(String, String)>>,
     /// 额外注入的 MCP server（**测试专用**）。
-    ///
     /// 为什么要这个：测「pi 真的能连 MCP、真的能调到 MCP 工具」需要一个
     /// **确定**的 server —— 不能依赖用户本机配的 `1mcp` 网关（它可能没起、
     /// 工具名可能变）。测试通过 `add_mcp_server_for_test()` 注入一个本地的
     /// 假 server，**不写用户的 `agent-data/mcp.json`**。
     extra_mcp: tokio::sync::Mutex<Vec<TestMcpServer>>,
+    /// 本轮的 prompt 上下文（宿主开跑前塞进来，见 [`PromptCtx`]）。
+    prompt_ctx: Arc<std::sync::Mutex<PromptCtx>>,
+    /// 这个 pi 进程**属于哪个会话**（多会话并行时用于路由权限裁决）。
+    session_id: Option<String>,
+    /// pi 的会话文件目录（`--session-dir`）。`None` = 用 `agent_dir/sessions`。
+    ///
+    /// 多会话并行时每个会话一个 pi 进程 ⇒ 各自的 session 文件必须**分目录**，
+    /// 否则两个进程抢同一个 session 文件。
+    session_dir: Option<PathBuf>,
     /// 正在跑的标记（防重入）
     busy: AtomicBool,
 }
@@ -160,8 +202,60 @@ impl PiRuntime {
             gate: tokio::sync::Mutex::new(None),
             model_override: tokio::sync::Mutex::new(None),
             extra_mcp: tokio::sync::Mutex::new(Vec::new()),
+            prompt_ctx: Arc::new(std::sync::Mutex::new(PromptCtx::default())),
+            session_id: None,
+            session_dir: None,
             busy: AtomicBool::new(false),
         })
+    }
+
+    /// 新建一个**属于某个会话**的运行时（多会话并行用）。
+    ///
+    /// - `agent_dir` —— 共享的（`models.json` / `mcp.json` 只有一份）
+    /// - `session_dir` —— **每会话独立**（`agent_dir/sessions/<session_id>/`）
+    ///   ⇒ 两个 pi 进程不会抢同一个 session 文件
+    pub fn with_session(
+        data_dir: PathBuf,
+        runtime: PathBuf,
+        agent_dir: PathBuf,
+        session_id: &str,
+    ) -> Arc<Self> {
+        let session_dir = agent_dir.join("sessions").join(session_id);
+        let _ = std::fs::create_dir_all(&session_dir);
+        Arc::new(Self {
+            data_dir,
+            runtime,
+            agent_dir,
+            client: tokio::sync::Mutex::new(None),
+            bridge: tokio::sync::Mutex::new(None),
+            gate: tokio::sync::Mutex::new(None),
+            model_override: tokio::sync::Mutex::new(None),
+            extra_mcp: tokio::sync::Mutex::new(Vec::new()),
+            prompt_ctx: Arc::new(std::sync::Mutex::new(PromptCtx::default())),
+            session_id: Some(session_id.to_string()),
+            session_dir: Some(session_dir),
+            busy: AtomicBool::new(false),
+        })
+    }
+
+    /// 这个 pi 进程属于哪个会话。
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// 当前有没有在跑（跑着的不该被淘汰）。
+    pub fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Relaxed)
+    }
+
+    /// 关掉这个 pi 进程（释放它占的内存）。
+    pub async fn shutdown(&self) {
+        if let Some(c) = self.client.lock().await.take() {
+            c.shutdown().await;
+        }
+        if let Some(b) = self.bridge.lock().await.take() {
+            b.stop();
+        }
     }
 
     /// 注入一个 MCP server（**测试专用**，不写用户的 `mcp.json`）。
@@ -195,6 +289,16 @@ impl PiRuntime {
         *self.model_override.lock().await = Some((model_id.into(), base_url.into()));
     }
 
+    /// 设置本轮的 prompt 上下文（**宿主在开跑前调**）。
+    ///
+    /// 见 [`PromptCtx`]：pi 内核以前传的是 `(None, None)`，
+    /// 丢了 per-session mode 与 PTC SDK 声明；这里补回来。
+    pub fn set_prompt_ctx(&self, session_id: Option<String>, ptc_sdk: Option<String>) {
+        if let Ok(mut g) = self.prompt_ctx.lock() {
+            *g = PromptCtx { session_id, ptc_sdk };
+        }
+    }
+
     /// 设置权限裁决回调。
     ///
     /// 回调签名：`(工具名, 参数)` → `(允许?, 理由)`。
@@ -206,6 +310,9 @@ impl PiRuntime {
     /// Tauri 的 `setup` 闭包是同步的 —— 里面没法 await。
     /// 这个回调只在「起桥时」被读一次（存进 `GateHandler`），
     /// 所以同步设置完全够用。
+    ///
+    /// ⚠️ 签名第三个参数是**这个 pi 进程自己的会话 id**（`Option<&str>`）——
+    /// 多会话并行时不能拿「用户当前正在看的会话」，否则权限裁决会串味。
     pub fn set_gate(&self, f: GateFn) {
         if let Ok(mut g) = self.gate.try_lock() {
             *g = Some(f);
@@ -274,7 +381,13 @@ impl PiRuntime {
         );
         // ⚠️ **不能用 `--no-session`** —— 那样 pi 崩了就丢上下文。
         // 用 orbcat 数据目录下的 pi/sessions，pi 自己能续。
-        let sessions = self.agent_dir.join("sessions");
+        //
+        // 多会话并行时：每会话一个 pi 进程 ⇒ session 目录**必须分开**，
+        // 否则两个进程抢同一个 session 文件。
+        let sessions = self
+            .session_dir
+            .clone()
+            .unwrap_or_else(|| self.agent_dir.join("sessions"));
         let _ = std::fs::create_dir_all(&sessions);
         cfg.session_dir = Some(sessions);
 
@@ -289,17 +402,23 @@ impl PiRuntime {
             cfg.model = Some(mid);
         }
 
-        // 工具：pi 内置的 8 个 + orbcat 的 34 个（通过 bridge extension 注册）
-        // ⚠️ `--tools` 是**替换**语义 —— 必须列全，否则内置工具会被一起干掉。
-        let mut tools: Vec<String> = vec![
-            "read".into(),
-            "bash".into(),
-            "edit".into(),
-            "write".into(),
-            "grep".into(),
-            "find".into(),
-            "ls".into(),
-        ];
+        // 工具：orbcat 的 34 个（通过 bridge extension 注册）+ MCP 工具（pi 原生连）
+        //
+        // ⚠️ **绝不列 pi 的内置工具**（read/bash/edit/write/grep/find/ls/powershell）——
+        //
+        // `--tools` 是**替换语义**：列进去它就进 pi 的 registry，模型能直接调，
+        // 而它们**原生执行**，**不经过** orbcat 的 `permission.rs` 文件网关与
+        // `command_policy.rs` 命令策略 ⇒ 权限体系出现旁路。
+        //
+        // 实测（2026-10-23）：pi 的 `bash` RPC 真的执行了命令并返回结果。
+        //
+        // orbcat 有全套等价物（`orb_read_file` / `orb_write_file` / `orb_edit_file` /
+        // `orb_grep_files` / `orb_list_dir` / `orb_run_command`），**都走网关**。
+        //
+        // ⚠️ 另有一道独立的闸：`--exclude-tools`（见 `pi::PiConfig::exclude_tools`），
+        //    优先级最高，把这 8 个从 registry 里**整个剔除** —— 双保险，
+        //    防止 `--tools` 语义将来被 pi 改动后漏回去。
+        let mut tools: Vec<String> = Vec::new();
         // orbcat 的工具用 `orb_` 前缀注册，避免和 pi 内置撞名
         for name in crate::tools::BUILTIN_TOOL_NAMES {
             tools.push(format!("orb_{name}"));
@@ -326,6 +445,27 @@ impl PiRuntime {
             tools.push("mcp__*".into());
         }
         cfg.tools = tools;
+
+        // ── 安全自检：白名单里绝不能出现 pi 内置工具 ──
+        //
+        // 防止以后有人「顺手把 read/bash 加回去」—— 那等于把权限网关的旁路
+        // 又打开一次。这道检查是**编译期之外**的最后一道：写错了直接起不来，
+        // 而不是等真机被绕过一次才发现。
+        for b in crate::pi::PI_BUILTIN_TOOLS {
+            if cfg.tools.iter().any(|t| t == b) {
+                return Err(format!(
+                    "--tools 白名单里出现了 pi 内置工具 `{b}` —— 它原生执行、绕过文件网关与命令策略"
+                ));
+            }
+        }
+        // 排除闸也必须真的带上（`PiConfig::new` 默认就有，但别被谁清掉了）
+        for b in crate::pi::PI_BUILTIN_TOOLS {
+            if !cfg.exclude_tools.iter().any(|t| t == b) {
+                return Err(format!(
+                    "--exclude-tools 里缺少 pi 内置工具 `{b}` —— 排除闸失效，内置工具会回到 registry"
+                ));
+            }
+        }
 
         // 桥端口 + 工具清单 → 通过环境变量传给 extension
         cfg.bridge_port = bridge.port();
@@ -541,7 +681,7 @@ impl PiRuntime {
             ("providers", Value::Object(pmap)),
         ]);
         let txt = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-        std::fs::write(&dst, txt).map_err(|e| format!("写 pi models.json 失败: {e}"))?;
+        write_atomic(&dst, &txt).map_err(|e| format!("写 pi models.json 失败: {e}"))?;
 
         // ── 选最终用的模型：优先用户在 orbcat 里选的那个（或 override）──
         //
@@ -686,7 +826,7 @@ impl PiRuntime {
         let _ = std::fs::create_dir_all(&self.agent_dir);
         let doc = json_obj(&[("mcpServers", Value::Object(map))]);
         let txt = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-        std::fs::write(self.agent_dir.join("mcp.json"), txt)
+        write_atomic(&self.agent_dir.join("mcp.json"), &txt)
             .map_err(|e| format!("写 pi mcp.json 失败: {e}"))?;
         Ok(n)
     }
@@ -696,12 +836,26 @@ impl PiRuntime {
         Arc::new(move |req: PiHostRequest| -> Option<PiHostReply> {
             match req {
                 PiHostRequest::Confirm { id, title, message } => {
-                    // ⚠️ 这里**不裁决** —— 真正的裁决在 Rust 的工具层（authorize）。
-                    // 这里只是让 pi 知道"宿主收到了"，具体放行交给工具自己。
-                    let _ = (id, title, message);
-                    Some(PiHostReply::Confirm(true))
+                    // ⚠️ **fail-closed**：这里**不能**返回 true。
+                    //
+                    // orbcat 的授权流程是**一套**：`/gate` → `pi_host_gate`（lib.rs）
+                    // → MCP 确认卡 / 文件网关；orbcat 私有工具走
+                    // `tools::execute` → `authorize()`。
+                    //
+                    // pi 自己的 `ctx.ui.confirm()` 是**第二套**口径 —— 它**不认**
+                    // orbcat 的授权表（`mcp_grants.json` / 命令授权 / 审计链）。
+                    // 自动同意 = 白白开一条旁路。
+                    //
+                    // 正常路径下这里**根本不会被问到**：pi 的内置工具已全部排除
+                    // （`pi::PI_BUILTIN_TOOLS`），我们自己的 extension 也不调
+                    // `ctx.ui.confirm()`。所以「拒绝」是安全的兜底。
+                    let _ = id;
+                    eprintln!(
+                        "[orbcat] ⚠️ pi 请求确认（已按**拒绝**处理，不走 orbcat 授权体系）：{title} / {message}"
+                    );
+                    Some(PiHostReply::Confirm(false))
                 }
-                PiHostRequest::Select { id, .. } => Some(PiHostReply::Select(Some(String::new()))),
+                PiHostRequest::Select { id: _, .. } => Some(PiHostReply::Select(Some(String::new()))),
                 PiHostRequest::Input { .. } => Some(PiHostReply::Input(String::new())),
                 PiHostRequest::Ignored { .. } => None,
             }
@@ -762,9 +916,14 @@ impl PiRuntime {
         // 订阅事件（**必须在发 prompt 之前**，否则会漏掉快速完成的事件）
         let mut rx = client.take_events().ok_or("事件通道已被占用")?;
 
-        // 把 system prompt 交给 pi（走 --append-system-prompt 不行 —— 那是启动参数，
-        // 运行期改不了）。用 extension 的 before_agent_start 更灵活，
-        // 但那条路要改 extension。**这里先不接管** —— 见下方 TODO。
+        // 把 system prompt 交给 pi：靠 `orbcat-prompt.ts` 的 `before_agent_start`
+        // 回调宿主拿（`POST /prompt` → `agent::build_system_prompt_full`）。
+        //
+        // ⚠️ **不能**用 `--append-system-prompt` —— 那是**启动参数**，运行期改不了。
+        //
+        // （2026-10-23 更正：这里原来留着一句「先不接管 —— 见下方 TODO」，
+        //   那是早期版本的状态。prompt **早已**通过 extension 接管，
+        //   见 `ensure_bridge()` 里的 `prompt_handler`。）
         client.prompt(input, images).await?;
 
         // 收事件直到 settled
@@ -990,16 +1149,20 @@ impl PiRuntime {
         let gate_dir = self.data_dir.clone();
         // 宿主注入的 gate（**优先**）—— 它能弹确认卡（MCP 授权那套）。
         let host_gate = self.gate.lock().await.clone();
+        // ⚠️ **会话 id 要用「这个 pi 进程自己的」**，不是用户当前正在看的那个。
+        // 多会话并行时两者会不一样（用户可能在 B 会话看 A 的 run）。
+        let gate_sid = self.session_id.clone();
         let gate: crate::pi_bridge::GateHandler = Arc::new(move |tool, args| {
             let real = tool.strip_prefix("orb_").unwrap_or(tool);
             // 有宿主 gate → 用它（能弹卡、能走真实的 mcp_grants / 确认卡流程）
             if let Some(g) = host_gate.clone() {
                 let real = real.to_string();
                 let args = args.clone();
+                let sid = gate_sid.clone();
                 // gate 是 async（可能阻塞在确认卡上）→ 桥是同步线程，
                 // 用独立 runtime 把 future 跑完（与工具执行那条路同口径）。
                 return match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => Ok(rt.block_on(async move { g(&real, &args).await })),
+                    Ok(rt) => Ok(rt.block_on(async move { g(&real, &args, sid).await })),
                     Err(e) => Err(format!("起权限裁决 runtime 失败: {e}")),
                 };
             }
@@ -1012,13 +1175,23 @@ impl PiRuntime {
         // 复用旧内核那条拼装路（`agent::build_system_prompt_full`）：
         // 四文件记忆 + 项目记忆 + 记忆使用规则 + 技能命中，全是同一份逻辑 ——
         // **两个内核看到的 prompt 逐字一致**，不会出现「切了内核人格就变了」。
+        //
+        // ⚠️ `session_id` 与 `ptc_sdk` 由宿主在开跑前算好放进 `prompt_ctx`
+        //    （见 [`PromptCtx`]）—— 这两样决定 per-session mode 与 PTC 工具声明，
+        //    漏了就是「pi 内核下的 prompt 比自研内核少一截」。
         let prompt_dir = self.data_dir.clone();
+        let prompt_ctx = self.prompt_ctx.clone();
         let prompt_handler: crate::pi_bridge::PromptHandler = Arc::new(move |user_text: &str| {
+            let ctx = prompt_ctx
+                .lock()
+                .ok()
+                .map(|g| (*g).clone())
+                .unwrap_or_default();
             crate::agent::build_system_prompt_full(
                 &prompt_dir,
                 user_text,
-                None,
-                None,
+                ctx.ptc_sdk.as_deref(),
+                ctx.session_id.as_deref(),
             )
         });
 
@@ -1026,6 +1199,181 @@ impl PiRuntime {
             .map_err(|e| format!("起工具桥失败: {e}"))?;
         *self.bridge.lock().await = Some(bridge.clone());
         Ok(bridge)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 会话池（多会话并行）
+// ---------------------------------------------------------------------------
+
+/// pi 内核的**会话池** —— 每个会话一个 pi 进程。
+///
+/// ## 为什么必须是「一进程一会话」
+///
+/// pi 的 RPC 模式**一个进程只有一个会话**：`new_session` 是**换绑**当前会话，
+/// 不是开并存会话（实测，见 `docs/explore/pi-upstream-context-interaction.md`）。
+///
+/// 而 orbcat 有一条**已拍板**的产品能力：多会话并行 run ——「切到别的会话能干活」
+/// （`allmemory/MEMORY.md`，2026-09-26 用户拍板）。自研内核靠
+/// `agent::RunRegistry`（`session_id → RunSlot`）实现。
+///
+/// ⇒ pi 侧要做到同一件事，只能**开多个 pi 进程**。
+///
+/// ## 上限为什么是 2
+///
+/// 本机只剩 **2.8 GB 空闲内存**（实测 2026-10-23），而 pi 是 Node 进程，
+/// 基线常驻约 **40~80 MB**。开太多会把机器拖垮 —— 所以**默认只允许 2 个**，
+/// 超了直接报错让用户关掉一个，而不是悄悄把机器榨干。
+///
+/// ⚠️ 不用 `#[derive(Clone)]` —— 里面有 `AtomicUsize`（不是 `Clone`）。
+/// 需要共享就包 `Arc`（调用方本来就这么用）。
+pub struct PiPool {
+    data_dir: PathBuf,
+    runtime: PathBuf,
+    agent_dir: PathBuf,
+    /// `session_id` → 该会话的 pi 运行时
+    sessions: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<PiRuntime>>>>,
+    /// 权限裁决回调（创建新运行时时套上）
+    ///
+    /// ⚠️ 用 `std::sync::Mutex` 而不是 `tokio::sync::Mutex`：
+    /// Tauri 的 `setup` 闭包是**同步**的，没法 await。
+    /// 这里只在启动时写一次、创建运行时时读一次，临界区里没有 await ⇒ 安全。
+    gate: std::sync::Arc<std::sync::Mutex<Option<GateFn>>>,
+    /// 最多同时存在几个 pi 进程
+    max_live: std::sync::atomic::AtomicUsize,
+}
+
+impl PiPool {
+    /// 新建会话池。
+    pub fn new(data_dir: PathBuf, runtime: PathBuf) -> Arc<Self> {
+        let agent_dir = data_dir.join("pi");
+        Arc::new(Self {
+            data_dir,
+            runtime,
+            agent_dir,
+            sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            max_live: std::sync::atomic::AtomicUsize::new(2),
+        })
+    }
+
+    /// 设置权限裁决回调（池里**新建**的运行时都会套上）。
+    ///
+    /// **同步** —— Tauri 的 `setup` 闭包是同步的，没法 await。
+    pub fn set_gate(&self, f: GateFn) {
+        if let Ok(mut g) = self.gate.lock() {
+            *g = Some(f);
+        }
+    }
+
+    /// 并发上限。
+    pub fn max_live(&self) -> usize {
+        self.max_live.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 调整并发上限（至少 1）。
+    pub fn set_max_live(&self, n: usize) {
+        self.max_live
+            .store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 内置 runtime 目录。
+    pub fn runtime_dir(&self) -> &Path {
+        &self.runtime
+    }
+
+    /// pi 的 agent 目录（`models.json` / `mcp.json` 落这儿，**共享**）。
+    pub fn agent_dir(&self) -> &Path {
+        &self.agent_dir
+    }
+
+    /// 拿到（或为）某个会话的 pi 运行时。
+    ///
+    /// - 已有 → 直接复用（pi 进程常驻，避免每轮付 0.4s 冷启动）
+    /// - 没有 → 新建一个**属于该会话**的运行时（session 目录独立）
+    /// - 超过并发上限 → **报错**（不排队、不静默挤掉别人正在跑的）
+    pub async fn acquire(&self, session_id: &str) -> Result<Arc<PiRuntime>, String> {
+        // 快路径：已存在
+        {
+            let g = self.sessions.lock().await;
+            if let Some(rt) = g.get(session_id).cloned() {
+                return Ok(rt);
+            }
+        }
+        // 慢路径：加锁再判一次（避免并发 acquire 建出两个）
+        let mut g = self.sessions.lock().await;
+        if let Some(rt) = g.get(session_id).cloned() {
+            return Ok(rt);
+        }
+        let mut evicted: Option<Arc<PiRuntime>> = None;
+        if g.len() >= self.max_live() {
+            // 满了 → 先找**空闲的**挤掉（不打断正在跑的）。
+            //
+            // ⚠️ 不能只报错：用户依次开 3 个会话，第 3 个就永远起不来，
+            // 而第 1 个可能早就跑完了 —— 那是「明明空着却说满了」。
+            let idle: Option<String> = g
+                .iter()
+                .find(|(_, rt)| !rt.is_busy())
+                .map(|(k, _)| k.clone());
+            match idle {
+                Some(k) => {
+                    evicted = g.remove(&k);
+                }
+                None => {
+                    let ids: Vec<String> = g.keys().cloned().collect();
+                    return Err(format!(
+                        "pi 内核同时最多跑 {} 个会话（当前 {} 个都在跑：{}）—— \
+                         等一个跑完，或先停掉一个。",
+                        self.max_live(),
+                        g.len(),
+                        ids.join("、")
+                    ));
+                }
+            }
+        }
+        let rt = PiRuntime::with_session(
+            self.data_dir.clone(),
+            self.runtime.clone(),
+            self.agent_dir.clone(),
+            session_id,
+        );
+        {
+            // std Mutex 的 guard 在这个语句结束就drop —— 临界区里没有 await。
+            let gate = self.gate.lock().ok().and_then(|g| g.clone());
+            if let Some(gate) = gate {
+                rt.set_gate(gate);
+            }
+        }
+        g.insert(session_id.to_string(), rt.clone());
+        // ⚠️ **放锁之后**再关被挤掉的进程 —— 关进程最多要等 3s，
+        // 占着锁会让别的会话的 acquire 一起卡住。
+        drop(g);
+        if let Some(old) = evicted {
+            // 挤掉的进程要**关掉**，否则 node 进程白占 40~80MB
+            old.shutdown().await;
+        }
+        Ok(rt)
+    }
+
+    /// 拿到某个会话的运行时（**不新建**）。
+    ///
+    /// 给 `steer` / `abort` / `compact` 用 —— 它们只该作用于**正在跑的那个会话**。
+    pub async fn get(&self, session_id: &str) -> Option<Arc<PiRuntime>> {
+        self.sessions.lock().await.get(session_id).cloned()
+    }
+
+    /// 当前活着的 pi 进程数。
+    pub async fn live_count(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+
+    /// 活着的会话 id 列表（诊断用）。
+    pub async fn live_sessions(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.sessions.lock().await.keys().cloned().collect();
+        v.sort();
+        v
     }
 }
 
@@ -1083,6 +1431,38 @@ reasoning: &str,
 if let Some(f) = cb.as_ref() {
     f(steps, answer, reasoning);
 }
+}
+
+/// **原子**写文件（先写临时文件，再 rename）。
+///
+/// ## 为什么必须原子
+///
+/// 多会话并行时**每个会话一个 pi 进程**，但 `models.json` / `mcp.json` 是
+/// **共享**的（都在 `agent_dir` 下）—— 两个进程可能同时写。
+///
+/// `std::fs::write` 是「截断 → 写」：写到一半被另一个进程读走，
+/// pi 就会读到**半截 JSON** ⇒ 报 `Unknown provider` / schema 校验失败。
+///
+/// `rename` 在同一卷上是原子的 ⇒ 读到的永远是完整的旧版本或完整的新版本。
+fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let tmp = path.with_extension(format!(
+        "tmp{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|x| x.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&tmp, content)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // 失败就清掉临时文件，别留垃圾
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 fn json_obj(pairs: &[(&str, Value)]) -> Value {

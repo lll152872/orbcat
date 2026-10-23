@@ -39,6 +39,37 @@ use tokio::sync::mpsc;
 /// pi 子进程的一个事件（已从 JSONL 解析出的原始记录）。
 pub type PiEvent = Value;
 
+/// pi 的 **8 个内置工具**（上游 `createAllToolDefinitions`）。
+///
+/// ## 为什么必须全部排除
+///
+/// 这 8 个工具**原生执行**，**不经过** orbcat 的 `permission.rs` 文件网关与
+/// `command_policy.rs` 命令策略 —— 留着它们 = orbcat 的权限体系出现旁路，
+/// 直接违反 `docs/00-CONCEPT.md` 的决策 7（三层闸门）与决策 9（命令三路）。
+///
+/// 实测（2026-10-23，见 `docs/explore/pi-upstream-context-interaction.md` §二 2.6）：
+/// pi 的 `bash` RPC **真的执行了命令**并返回结果（78ms）。
+///
+/// ## 上游机制（读 bundle 源码确认）
+///
+/// - `_isAllowedTool(name)`：`excludedTools` 命中 → **直接 false**（优先级最高）；
+///   否则看 `allowedTools`（`--tools` 白名单）；再否则看是不是 MCP 且白名单不过滤 MCP。
+/// - `_refreshToolRegistry`：`definitionRegistry` 与 `wrappedBuiltInTools` **都按
+///   `_isAllowedTool` 过滤** ⇒ 被排除的工具**根本不在 registry 里**，
+///   模型既不能直接调，`tool_search` / `codemode` 也**找不到**它。
+/// - `_applyToolLoadout`：只从 registry 里取工具 ⇒ 排除 = 彻底消失。
+///
+/// ## orbcat 有全套等价物（都走网关）
+///
+/// `orb_read_file` / `orb_write_file` / `orb_edit_file` / `orb_grep_files` /
+/// `orb_list_dir` / `orb_run_command` —— 全部经 `tools::execute` →
+/// `authorize()` → 文件网关 + 命令策略 + 审计链。
+///
+/// 所以策略是：**8 个全排除**，用 orbcat 自己那套替代。
+pub const PI_BUILTIN_TOOLS: &[&str] = &[
+    "read", "bash", "powershell", "edit", "write", "grep", "find", "ls",
+];
+
 // ---------------------------------------------------------------------------
 // 运行期资产定位
 // ---------------------------------------------------------------------------
@@ -121,6 +152,21 @@ pub struct PiConfig {
     pub model: Option<String>,
     /// `--tools` 白名单。**注意是替换语义** —— 不列全会把内置工具一起干掉。
     pub tools: Vec<String>,
+    /// `--exclude-tools`：**要排除**的工具名（pi 1.4.0 支持，`-xt`）。
+    ///
+    /// ## 与 `tools`（`--tools` 白名单）是**两道独立的闸**
+    ///
+    /// | 参数 | 作用 | 优先级 |
+    /// |---|---|---|
+    /// | `--exclude-tools` | 命中即**从 registry 剔除** | **最高**（上游 `_isAllowedTool` 先判排除）|
+    /// | `--tools` | 白名单外的工具**不存在** | 次之 |
+    ///
+    /// 为什么要两道：`--tools` 的语义若因 pi 升级而变（它已经有 `--no-tools` /
+    /// `--no-builtin-tools` / `+name` / `-name` 好几种形态），`--exclude-tools`
+    /// 这一道仍然拦得住。**安全闸要独立于会被改动的那个**。
+    ///
+    /// 默认值 = [`PI_BUILTIN_TOOLS`] 全量。
+    pub exclude_tools: Vec<String>,
     /// `--system-prompt` / `--append-system-prompt`
     pub append_system_prompt: Vec<String>,
     /// 额外参数（逃生口）
@@ -144,6 +190,9 @@ impl PiConfig {
             provider: None,
             model: None,
             tools: Vec::new(),
+            // ⚠️ 默认就把 pi 的全部内置工具排掉 —— 这是**安全默认值**，
+            // 不依赖调用方记得配。要放开得显式 `cfg.exclude_tools.clear()`。
+            exclude_tools: PI_BUILTIN_TOOLS.iter().map(|s| s.to_string()).collect(),
             append_system_prompt: Vec::new(),
             extra_args: Vec::new(),
             offline: true,
@@ -201,6 +250,18 @@ impl PiConfig {
         if !self.tools.is_empty() {
             v.push("--tools".into());
             v.push(self.tools.join(","));
+        }
+        // ⚠️ 排除闸：把 pi 的内置工具从 registry 里**整个剔除**。
+        //
+        // 上游：`--exclude-tools a,b` → `excludedToolNames` → `_excludedTools`
+        // → `_isAllowedTool` 里**第一个**判 ⇒ 命中即 false ⇒ 不进 registry。
+        //
+        // ⚠️ **不能和 `--tools` 的 `+name` / `-name` 修饰符混用** ——
+        // 上游 `getToolListError` 明确报 "tool names cannot be mixed with
+        // +name or -name entries"。我们两个都不用（白名单是纯名字 + `mcp__*` 通配）。
+        if !self.exclude_tools.is_empty() {
+            v.push("--exclude-tools".into());
+            v.push(self.exclude_tools.join(","));
         }
         for s in &self.append_system_prompt {
             v.push("--append-system-prompt".into());
@@ -1018,6 +1079,83 @@ mod tests {
             "有 session_dir 时不能加 --no-session（那会让 --session-dir 失效）"
         );
         assert!(a.contains(&"--session-dir".to_string()));
+    }
+
+    /// 回归测试（2026-10-23 安全修复）：pi 的 8 个内置工具**必须**全部被排除。
+    ///
+    /// 它们原生执行，绕过 orbcat 的 `permission.rs` 文件网关与
+    /// `command_policy.rs` 命令策略（实测 pi 的 `bash` RPC 真的执行了命令）。
+    #[test]
+    fn argv_排除全部pi内置工具() {
+        let cfg = PiConfig::new(
+            PathBuf::from("C:/rt"),
+            PathBuf::from("C:/ad"),
+            PathBuf::from("C:/cwd"),
+        );
+        let a = cfg.argv();
+        let i = a
+            .iter()
+            .position(|x| x == "--exclude-tools")
+            .expect("应有 --exclude-tools");
+        let list: Vec<&str> = a[i + 1].split(',').collect();
+        for b in PI_BUILTIN_TOOLS {
+            assert!(
+                list.contains(b),
+                "pi 内置工具 `{b}` 必须被排除（它绕过权限网关），实际排除列表: {list:?}"
+            );
+        }
+        // 8 个内置工具一个都不能漏
+        assert_eq!(
+            PI_BUILTIN_TOOLS.len(),
+            8,
+            "pi 的内置工具数变了？上游 createAllToolDefinitions 改了的话这里要跟着改"
+        );
+    }
+
+    /// 回归测试：`--tools` 白名单里**不能**出现 pi 内置工具。
+    ///
+    /// `--tools` 是**替换语义** —— 白名单里列了它，它就进 registry，模型能直接调。
+    #[test]
+    fn argv_白名单不含任何pi内置工具() {
+        let mut cfg = PiConfig::new(
+            PathBuf::from("C:/rt"),
+            PathBuf::from("C:/ad"),
+            PathBuf::from("C:/cwd"),
+        );
+        cfg.tools = vec!["orb_read_file".into(), "orb_run_command".into(), "mcp__*".into()];
+        let a = cfg.argv();
+        let i = a.iter().position(|x| x == "--tools").expect("应有 --tools");
+        let list: Vec<&str> = a[i + 1].split(',').collect();
+        for b in PI_BUILTIN_TOOLS {
+            assert!(
+                !list.contains(b),
+                "白名单里不该有 pi 内置工具 `{b}`（会绕过权限网关），实际: {list:?}"
+            );
+        }
+    }
+
+    /// 回归测试：白名单**不能**混用 `+name` / `-name` 修饰符。
+    ///
+    /// 上游 `getToolListError`：混用会直接报
+    /// "tool names cannot be mixed with +name or -name entries" → pi 起不来。
+    /// 白名单里的 `mcp__*` 是**通配**，不是修饰符 —— 两者别混。
+    #[test]
+    fn argv_白名单不用加减修饰符() {
+        let mut cfg = PiConfig::new(
+            PathBuf::from("C:/rt"),
+            PathBuf::from("C:/ad"),
+            PathBuf::from("C:/cwd"),
+        );
+        cfg.tools = vec!["orb_read_file".into(), "mcp__*".into()];
+        let a = cfg.argv();
+        let i = a.iter().position(|x| x == "--tools").expect("应有 --tools");
+        let list: Vec<&str> = a[i + 1].split(',').collect();
+        for entry in &list {
+            assert!(
+                !entry.starts_with('+') && !entry.starts_with('-'),
+                "白名单里不该有 +/- 修饰符（上游会直接报错），实际: {list:?}"
+            );
+        }
     }
 
     /// 回归测试：必须带 `--approve`。

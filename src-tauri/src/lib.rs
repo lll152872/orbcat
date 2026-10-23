@@ -297,7 +297,11 @@ struct AppState {
     ///
     /// 为什么单独一个而不是复用 `runs`：`runs` 管的是「旧内核的 run 槽位」，
     /// pi 的 run 有自己的生命周期（进程常驻、上下文在 pi 的 session 文件里）。
-    pi: Option<std::sync::Arc<pi_runtime::PiRuntime>>,
+    ///
+    /// ⚠️ 2026-10-23 起是**会话池**（`PiPool`）：多会话并行 ⇒ 每个会话一个
+    /// pi 进程（pi 的 RPC 模式一个进程只有一个会话，`new_session` 是换绑不是并存）。
+    /// 并发上限 2（本机只剩 2.8GB 空闲内存，pi 是 Node 进程 40~80MB）。
+    pi: Option<std::sync::Arc<pi_runtime::PiPool>>,
 }
 
 /// 换会话时重装临时授权（**仅文件授权**）。
@@ -3874,7 +3878,7 @@ async fn chat_pi(
     input: String,
     images: Option<Vec<String>>,
 ) -> Result<pi_runtime::PiRun, String> {
-    let rt = state
+    let pool = state
         .pi
         .clone()
         .ok_or_else(|| "pi 内核不可用：未找到内置 runtime/（先跑 node tools/build-runtime-assets.mjs）".to_string())?;
@@ -3885,6 +3889,33 @@ async fn chat_pi(
     // 当前会话 id
     let session_id = sessions::current_id(&state.data_dir)
         .unwrap_or_else(|| sessions::ensure_current(&state.data_dir).id);
+
+    // ── prompt 上下文：per-session mode + PTC 工具声明 ──
+    //
+    // ⚠️ pi 内核以前传的是 `(None, None)` ⇒ **丢了 per-session mode 与 PTC SDK 声明**。
+    //    自研内核（`agent::run`）传的是 `(Some(session_id), ptc_sdk)`。
+    //    ⇒ 同一个会话在两个内核下模型看到的 prompt **不一样**（PTC 会话尤其明显）。
+    //
+    // `ptc_sdk` 要读 MCP 注册表（async）而桥的 prompt 回调是同步闭包 ⇒ 在这里算好。
+    let ptc_sdk: Option<String> = if crate::ptc::mode_active(&state.data_dir, Some(&session_id)) {
+        let reg = state.mcp.lock().await;
+        let ready = crate::web_search_ready_for(&state.data_dir);
+        let tools = crate::tools::ptc_sdk_tools(
+            Some(&reg),
+            ready,
+            &state.data_dir,
+            Some(&session_id),
+        );
+        Some(crate::ptc::sdk_declarations(&tools))
+    } else {
+        None
+    };
+    // ── 拿到（或为）本会话的 pi 运行时 ──
+    //
+    // 多会话并行 ⇒ 每会话一个 pi 进程（pi 的 RPC 模式一个进程只有一个会话）。
+    // 池上限 2，超了会明确报错（不让用户当测试员）。
+    let rt = pool.acquire(&session_id).await?;
+    rt.set_prompt_ctx(Some(session_id.clone()), ptc_sdk);
 
     // 开跑前落盘（与旧内核同一条路：先写占位，checkpoint 覆盖）
     if let Err(e) = sessions::begin_turn_in(&state.data_dir, Some(&session_id), &input, &imgs) {
@@ -3958,14 +3989,27 @@ async fn chat_pi(
 /// pi 内核状态（给 UI 显示用）。
 #[tauri::command]
 async fn pi_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let Some(rt) = state.pi.clone() else {
+    let Some(pool) = state.pi.clone() else {
         return Ok(serde_json::json!({"available": false}));
+    };
+    // ⚠️ 桥端口是**每个会话一个**（每会话一个 pi 进程 ⇒ 一个桥）。
+    // 这里报**第一个**活着的会话的端口，够 UI 诊断用。
+    let sessions = pool.live_sessions().await;
+    let (bridge_port, first) = match sessions.first() {
+        Some(sid) => match pool.get(sid).await {
+            Some(rt) => (rt.bridge_port(), Some(rt.session_id().map(|s| s.to_string()))),
+            None => (0, None),
+        },
+        None => (0, None),
     };
     Ok(serde_json::json!({
         "available": true,
-        "runtimeDir": rt.runtime_dir().display().to_string(),
-        "agentDir": rt.agent_dir().display().to_string(),
-        "bridgePort": rt.bridge_port(),
+        "runtimeDir": pool.runtime_dir().display().to_string(),
+        "agentDir": pool.agent_dir().display().to_string(),
+        "bridgePort": bridge_port,
+        "liveSessions": sessions,
+        "maxLive": pool.max_live(),
+        "currentSession": first,
     }))
 }
 
@@ -3984,11 +4028,24 @@ async fn chat_pi_steer(
     message: String,
     session_id: Option<String>,
 ) -> Result<agent::SteerAck, String> {
-    let rt = state.pi.clone().ok_or("pi 内核不可用")?;
+    let pool = state.pi.clone().ok_or("pi 内核不可用")?;
     let text = message.trim().to_string();
     if text.is_empty() {
         return Err("插话内容为空".into());
     }
+    // ⚠️ **按会话路由** —— 多会话并行时，插话必须进**它自己那个会话**的 pi 进程，
+    // 否则 B 会话里打的字会插进 A 的对话里（自研内核靠 `RunRegistry` 分槽）。
+    let sid = match session_id {
+        Some(s) if !s.is_empty() => s,
+        _ => sessions::current_id(&state.data_dir).unwrap_or_default(),
+    };
+    if sid.is_empty() {
+        return Err("当前没有进行中的对话".into());
+    }
+    let rt = pool
+        .get(&sid)
+        .await
+        .ok_or_else(|| format!("会话 {sid} 没有正在运行的 pi 内核"))?;
     rt.steer(&text).await?;
     Ok(agent::SteerAck {
         id: agent::new_steer_id(),
@@ -3998,15 +4055,37 @@ async fn chat_pi_steer(
 
 /// pi 内核：中断。
 #[tauri::command]
-async fn chat_pi_abort(state: State<'_, AppState>) -> Result<(), String> {
-    let rt = state.pi.clone().ok_or("pi 内核不可用")?;
+async fn chat_pi_abort(
+    state: State<'_, AppState>,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    let pool = state.pi.clone().ok_or("pi 内核不可用")?;
+    let sid = match session_id {
+        Some(s) if !s.is_empty() => s,
+        _ => sessions::current_id(&state.data_dir).unwrap_or_default(),
+    };
+    let rt = pool
+        .get(&sid)
+        .await
+        .ok_or_else(|| format!("会话 {sid} 没有正在运行的 pi 内核"))?;
     rt.abort().await
 }
 
 /// pi 内核：手动触发压缩。
 #[tauri::command]
-async fn chat_pi_compact(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let rt = state.pi.clone().ok_or("pi 内核不可用")?;
+async fn chat_pi_compact(
+    state: State<'_, AppState>,
+    session_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let pool = state.pi.clone().ok_or("pi 内核不可用")?;
+    let sid = match session_id {
+        Some(s) if !s.is_empty() => s,
+        _ => sessions::current_id(&state.data_dir).unwrap_or_default(),
+    };
+    let rt = pool
+        .get(&sid)
+        .await
+        .ok_or_else(|| format!("会话 {sid} 没有正在运行的 pi 内核"))?;
     rt.compact().await
 }
 
@@ -5297,7 +5376,14 @@ pub fn run() {
                 match runtime {
                     Some(rt) => {
                         eprintln!("[orbcat] pi 内核已就绪: {}", rt.display());
-                        let rt = pi_runtime::PiRuntime::new(data_dir.clone(), rt);
+                        // ── 会话池：每个会话一个 pi 进程 ──
+                        //
+                        // pi 的 RPC 模式**一个进程只有一个会话**（`new_session` 是换绑
+                        // 不是并存）⇒ 多会话并行只能开多个进程。
+                        //
+                        // 上限 2 个：本机只剩 2.8GB 空闲内存，pi 是 Node 进程
+                        // （基线 40~80MB），开太多会把机器拖垮。
+                        let pool = pi_runtime::PiPool::new(data_dir.clone(), rt);
                         // ── 权限闸门接线 ──
                         //
                         // ⚠️ **这行以前是漏的** —— `set_gate` 从来没被调用过，
@@ -5314,20 +5400,27 @@ pub fn run() {
                         // 少一道就等于某个入口没人管。
                         let perm_for_gate = perm.clone();
                         let dd_for_gate = data_dir.clone();
-                        rt.set_gate(std::sync::Arc::new(move |tool, args| {
-                            let perm = perm_for_gate.clone();
-                            let dd = dd_for_gate.clone();
-                            let tool = tool.to_string();
-                            let args = args.clone();
-                            Box::pin(async move {
-                                // 会话 id 在这里取 —— gate 回调本身是**同步**注入的，
-                                // 拿不到 `State<AppState>`，所以每次调用时现取。
-                                let sid = sessions::current_id(&dd)
-                                    .unwrap_or_else(|| sessions::ensure_current(&dd).id);
-                                pi_host_gate(&perm, &dd, &sid, &tool, &args).await
-                            })
-                        }));
-                        Some(rt)
+                        let gate: pi_runtime::GateFn = std::sync::Arc::new(
+                            move |tool, args, sid_from_runtime: Option<String>| {
+                                let perm = perm_for_gate.clone();
+                                let dd = dd_for_gate.clone();
+                                let tool = tool.to_string();
+                                let args = args.clone();
+                                Box::pin(async move {
+                                    // ⚠️ 会话 id **优先用这个 pi 进程自己的** ——
+                                    // 用户当前正在看的会话可能是另一个（并行时）。
+                                    // 拿不到才退回全局当前会话。
+                                    let sid = sid_from_runtime.unwrap_or_else(|| {
+                                        sessions::current_id(&dd)
+                                            .unwrap_or_else(|| sessions::ensure_current(&dd).id)
+                                    });
+                                    pi_host_gate(&perm, &dd, &sid, &tool, &args).await
+                                })
+                            },
+                        );
+                        // `set_gate` 是**同步**的（`setup` 闭包没法 await）。
+                        pool.set_gate(gate);
+                        Some(pool)
                     }
                     None => {
                         eprintln!(
