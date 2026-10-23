@@ -140,7 +140,7 @@ async fn pi能连上mcp并真的调到mcp工具() {
 
     let rt = PiRuntime::with_agent_dir(data_dir.clone(), runtime.clone(), agent_dir.clone());
     rt.set_model_override("fake-model", fake.base_url()).await;
-    rt.set_gate(Arc::new(|_t, _a| {
+    rt.set_gate(Arc::new(|_t, _a, _sid| {
         Box::pin(async { (true, String::new()) })
     }));
     // 注入假 MCP server（不写用户的 agent-data/mcp.json）
@@ -263,7 +263,7 @@ async fn mcp_server连不上时不卡死() {
 
     let rt = PiRuntime::with_agent_dir(data_dir.clone(), runtime.clone(), agent_dir);
     rt.set_model_override("fake-model", fake.base_url()).await;
-    rt.set_gate(Arc::new(|_t, _a| {
+    rt.set_gate(Arc::new(|_t, _a, _sid| {
         Box::pin(async { (true, String::new()) })
     }));
     // 注入一个**不存在的**命令 —— 连不上

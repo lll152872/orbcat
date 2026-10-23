@@ -111,7 +111,7 @@ async fn pi_runtime能跑完整一轮并调通rust工具() {
     // ⚠️ data_dir 必须是**真实数据目录**（模型从那儿来），
     // agent_dir 才是临时的（pi 的 models.json/sessions 落这儿，别污染真实数据）。
     let rt = PiRuntime::with_agent_dir(data_dir.clone(), runtime.clone(), tmp_agent.clone());
-    rt.set_gate(Arc::new(|_tool, _args| {
+    rt.set_gate(Arc::new(|_tool, _args, _sid| {
         Box::pin(async { (true, String::new()) })
     }));
 
@@ -204,7 +204,7 @@ async fn pi能调到orbcat的真实工具() {
     std::fs::write(&target, "MAGIC-ORBCAT-42").unwrap();
 
     let rt = PiRuntime::with_agent_dir(data_dir.clone(), runtime.clone(), tmp_agent);
-    rt.set_gate(Arc::new(|_t, _a| {
+    rt.set_gate(Arc::new(|_t, _a, _sid| {
         Box::pin(async { (true, String::new()) })
     }));
 

@@ -96,7 +96,7 @@ async fn mock模型驱动_完整一轮跑通() {
     let rt = PiRuntime::with_agent_dir(data_dir.clone(), runtime.clone(), agent_dir.clone());
     // 让 pi 去连假模型（URL 不在 models.json 里 → sync_models 会注入临时 provider）
     rt.set_model_override("fake-model", fake.base_url()).await;
-    rt.set_gate(Arc::new(|_t, _a| {
+    rt.set_gate(Arc::new(|_t, _a, _sid| {
         Box::pin(async { (true, String::new()) })
     }));
 
@@ -228,7 +228,7 @@ async fn mock模型能看到orbcat的人格与记忆() {
 
     let rt = PiRuntime::with_agent_dir(data_dir.clone(), runtime.clone(), agent_dir);
     rt.set_model_override("fake-model", fake.base_url()).await;
-    rt.set_gate(Arc::new(|_t, _a| {
+    rt.set_gate(Arc::new(|_t, _a, _sid| {
         Box::pin(async { (true, String::new()) })
     }));
 

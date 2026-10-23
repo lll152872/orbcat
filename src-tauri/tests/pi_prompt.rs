@@ -112,7 +112,7 @@ async fn pi内核继承orbcat的人格与记忆() {
 
     let rt = PiRuntime::with_agent_dir(data_dir.clone(), runtime.clone(), agent_dir);
     // gate：一律放行（这个测试只验 prompt 接管，不碰权限）
-    rt.set_gate(std::sync::Arc::new(|_t, _a| {
+    rt.set_gate(std::sync::Arc::new(|_t, _a, _sid| {
         Box::pin(async { (true, String::new()) })
     }));
 
