@@ -612,8 +612,9 @@ fn retain_head_tail_except(data_dir: &Path, keep_id: Option<&str>) -> Result<Pru
     // ---- 按原路径分组 ----
     // ⚠️ 分组必须作用在 **`list_backups` 返回的完整集合**上 —— 它 = 清单记录
     //    **+** 磁盘上没进清单的老备份（legacy 分支补录，`original` 为空）。
-    //    实测用户备份区顶层 457 个文件、清单 `backups.jsonl` 只有 246 条
-    //    ⇒ 另有 211 个「孤儿副本」**只可能从 `list_backups` 的返回值里看得到**
+    //    实测用户备份区顶层 457 个文件（= 456 份备份副本 + 清单 `backups.jsonl` 本身），
+    //    清单里只有 246 条 ⇒ 另有 **210** 个「孤儿副本」（17.41 MB）
+    //    **只可能从 `list_backups` 的返回值里看得到**
     //    ⇒ 若改成自己读清单，下面那条「空 original 不动」的补修就白做了。
     let mut groups: Vec<(String, Vec<BackupRec>)> = Vec::new();
     for r in recs {
@@ -1344,10 +1345,10 @@ mod tests {
 
     /// 🔴 **补修必须作用在 `list_backups` 返回的完整集合上**（含 legacy 孤儿）
     ///
-    /// 实测用户备份区顶层 457 个文件、清单 `backups.jsonl` 只有 246 条
-    /// ⇒ **211 个是「孤儿副本」**（不在清单里，靠 `list_backups` 的 legacy 分支补录、
-    /// `original` 为空，共 17.47 MB）。
-    /// ⇒ 若分组只拿「清单记录」做，这 211 个孤儿不会被补修覆盖 ⇒ **补修白做**。
+    /// 实测用户备份区顶层 457 个文件（= 456 份备份副本 + 清单 `backups.jsonl` 本身），
+    /// 清单里只有 246 条 ⇒ **210 个是「孤儿副本」**（不在清单里，靠 `list_backups` 的
+    /// legacy 分支补录、`original` 为空，共 17.41 MB）。
+    /// ⇒ 若分组只拿「清单记录」做，这 210 个孤儿不会被补修覆盖 ⇒ **补修白做**。
     ///
     /// 本例造：清单里 3 条 `original` 非空（三个不同的原路径 ⇒ 每组 1 份 ⇒ 全留）
     /// + 磁盘上 2 个 legacy 孤儿（`original` 为空、文件名不同）
