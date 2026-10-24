@@ -30,6 +30,7 @@ import type {
   CmdVerdictView,
   ContextCapability,
   FgCtx,
+  FileGrant,
   LifeStatus,
   McpServerCfg,
   McpStatus,
@@ -615,6 +616,15 @@ export class MockSource implements DataSource {
       }
       case "perm_grants_list":
         return this.settle<unknown[]>(cmd, []);
+      // 永久文件授权（「永远允许这个路径」）—— 落 file_grants.json
+      case "file_grants_list":
+        return this.settle<FileGrant[]>(cmd, [...d.fileGrants]);
+      case "file_grants_revoke": {
+        const prefix = String(a.prefix ?? "");
+        const before = d.fileGrants.length;
+        d.fileGrants = d.fileGrants.filter((g) => g.prefix !== prefix);
+        return this.settle<number>(cmd, before - d.fileGrants.length);
+      }
       case "perm_grant_revoke":
       case "perm_revoke_label":
         return this.settle<number>(cmd, 0);
@@ -948,6 +958,9 @@ export class MockSource implements DataSource {
     cmdTest: (args) => this.call<CmdVerdictView>("perm_cmd_test", args),
     grantsList: () => this.call<unknown[]>("perm_grants_list"),
     grantRevoke: (args) => this.call<number>("perm_grant_revoke", args),
+    // 永久文件授权（「永远允许这个路径」）—— 落 file_grants.json
+    fileGrantsList: () => this.call<FileGrant[]>("file_grants_list"),
+    fileGrantsRevoke: (args) => this.call<number>("file_grants_revoke", args),
     revokeLabel: (args) => this.call<number>("perm_revoke_label", args),
     setRules: (args) => this.call<void>("perm_set_rules", args),
     rulesPath: () => this.call<string>("perm_rules_path"),

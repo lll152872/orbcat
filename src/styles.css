@@ -2201,6 +2201,20 @@ body {
   background: rgba(240, 196, 107, 0.26);
 }
 
+/* 「永远允许」（永久文件授权）：猫白**描边**，不是实心 ——
+   实心留给「批准」；永久授权的后果更重（跨会话、跨重启都在）⇒ 视觉上弱一档，
+   但仍是"批准"家族（猫白），一眼能看出是放行而不是拒绝。
+   ⚠️ 色值全部走 :root token（新增裸色值 = 0）。 */
+.perm-btn.forever {
+  background: var(--cat-wash);
+  border-color: var(--cat-wash-3);
+  color: var(--cat);
+}
+
+.perm-btn.forever:hover:not(:disabled) {
+  background: var(--cat-wash-2);
+}
+
 .perm-btn.no {
   background: rgba(224, 138, 124, 0.14);
   border-color: rgba(224, 138, 124, 0.35);

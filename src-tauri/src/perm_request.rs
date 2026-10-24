@@ -62,6 +62,13 @@ pub enum Decision {
     ApprovePrefix,
     /// **命令授权**：记住完整命令（最窄粒度）
     ApproveFull,
+    /// **文件授权**：永远允许**这个路径**（最窄粒度）——
+    /// 跨会话、跨重启都生效，可在设置里撤销。
+    ///
+    /// ⚠️ **不复用 `ApproveFull`**：那个是**命令**语义（落 `command_grants.json`），
+    /// 文件走它会落错地方（命令授权表里根本没有路径维度）。
+    /// ⚠️ 也不复用 `ApprovePrefix`：那是「记住这类命令」，粒度比用户要的宽。
+    ApproveForever,
 }
 
 impl Decision {
@@ -75,6 +82,10 @@ impl Decision {
             "full" | "approve-full" | "记住完整命令" | "always" | "总是允许" => {
                 Some(Decision::ApproveFull)
             }
+            // 文件授权的永久档（⚠️ 与上面的 "always" 是两回事：那个是命令语义）
+            "forever" | "approve-forever" | "always-file" | "永远允许" | "永久" => {
+                Some(Decision::ApproveForever)
+            }
             _ => None,
         }
     }
@@ -82,7 +93,11 @@ impl Decision {
     pub fn is_approved(&self) -> bool {
         matches!(
             self,
-            Decision::Approve | Decision::Narrow | Decision::ApprovePrefix | Decision::ApproveFull
+            Decision::Approve
+                | Decision::Narrow
+                | Decision::ApprovePrefix
+                | Decision::ApproveFull
+                | Decision::ApproveForever
         )
     }
 }
@@ -144,6 +159,9 @@ impl Verdict {
                  现在直接重试原来那条命令即可。"
                 .to_string(),
             Decision::ApproveFull => "用户已批准，并**总是允许**（跨会话持久，可在设置撤销）。现在可以执行。"
+                .to_string(),
+            Decision::ApproveForever => "用户已批准，并**永远允许这个路径**（跨会话、跨重启都生效，可在设置里撤销）。\
+                 现在直接重试原来那个工具即可 —— 同一个路径以后不会再弹卡。"
                 .to_string(),
         }
     }
@@ -514,6 +532,46 @@ impl PermHub {
     /// 注入 agent 数据目录 —— 命令授权落盘靠它。重复注入会被忽略。
     pub fn attach_data_dir(&self, dir: PathBuf) {
         let _ = self.data_dir.set(dir);
+    }
+
+    /// 把**永久档**文件授权写进 `<data_dir>/file_grants.json`。
+    ///
+    /// `data_dir` 未注入（单测场景）→ 静默跳过：内存授权照常生效，只是不持久。
+    /// 落盘失败**不回滚**已生效的内存授权：用户已经批了，让这次操作继续，
+    /// 只是"重启后失效"。把错误记下来即可。
+    fn persist_file_grants(&self, grants: &[Grant]) {
+        let Some(dir) = self.data_dir.get() else { return };
+        if let Err(e) = crate::permission::save_file_grants(dir, grants) {
+            eprintln!("[orbcat] ⚠️ 永久文件授权落盘失败（重启后会失效）: {e}");
+        }
+    }
+
+    /// 当前生效的**永久文件授权**（设置页展示 + 撤销用）。
+    pub fn file_grants(&self) -> Vec<Grant> {
+        self.grants
+            .lock()
+            .map(|s| s.forever_grants())
+            .unwrap_or_default()
+    }
+
+    /// 撤销一条永久文件授权（设置页「撤销」）。**同时落盘**，返回撤销条数。
+    pub fn revoke_file_grant(&self, prefix: &str) -> usize {
+        let (n, forever) = {
+            let mut store = match self.grants.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[orbcat] ⚠️ 授权表锁失败，撤销未生效: {e}");
+                    return 0;
+                }
+            };
+            let n = store.revoke(prefix, Some(GrantTier::Forever));
+            let forever = store.forever_grants();
+            (n, forever)
+        };
+        if n > 0 {
+            self.persist_file_grants(&forever);
+        }
+        n
     }
 
     /// 把**永久档**命令授权写进 `<data_dir>/command_grants.json`。
@@ -1133,6 +1191,16 @@ impl PermHub {
             return None;
         }
 
+        // ⚠️ 档位由**决定**说了算，不由调用方传进来的 tier 说了算 ——
+        //    「永远允许」那颗按钮传上来的 tier 往往是模型申请时的档
+        //    （模型申请什么档就是什么档）⇒ 必须在这一层改成永久档，
+        //    否则用户点了「永远允许」拿到的还是一次性的（这正是用户的抱怨）。
+        let tier = if decision == Decision::ApproveForever {
+            GrantTier::Forever
+        } else {
+            tier
+        };
+
         let prefix: PathBuf = match decision {
             Decision::Narrow => denied_path.unwrap_or(requested).to_path_buf(),
             _ => requested.to_path_buf(),
@@ -1147,6 +1215,17 @@ impl PermHub {
         match self.grants.lock() {
             Ok(mut store) => {
                 store.add(grant);
+                // 「永远允许」要**落盘**：活过会话 ⇒ 落 `file_grants.json`，
+                // **不进** `sessions/<id>.grants.json`（那个随会话消失，语义会破）。
+                let forever = if tier.is_forever() {
+                    Some(store.forever_grants())
+                } else {
+                    None
+                };
+                drop(store);
+                if let Some(grants) = forever {
+                    self.persist_file_grants(&grants);
+                }
                 Some(prefix)
             }
             Err(e) => {
@@ -1650,5 +1729,137 @@ mod tests {
         hub.decide_command(&id, Decision::Deny, "不删".to_string())
             .expect("命令卡应能被 decide_command 唤醒");
         let _ = tokio::time::timeout(Duration::from_millis(500), waiter).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 「永远允许这个路径」（永久文件授权）—— 用户 2026-10-24 拍板加的
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod forever_file_grant_tests {
+    use super::*;
+
+    /// 临时目录（纳秒后缀 —— 免得并行测试互相踩）。
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir().join(format!("orbcat_forever_req_{tag}_{stamp}"));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn decision_parse_knows_forever() {
+        assert_eq!(Decision::parse("forever"), Some(Decision::ApproveForever));
+        assert_eq!(Decision::parse("永远允许"), Some(Decision::ApproveForever));
+        assert_eq!(Decision::parse("永久"), Some(Decision::ApproveForever));
+        // ⚠️ "always" 仍是**命令**语义（ApproveFull）—— 别被永久档抢走
+        assert_eq!(Decision::parse("always"), Some(Decision::ApproveFull));
+        assert!(Decision::ApproveForever.is_approved());
+        assert!(!Decision::Deny.is_approved());
+    }
+
+    #[test]
+    fn approve_forever_makes_a_forever_grant_and_writes_file_grants() {
+        let dir = tmp_dir("apply");
+        let hub = PermHub::new();
+        hub.attach_data_dir(dir.clone());
+
+        // ⚠️ 调用方传的 tier 是「一次」也不该影响结果 —— **决定说了算**
+        let used = hub.apply_decision(
+            Decision::ApproveForever,
+            Path::new(r"D:\docs"),
+            None,
+            Access::ReadWrite,
+            GrantTier::Once,
+            "整理文档",
+        );
+        assert!(used.is_some(), "「永远允许」必须真的批下去");
+
+        // 内存里是永久档
+        let forever = hub.file_grants();
+        assert_eq!(forever.len(), 1, "应当只有一条永久授权：{forever:?}");
+        assert!(forever[0].tier.is_forever(), "档位必须是永久");
+
+        // 落了 file_grants.json
+        assert!(
+            crate::permission::file_grants_path(&dir).exists(),
+            "永久授权要落 file_grants.json"
+        );
+        // **不能**落进 sessions/<id>.grants.json（那个随会话消失 ⇒ 语义会破）
+        let sessions_dir = dir.join("sessions");
+        let leaked = std::fs::read_dir(&sessions_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .any(|e| e.file_name().to_string_lossy().contains("grants"))
+            })
+            .unwrap_or(false);
+        assert!(
+            !leaked,
+            "永久授权不该落进 sessions/<id>.grants.json（那个会随会话消失）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn switching_session_keeps_the_forever_grant() {
+        let hub = PermHub::new();
+        hub.apply_decision(
+            Decision::ApproveForever,
+            Path::new(r"D:\docs"),
+            None,
+            Access::ReadWrite,
+            GrantTier::Once,
+            "永久",
+        );
+        assert_eq!(hub.file_grants().len(), 1);
+
+        // 切会话 = 会话级授权整体替换（lib.rs 的 reload_grants_for_session 就是这么做的）
+        {
+            let mut store = hub.grants().lock().unwrap();
+            store.replace_session_scoped(vec![Grant::lasting(
+                Path::new(r"D:\other"),
+                Access::ReadWrite,
+                GrantTier::Task,
+                "新会话的任务",
+            )]);
+        }
+
+        assert_eq!(
+            hub.file_grants().len(),
+            1,
+            "切会话后永久授权必须还在（用户报的就是这个）"
+        );
+    }
+
+    #[test]
+    fn revoke_file_grant_drops_it_and_clears_the_file() {
+        let dir = tmp_dir("revoke");
+        let hub = PermHub::new();
+        hub.attach_data_dir(dir.clone());
+        hub.apply_decision(
+            Decision::ApproveForever,
+            Path::new(r"D:\docs"),
+            None,
+            Access::ReadWrite,
+            GrantTier::Once,
+            "永久",
+        );
+        assert_eq!(hub.file_grants().len(), 1);
+
+        let prefix = hub.file_grants()[0].prefix.clone();
+        let n = hub.revoke_file_grant(&prefix.to_string_lossy());
+        assert_eq!(n, 1, "应该撤掉一条");
+        assert!(hub.file_grants().is_empty(), "撤销后内存里不该剩");
+        assert!(
+            !crate::permission::file_grants_path(&dir).exists(),
+            "撤销后文件也要清掉（否则重启又回来）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

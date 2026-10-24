@@ -617,6 +617,17 @@ pub enum GrantTier {
     /// 整个任务：任务会话生命周期。
     /// 主聊天里降级为「本次 app 运行期」→ 不落盘（见 [`GrantTier::is_persistent`] 的调用方）
     Task,
+    /// **永久**：跨会话、跨重启一直有效（落 `<data_dir>/file_grants.json`）。
+    ///
+    /// ## 与 `Task` 的区别（别混）
+    ///
+    /// - `Task` = **跟随会话**：落 `sessions/<id>.grants.json`，**会话删了就没了**；
+    /// - `Forever` = **活过会话**：落 `file_grants.json`，与 `command_grants.json` /
+    ///   `mcp_grants.json` 同级 ⇒ 切会话、切项目、重启都在。
+    ///
+    /// ⚠️ 所以 `Forever` **不能**复用 `sessions/<id>.grants.json` ——
+    ///   那个文件会随会话一起消失，语义当场破裂。
+    Forever,
 }
 
 // ⚠️ 本段（含 `Grant` / `GrantStore` / `Allowed.grant_idx`）是「申请权限」的地基，
@@ -629,6 +640,7 @@ impl GrantTier {
             GrantTier::Once => "once",
             GrantTier::Turn => "turn",
             GrantTier::Task => "task",
+            GrantTier::Forever => "forever",
         }
     }
 
@@ -637,16 +649,24 @@ impl GrantTier {
             "once" | "一次" => Some(GrantTier::Once),
             "turn" | "一轮" => Some(GrantTier::Turn),
             "task" | "整个任务" => Some(GrantTier::Task),
+            "forever" | "永久" | "永远" => Some(GrantTier::Forever),
             _ => None,
         }
     }
 
-    /// 这一档是否落盘。只有 `Task` 落盘，且**落在会话旁边**（`sessions/<id>.grants.json`）。
+    /// 这一档是否落盘。`Task` 落**会话旁边**，`Forever` 落**数据目录**（活过会话）。
     ///
     /// ⚠️ 主聊天是永久会话，在它里面批 `Task` 等于变相无限期授权 ——
     /// 所以调用方要判断会话 `kind`，主聊天时**不要**把 `Task` 写盘。
+    /// （`Forever` 不受这条限制：它本来就是用户明确要的「永远允许」，
+    ///   且它有独立文件 + 设置页可撤销。）
     pub fn is_persistent(&self) -> bool {
-        matches!(self, GrantTier::Task)
+        matches!(self, GrantTier::Task | GrantTier::Forever)
+    }
+
+    /// 这一档是否**活过会话**（落 `file_grants.json`）。
+    pub fn is_forever(&self) -> bool {
+        matches!(self, GrantTier::Forever)
     }
 }
 
@@ -776,6 +796,41 @@ impl GrantStore {
         self.grants = grants;
     }
 
+    /// **换会话**时重装授权：会话级的整体替换，**永久档（`Forever`）保留**。
+    ///
+    /// ## 为什么不能直接 `replace`
+    ///
+    /// `replace` 是**整体**换掉 ⇒ 切一次会话就把内存里的永久授权清空了
+    /// ⇒ 用户刚点「永远允许」，换个会话又弹卡 ⇒ **这正是用户抱怨的
+    /// 「权限不会一直绑定」**（2026-10-24 真机反馈）。
+    ///
+    /// ## 这里替换的到底是哪些
+    ///
+    /// - `Once` / `Turn`：**只在内存里**，换会话即失效（跨过去毫无意义）；
+    /// - `Task`：落 `sessions/<id>.grants.json`，跟着会话走 ⇒ 换会话自然换成新的那份；
+    /// - `Forever`：落 `file_grants.json`，**活过会话** ⇒ 必须留下。
+    pub fn replace_session_scoped(&mut self, grants: Vec<Grant>) {
+        let forever: Vec<Grant> = self
+            .grants
+            .iter()
+            .filter(|g| g.tier.is_forever())
+            .cloned()
+            .collect();
+        self.grants = forever;
+        for g in grants {
+            self.add(g);
+        }
+    }
+
+    /// 只取**永久档**授权（落盘 / 设置页展示用）。
+    pub fn forever_grants(&self) -> Vec<Grant> {
+        self.grants
+            .iter()
+            .filter(|g| g.tier.is_forever())
+            .cloned()
+            .collect()
+    }
+
     /// 命中判定（**不消费**）：返回「最长前缀且权限足够」的授权下标。
     ///
     /// 返回下标而不是引用 —— 调用方拿到它之后还要 `consume`，借用会打架。
@@ -833,6 +888,74 @@ impl GrantStore {
             .retain(|g| !(g.prefix == target && tier.map(|t| t == g.tier).unwrap_or(true)));
         before - self.grants.len()
     }
+}
+
+// ---------------------------------------------------------------------------
+// 永久文件授权（`<data_dir>/file_grants.json`）
+// ---------------------------------------------------------------------------
+
+/// `<data_dir>/file_grants.json` 的路径。
+///
+/// ⚠️ **不能**复用 `sessions/<id>.grants.json` —— 那个文件随会话一起消失，
+///    而「永远允许」的语义就是**活过会话**（切会话 / 切项目 / 重启都还在）。
+/// 与 `command_grants.json` / `mcp_grants.json` 同级（数据目录的根）。
+pub fn file_grants_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("file_grants.json")
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FileGrantsFile {
+    #[serde(default)]
+    grants: Vec<Grant>,
+}
+
+/// 读永久文件授权。**文件不存在 = 空表，不是错误**。
+///
+/// 只收**永久档**：`Once` / `Turn` / `Task` 若出现在文件里
+/// （历史脏数据 / 手工编辑 / 误写）一律忽略 ——
+/// 否则「一次 / 一轮」会跨重启复活，语义当场破裂。
+pub fn load_file_grants(data_dir: &Path) -> Vec<Grant> {
+    let p = file_grants_path(data_dir);
+    let Ok(txt) = std::fs::read_to_string(&p) else {
+        return Vec::new();
+    };
+    let Ok(f) = serde_json::from_str::<FileGrantsFile>(&txt) else {
+        eprintln!(
+            "[orbcat] ⚠️ file_grants.json 解析失败，按空表处理: {}",
+            p.display()
+        );
+        return Vec::new();
+    };
+    f.grants
+        .into_iter()
+        .filter(|g| g.tier.is_forever())
+        .collect()
+}
+
+/// 写永久文件授权（**只写永久档**）。
+///
+/// 表空 ⇒ 删文件（别留一个空壳让人以为「还有授权」）。
+/// 走「先写 .tmp 再 rename」：写一半崩了不会留下半个坏 JSON
+/// （授权表读坏了 = 用户的永久授权全丢，比多写一次更糟）。
+pub fn save_file_grants(data_dir: &Path, grants: &[Grant]) -> Result<(), String> {
+    let forever: Vec<Grant> = grants.iter().filter(|g| g.tier.is_forever()).cloned().collect();
+    let path = file_grants_path(data_dir);
+
+    if forever.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("清理 {} 失败: {e}", path.display())),
+        };
+    }
+
+    std::fs::create_dir_all(data_dir).map_err(|e| format!("建数据目录失败: {e}"))?;
+    let txt = serde_json::to_string_pretty(&FileGrantsFile { grants: forever })
+        .map_err(|e| format!("序列化永久文件授权失败: {e}"))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, txt).map_err(|e| format!("写 {} 失败: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("落 {} 失败: {e}", path.display()))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1583,5 +1706,144 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&app);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 永久文件授权（`GrantTier::Forever`）—— 用户 2026-10-24 拍板加的一档
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod forever_grants_tests {
+    use super::*;
+
+    /// 临时目录（纳秒后缀 —— 免得并行测试互相踩）。
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir().join(format!("orbcat_forever_{tag}_{stamp}"));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn forever_tier_parses_and_is_persistent() {
+        assert_eq!(GrantTier::parse("forever"), Some(GrantTier::Forever));
+        assert_eq!(GrantTier::parse("永久"), Some(GrantTier::Forever));
+        assert_eq!(GrantTier::Forever.as_str(), "forever");
+        // 落盘档位：永久 + 整个任务
+        assert!(GrantTier::Forever.is_persistent());
+        assert!(GrantTier::Task.is_persistent());
+        // 旧语义不许回归：一次 / 一轮 **仍然不落盘**
+        assert!(!GrantTier::Once.is_persistent());
+        assert!(!GrantTier::Turn.is_persistent());
+    }
+
+    #[test]
+    fn file_grants_round_trip_and_only_keeps_forever() {
+        let d = tmp_dir("roundtrip");
+        let forever = Grant::lasting(
+            Path::new(r"D:\docs"),
+            Access::ReadWrite,
+            GrantTier::Forever,
+            "整理文档",
+        );
+        let once = Grant::once(Path::new(r"D:\tmp"), Access::Read, "临时");
+        let task = Grant::lasting(
+            Path::new(r"D:\proj"),
+            Access::ReadWrite,
+            GrantTier::Task,
+            "任务",
+        );
+
+        save_file_grants(&d, &[forever.clone(), once.clone(), task.clone()]).expect("写永久授权");
+
+        // 落的是 file_grants.json（不是 sessions/<id>.grants.json）
+        assert!(
+            file_grants_path(&d).exists(),
+            "永久授权要落 file_grants.json"
+        );
+
+        // 读回来只该有永久档那一条
+        let back = load_file_grants(&d);
+        assert_eq!(back.len(), 1, "只该读回永久档：{back:?}");
+        assert!(back[0].tier.is_forever());
+
+        // 手工把档位改成「一次」⇒ 读的时候必须忽略（否则「一次」跨重启复活）
+        let raw = std::fs::read_to_string(file_grants_path(&d)).unwrap();
+        std::fs::write(file_grants_path(&d), raw.replace("\"forever\"", "\"once\"")).unwrap();
+        assert!(
+            load_file_grants(&d).is_empty(),
+            "一次档不该从文件里复活"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn save_file_grants_removes_file_when_empty() {
+        let d = tmp_dir("empty");
+        let forever = Grant::lasting(
+            Path::new(r"D:\docs"),
+            Access::ReadWrite,
+            GrantTier::Forever,
+            "整理文档",
+        );
+        save_file_grants(&d, &[forever]).unwrap();
+        assert!(file_grants_path(&d).exists());
+        // 表空 ⇒ 删文件（别留空壳让人以为「还有授权」）
+        save_file_grants(&d, &[]).unwrap();
+        assert!(
+            !file_grants_path(&d).exists(),
+            "撤销最后一条后不该留下空文件"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn replace_session_scoped_keeps_forever_and_drops_once() {
+        let mut store = GrantStore::new();
+        store.add(Grant::lasting(
+            Path::new(r"D:\docs"),
+            Access::ReadWrite,
+            GrantTier::Forever,
+            "永久",
+        ));
+        store.add(Grant::once(Path::new(r"D:\tmp"), Access::Read, "一次"));
+        store.add(Grant::lasting(
+            Path::new(r"D:\proj"),
+            Access::ReadWrite,
+            GrantTier::Task,
+            "任务",
+        ));
+
+        // 换会话：会话级整体替换（lib.rs 的 reload_grants_for_session 就是这么做的）
+        let mut next = GrantStore::new();
+        next.add(Grant::lasting(
+            Path::new(r"D:\other"),
+            Access::ReadWrite,
+            GrantTier::Task,
+            "新会话的任务",
+        ));
+        store.replace_session_scoped(next.grants().to_vec());
+
+        let tiers: Vec<GrantTier> = store.grants().iter().map(|g| g.tier).collect();
+        assert_eq!(
+            tiers.iter().filter(|t| **t == GrantTier::Forever).count(),
+            1,
+            "永久授权必须活过换会话（用户报的就是这个）：{tiers:?}"
+        );
+        assert_eq!(
+            tiers.iter().filter(|t| **t == GrantTier::Task).count(),
+            1,
+            "会话级授权跟着会话换"
+        );
+        assert_eq!(
+            tiers.iter().filter(|t| **t == GrantTier::Once).count(),
+            0,
+            "一次档不该跨会话"
+        );
     }
 }

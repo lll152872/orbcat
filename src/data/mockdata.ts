@@ -20,6 +20,7 @@ import type {
   CmdPolicy,
   ContextCapability,
   FgCtx,
+  FileGrant,
   LifeSourceView,
   LifeStatus,
   McpServerCfg,
@@ -521,6 +522,23 @@ const permRules: PermRule[] = [
   { prefix: "D:\\wechat", access: "deny", label: "微信聊天存档（不删）" },
 ];
 
+/**
+ * **永久文件授权**（「永远允许这个路径」）的 mock 数据。
+ *
+ * 落 `agent-data/file_grants.json`（真机上）⇒ 跨会话、跨重启都生效。
+ * 这里给一条，好让预览件能看出设置页那一节长什么样。
+ */
+const fileGrants: FileGrant[] = [
+  {
+    prefix: "D:\\workplace\\悬浮小agent\\docs",
+    access: "readwrite",
+    tier: "forever",
+    remaining: null,
+    reason: "整理文档目录",
+    granted_at: Date.now() - 3_600_000,
+  },
+];
+
 const cmdPolicy: CmdPolicy = {
   allow: ["git status", "git diff", "cargo test", "npm run build", "npx vitest run"],
   hard_block: ["rm -rf /", "rm -rf /*", "mkfs.*", "dd of=/dev/sd*", "curl ... | sh", "wget ... | bash"],
@@ -993,6 +1011,8 @@ export interface MockData {
   memStats: MemStats;
   permRequests: PendingPerm[];
   permRules: PermRule[];
+  /** 永久文件授权（「永远允许这个路径」） */
+  fileGrants: FileGrant[];
   cmdPolicy: CmdPolicy;
   cmdGrants: CmdGrantsView[];
   cmdAudit: CmdAuditRecord[];
@@ -1041,6 +1061,7 @@ export function defaultMockData(): MockData {
     // 混在对话里会把聊天流顶掉（用户打开预览第一眼看到的是权限卡，不是对话）。
     permRequests: [],
     permRules: permRules.map((r) => ({ ...r })),
+    fileGrants: fileGrants.map((g) => ({ ...g })),
     cmdPolicy: { allow: [...cmdPolicy.allow], hard_block: [...cmdPolicy.hard_block] },
     cmdGrants: cmdGrants.map((g) => ({ ...g })),
     cmdAudit: cmdAudit.map((a) => ({ ...a })),
@@ -1209,6 +1230,22 @@ const permCover = (d: MockData): void => {
 };
 
 /**
+ * **文件权限卡场景** —— 只挂文件读写那一张（`kind === "file"`）。
+ *
+ * ## 为什么单独一个场景
+ *
+ * 「永远允许」这颗按钮只长在**文件卡**上（命令卡有「记住这类/这条」、
+ * MCP 卡有「总是允许」—— 那是另外两套落盘）⇒ 想目视核对这颗新按钮，
+ * 得有一屏**只出现文件卡**。
+ */
+const filePermCover = (d: MockData): void => {
+  d.permRequests = permRequests
+    .filter((p) => p.kind === "file")
+    .map((p) => ({ ...p }));
+  d.memStats = { pending: 0, handled: 37 };
+};
+
+/**
  * **pi 确认卡场景** —— 只挂一张 `kind="pi"` 的卡。
  *
  * ## 为什么单独一个场景
@@ -1313,6 +1350,13 @@ export const SCENARIOS: MockScenario[] = [
     label: "pi 确认卡（kind=pi）",
     desc: "pi 内核的确认框：标题 + 正文 + 只「允许 / 拒绝」",
     cover: piPermCover,
+    goto: "chat",
+  },
+  {
+    id: "file-perm",
+    label: "文件权限卡（永远允许）",
+    desc: "文件读写权限卡：新增一颗「永远允许」（落 file_grants.json，可撤销）",
+    cover: filePermCover,
     goto: "chat",
   },
   {

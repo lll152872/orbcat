@@ -39,6 +39,7 @@ import type {
   ModelView,
   PendingPerm,
   PermRule,
+  FileGrant,
   PiRuntimeStatus,
   ProgressEvent,
   ProjectListView,
@@ -4052,6 +4053,7 @@ const PERM_TIER_LABEL: Record<string, string> = {
   once: "仅这一次",
   turn: "本轮对话",
   task: "整个任务",
+  forever: "永远",
 };
 
 /** 命令授权的档位展示 —— 命令侧只有两种寿命：「仅这一次」与「永久」 */
@@ -4173,6 +4175,12 @@ function renderFilePermCard(p: PendingPerm): string {
     <div class="perm-actions">
       ${narrowBtn}
       <button type="button" class="perm-btn ok" data-act="approve">批准 ${esc(target)}</button>
+      <!-- 「永远允许」＝**永久文件授权**（落 file_grants.json）——
+           跨会话、跨重启都生效，可在「设置 › 文件权限」撤销。
+           ⚠️ 与 MCP 卡的「总是允许」不是一回事：那个是工具维度，这个是**路径**维度。
+           ⚠️ 粒度只到**这个路径**（最窄）—— 不做「记住这类目录」。 -->
+      <button type="button" class="perm-btn ok forever" data-act="forever"
+              title="永远允许这个路径的读写权（跨会话、重启后仍生效，可在设置 › 文件权限撤销）">永远允许</button>
       <button type="button" class="perm-btn no" data-act="deny">拒绝</button>
       <button type="button" class="perm-btn why" data-act="deny-why"
               title="拒绝并说明理由（会告诉 AI 它下次该怎么改）">✎</button>
@@ -5526,12 +5534,15 @@ function renderBody(): void {
 
   if (view === "perm") {
     b.innerHTML = `<div class="mem-loading">加载中…</div>`;
-    void data.permissions.rules()
-      .then((rules) => {
-        if (view !== "perm") return;
-        b.innerHTML = renderPermView(rules);
-        bindPermView(b);
-      })
+    void Promise.all([
+      data.permissions.rules(),
+      // 永久文件授权（「永远允许这个路径」那批）—— 读不到就当没有，不该让整页崩
+      data.permissions.fileGrantsList().catch(() => [] as FileGrant[]),
+    ]).then(([rules, fileGrants]) => {
+      if (view !== "perm") return;
+      b.innerHTML = renderPermView(rules, fileGrants);
+      bindPermView(b);
+    })
       .catch((e) => {
         if (view !== "perm") return;
         b.innerHTML = `<div class="mem-head">文件权限</div>
@@ -7478,7 +7489,7 @@ const ACCESS_DESC: Record<string, string> = {
   full: "含删除在内的完全控制",
 };
 
-function renderPermView(rules: PermRule[]): string {
+function renderPermView(rules: PermRule[], fileGrants: FileGrant[] = []): string {
   const rows = rules
     .map(
       (r, i) => `
@@ -7493,6 +7504,36 @@ function renderPermView(rules: PermRule[]): string {
       </div>`,
     )
     .join("");
+
+  // ---- 永久文件授权（「永远允许这个路径」）----
+  //
+  // 与上面的「文件权限」**不是一回事**：那些是长期**策略**（permissions.json，
+  // 手写规则）；这里是用户当场点「永远允许」留下的**授权**（file_grants.json）。
+  const foreverRows =
+    fileGrants.length === 0
+      ? `<div class="mem-empty">当前没有「永远允许」的文件路径。点文件权限卡的「永远允许」即写入 <code>file_grants.json</code>。</div>`
+      : fileGrants
+          .map(
+            (g) => `
+      <div class="set-row">
+        <div class="set-name">${esc(g.prefix)}</div>
+        <div class="set-url">${esc(ACCESS_LABEL[g.access] ?? g.access)}${
+          g.reason ? ` · ${esc(g.reason)}` : ""
+        }</div>
+        <div class="set-actions">
+          <button class="set-btn file-grant-revoke" data-prefix="${esc(g.prefix)}">撤销</button>
+        </div>
+      </div>`,
+          )
+          .join("");
+
+  const foreverBlock = `
+    <div class="mem-head">🔓 永远允许 ${fileGrants.length}</div>
+    ${foreverRows}
+    <div class="set-hint" style="margin-top:6px">
+      落盘 <code>file_grants.json</code>，跨会话、重启后仍生效。粒度只到<b>这一个路径</b>；
+      要收回就在这里撤销。
+    </div>`;
 
   const opts = ["read", "readwrite", "full", "deny"]
     .map((a) => `<option value="${a}">${ACCESS_LABEL[a]}</option>`)
@@ -7512,6 +7553,8 @@ function renderPermView(rules: PermRule[]): string {
     </div>
 
     <div class="set-list">${rows || '<div class="mem-empty">还没有规则（所有文件操作都会被拒绝）。</div>'}</div>
+
+    ${foreverBlock}
 
     <div class="mem-head">➕ 添加规则</div>
     <div class="set-form">
@@ -7555,6 +7598,21 @@ function bindPermView(root: HTMLElement): void {
       renderBody();
     }),
   );
+
+  // ---- 永久文件授权撤销（「永远允许这个路径」那批）----
+  root.querySelectorAll<HTMLButtonElement>(".file-grant-revoke").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const prefix = btn.dataset.prefix ?? "";
+      if (!prefix) return;
+      try {
+        const n = await data.permissions.fileGrantsRevoke( { prefix });
+        showToast(n > 0 ? "已撤销这条永远允许" : "这条授权已经不存在了", "ok");
+        renderBody();
+      } catch (e) {
+        showToast(`撤销失败：${e}`, "error");
+      }
+    });
+  });
 
   // 「安全闸门」是两个页面合并后的入口：文件权限页顶部要能跳到命令策略，
   // 否则设置入口页只留一行之后，命令策略就没有可达路径了。

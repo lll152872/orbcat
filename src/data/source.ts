@@ -36,6 +36,7 @@ import type {
   CmdVerdictView,
   ContextCapability,
   FgCtx,
+  FileGrant,
   LifeStatus,
   McpServerCfg,
   McpStatus,
@@ -327,6 +328,14 @@ export interface PermissionsApi {
   cmdTest(args: { command: string }): Promise<CmdVerdictView>;
   grantsList(): Promise<unknown[]>;
   grantRevoke(args: { prefix: string; tier?: string | null }): Promise<number>;
+  /**
+   * **永久文件授权**清单（「永远允许这个路径」那批）。
+   *
+   * 落 `agent-data/file_grants.json` —— 跨会话、跨重启都生效。
+   */
+  fileGrantsList(): Promise<FileGrant[]>;
+  /** 撤销一条永久文件授权（按路径前缀），返回撤销条数 */
+  fileGrantsRevoke(args: { prefix: string }): Promise<number>;
   revokeLabel(args: { label: string }): Promise<number>;
   setRules(args: { rules: PermRule[] }): Promise<void>;
   rulesPath(): Promise<string>;
