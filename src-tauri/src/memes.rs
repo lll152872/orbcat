@@ -78,6 +78,18 @@ struct Item {
     stem: String,
     /// 去重后的标签（保留首次出现的写法）
     tags: Vec<String>,
+    /// **给模型看的标签** —— 进系统提示、进 `send_meme` 的报错清单。
+    ///
+    /// 🔴 与 [`Item::tags`] 的差别就一条：**不含任何来自文件名的分词**。
+    /// 真机事故（2026-10-24）：散图形态下 `walk()` 把文件名主干当标签，
+    /// 于是提示词里出现了 `deyi` ⇒ 模型手上就有「目录层级 + 文件名」两样零件
+    /// ⇒ 能自己拼出一条「看起来几乎对」的路径 ⇒ 用户那边只看到破图。
+    ///
+    /// ⇒ **匹配**（`tags`）保留文件名分词：用户说「大笑」照样搜得到
+    /// `猫_大笑.png`（这是产品功能，删不得）。
+    /// ⇒ **展示**（本字段）不许带文件名 —— 模型一旦看见真名就会去猜、去改、
+    /// 去拼 ⇒ 破图。
+    display_tags: Vec<String>,
     /// 图库包给的**官方描述**（`index.db` 的 caption，如「得意闭眼拳头，好耶」）。
     /// 有它就用它当 markdown 的 `alt` —— 比文件名/标签可读得多。
     caption: Option<String>,
@@ -91,10 +103,15 @@ struct Item {
 ///
 /// 排序固定是为了让同一份磁盘内容产出同一个顺序 —— 这段清单会进系统提示，
 /// 顺序抖动会让 prompt 前缀不稳定（见 `agent.rs` 的缓存说明）。
+///
+/// 🔴 这里列的是**展示侧标签**（[`Item::display_tags`]）—— **不含文件名**。
+/// 这段清单有**两个出口**，都直接进模型的眼睛：
+/// ① [`prompt_section`] → 系统提示 ② [`pick`] 没命中时的报错 → 工具返回。
+/// ⇒ 里面出现一个真名，就等于给模型递上「拼路径」的零件。
 pub fn tag_index(data_dir: &Path) -> Vec<(String, usize)> {
     let mut m: BTreeMap<String, usize> = BTreeMap::new();
     for it in collect(data_dir) {
-        for t in it.tags {
+        for t in it.display_tags {
             *m.entry(t).or_insert(0) += 1;
         }
     }
@@ -395,6 +412,9 @@ fn collect_pack(pack_dir: &Path, out: &mut Vec<Item>) {
         out.push(Item {
             path: p,
             stem,
+            // 图库包的标签全来自 `index.db`（官方 tag + 关键词）⇒ 本来就是语义词，
+            // **不含文件名** ⇒ 展示侧与匹配侧一致。
+            display_tags: tags.clone(),
             tags,
             caption,
         });
@@ -454,20 +474,38 @@ fn make_item(p: &Path, groups: &[String], extra: &HashMap<String, Vec<String>>) 
     for g in groups {
         push_tag(&mut tags, g);
     }
-    for t in tokenize(&stem) {
-        push_tag(&mut tags, &t);
+    let stem_tags = tokenize(&stem);
+    for t in &stem_tags {
+        push_tag(&mut tags, t);
+    }
+    // 展示侧：目录名 + 别名（**不含文件名分词**）
+    let mut display_tags: Vec<String> = Vec::new();
+    for g in groups {
+        push_tag(&mut display_tags, g);
     }
     if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
         if let Some(list) = extra.get(name) {
             for t in list {
                 push_tag(&mut tags, t);
+                push_tag(&mut display_tags, t);
             }
+        }
+    }
+    // 🔴 唯一例外：**直接躺在库根下**的散图（一个目录级标签都没有）。
+    //    不给它任何展示标签 ⇒ 它从提示词里彻底消失 ⇒ 模型永远选不中 ⇒
+    //    「把图直接扔在 `memes/` 根下」这个用法等于没了。
+    //    而它**没有目录上下文** ⇒ 光有文件名也拼不出完整路径（库根不在提示词里）
+    //    ⇒ 风险有界 ⇒ 这条例外可以接受。
+    if groups.is_empty() {
+        for t in &stem_tags {
+            push_tag(&mut display_tags, t);
         }
     }
     Item {
         path: p.to_path_buf(),
         stem,
         tags,
+        display_tags,
         caption: None,
     }
 }
@@ -755,6 +793,93 @@ mod tests {
         assert!(
             p.contains("100% 是破图"),
             "必须说清自己写的路径必然破图: {p}"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 🔴 散图形态（没有 `index.db` 的自建分类库）下，**文件名不许进提示词**。
+    ///
+    /// 真机事故（2026-10-24）：`walk()` 把文件名主干当标签 ⇒ 提示词里出现
+    /// `deyi` ⇒ 模型手上就有「目录层级 + 文件名」两样零件 ⇒ 能自己拼出
+    /// `happy\deyi2.jpg` ⇒ 用户那边只看到破图。
+    ///
+    /// ⇒ **展示侧**不许含文件名（**哪怕不带扩展名** —— 扩展名模型自己会猜）；
+    /// ⇒ **匹配侧**照旧（用户说「大笑」仍要搜得到 `猫_大笑.png`，那是产品功能）。
+    #[test]
+    fn prompt_section_never_leaks_file_names_in_scatter_mode() {
+        let d = tmp("scatter_leak");
+        let dir = memes_dir(&d).join("开心");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("猫_大笑.png"), b"x").unwrap();
+
+        let p = prompt_section(&d);
+        assert!(!p.is_empty(), "库非空 ⇒ 摘要应有内容: {p}");
+        // 🔴 文件名分词一个都不许出现（不带扩展名也不行）
+        assert!(
+            !p.contains("大笑") && !p.contains("猫"),
+            "文件名分词不许进提示词（那是模型拼路径的零件）: {p}"
+        );
+        // 反向：目录级语义标签必须还在（撤原料 ≠ 撤信息）
+        assert!(
+            p.contains("开心（1）"),
+            "目录级语义标签必须保留（那才是模型该用的东西）: {p}"
+        );
+        // 匹配侧不受影响：文件名分词仍然能命中
+        let hit = pick(&d, Some("大笑")).expect("文件名分词仍要能匹配");
+        assert!(
+            hit.path.ends_with("猫_大笑.png"),
+            "匹配侧不该被改坏: {hit:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 直接躺在库根下的散图（一个目录级标签都没有）**例外**：仍以文件名分词
+    /// 作展示标签。
+    ///
+    /// 不给它标签 ⇒ 它从提示词里彻底消失 ⇒ 模型永远选不中 ⇒ 「把图直接扔在
+    /// `memes/` 根下」这个用法等于没了。
+    /// 风险有界：它**没有目录上下文** ⇒ 光有文件名拼不出完整路径。
+    ///
+    /// 这条例外是**故意**的 ⇒ 单独用一条测试锁住，免得以后有人「顺手统一」
+    /// 把它也砍了（那就等于砍功能）。
+    #[test]
+    fn root_level_loose_image_keeps_its_name_as_tag() {
+        let d = tmp("rootloose");
+        let root = memes_dir(&d);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("摸鱼躺平.png"), b"x").unwrap();
+
+        let p = prompt_section(&d);
+        assert!(
+            p.contains("摸鱼躺平"),
+            "根目录散图不能从提示词里消失（否则这个用法等于没了）: {p}"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 🔴 第二个出口：`send_meme` **没命中**时返回的「可用标签」清单
+    /// （工具返回给模型的文本）—— 同样不许带文件名分词。
+    ///
+    /// 系统提示堵住了**还不够**：这条文本会**原样进模型的眼睛**，
+    /// 模型照样能拿它当「拼路径的零件」⇒ 两个出口都得堵。
+    #[test]
+    fn pick_error_list_never_leaks_file_names() {
+        let d = tmp("pickleak");
+        let dir = memes_dir(&d).join("开心");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("绝密暗号.png"), b"x").unwrap();
+
+        let e = pick(&d, Some("查无此标签")).expect_err("没命中就该报错");
+        assert!(
+            !e.contains("绝密暗号"),
+            "报错里的可用标签清单不许带文件名主干（那是给模型递拼路径的零件）: {e}"
+        );
+        assert!(
+            e.contains("开心"),
+            "目录级标签必须还在（那才是模型该换的标签）: {e}"
         );
 
         let _ = std::fs::remove_dir_all(&d);
