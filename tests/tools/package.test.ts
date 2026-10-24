@@ -134,6 +134,42 @@ describe("stageWindowsRelease", () => {
     verifyReleaseLayout(out, { exeName: "orbcat.exe" });
   });
 
+  // ★ 初始化指引必须在**包根**（与 agent-data/ 同级），不是 agent-data/ 下面。
+  //
+  // 为什么：prompt 的原话是「读**项目根**的 `初始化.md`（和 `agent-data/` 同级）」，
+  // 启动器 `tools/orbcat-launch.ps1` 又用 `-WorkingDirectory <exe 目录>` 起进程
+  // ⇒ 运行时 cwd = 包根 ⇒ 放在 agent-data/ 里 agent **找不到** ⇒ 初始化链路断链。
+  it("初始化指引落在产物根（与 agent-data 同级），不是 agent-data 里", () => {
+    const initDoc = path.join(tmp, "初始化.md");
+    writeFileSync(initDoc, "# 初始化.md\n");
+    const out = path.join(tmp, "out");
+
+    stageWindowsRelease({
+      exePath: makeExe(),
+      distDir: makeDist(),
+      outDir: out,
+      initDoc,
+    });
+
+    expect(existsSync(path.join(out, "初始化.md"))).toBe(true);
+    expect(
+      existsSync(path.join(out, "agent-data", "初始化.md")),
+      "初始化指引不能放进 agent-data/（那里不是运行时 cwd）"
+    ).toBe(false);
+  });
+
+  it("初始化指引不存在时**当场拒绝**，不产出半成品目录", () => {
+    const out = path.join(tmp, "out");
+    expect(() =>
+      stageWindowsRelease({
+        exePath: makeExe(),
+        distDir: makeDist(),
+        outDir: out,
+        initDoc: path.join(tmp, "没有这个文件.md"),
+      })
+    ).toThrow(/初始化指引不存在/);
+  });
+
   it("输入 dist 缺 index.html 时**当场拒绝**，不产出半成品目录", () => {
     const emptyDist = path.join(tmp, "empty-dist");
     mkdirSync(emptyDist, { recursive: true });

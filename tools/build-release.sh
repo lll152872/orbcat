@@ -245,21 +245,26 @@ if [ -d "$REL/runtime" ]; then
   done
 fi
 
-echo "==> 同步 agent-data（运行态的 init 指引，不覆盖已有内容）"
-# ⚠️ 只从**骨架目录**取，绝不从仓库根的 agent-data/ 取 ——
-#    后者是开发机上的真实用户数据（API key / 会话 / 记忆 / 截图）。
-#    CI 的 tools/check-no-user-data.mjs 会盯着这条命令，抓到真实数据就直接拒绝提交。
-# 只在运行态还没有 agent-data\ 时放一份 init 指引过去 —— 用户的数据**绝不能**被拷贝覆盖。
-if [ ! -d "$RUNTIME/agent-data" ]; then
-  mkdir -p "$RUNTIME/agent-data"
-  if [ -f src-tauri/skeleton/agent-data/初始化.md ]; then
-    cp -f src-tauri/skeleton/agent-data/初始化.md "$RUNTIME/agent-data/初始化.md"
-    echo "  已放入骨架的 init 指引"
-  else
-    echo "  ⚠ 骨架里没有 agent-data/初始化.md，跳过（首次运行会自行生成）"
-  fi
+echo "==> 部署初始化指引（包根，与 agent-data 同级）"
+# ⚠️ **位置必须是包根**，不是 agent-data/ 下面 ——
+#    prompt 的原话是「读**项目根**的 `初始化.md`（和 `agent-data/` 同级）」，
+#    启动器又用 `-WorkingDirectory <exe 目录>` 起进程
+#    （tools/orbcat-launch.ps1）⇒ 只有包根那份找得到。
+#
+# ⚠️ 旧实现找的是 `src-tauri/skeleton/agent-data/初始化.md` —— 那个路径
+#    **从来不存在** ⇒ 这段一直是死分支 ⇒ 部署态从来没有过初始化.md
+#    ⇒ 新用户点完「建出目录结构」，agent 被引导去读一个不存在的文件
+#    ⇒ 初始化链路断链。
+#
+# 源：仓库根的 `初始化.md`（入库文件，不是生成物）。
+# 它是**说明书**，不是用户数据 ⇒ 覆盖部署无风险。
+mkdir -p "$RUNTIME/agent-data"
+if [ -f "初始化.md" ]; then
+  cp -f "初始化.md" "$RUNTIME/初始化.md"
+  echo "  已部署 初始化.md（包根，与 agent-data 同级）"
 else
-  echo "  已存在，保持原样（绝不覆盖用户数据）"
+  echo "  ✗ 仓库根没有 初始化.md —— 新用户初始化链路会断链，拒绝部署"
+  exit 1
 fi
 
 echo "==> 检查桌面快捷方式"

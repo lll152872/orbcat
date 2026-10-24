@@ -274,9 +274,19 @@ bash tools/build-release.sh --fast   # 快速档，给人真机测试用
 │   ├── memory/MEMORY.md
 │   ├── skills/{dual-token-dashboard,self-rebuild,token-usage-report}/
 │   ├── pending/README.md
-│   └── projects/README.md
+│   ├── projects/README.md
+│   ├── RULES.md              ← 四个**0 字节占位**（内容由 agent 问过用户后写）
+│   ├── SOUL.md
+│   ├── IDENTITY.md
+│   └── USER.md
+├── 初始化.md                ← 初始化说明书（给 agent 读）·**包根**，与 agent-data/ 同级
 └── README.md
 ```
+
+> ⚠️ **那四个人格文件是 0 字节的**（用户拍板「有文件、不带内容」）：
+> 骨架里只放**占位**，不预置任何人格/红线内容 —— 那些必须**问过用户**才能写。
+> 「存在但空」在判定上**视同缺失**（`agent.rs` 的 `missing_persona`），
+> 所以初始化引导照常出现，agent 会主动问你要这几份内容。
 
 四个目录各有各的硬契约，少任何一个都会静默降级：
 
