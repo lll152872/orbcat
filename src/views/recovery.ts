@@ -115,8 +115,11 @@ export function renderRecoveryView(st: RecoveryState, headerHtml: string): strin
 
     <div class="mem-head">保留策略</div>
     <div class="set-hint">
-      清理**只在点按钮时执行**（不做后台自动删除 —— 后悔药不该被程序偷偷清掉）。
+      <strong>自动</strong>：每次新增备份后，同一个原路径只保留<strong>最新一份 + 最旧一份</strong>，
+      中间的版本自动清掉（设计稿 §7）。<br>
+      <strong>手动</strong>：下面这个按钮是<strong>按天数/条数批量腾空间</strong> ——
       两个条件<strong>同时满足</strong>才删：超过保留天数 <em>且</em> 超出条目上限。
+      它<strong>不是</strong>清空备份区：每一份备份都能单独「删除」，也能一键还原。
     </div>
     <div class="rec-prune">
       <label>保留天数
@@ -126,7 +129,7 @@ export function renderRecoveryView(st: RecoveryState, headerHtml: string): strin
         <input id="rec-items" type="number" min="1" max="100000" value="${st.defaultKeepItems}" />
         条
       </label>
-      <button class="set-btn" id="rec-prune">立即清理</button>
+      <button class="set-btn" id="rec-prune">批量清理</button>
     </div>
     <div id="rec-msg" class="set-hint"></div>
 
