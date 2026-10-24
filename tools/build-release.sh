@@ -92,42 +92,30 @@ if [ "$MODE" = "--fast" ]; then
   echo "==> Rust 构建（release-fast profile：无 LTO + cgu=256，快速模式）"
   ( cd src-tauri && cargo build --profile release-fast )
   SRC_EXE=src-tauri/target/release-fast/orbcat.exe
-  CLI_SRC=src-tauri/target/release-fast/orbcat-perm.exe
 else
   echo "==> Rust 构建（release + fat LTO，正式模式）"
   ( cd src-tauri && cargo build --release )
   SRC_EXE=src-tauri/target/release/orbcat.exe
-  CLI_SRC=src-tauri/target/release/orbcat-perm.exe
 fi
 
 # --fast 的产物在 target/release-fast/，要落到 release/ 供桌面快捷方式使用
 if [ "$SRC_EXE" != "$REL/orbcat.exe" ]; then
   cp -f "$SRC_EXE" "$REL/orbcat.exe"
-  # ⚠️ CLI 只在**构建目录**里留一份给测试/内部场景用 —— **不随包分发**
-  #    （用户 2026-10-24 拍板：只在测试中存在）。⇒ 没有就跳过，不失败。
-  if [ -f "$CLI_SRC" ]; then
-    cp -f "$CLI_SRC" "$REL/orbcat-perm.exe"
-    CLI_SRC="$REL/orbcat-perm.exe"
-  fi
 fi
 
-# ---- 外部代批 CLI（orbcat-perm）----
+# ---- 外部代批 CLI（orbcat-perm）：**本版不随包分发**（2026-10-24 用户拍板）----
 #
-# ⚠️ **文件名必须精确是 orbcat-perm.exe（带连字符）**：
-#    层 1 阻断按**文件名**匹配（`perm_cli::CLI_STEM = "orbcat-perm"`，
-#    忽略 .exe/.cmd/.bat/.ps1/.com 后缀）⇒ 名字对不上 = 阻断规则在真机上失效。
-#    （Cargo 自动发现会把它叫成 `orbcat_perm.exe` —— 所以 Cargo.toml 里是
-#      **显式** `[[bin]] name = "orbcat-perm"`。）
+# 用户原话：「外部代批 CLI 只在测试中存在、不随包分发」⇒
+#   · 发布包/运行态里**不许有** `bin/orbcat-perm.exe`；
+#   · 所以这里**不编译、不拷贝、不部署**它。
 #
-# ⚠️ 找不到 = **不再失败**（用户 2026-10-24 拍板：CLI 只在测试中存在、不随包分发）
-#    ⇒ 找不到就打印一行说明，继续往下走；发布包**不含** bin/orbcat-perm.exe。
-#    ⚠️ 层 1 阻断按**文件名**匹配（`perm_cli::CLI_STEM = "orbcat-perm"`）⇒
-#    这个名字**要留着**（构建目录里照旧产出，供测试/内部场景用）。
-if [ ! -f "$CLI_SRC" ]; then
-  echo "  外部代批 CLI：未构建（$CLI_SRC）—— 不随包分发（仅测试存在），继续"
-else
-  echo "  外部代批 CLI：$CLI_SRC（仅构建目录保留，**不随包分发**）"
-fi
+# ⚠️ 但**运行态的残留要清**：旧版本部署过 ⇒ `<运行态>\bin\orbcat-perm.exe`
+#    还在 ⇒ 宿主检测到它就会**起端点** ⇒ 等于把「外部代批」这个能力
+#    悄悄留给了用户（用户根本没装它）。
+#    ⇒ 部署阶段必须主动删掉（见下面「清理运行态残留」）。
+#
+# 开发者本地想用 ⇒ 自己 cargo build --release --bin orbcat-perm，
+#   再把 `orbcat-perm.exe` 放进 `<包根>\bin\`（宿主检测到就起端点，删掉即停用）。
 
 # ---- 内置运行时（node / pi 内核）----
 #
@@ -251,14 +239,23 @@ rm -rf "$RUNTIME/dist/assets" 2>/dev/null || true
 mkdir -p "$RUNTIME/dist"
 cp -rf "$REL/dist/." "$RUNTIME/dist/"
 
-# ---- 外部代批 CLI 部署到运行态（**包根的 bin/**，与 dist/、runtime/ 同级）----
+# ---- 清理运行态残留：外部代批 CLI（**本版不随包分发**）----
 #
-# ⚠️ 位置契约：层 1 的 `is_under_bin_dir()` 认的正是 `<包根>/bin/`。
-# ⚠️ **不进 runtime/** —— runtime/ 是 node + pi 的**白名单分发目录**，
-#    塞个权限 CLI 进去会污染那个契约（pi::runtime_dir 只认 node/pi）。
-# ⚠️ 用户 2026-10-24 拍板：**外部代批 CLI 不随包分发**（只在测试中存在）
-#    ⇒ 这里**不再部署**到运行态 ⇒ 运行态 $RUNTIME/bin/orbcat-perm.exe 由 Chief 手动移走。
-echo "==> 外部代批 CLI：不随包分发（仅测试存在）—— 跳过部署"
+# ⚠️ 为什么必须**主动删**：宿主是「CLI 文件在 ⇒ 就起端点」（`perm_cli::serve`）。
+#    旧版本部署过 ⇒ 运行态 `<包根>\bin\orbcat-perm.exe` 还在
+#    ⇒ 宿主检测到就会**起端点 + 签 token** ⇒ 等于把「外部代批」这个
+#    用户根本没要的能力悄悄打开了（用户口径：本版不随包分发）。
+#
+# ⇒ 出包时把残留清掉，运行态就回到「能力关闭」的状态。
+echo "==> 清理运行态残留（外部代批 CLI：本版不随包分发）"
+if [ -f "$RUNTIME/bin/orbcat-perm.exe" ]; then
+  rm -f "$RUNTIME/bin/orbcat-perm.exe"
+  echo "  已删除 $RUNTIME/bin/orbcat-perm.exe（旧版本残留）"
+else
+  echo "  无残留（$RUNTIME/bin/orbcat-perm.exe 不存在）"
+fi
+# bin/ 目录本身空了就一并清掉（不留空壳目录）
+rmdir "$RUNTIME/bin" 2>/dev/null || true
 
 # 内置运行时同样部署到运行态 —— 位置契约同上（<exe 同目录>/runtime/）
 #

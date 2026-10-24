@@ -79,11 +79,33 @@
 //!    给前端，approve 与 deny **都发**。
 //! ⑤ **状态查询** —— [`status_at`] / [`status_current`]：CLI 文件在不在、通道起没起。
 //!
+//! ## ✅ 真开关：**删掉 CLI 即停用外部代批**（2026-10-24 Chief 拍板）
+//!
+//! 端点**随 CLI 一起消失** —— 不是「token 等 TTL 过期」那种软办法：
+//!
+//! | 时机 | 触发 | 后果 |
+//! |---|---|---|
+//! | **启动时** | [`cli_install_path`] 指向的文件不存在 | **不起端点**（不绑端口）+ **不签发 token** + **擦掉**上一轮遗留的 token / 端口文件 ⇒ [`serve`] 返回 `Ok(None)` |
+//! | **运行中被删** | 续期线程每 200 ms 查一次；accept 循环每次 accept 前也查 | **拒掉这一条** + **停掉监听**（端口关闭）+ **擦掉 token / 端口文件** + 从登记表注销 ⇒ 之后的请求连不上 |
+//!
+//! ⇒ 删掉 `bin\orbcat-perm.exe` ⇒ 外部 AI 那条路**彻底消失**
+//!    （内部 AI 即便读到过 token 也没地方用 —— 没有监听端口）。
+//!
+//! ⚠️ **状态查询必须自洽**：CLI 不在 ⇒ `cliPresent=false`、`channelUp=false`、
+//!    `available=false`、`port=null`（见 [`status_at`]）。
+//!
 //! ## ⚠️ 残余风险（**交付说明必须照实写**）
 //!
 //! 内部 AI 与外部 AI **同用户、同完整性级别 ⇒ 共享同一安全主体** ⇒ 内部 AI
 //! **理论上**也能读到 token 文件并自己直调端点（层 1 只挡「直接调用 CLI」）。
 //! ⇒ 本版按用户拍板**不做内核级隔离**，用「**每次代批都有界面提醒 + CLI 可随时删除**」兜底。
+//!
+//! ⚠️ 但「CLI 可随时删除」这一条**本版已经做实**（不是口号）：删掉 `bin\orbcat-perm.exe`
+//!    ⇒ 端点**跟着消失**（停监听 + 擦 token + 能力标记不可用）⇒ 风险**一键可撤**。
+//! ⚠️ 另有一条**独立于本通道**的残余风险（PTC 那条绕路）—— **不在本模块范围内**：
+//!    PTC 能绕开宿主文件网关/起进程/读环境变量 ⇒「界面提醒」对它不成立
+//!    （直调端点 ⇒ 不经宿主 ⇒ 不发事件），「删 CLI」也不是可靠边界
+//!    （判据只是「文件在不在」）。⇒ **用户 2026-10-24 决定不修**。
 
 // ⚠️ 曾经这里有 `#![allow(dead_code)]`（层 2 还没接线时加的）——
 //    现在通道**已接上**（宿主 setup 调 serve）⇒ 那行整体放行已收窄为
@@ -505,8 +527,10 @@ pub struct PermCliDecision {
 pub struct PermCliStatus {
     /// CLI 文件在不在（`<包根>/bin/orbcat-perm.exe`）
     pub cli_present: bool,
-    /// 通道起没起（**以内存里的端口为准**，不看端口文件 ——
-    /// 端口文件可能是上一轮进程留下的 ⇒ 文件在 ≠ 通道在）
+    /// 通道起没起（**以内存里的登记表为准**，不看端口文件 ——
+    /// 端口文件可能是上一轮进程留下的 ⇒ 文件在 ≠ 通道在）。
+    ///
+    /// ⚠️ **CLI 不在 ⇒ 必为 false**（端点随 CLI 一起消失，这是硬不变式）。
     pub channel_up: bool,
     /// 两者都满足才可用
     pub available: bool,
@@ -516,7 +540,11 @@ pub struct PermCliStatus {
     pub state_dir: String,
     /// 当前通道端口
     pub port: Option<u16>,
-    /// token 是否还在有效期内
+    /// token 是否**当前可用**。
+    ///
+    /// ⚠️ = 「CLI 在」**且**「token 文件在有效期内」——
+    ///    CLI 没了 ⇒ 一律 false（哪怕文件还没被擦干净的那 200 ms 窗口，
+    ///    端点也已经关了 ⇒ 这枚凭证**用不了**）。
     pub token_valid: bool,
     /// token 的过期时间戳
     pub token_expires_at: Option<u64>,
@@ -527,31 +555,50 @@ pub fn cli_install_path(app_root: &Path) -> PathBuf {
     app_root.join(CLI_SUBDIR).join(format!("{CLI_STEM}.exe"))
 }
 
+/// **包根** = exe 同目录（`bin\orbcat-perm.exe` 就装在它下面）。
+///
+/// ⚠️ 部署形态 = `<包根>\orbcat.exe` + `<包根>\bin\orbcat-perm.exe`
+///    ⇒ exe 同级就是包根（见 `tools/package.mjs` 的装配逻辑）。
+pub fn app_root() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// CLI 文件此刻**在不在**（**真开关的判据**）。
+///
+/// ⚠️ 这是「删掉 CLI 即停用外部代批」的唯一判据 —— 启动时、运行中、
+///    状态查询**三处用的是同一个函数**，不许各写各的。
+pub fn cli_present(app_root: &Path) -> bool {
+    cli_install_path(app_root).is_file()
+}
+
 /// 查状态（路径显式传 ⇒ **可测**）。
+///
+/// ⚠️ **三字段必须自洽**：CLI 不在 ⇒ 端点不可能在
+///    （启动时就不起、运行中被删就停）⇒ `channel_up=false`、`port=null`、
+///    `available=false` —— 不许出现「文件没了但状态说还能用」。
 pub fn status_at(app_root: &Path, state_dir: &Path) -> PermCliStatus {
     let cli_path = cli_install_path(app_root);
-    let cli_present = cli_path.is_file();
-    let port = channel_port();
-    let channel_up = channel_up();
+    let present = cli_present(app_root);
+    let raw_port = channels_port(state_dir);
+    let channel_up = present && raw_port.is_some();
     PermCliStatus {
-        cli_present,
+        cli_present: present,
         channel_up,
-        available: cli_present && channel_up,
+        available: present && channel_up,
         cli_path: cli_path.to_string_lossy().to_string(),
         state_dir: state_dir.to_string_lossy().to_string(),
-        port,
-        token_valid: token_is_valid(state_dir, crate::permission::now_ms()),
+        port: if channel_up { raw_port } else { None },
+        token_valid: present && token_is_valid(state_dir, crate::permission::now_ms()),
         token_expires_at: token_expiry(state_dir),
     }
 }
 
 /// 查状态（用**运行时的** exe 目录 + 默认状态目录）—— 给 Tauri 命令用。
 pub fn status_current() -> PermCliStatus {
-    let app_root = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    status_at(&app_root, &cli_state_dir())
+    status_at(&app_root(), &cli_state_dir())
 }
 
 /// 处理一次外部通道请求。
@@ -794,11 +841,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
 /// 运行时目录：**cwd**（相对路径的基准）与**包根**（exe 同目录）。
 fn runtime_dirs() -> (PathBuf, PathBuf) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let app_root = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| cwd.clone());
-    (cwd, app_root)
+    (cwd, app_root())
 }
 
 /// 工具网关入口的阻断：**工具名 + 全部参数**里出现 CLI ⇒ 拒。
@@ -859,16 +902,38 @@ fn block_message(tool: &str, hit: &CliHit) -> String {
 /// - 启动时**自动签发**一个 token（用户不用手动开）；
 /// - 后台线程每 `TTL/2` **重新签发** ⇒ 文件里的 token 不会过期
 ///   ⇒ 外部 AI 隔很久再来也能用（否则 5 分钟后链就断了）。
+///
+/// ## ★ 真开关：**CLI 不在 ⇒ 端点压根不起**
+///
+/// `app_root` 下的 `bin\orbcat-perm.exe` 不存在 ⇒
+/// **不起端点**（不绑端口）+ **不签 token** + **擦掉**上一轮遗留的凭证
+/// ⇒ 返回 `Ok(None)`（**不是错误** —— 「用户没装 CLI」是正常状态）。
 pub fn serve(
     state_dir: &Path,
     data_dir: &Path,
+    app_root: &Path,
     perm: std::sync::Arc<crate::perm_request::PermHub>,
-) -> Result<u16, String> {
-    use std::io::{BufRead, BufReader, Write};
-
+) -> Result<Option<u16>, String> {
     // ⚠️ 必须转成 owned 再进线程（`&Path` 逃不出函数）
     let state_dir = state_dir.to_path_buf();
     let data_dir = data_dir.to_path_buf();
+    let app_root = app_root.to_path_buf();
+
+    // ── ★ 真开关 · 启动时：CLI 不在 ⇒ 端点不起、token 不签、旧凭证擦掉 ──
+    //
+    // ⚠️ 这就是「删掉 bin\orbcat-perm.exe 即停用外部代批」的**启动侧**落点。
+    //    端点（外部 AI 能直调的那条路）随 CLI 一起消失 ⇒
+    //    内部 AI 即便读到 token 也没地方用（**没有监听端口**）。
+    let cli_path = cli_install_path(&app_root);
+    if !cli_present(&app_root) {
+        // 擦掉**上一轮**留下的 token / 端口文件（否则状态查询会说「有凭证」）
+        erase_credentials(&state_dir);
+        eprintln!(
+            "[orbcat] 外部代批通道未启动：CLI 不存在（{}）—— 删掉该文件即停用外部代批",
+            cli_path.display()
+        );
+        return Ok(None);
+    }
 
     // ① 启动即自动签发 token（不签发 ⇒ 外部 AI 一上来就全拒）
     match issue_token(&state_dir, crate::permission::now_ms()) {
@@ -886,19 +951,42 @@ pub fn serve(
         .map_err(|e| format!("取端口失败: {e}"))?
         .port();
     write_port(&state_dir, port)?;
-    CHANNEL_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+    // 非阻塞 accept —— 这样「停监听」不必等下一个连接来唤醒它
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("设非阻塞失败: {e}"))?;
+
+    // 停止标志：通道整体停（accept 循环 + 续期线程都看它）
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // 只给续期线程看的闸门（生产恒为 false；测试用它单独停续期线程）
+    let stop_renew = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    channels_register(&state_dir, port, stop.clone(), stop_renew.clone());
 
     // ② 续期线程：每 TTL/2 重新签发 ⇒ 文件里的 token 不会过期
+    //    ⚠️ **每 tick（200 ms）都查 CLI 在不在** —— 运行中被删时
+    //       **立刻停**（⛔ 不等 TTL）⇒ 否则会重新签出一个「看着能用」的凭证。
     {
         let sd = state_dir.clone();
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        register_serve(&state_dir, stop.clone());
+        let cli = cli_path.clone();
+        let stop = stop.clone();
+        let stop_renew = stop_renew.clone();
         std::thread::spawn(move || {
             let step = 200u64;
             let mut waited = 0u64;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed)
+                && !stop_renew.load(std::sync::atomic::Ordering::Relaxed)
+            {
                 std::thread::sleep(std::time::Duration::from_millis(step));
                 waited += step;
+                // ★ 真开关 · 运行期：CLI 没了 ⇒ 停监听 + 擦 token/端口文件
+                if !cli.is_file() {
+                    eprintln!(
+                        "[orbcat] 外部代批通道：CLI 已被删除 ⇒ 停用外部代批（停监听 + 擦除 token）"
+                    );
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    shutdown_channel(&sd);
+                    return;
+                }
                 if waited >= TOKEN_TTL_MS / 2 {
                     waited = 0;
                     if let Err(e) = issue_token(&sd, crate::permission::now_ms()) {
@@ -909,84 +997,225 @@ pub fn serve(
         });
     }
 
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let state_dir = state_dir.to_path_buf();
-            let data_dir = data_dir.to_path_buf();
-            let perm = perm.clone();
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(match stream.try_clone() {
-                    Ok(s) => s,
-                    Err(_) => return,
-                });
-                let mut line = String::new();
-                if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
-                    return;
-                }
-                let resp = match serde_json::from_str::<serde_json::Value>(line.trim()) {
-                    Ok(v) => {
-                        let token = v.get("token").and_then(|x| x.as_str()).unwrap_or("");
-                        let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("");
-                        let arg = v.get("arg").and_then(|x| x.as_str()).unwrap_or("");
-                        // CLI 实例标识（**仅展示**，客户端可自称 ⇒ 不是安全边界）
-                        let client = v.get("client").and_then(|x| x.as_str()).unwrap_or("unknown");
-                        match handle_op(&state_dir, &data_dir, &perm, token, op, arg, client) {
-                            Ok(s) => s,
-                            Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
-                        }
-                    }
-                    Err(e) => serde_json::json!({ "ok": false, "error": format!("请求格式错: {e}") })
-                        .to_string(),
-                };
-                let _ = writeln!(stream, "{resp}");
-                let _ = stream.flush();
-            });
+    // ③ accept 循环（**每次 accept 前都查 CLI 在不在**）
+    {
+        let sd = state_dir.clone();
+        let dd = data_dir.clone();
+        let cli = cli_path.clone();
+        let stop2 = stop.clone();
+        let perm2 = perm.clone();
+        std::thread::spawn(move || accept_loop(listener, sd, dd, cli, perm2, stop2));
+    }
+
+    Ok(Some(port))
+}
+
+/// accept 循环（**每次 accept 前都查 CLI 在不在** ⇒ 不在就**拒掉这一条 + 停监听**）。
+fn accept_loop(
+    listener: std::net::TcpListener,
+    state_dir: PathBuf,
+    data_dir: PathBuf,
+    cli_path: PathBuf,
+    perm: Arc<crate::perm_request::PermHub>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
+    loop {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
         }
-    });
-
-    Ok(port)
-}
-
-/// 当前运行中的通道端口（0 = 没起）。
-static CHANNEL_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-
-/// 通道起没起（**以内存里的端口为准**，不看端口文件 ——
-/// 端口文件可能是上一轮进程留下的 ⇒ 文件在 ≠ 通道在）。
-pub fn channel_up() -> bool {
-    channel_port().is_some()
-}
-
-/// 当前通道端口（没起 ⇒ `None`）。
-pub fn channel_port() -> Option<u16> {
-    match CHANNEL_PORT.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => None,
-        p => Some(p),
+        match listener.accept() {
+            Ok((mut stream, _addr)) => {
+                // ★ 真开关 · 运行期：CLI 没了 ⇒ 拒掉这一条 + 停监听 + 擦 token
+                if !cli_path.is_file() {
+                    refuse_and_shutdown(&mut stream, &data_dir, &state_dir, &stop);
+                    // 退出循环 ⇒ `listener` drop ⇒ **端口立刻关闭**（之后连不上）
+                    break;
+                }
+                let sd = state_dir.clone();
+                let dd = data_dir.clone();
+                let cli = cli_path.clone();
+                let p = perm.clone();
+                let st = stop.clone();
+                std::thread::spawn(move || {
+                    // 再查一次（accept 与处理之间的窗口）—— 双保险
+                    if !cli.is_file() {
+                        let mut s = stream;
+                        refuse_and_shutdown(&mut s, &dd, &sd, &st);
+                        return;
+                    }
+                    handle_conn(stream, sd, dd, p);
+                });
+            }
+            // 非阻塞模式下「暂时没人连」是常态 ⇒ 睡一下再看
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
     }
 }
 
-/// 已启动的通道（按状态目录索引）—— 用来停掉续期线程。
-static SERVES: std::sync::OnceLock<
-    std::sync::Mutex<Vec<(PathBuf, Arc<std::sync::atomic::AtomicBool>)>>,
-> = std::sync::OnceLock::new();
+/// 处理一条连接（读一行 JSON ⇒ 回一行 JSON）。
+fn handle_conn(
+    mut stream: std::net::TcpStream,
+    state_dir: PathBuf,
+    data_dir: PathBuf,
+    perm: Arc<crate::perm_request::PermHub>,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    let mut reader = BufReader::new(match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    });
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+        return;
+    }
+    let resp = match serde_json::from_str::<serde_json::Value>(line.trim()) {
+        Ok(v) => {
+            let token = v.get("token").and_then(|x| x.as_str()).unwrap_or("");
+            let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("");
+            let arg = v.get("arg").and_then(|x| x.as_str()).unwrap_or("");
+            // CLI 实例标识（**仅展示**，客户端可自称 ⇒ 不是安全边界）
+            let client = v.get("client").and_then(|x| x.as_str()).unwrap_or("unknown");
+            match handle_op(&state_dir, &data_dir, &perm, token, op, arg, client) {
+                Ok(s) => s,
+                Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+            }
+        }
+        Err(e) => serde_json::json!({ "ok": false, "error": format!("请求格式错: {e}") }).to_string(),
+    };
+    let _ = writeln!(stream, "{resp}");
+    let _ = stream.flush();
+}
 
-fn register_serve(state_dir: &Path, stop: Arc<std::sync::atomic::AtomicBool>) {
-    let v = SERVES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
-    if let Ok(mut g) = v.lock() {
-        g.push((state_dir.to_path_buf(), stop));
+/// CLI 已被删除时的**统一处置**：关门（擦凭证 + 注销 + 置停止标志）⇒ 再回一句明确错误。
+fn refuse_and_shutdown(
+    stream: &mut std::net::TcpStream,
+    data_dir: &Path,
+    state_dir: &Path,
+    stop: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::io::Write;
+    const MSG: &str =
+        "外部代批 CLI 已被删除 ⇒ 通道已停用（删掉 bin\\orbcat-perm.exe 即停用外部代批）";
+    // ① 先关门（顺序重要：客户端拿到响应时凭证**已经**没了）
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    shutdown_channel(state_dir);
+    // ② 再回话（明确错误，不是静默）
+    let resp = serde_json::json!({ "ok": false, "error": MSG }).to_string();
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.write_all(b"\n");
+    let _ = stream.flush();
+    audit_cli(data_dir, "denied", "channel", "", MSG);
+}
+
+/// 擦掉凭证文件（token + 端口）。
+///
+/// ⚠️ **幂等** —— 启动时（CLI 缺失）、运行中被删、正常停机，三条路都会调它。
+fn erase_credentials(state_dir: &Path) {
+    let _ = std::fs::remove_file(token_path(state_dir));
+    let _ = std::fs::remove_file(port_path(state_dir));
+}
+
+/// **停掉通道并擦掉凭证**（幂等）。
+///
+/// - 擦 token 文件 + 端口文件；
+/// - 从登记表注销 ⇒ 状态查询立刻报「通道没起」。
+fn shutdown_channel(state_dir: &Path) {
+    erase_credentials(state_dir);
+    channels_unregister(state_dir);
+}
+
+/// 运行中的通道登记（状态目录 → 端口 + 停止标志）。
+///
+/// ⚠️ **为什么按状态目录索引**（而不是一个全局端口）：
+///    生产上宿主只起一个通道；测试里多个用例各起各的 ⇒ 全局单值会互相覆盖
+///    （A 用例的端口被 B 用例冲掉 ⇒ 状态查询报错端口）。
+struct ChannelEntry {
+    state_dir: PathBuf,
+    port: u16,
+    /// **通道整体停**（accept 循环 + 续期线程都看它）。
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    /// **只停续期线程**（测试闸门用：让「accept 循环拒连接」这条路径能被确定性验证）。
+    ///
+    /// ⚠️ 非测试构建里**没人读它**（只有测试闸门 `stop_renewal` 读）⇒ 显式放行。
+    #[allow(dead_code)]
+    stop_renew: Arc<std::sync::atomic::AtomicBool>,
+}
+
+static CHANNELS: std::sync::OnceLock<std::sync::Mutex<Vec<ChannelEntry>>> = std::sync::OnceLock::new();
+
+fn channels_lock() -> &'static std::sync::Mutex<Vec<ChannelEntry>> {
+    CHANNELS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// 登记一个通道（端点起好之后调）。
+fn channels_register(
+    state_dir: &Path,
+    port: u16,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    stop_renew: Arc<std::sync::atomic::AtomicBool>,
+) {
+    if let Ok(mut g) = channels_lock().lock() {
+        g.retain(|e| e.state_dir != state_dir);
+        g.push(ChannelEntry {
+            state_dir: state_dir.to_path_buf(),
+            port,
+            stop,
+            stop_renew,
+        });
+    }
+}
+
+/// 注销一个通道（端点停了之后调）⇒ 状态查询立刻报「没起」。
+fn channels_unregister(state_dir: &Path) {
+    if let Ok(mut g) = channels_lock().lock() {
+        g.retain(|e| e.state_dir != state_dir);
+    }
+}
+
+/// 某个状态目录上的通道端口（没起 ⇒ `None`）。
+///
+/// ⚠️ **以登记表为准**，不看端口文件 —— 端口文件可能是上一轮进程留下的。
+/// ⚠️ 停止标志已置 ⇒ 通道正在/已经关掉 ⇒ 也不再报「在」。
+pub fn channels_port(state_dir: &Path) -> Option<u16> {
+    let g = channels_lock().lock().ok()?;
+    let e = g.iter().find(|e| e.state_dir == state_dir)?;
+    if e.stop.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    Some(e.port)
+}
+#[cfg(test)]
+
+/// 停掉某个状态目录上的**通道**（续期线程 + accept 循环一起停）。
+///
+/// 主要是给测试用：测试结束不收线程 ⇒ 它会一直往已删的临时目录里写 token。
+pub fn stop_serve(state_dir: &Path) {
+    if let Ok(g) = channels_lock().lock() {
+        for e in g.iter() {
+            if e.state_dir == state_dir {
+                e.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                e.stop_renew.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 }
 #[cfg(test)]
 
-/// 停掉某个状态目录上的**续期线程**（主要是给测试用：
-/// 测试结束不收线程 ⇒ 它会一直往已删的临时目录里写 token）。
-pub fn stop_serve(state_dir: &Path) {
-    if let Some(v) = SERVES.get() {
-        if let Ok(g) = v.lock() {
-            for (d, stop) in g.iter() {
-                if d == state_dir {
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+/// **只**停掉续期线程（accept 循环继续跑）。
+///
+/// ⚠️ 这是一个**测试闸门**：让「CLI 被删 ⇒ accept 循环拒连接」这条路径
+///    能被**确定性**验证（否则续期线程可能先一步发现删除 ⇒ 连不上、拿不到错误文案）。
+///    生产路径**不走**这里。
+pub fn stop_renewal(state_dir: &Path) {
+    if let Ok(g) = channels_lock().lock() {
+        for e in g.iter() {
+            if e.state_dir == state_dir {
+                e.stop_renew.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -1292,8 +1521,12 @@ mod tests {
     fn 外部代批通道在宿主起来后端点可连() {
         use std::io::{BufRead, BufReader, Write};
         let dir = tmp_dir("serve");
+        let data = tmp_dir("serve-data");
+        let (root, _bin) = app_with_cli("serve");
         let hub = std::sync::Arc::new(crate::perm_request::PermHub::new());
-        let port = serve(&dir, &dir, hub).expect("通道应当起得来");
+        let port = serve(&dir, &data, &root, hub)
+            .expect("通道应当起得来")
+            .expect("CLI 在 ⇒ 通道应当起来");
         assert!(port > 0, "端口得是真的");
 
         // 端口文件必须写出来（CLI 靠它找端点）
@@ -1506,5 +1739,188 @@ mod tests {
         for w in recs.windows(2) {
             assert_eq!(w[1].prev_hash, w[0].hash, "hash 链必须连上：{audit}");
         }
+    }
+
+    // -------------------------------------------------------------------
+    // 守卫用例 ⑮ ~ ⑱（2026-10-24：把「删掉 CLI」做成**真开关**）
+    //
+    // ⚠️ 这四条验的是**机制**（CLI 在 ⇒ 能力开；CLI 不在 ⇒ 能力关），
+    //    与「本版不随包分发 CLI」**不冲突** —— 用例里 CLI 文件是**伪造存在**的。
+    // -------------------------------------------------------------------
+
+    /// ⑮ 运行中删掉 CLI ⇒ 端点**立刻拒这一条** + **停掉监听**。
+    #[test]
+    #[allow(non_snake_case)]
+    fn 删掉CLI后端点立刻拒所有请求_并停掉监听() {
+        use std::io::{BufRead, BufReader, Write};
+        let state = tmp_dir("kill-state");
+        let data = tmp_dir("kill-data");
+        let (root, bin) = app_with_cli("kill");
+        let hub = std::sync::Arc::new(crate::perm_request::PermHub::new());
+
+        let port = serve(&state, &data, &root, hub)
+            .expect("通道应当起得来")
+            .expect("CLI 在 ⇒ 通道应当起来");
+
+        // 启动时 token 已签发
+        let raw = std::fs::read_to_string(token_path(&state)).expect("启动应当自动签发 token");
+        let token = raw.lines().next().unwrap().trim().to_string();
+
+        // ⚠️ **只**停续期线程（测试闸门）⇒ 让 accept 循环成为**唯一**发现者
+        //    ⇒ 「拒连接 + 停监听」这条路径能被**确定性**验证。
+        stop_renewal(&state);
+
+        // ★ 用户把 CLI 删了
+        std::fs::remove_file(bin.join("orbcat-perm.exe")).unwrap();
+
+        // 连一次 ⇒ 必须被**明确拒**（带错误文案，不是静默、不是成功）
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("此刻端口还开着");
+        let req = format!("{{\"token\":\"{token}\",\"op\":\"list\",\"arg\":\"\",\"client\":\"test\"}}\n");
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("响应不是 JSON：{line}（{e}）"));
+        assert_eq!(v["ok"], false, "CLI 删了之后必须拒：{line}");
+        let err = v["error"].as_str().unwrap_or("");
+        assert!(err.contains("CLI"), "错误要说清是 CLI 被删了：{line}");
+
+        // 监听必须停掉（端口关了 ⇒ 连不上）
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "监听必须停掉（端口应当连不上）"
+        );
+
+        // 凭证必须跟着擦掉
+        assert!(!token_path(&state).exists(), "token 文件必须被擦掉");
+        assert!(!port_path(&state).exists(), "端口文件必须被擦掉");
+
+        // 状态查询必须如实报不可用
+        let st = status_at(&root, &state);
+        assert!(!st.cli_present, "CLI 没了 ⇒ cli_present 必须为 false");
+        assert!(!st.channel_up, "CLI 没了 ⇒ 通道必须报没起");
+        assert!(!st.available, "CLI 没了 ⇒ 必须报不可用");
+        assert!(st.port.is_none(), "通道没起 ⇒ 端口必须报 None");
+        stop_serve(&state);
+    }
+
+    /// ⑯ 运行中删掉 CLI ⇒ **token 文件被擦掉**、读到的 token 是废的。
+    ///
+    /// ⚠️ 这条验的是**续期线程那条路**：即使**一个请求都不来**，
+    ///    续期线程也必须发现 CLI 没了 ⇒ 停 + 擦（⛔ 不等 TTL）。
+    #[test]
+    #[allow(non_snake_case)]
+    fn 删掉CLI后token文件被擦掉_读到的token是废的() {
+        let state = tmp_dir("erase-state");
+        let data = tmp_dir("erase-data");
+        let (root, bin) = app_with_cli("erase");
+        let hub = std::sync::Arc::new(crate::perm_request::PermHub::new());
+
+        serve(&state, &data, &root, hub)
+            .expect("通道应当起得来")
+            .expect("CLI 在 ⇒ 通道应当起来");
+
+        // 刚签发时 token 有效
+        let raw = std::fs::read_to_string(token_path(&state)).expect("应当签发了 token");
+        let token = raw.lines().next().unwrap().trim().to_string();
+        assert!(
+            verify_token(&state, &token, crate::permission::now_ms()),
+            "刚签发时 token 必须有效"
+        );
+
+        // ★ 用户把 CLI 删了（**不发任何请求** ⇒ 只有续期线程能发现）
+        std::fs::remove_file(bin.join("orbcat-perm.exe")).unwrap();
+
+        // 续期线程每 200 ms 查一次 ⇒ 最多等 3 s
+        let mut erased = false;
+        for _ in 0..150 {
+            if !token_path(&state).exists() {
+                erased = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(erased, "CLI 删掉后 token 文件必须被擦掉（续期线程要同步停）");
+
+        // 读到的 token 是废的
+        assert!(
+            !verify_token(&state, &token, crate::permission::now_ms()),
+            "擦掉后的 token 必须作废"
+        );
+        assert!(
+            !token_is_valid(&state, crate::permission::now_ms()),
+            "状态必须报 token 无效"
+        );
+        assert!(!port_path(&state).exists(), "端口文件必须一起擦掉");
+        stop_serve(&state);
+    }
+
+    /// ⑰ 启动时 CLI 缺失 ⇒ **不起端点** + **不签 token** + **清掉旧 token 文件**。
+    #[test]
+    #[allow(non_snake_case)]
+    fn CLI缺失时宿主启动不起端点_不签发token_并清掉旧token文件() {
+        let state = tmp_dir("nostart-state");
+        let data = tmp_dir("nostart-data");
+        let root = tmp_dir("nostart-root"); // **空的包根**（没有 bin\orbcat-perm.exe）
+        let hub = std::sync::Arc::new(crate::perm_request::PermHub::new());
+
+        // 先造一份**上一轮**遗留的旧凭证
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(token_path(&state), "old-token\n1").unwrap();
+        std::fs::write(port_path(&state), "12345").unwrap();
+
+        // ★ 启动 ⇒ 端点**不起**
+        let r = serve(&state, &data, &root, hub).expect("CLI 缺失不该是错误");
+        assert!(r.is_none(), "CLI 缺失 ⇒ 端点必须不起（返回 None）");
+
+        // 旧凭证必须被清掉
+        assert!(!token_path(&state).exists(), "旧 token 文件必须被清掉");
+        assert!(!port_path(&state).exists(), "旧端口文件必须被清掉");
+
+        // 状态必须自洽
+        let st = status_at(&root, &state);
+        assert!(!st.cli_present);
+        assert!(!st.channel_up);
+        assert!(!st.available);
+        assert!(st.port.is_none());
+        assert!(!st.token_valid);
+    }
+
+    /// ⑱ `perm_cli_status` 三字段**自洽**：CLI 不在 ⇒ 三字段全 false。
+    ///
+    /// ⚠️ 用例名里 Chief 写的 `cliPresent=channelUp=available=false`
+    ///    含有 `=` —— **不是合法 Rust 标识符** ⇒ 改成 `_` 连接（语义不变）。
+    #[test]
+    #[allow(non_snake_case)]
+    fn perm_cli_status三字段自洽_cliPresent与channelUp与available全为false() {
+        let state = tmp_dir("status-state");
+        let data = tmp_dir("status-data");
+        let (root, bin) = app_with_cli("status");
+        let hub = std::sync::Arc::new(crate::perm_request::PermHub::new());
+
+        // ① CLI 在 ⇒ 端点起来 ⇒ 三字段全 true
+        let port = serve(&state, &data, &root, hub)
+            .expect("通道应当起得来")
+            .expect("CLI 在 ⇒ 通道应当起来");
+        let st = status_at(&root, &state);
+        assert!(st.cli_present, "CLI 在 ⇒ cli_present 必须为 true");
+        assert!(st.channel_up, "端点起着 ⇒ channel_up 必须为 true");
+        assert!(st.available, "两者都满足 ⇒ available 必须为 true");
+        assert_eq!(st.port, Some(port), "通道起着 ⇒ 端口必须报出来");
+        assert_eq!(st.available, st.cli_present && st.channel_up, "不变式必须成立");
+
+        // ② ★ 删掉 CLI ⇒ 三字段**立刻**全 false（不必等续期线程发现）
+        std::fs::remove_file(bin.join("orbcat-perm.exe")).unwrap();
+        let st2 = status_at(&root, &state);
+        assert!(!st2.cli_present, "CLI 没了 ⇒ cli_present 必须为 false");
+        assert!(!st2.channel_up, "CLI 没了 ⇒ channel_up 必须为 false");
+        assert!(!st2.available, "CLI 没了 ⇒ available 必须为 false");
+        assert!(st2.port.is_none(), "通道没起 ⇒ 端口必须报 None");
+        assert_eq!(st2.available, st2.cli_present && st2.channel_up, "不变式必须成立");
+        assert!(!st2.token_valid, "CLI 没了 ⇒ 凭证不许还报有效");
+        stop_serve(&state);
     }
 }
