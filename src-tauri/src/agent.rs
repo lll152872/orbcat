@@ -2484,8 +2484,9 @@ fn image_replies_prompt(mode: &crate::modes::Mode) -> String {
     if mode.freestyle_images() {
         format!(
             "# 发图\n\n\
-             现在是**闲聊场景**，可以主动发图：情绪到了就发一张表情包 / 梗图，\
-             不用等用户开口要。一条回复最多一张，别刷屏 —— 发多了很吵。\n\n{how}"
+             现在是**闲聊场景**，正文里可以发图（表情包 / 梗图 / 截图 / 图表都行）。\n\
+             一条回复最多一张，别刷屏 —— 发多了很吵。\n\
+             表情包**要不要发、怎么发**，见后面「表情包」那一段。\n\n{how}"
         )
     } else {
         format!(
@@ -2495,6 +2496,50 @@ fn image_replies_prompt(mode: &crate::modes::Mode) -> String {
              ⚠️ 这个模式**没有 `send_meme`**（发表情包的工具不存在），\
              也**不要**发梗图、表情包之类与当前任务无关的图。\n\n{how}"
         )
+    }
+}
+
+/// 闲聊模式的「表情包」那一段 —— **必须排在场景上下文之后**。
+///
+/// ## 语义（用户 2026-10-24 真机反馈）
+///
+/// 「闲聊模式**默认要发**表情包，**除非没有能表达情感的**」。
+/// 注意是「**默认要发**」，不是「最好发」；但「没有能表达情感的」时
+/// **不许硬塞**一个不相干的 —— 那比不发更尴尬。
+///
+/// ## 为什么单独一段、且排在 `promptExtra` 之后
+///
+/// ① **这条是产品口径，不是用户可配文本**：`promptExtra` 在
+///    `agent-data/modes.json` 里，是**用户能改的静态文件**。旧版本落盘的用户
+///    那边可能写着旧口径（「情绪到了**可以**发一张表情包」）—— 「可以」与
+///    「默认要发」冲突。本段是**代码里的口径**，对所有用户生效。
+/// ② **模型对靠后的指令更敏感** ⇒ 放最后 ⇒ 它是关于表情包的**最终口径**，
+///    不会被前面任何一句（含用户自己写的场景文案）削弱。
+///
+/// ## 为什么「能不能表达情感」交给模型
+///
+/// 那是**语义判断**（当前情绪 ↔ 标签），代码做不了 —— 而且「没有合适的」
+/// 在工具层已有**硬保证**：`send_meme` 的 query 没命中就**报错并列出可用标签**，
+/// **不会**退回「随便发一张」（理由见 [`crate::memes::pick`] 的注释）。
+/// ⇒ 模型换不到标签就自然不发，不需要代码替它判断「有没有能表达情感的」。
+fn meme_policy_prompt(memes_available: bool) -> String {
+    if memes_available {
+        "# 表情包\n\n\
+         **默认要发表情包**：每条回复都要挑一张**能表达当前情感**的表情包 / 梗图，\
+         不用等用户开口要 —— 这是闲聊模式的要求，不是可选项。\n\
+         ⚠️ **唯一可以不发的情况**：库里没有能表达当前情感的 —— 那就不发，\
+         **别硬塞一个不相干的**（不相干的图比没有更尴尬）。\n\
+         怎么挑：用 `send_meme`，`query` 填一个能表达当前情感的标签\
+         （标签清单见上面「表情包库」那段）。标签对不上时 `send_meme` 会把可用标签列回来，\
+         照着换一个；确实没有合适的就别发。\n\
+         一条回复最多一张，别刷屏 —— 发多了很吵。"
+            .to_string()
+    } else {
+        "# 表情包\n\n\
+         ⚠️ **你的表情包库是空的** ⇒ 这一轮**不要发表情包**\
+         （调 `send_meme` 只会拿回一个「库是空的」报错）。\
+         等用户往表情包库里放了图之后，下一轮就能发了。"
+            .to_string()
     }
 }
 
@@ -2777,11 +2822,17 @@ fn build_prompt_segments(
     // 表情包库摘要 —— **只在能随便发图的模式下注入**。
     // 工作模式不注：那儿本来就不该发表情包，把库摆出来等于诱导。
     // 库为空时 `prompt_section` 返回空串，这里自然跳过，不会塞一段废话进 prompt。
-    if mode.freestyle_images() {
-        let memes = crate::memes::prompt_section(data_dir);
-        if !memes.is_empty() {
-            stable.push(memes);
-        }
+    //
+    // ⚠️ 「库有没有图」要**单独记一份**：后面「表情包」那段（默认要发 / 库是空的）
+    //    要按它分岔 —— 而 `memes` 会被 move 进 stable，所以先算好再推。
+    let memes_section = if mode.freestyle_images() {
+        crate::memes::prompt_section(data_dir)
+    } else {
+        String::new()
+    };
+    let memes_available = !memes_section.is_empty();
+    if memes_available {
+        stable.push(memes_section);
     }
 
     // 聊天式呈现：教模型**怎么分段**（前端按段落切成气泡，见 `bubble.ts`）。
@@ -2811,6 +2862,17 @@ fn build_prompt_segments(
             mode.name,
             mode.prompt_extra.trim()
         ));
+    }
+
+    // 表情包口径（闲聊模式：**默认要发**）—— **必须排在场景上下文之后**。
+    //
+    // ⚠️ 顺序不是随手排的：`promptExtra` 是**用户可配的静态文件**
+    //    （`agent-data/modes.json`），旧版本落盘的用户那边可能写着旧口径
+    //    「情绪到了**可以**发一张表情包」—— 「可以」与「默认要发」冲突。
+    //    放最后 ⇒ 它是关于表情包的**最终口径**，不会被前面削弱。
+    //    理由详见 [`meme_policy_prompt`] 的注释。
+    if mode.freestyle_images() {
+        stable.push(meme_policy_prompt(memes_available));
     }
 
     // ── 未初始化 / 人格缺失 ─────────────────────────────────────────────
@@ -4130,6 +4192,112 @@ mod tests {
             &a[..ia],
             &b[..ib],
             "稳定前缀必须逐字节一致（前缀缓存按字节比对）"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -----------------------------------------------------------------
+    // 闲聊模式的「表情包」口径（用户 2026-10-24 真机反馈）
+    //
+    // 用户原话：「闲聊模式默认要求 AI 发表情包，除非没有能表达情感的」
+    //
+    // 三条锁：
+    // 1. 库里有图 ⇒ prompt **要求**默认发表情包（不是「最好发」）；
+    // 2. 库里没图 ⇒ **不许**要求发表情包（否则模型只会拿到一个报错）；
+    // 3. 这条口径必须排在**场景上下文之后** —— `promptExtra` 是用户可配的
+    //    静态文件（旧用户那边写着「可以发」的旧口径），放前面会被削弱。
+    // -----------------------------------------------------------------
+
+    /// 测试用临时 agent-data 目录（名字带纳秒 ⇒ 并行跑不互删）。
+    fn meme_tmp(tag: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir().join(format!("orbcat_meme_{tag}_{stamp}"));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 在表情包库里放一张图（子目录名 = 标签）。
+    fn put_meme(data_dir: &Path, tag: &str, file: &str) {
+        let dir = data_dir.join("memes").join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file), b"\x89PNG\r\n\x1a\n").unwrap();
+    }
+
+    #[test]
+    fn chat_mode_requires_a_meme_by_default() {
+        let tmp = meme_tmp("require");
+        put_meme(&tmp, "开心", "deyi.png");
+
+        let sid = crate::sessions::new_session(&tmp, "chat").id;
+        let p = build_system_prompt_full(&tmp, "", None, Some(&sid));
+
+        assert!(
+            p.contains("默认要发表情包"),
+            "闲聊模式必须**要求**默认发表情包（用户 2026-10-24 原话）"
+        );
+        assert!(
+            p.contains("别硬塞"),
+            "必须说清「没有能表达情感的就不发」，不许硬塞不相干的"
+        );
+        assert!(p.contains("send_meme"), "必须点明用工具挑，不许手写路径");
+        assert!(
+            p.contains("表情包库"),
+            "库非空时应有标签清单那一段（模型要按标签挑）"
+        );
+
+        // ⚠️ 口径必须排在场景上下文**之后** —— promptExtra 是用户可配的静态文件
+        let i_policy = p.find("默认要发表情包").expect("口径段");
+        let i_scene = p.find("# 当前场景").expect("场景段");
+        assert!(
+            i_policy > i_scene,
+            "表情包口径必须排在场景上下文之后（否则会被用户旧文案削弱）：policy={i_policy} scene={i_scene}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn chat_mode_without_meme_library_does_not_ask_for_one() {
+        let tmp = meme_tmp("empty");
+
+        let sid = crate::sessions::new_session(&tmp, "chat").id;
+        let p = build_system_prompt_full(&tmp, "", None, Some(&sid));
+
+        assert!(
+            !p.contains("默认要发表情包"),
+            "库里没图时**不许**要求发表情包 —— 用户说的例外就是这一条"
+        );
+        assert!(
+            p.contains("表情包库是空的"),
+            "必须说清库是空的、这一轮别发"
+        );
+        assert!(
+            !p.contains("表情包库\n\n"),
+            "库为空时不该注入标签清单段（那是一段废话）"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn work_mode_never_asks_for_a_meme() {
+        let tmp = meme_tmp("work");
+        put_meme(&tmp, "开心", "deyi.png");
+
+        let sid = crate::sessions::new_session(&tmp, "standard").id;
+        let p = build_system_prompt_full(&tmp, "", None, Some(&sid));
+
+        assert!(
+            !p.contains("默认要发表情包"),
+            "工作模式不该要求发表情包"
+        );
+        assert!(
+            !p.contains("# 表情包\n"),
+            "工作模式不该注入「表情包」那一段（库摆出来等于诱导）"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
