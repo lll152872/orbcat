@@ -5509,15 +5509,20 @@ pub fn run() {
             //    （层 1 的路径阻断只挡「直接调用 CLI」）。
             //    ⇒ 按用户 2026-10-24 拍板，本版**不做内核级隔离**，
             //    用「① 每次代批都有界面提醒（perm-cli-decision 事件）
-            //      ② CLI 可随时删掉（删了状态查询就报不可用）」兜底。
+            //      ② **CLI 可随时删掉 ⇒ 端点跟着消失**」兜底。
             {
                 let perm_for_cli = perm.clone();
                 let dd_for_cli = data_dir.clone();
                 let state_dir = perm_cli::cli_state_dir();
-                match perm_cli::serve(&state_dir, &dd_for_cli, perm_for_cli) {
-                    Ok(port) => eprintln!(
+                let app_root = perm_cli::app_root();
+                match perm_cli::serve(&state_dir, &dd_for_cli, &app_root, perm_for_cli) {
+                    Ok(Some(port)) => eprintln!(
                         "[orbcat] 外部代批通道已启动：127.0.0.1:{port}（状态目录 {}）",
                         state_dir.display()
+                    ),
+                    Ok(None) => eprintln!(
+                        "[orbcat] 外部代批通道未启动：{} 不存在 ⇒ 外部代批已停用（删掉该文件即停用）",
+                        perm_cli::cli_install_path(&app_root).display()
                     ),
                     Err(e) => eprintln!("[orbcat] ⚠️ 外部代批通道启动失败: {e}"),
                 }

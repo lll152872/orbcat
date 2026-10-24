@@ -697,58 +697,79 @@ describe("runtime extension 防漂移闸门", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 外部代批 CLI（orbcat-perm）进包契约（2026-10-24）
+// 外部代批 CLI（orbcat-perm）**不随包分发**契约（2026-10-24 用户拍板）
 // ---------------------------------------------------------------------------
 //
 // ## 这组测试为什么存在
 //
-// 层 1 的路径阻断认的是**文件名 `orbcat-perm`**（`perm_cli::CLI_STEM`）。
-// 而 Cargo 的 bin 自动发现会把 `src/bin/orbcat_perm.rs` 编译成
-// **`orbcat_perm.exe`（下划线）** ⇒ 产物名对不上 ⇒ 用户装到的 CLI
-// 内部 AI 引用时**扫不到** ⇒ 阻断规则在真机上形同虚设，而构建日志全绿。
+// 用户 2026-10-24 拍板：「**外部代批 CLI 只在测试中存在、不随包分发**」
+// ⇒ 成品 zip 内**不含** `bin\orbcat-perm.exe`（也不放任何快捷方式）。
 //
-// ⇒ 三个环节各锁一条：
-//   ① Cargo.toml 显式 `[[bin]] name = "orbcat-perm"`（产物名的唯一来源）；
-//   ② 装配把它拷进 **包根的 bin/**（层 1 的 `is_under_bin_dir()` 认这个位置），
-//      且**不进 runtime/**（runtime/ 是 node + pi 的白名单分发目录）；
-//   ③ CI / 构建脚本都必须真的编它、传它、部署它。
+// ⚠️ 这条口径必须由**打包链**兜住，不能只写在文档里：
+//   ① 装配**默认不带** CLI（`stageWindowsRelease` 不传 `cliExe` ⇒ 产物里没有）；
+//   ② 验包有**反向闸门**（`verifyReleaseLayout({forbidCli:true})`）
+//      ⇒ 谁手滑把 `--cli-exe` 加回装配链，当场红，而不是悄悄把
+//      「外部代批」这个能力发给用户；
+//   ③ CI / build-release.sh 都**不许**再传 / 部署它，
+//      且 build-release.sh 会**清掉运行态残留**（旧版本部署过的那份）。
 //
 // ⚠️ 反向用例（坏包不许放行）才是重点 —— 只测「正确布局能通过」是自说自话。
 // ---------------------------------------------------------------------------
 
-describe("外部代批 CLI 进包契约", () => {
-  it("外部代批 CLI 落在产物根的 bin/ 下，不在 runtime/ 里", () => {
+describe("外部代批 CLI 不随包分发契约", () => {
+  it("装配默认不带 CLI：产物里没有 bin/orbcat-perm.exe", () => {
     const out = path.join(tmp, "out");
     stageWindowsRelease({
       exePath: makeExe(),
       distDir: makeDist(),
       outDir: out,
       runtimeDir: makeRuntime(tmp, ["node", "pi"]),
-      cliExe: makeCli(),
     });
 
-    expect(existsSync(path.join(out, CLI_SUBDIR, CLI_BIN_NAME))).toBe(true);
+    expect(existsSync(path.join(out, CLI_SUBDIR, CLI_BIN_NAME))).toBe(false);
+    // 连 bin/ 目录都不该留下
+    expect(existsSync(path.join(out, CLI_SUBDIR))).toBe(false);
     // ⚠️ 不许进 runtime/ —— 那是 node + pi 的白名单分发目录
     expect(existsSync(path.join(out, "runtime", CLI_BIN_NAME))).toBe(false);
-    expect(existsSync(path.join(out, "runtime", CLI_SUBDIR))).toBe(false);
   });
 
-  it("★ 反向：CLI 缺失时验包必须判不合格（不许放行坏包）", () => {
-    const out = path.join(tmp, "out-no-cli");
+  it("★ 反向：包里**有** CLI 时验包必须判不合格（不许放行坏包）", () => {
+    const out = path.join(tmp, "out-has-cli");
+    // 开发态仍可手动装（stageWindowsRelease 保留了这个能力）
     stageWindowsRelease({
       exePath: makeExe(),
       distDir: makeDist(),
       outDir: out,
-      runtimeDir: makeRuntime(tmp, ["node", "pi"], "rt-no-cli"),
+      runtimeDir: makeRuntime(tmp, ["node", "pi"], "rt-has-cli"),
+      cliExe: makeCli(),
     });
+    expect(existsSync(path.join(out, CLI_SUBDIR, CLI_BIN_NAME))).toBe(true);
 
     let msg = "";
     try {
-      verifyReleaseLayout(out, { exeName: "orbcat.exe", wantRuntime: true, wantCli: true });
+      verifyReleaseLayout(out, { exeName: "orbcat.exe", wantRuntime: true, forbidCli: true });
     } catch (e) {
       msg = String((e as Error).message ?? e);
     }
     expect(msg).toMatch(/orbcat-perm/);
+    expect(msg).toMatch(/不随包分发|不该有/);
+  });
+
+  it("不带 forbidCli 时不会误判（闸门是显式开关，不是隐式行为）", () => {
+    const out = path.join(tmp, "out-has-cli-noflag");
+    stageWindowsRelease({
+      exePath: makeExe(),
+      distDir: makeDist(),
+      outDir: out,
+      runtimeDir: makeRuntime(tmp, ["node", "pi"], "rt-has-cli-noflag"),
+      cliExe: makeCli(),
+    });
+
+    // 开发态单测不传 forbidCli ⇒ 不该因为「有 CLI」而炸
+    // （verifyReleaseLayout 有错就 throw ⇒ 这里断言「不抛」）
+    expect(() =>
+      verifyReleaseLayout(out, { exeName: "orbcat.exe", wantRuntime: true })
+    ).not.toThrow();
   });
 
   it("文件名带下划线（orbcat_perm.exe）时当场拒绝 —— 名字对不上 = 阻断失效", () => {
@@ -783,19 +804,33 @@ describe("外部代批 CLI 进包契约", () => {
     expect(toml).toMatch(/^autobins = false$/m);
   });
 
-  it("CI 会编 orbcat-perm 并把它传进装配脚本", () => {
+  it("CI 编 orbcat-perm 但**不**把它传进装配脚本（不许进包）", () => {
     const ci = readFileSync(path.join(REPO_ROOT, ".github", "workflows", "ci.yml"), "utf8");
+    // 仍然编译（产物名契约 + 这个 bin 还能编过）
     expect(ci).toMatch(/--bin orbcat-perm/);
-    expect(ci).toMatch(/--cli-exe\s+\S*orbcat-perm\.exe/);
+    // ⚠️ 只看**命令行**（注释里可以解释「为什么不带」）
+    const ciCmd = ci
+      .split("\n")
+      .filter((l) => !/^\s*#/.test(l))
+      .join("\n");
+    expect(ciCmd).not.toMatch(/--cli-exe/);
   });
 
-  it("build-release.sh 会把 CLI 部署到运行态的 bin/，缺件当场失败", () => {
+  it("build-release.sh 不再部署 CLI，且会清掉运行态残留", () => {
     const sh = readFileSync(path.join(REPO_ROOT, "tools", "build-release.sh"), "utf8");
-    expect(sh).toContain("orbcat-perm.exe");
-    expect(sh).toMatch(/\$RUNTIME\/bin/);
-    // 找不到 CLI 时必须 exit 1（不许 warn 就放过）
-    const idx = sh.indexOf("找不到外部代批 CLI");
-    expect(idx).toBeGreaterThan(-1);
-    expect(sh.slice(idx, idx + 900)).toMatch(/exit 1/);
+    // 不许再有「拷贝 CLI 到运行态」这条路
+    // ⚠️ 清理残留的动作**本来就要提到**这个路径 ⇒ 只查「拷贝」不查「提到」
+    expect(sh).not.toMatch(/\$CLI_SRC/);
+    expect(sh).not.toMatch(/部署外部代批 CLI/);
+    expect(sh).not.toMatch(/cp -f .*orbcat-perm\.exe/);
+    // 必须有「清理残留」的动作（宿主是「CLI 在 ⇒ 起端点」⇒ 残留 = 能力被意外打开）
+    expect(sh).toMatch(/清理运行态残留/);
+    expect(sh).toMatch(/rm -f "\$RUNTIME\/bin\/orbcat-perm\.exe"/);
+  });
+
+  it("package.mjs 的 main() 不接受 --cli-exe（发布路径没有这个口子）", () => {
+    const src = readFileSync(path.join(REPO_ROOT, "tools", "package.mjs"), "utf8");
+    expect(src).not.toMatch(/args\["cli-exe"\]/);
+    expect(src).toMatch(/forbidCli/);
   });
 });

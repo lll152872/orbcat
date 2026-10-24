@@ -37,8 +37,11 @@
 // ## 用法
 //
 //   node tools/package.mjs --exe <exe> --dist <dist> --out <dir> [--file <f> ...]
-//                            [--cli-exe <orbcat-perm.exe>]
 //   node tools/package.mjs --verify <dir> [--exe-name <name>]
+//
+// ⚠️ **本版不随包分发外部代批 CLI**（用户 2026-10-24 拍板：
+//    「外部代批 CLI 只在测试中存在、不随包分发」）⇒
+//    成品里**不得**出现 `bin/orbcat-perm.exe` —— 验包时**当场判不合格**。
 // ============================================================================
 
 import {
@@ -222,7 +225,10 @@ export function stageSkeleton(skeletonDir, outDir) {
 
 /**
  * 装配 Windows 发布形态：<out>/<exe> + <out>/dist/** + <out>/agent-data/**
- *                                  + <out>/bin/orbcat-perm.exe（外部代批 CLI）
+ *
+ * ⚠️ **<out>/bin/orbcat-perm.exe 不在默认形态里** —— 外部代批 CLI
+ *    **本版不随包分发**（用户 2026-10-24 拍板）⇒ 传 `cliExe` 才会装
+ *    （只给开发态 / 单测用），发布路径一律不传。
  *
  * 刻意**不**提供「把 dist 内容平铺进 out/」的选项 —— 那正是事故的成因，
  * 留着开关等于留着同一个坑。
@@ -248,6 +254,12 @@ export function stageWindowsRelease({
   }
 
   // ── 外部代批 CLI：**先验**（存在 + 文件名精确）──
+  //
+  // ⚠️ **本版发布包不带它**（用户 2026-10-24 拍板「只在测试中存在、不随包分发」）
+  //    ⇒ `main()` **不传** `cliExe` ⇒ 产物里没有 `bin/orbcat-perm.exe`；
+  //    验包另有一道**反向闸门**（`verifyReleaseLayout({forbidCli:true})`）
+  //    ⇒ 谁手滑把 `--cli-exe` 加回装配链，当场红。
+  //    这个参数**只给开发态 / 单测**用（本地想试一下外部代批时手动装）。
   //
   // ⚠️ 校验必须在 `rmSync(outDir)` **之前** ——
   //    放在后面的话，一次失败的装配会留下一个「看着挺像样」的半成品目录
@@ -354,12 +366,12 @@ export function stageWindowsRelease({
 
   // ── 外部代批 CLI（orbcat-perm）──
   //
+  // ⚠️ **发布包不带它**（2026-10-24 拍板「只在测试中存在」）⇒
+  //    `main()` 不传 `cliExe` ⇒ **这段在发布路径上不执行**。
+  //    留这段是为了：开发态/单测可以手动把它装进产物里试一下外部代批。
   // ⚠️ 名字/存在性在函数开头已验过（见上），这里只管拷。
   // ⚠️ 位置是**包根的 bin/**（与 dist/、runtime/ 同级），**不进 runtime/**：
   //    runtime/ 是白名单分发目录（RUNTIME_COMPONENTS = node + pi）。
-  //
-  // `cliExe` 传 null = 调用方**明确不要**这个组件（开发态 / 单测）；
-  // 发布包走 main() 的路径 ⇒ 那条路**强制要求**它存在。
   if (cliExe) {
     mkdirSync(path.join(outDir, CLI_SUBDIR), { recursive: true });
     copyFileSync(cliExe, path.join(outDir, CLI_SUBDIR, CLI_BIN_NAME));
@@ -402,7 +414,7 @@ export function stageWindowsRelease({
  */
 export function verifyReleaseLayout(
   dir,
-  { exeName = null, wantSkeleton = false, wantRuntime = false, wantCli = false } = {}
+  { exeName = null, wantSkeleton = false, wantRuntime = false, forbidCli = false } = {}
 ) {
   const errors = [];
   const notes = [];
@@ -517,21 +529,22 @@ export function verifyReleaseLayout(
     }
   }
 
-  // ---- 外部代批 CLI：<包根>/bin/orbcat-perm.exe 必查 -------------------
+  // ---- 外部代批 CLI：<包根>/bin/orbcat-perm.exe **不许有** -------------------
   //
-  // `wantCli` 由调用方传入：验发布包时传 true，单测 / 开发态不传。
+  // ⚠️ 2026-10-24 用户拍板：「外部代批 CLI **只在测试中存在、不随包分发**」
+  //    ⇒ 成品包里**必须没有** `bin/orbcat-perm.exe`。
+  // ⇒ 这是一道**反向闸门**：谁手滑把 `--cli-exe` 加回装配链，当场红，
+  //    而不是悄悄把「外部代批」这个能力发给用户。
   //
-  // ⚠️ 缺它的后果不是「功能差一点」，而是**外部 AI 代批这条链路整条断掉**
-  //    （用户侧 Codex / Claude Code 拿不到 CLI）。
-  //    且**当场红**，不许放过 —— 跟 runtime / photon 同一口径。
-  if (wantCli) {
+  // `forbidCli` 由调用方传入：验发布包时传 true（main() 的两条路都传）。
+  if (forbidCli) {
     const cli = path.join(dir, CLI_SUBDIR, CLI_BIN_NAME);
-    if (!isFile(cli)) {
+    if (isFile(cli)) {
       errors.push(
-        `产物里没有 ${CLI_SUBDIR}/${CLI_BIN_NAME}：${cli} 不存在。\n` +
-          `        发布包必须带外部代批 CLI（用户侧外部 AI 靠它代批权限申请）。\n` +
-          `        修法：cargo build --release --bin orbcat-perm（产物名必须带连字符），\n` +
-          `              再用 --cli-exe <路径> 传给装配脚本。`
+        `产物里不该有 ${CLI_SUBDIR}/${CLI_BIN_NAME}：${cli} 存在。\n` +
+          `        本版外部代批 CLI **只在测试中存在、不随包分发**（用户 2026-10-24 拍板）\n` +
+          `        ⇒ 成品包里放它 = 外部代批能力被意外打开。\n` +
+          `        修法：装配命令不要带 --cli-exe（package.mjs 的 main() 本来就不传）。`
       );
     }
   }
@@ -640,31 +653,23 @@ export function defaultRuntimeDir() {
 }
 
 /**
- * 外部代批 CLI 的默认位置：cargo 的产物目录。
+ * ⚠️ **本版不再随包分发外部代批 CLI**（用户 2026-10-24 拍板）⇒
+ *    这里**故意不再提供**「默认 CLI 位置」这个查找函数：
+ *    留着它 = 留着「装配链一不小心就把 CLI 装进包」的口子。
  *
- * 找不到就返回 null —— **调用方必须自己决定要不要报错**：
- * 开发态 / 单测可以不带它，但**发布包必须有**
- * （缺它 = 用户侧外部 AI 拿不到「代批权限申请」这个能力，链路整条断掉）。
+ *    开发者本地想试外部代批 ⇒ 自己把 `orbcat-perm.exe` 放进 `<包根>\bin\`，
+ *    宿主检测到它就会起端点（`perm_cli::serve`）；删掉即停用。
  */
-export function defaultCliExe() {
-  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  const candidates = [
-    path.join(root, "src-tauri", "target", "release", CLI_BIN_NAME),
-    path.join(root, "src-tauri", "target", "release-fast", CLI_BIN_NAME),
-  ];
-  for (const c of candidates) if (isFile(c)) return c;
-  return null;
-}
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
 
   if (args.verify) {
-    // 验发布包 = 必须有内置运行时（node + pi）+ 外部代批 CLI —— 与装配时同一套契约
+    // 验发布包 = 必须有内置运行时（node + pi）+ **不许有**外部代批 CLI
     const r = verifyReleaseLayout(args.verify, {
       exeName: args["exe-name"] ?? null,
       wantRuntime: true,
-      wantCli: true,
+      forbidCli: true,
     });
     verifyNoUserData(args.verify);
     console.log(`OK: 产物布局合法 ${path.join(args.verify, DIST_SUBDIR, DIST_ENTRY)}`);
@@ -677,20 +682,20 @@ function main() {
       "用法：\n" +
         "  node tools/package.mjs --exe <exe> --dist <dist> --out <dir>\n" +
         "                         [--skeleton src-tauri/skeleton] [--file <f> ...]\n" +
-        "                         [--runtime <dir>] [--cli-exe <orbcat-perm.exe>]\n" +
+        "                         [--runtime <dir>]\n" +
         "  node tools/package.mjs --verify <dir> [--exe-name <name>]\n" +
         "\n" +
-        "  --cli-exe   外部代批 CLI 的路径（产物名必须精确是\n" +
-        "              orbcat-perm.exe，带连字符）。拷成 <out>/bin/orbcat-perm.exe。\n" +
-        "              缺省找 src-tauri/target/{release,release-fast}/。\n" +
-        "              **发布包必须有**：缺了它，外部 AI 代批链路整条断掉。\n" +
         "  --runtime   内置运行时目录（node / pi 内核），\n" +
         "              拷成 <out>/runtime/。缺省找仓库根的 runtime/。\n" +
         "              **发布包必须有**：找不到会当场报错，不许发出坏包\n" +
         "              （审计 F1 —— 缺 runtime 的包 = pi 内核静默失效）。\n" +
         "  --skeleton  把空骨架铺进 <out>/agent-data/（三合一分发）。\n" +
         "              只能指向 src-tauri/skeleton —— 铺真实 agent-data/ 会被\n" +
-        "              verifyNoUserData 拦下，那等于把 API key 打进发布包。"
+        "              verifyNoUserData 拦下，那等于把 API key 打进发布包。\n" +
+        "\n" +
+        "  ⚠️ **本版不随包分发外部代批 CLI**（用户 2026-10-24 拍板：\n" +
+        "     「外部代批 CLI 只在测试中存在」）⇒ 产物里**不许有**\n" +
+        "     bin/orbcat-perm.exe —— 验包时发现它会**当场判不合格**。"
     );
     process.exit(2);
   }
@@ -731,20 +736,11 @@ function main() {
     process.exit(2);
   }
 
-  // ── 外部代批 CLI（orbcat-perm）——
-  //
-  // ⚠️ **找不到 = 当场报错**，跟 runtime 同一口径：
-  //    缺它 ⇒ 发布包里没有 bin/orbcat-perm.exe ⇒ 用户侧外部 AI（Codex / Claude Code）
-  //    根本拿不到「代批权限申请」这个能力 ⇒ 链路整条断掉，而构建日志一切正常。
-  const cliExe = args["cli-exe"] ?? defaultCliExe();
-  if (!cliExe || !isFile(cliExe)) {
-    console.error(
-      `找不到外部代批 CLI：${args["cli-exe"] ?? `src-tauri/target/{release,release-fast}/${CLI_BIN_NAME}`}\n` +
-        `  发布包必须带 ${CLI_SUBDIR}/${CLI_BIN_NAME} —— 缺了它，用户侧外部 AI 拿不到代批能力。\n` +
-        `  修法：cargo build --release --bin orbcat-perm（产物名必须带连字符）`
-    );
-    process.exit(2);
-  }
+  // ⚠️ **外部代批 CLI（orbcat-perm）本版不随包分发**（用户 2026-10-24 拍板：
+  //    「外部代批 CLI 只在测试中存在」）⇒ 这里**不传** `cliExe`
+  //    ⇒ 产物里不会有 `bin/orbcat-perm.exe`。
+  //    开发者本地想用 ⇒ 自己把 exe 放进 `<包根>\bin\`，宿主检测到就起端点；
+  //    删掉即停用（`perm_cli::serve` 的真开关）。
 
   const { exeName } = stageWindowsRelease({
     exePath: args.exe,
@@ -754,18 +750,17 @@ function main() {
     files: args.file ?? [],
     runtimeDir,
     initDoc,
-    cliExe,
   });
   const { notes } = verifyReleaseLayout(args.out, {
     exeName,
     wantSkeleton: !!args.skeleton,
     wantRuntime: true,
-    wantCli: true,
+    forbidCli: true,
   });
   verifyNoUserData(args.out);
   console.log(
     `OK: 已装配并自检通过 ${args.out}（${exeName} + ${DIST_SUBDIR}/` +
-      `${args.skeleton ? ` + ${DATA_SUBDIR}/` : ""} + ${CLI_SUBDIR}/${CLI_BIN_NAME}）`
+      `${args.skeleton ? ` + ${DATA_SUBDIR}/` : ""}）`
   );
   for (const n of notes ?? []) console.log(`  提示: ${n}`);
 }

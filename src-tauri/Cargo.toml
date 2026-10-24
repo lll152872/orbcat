@@ -44,8 +44,11 @@ path = "src/main.rs"
 
 # ② 外部代批 CLI（**名字带连字符，是硬要求**）——
 #
-#    部署形态：`<包根>\bin\orbcat-perm.exe`（`tools/package.mjs` 装配、
-#    `tools/build-release.sh` 部署到运行态）。
+#    ⚠️ **本版不随包分发**（用户 2026-10-24 拍板：「外部代批 CLI 只在测试中存在」）
+#       ⇒ 发布包 / 运行态里**没有** `bin\orbcat-perm.exe`；
+#       ⇒ CI 仍编它（产物名契约要验），但**不装进包**。
+#       ⇒ 开发者本地想用 ⇒ 自己把这个 exe 放进 `<包根>\bin\`
+#          （宿主检测到就起端点，删掉即停用 —— 见 `perm_cli::serve`）。
 #
 #    ⚠️ 名字必须精确是 `orbcat-perm`：
 #       层 1 阻断按**文件名**匹配（`perm_cli::CLI_STEM = "orbcat-perm"`，
