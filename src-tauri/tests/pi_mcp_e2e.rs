@@ -517,3 +517,302 @@ async fn 宿主注入注册表后_模型看得到orb_mcp工具且没有mcp裸名
     let _ = std::fs::remove_file(&trace_path);
     let _ = std::fs::remove_dir_all(&agent_dir);
 }
+
+/// 从 tool_result 文本里抠出**退出码**。
+///
+/// 宿主的命令执行结果长这样：
+/// ```text
+/// $ <命令>
+/// ... stderr ...
+/// 退出码：1
+/// ```
+/// ⇒ 「退出码：N」是「命令**真的跑了**」的可靠标志；
+/// 「被宿主挡住」⇒ 压根没有这段（只有拒绝理由）⇒ 没有退出码。
+///
+/// ⚠️ **手写解析，不引 regex 依赖**（集成测试里不必为一条断言加依赖）。
+fn exit_codes(text: &str) -> Vec<String> {
+    const MARKER: &str = "退出码：";
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    // ⚠️ **必须按 MARKER 的字节长度推进**，不能用 `i + 1` ——
+    //    `find` 返回的是**字节偏移**，而 `i + 1` 可能落在多字节字符**中间**
+    //    ⇒ Rust 切片 panic（byte index not char boundary）。
+    while let Some(rel) = text[start..].find(MARKER) {
+        let i = start + rel;
+        let tail = &text[i + MARKER.len()..];
+        let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            out.push(digits);
+        }
+        start = i + MARKER.len();
+    }
+    out
+}
+
+/// 🔴🔴 守卫：**pi 侧没有任何能碰到 `orbcat-perm` CLI 的路**。
+///
+/// ## 背景（用户硬线）
+///
+/// orbcat 要加一个内置 CLI（`bin\orbcat-perm.exe`），让**外部 AI**（orbcat 进程之外的
+/// agent）能代用户处理权限申请。
+/// ⚠️ **orbcat 内部的 AI 不许访问这个 CLI**（更不许用它跑用户没同意的命令）。
+/// 主体实现归后端（CLI 本体 + 阻断规则）；这条只证明**pi 侧根本没有那条路**。
+///
+/// ## 判据（三层，缺一层就可能漏）
+///
+/// ① **工具表层**：模型实际收到的 `tools` 数组里，**所有**名字都以 `orb_` 开头
+///    ⇒ pi **没有自己的 bash / powershell / read / write / grep / find / ls**
+///    ⇒ 没有能执行任意本地路径的工具；
+/// ② **命名层**：表里**没有任何** `mcp__` 裸名（那是 pi 原生 MCP 的命名空间，
+///    走它就绕过了宿主闸门）；
+/// ③ **路径层**：表里**没有**任何名字含 `orbcat-perm`。
+///
+/// ⇒ 合起来：**pi 侧唯一能执行命令的路径是 `orb_run_command`（走宿主桥）**，
+/// 那条路上对 CLI 的阻断**由后端实现**（见 `宿主拒绝时_pip侧如实透出错误不当成成功`）。
+#[tokio::test]
+async fn pi工具表里只有orb前缀_没有任何能执行本地路径的工具() {
+    let Some(runtime) = runtime_dir() else {
+        eprintln!("跳过：runtime/ 未构建");
+        return;
+    };
+    let Some(real_data) = orbcat_data_dir() else {
+        eprintln!("跳过：找不到 orbcat 的 agent-data/");
+        return;
+    };
+
+    let fake = fake_model::simple_text_model("好的").expect("假模型应能起");
+
+    let agent_dir = unique_tmp("pi-perm-cli-guard-agent");
+    let rt = PiRuntime::with_agent_dir(real_data, runtime, agent_dir.clone());
+    rt.set_model_override("fake-model", fake.base_url()).await;
+    rt.set_gate(Arc::new(|_t, _a, _sid| Box::pin(async { (true, String::new()) })));
+
+    let progress: ProgressFn = Arc::new(|_p| {});
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        rt.run("你好。", vec![], progress),
+    )
+    .await;
+    match r {
+        Err(_) => panic!("90 秒超时"),
+        Ok(Err(e)) => panic!("链路报错: {e}"),
+        Ok(Ok(_)) => {}
+    }
+
+    let names = model_tool_names(&fake);
+    eprintln!("=== 模型看到的工具（{} 个）===", names.len());
+    assert!(
+        !names.is_empty(),
+        "🔴 一个工具都没取到 —— 取名逻辑又出问题了（tools 是 OpenAI function-calling 形态）"
+    );
+
+    // ① 所有工具名都是 `orb_` 前缀（⇒ pi 没有自己的 bash / powershell / 读写工具）
+    let not_orb: Vec<&String> = names.iter().filter(|n| !n.starts_with("orb_")).collect();
+    assert!(
+        not_orb.is_empty(),
+        "🔴 pi 工具表里出现了**非 `orb_` 前缀**的工具 {not_orb:?} —— \
+         pi 自带工具没被 `--exclude-tools` 排干净 ⇒ 它能执行本地任意路径"
+    );
+
+    // ② 没有 `mcp__` 裸名（pi 原生 MCP 命名空间 ⇒ 绕过宿主闸门）
+    let bare: Vec<&String> = names.iter().filter(|n| n.starts_with("mcp__")).collect();
+    assert!(
+        bare.is_empty(),
+        "🔴 pi 工具表里有 MCP 裸名 {bare:?} —— 原生 MCP 还在放行（单通道失效）"
+    );
+
+    // ③ 没有指向那个 CLI 的工具
+    let cli: Vec<&String> = names
+        .iter()
+        .filter(|n| n.to_lowercase().contains("orbcat-perm"))
+        .collect();
+    assert!(
+        cli.is_empty(),
+        "🔴 pi 工具表里出现了指向 perm CLI 的工具 {cli:?} —— 内部 AI 不该看见它"
+    );
+
+    // ④ 唯一能执行命令的路径 = `orb_run_command`（走宿主桥 ⇒ 阻断由后端实现）
+    assert!(
+        names.iter().any(|n| n == "orb_run_command"),
+        "orb_run_command 应在表里（pi 侧唯一的命令执行出口）：{names:?}"
+    );
+
+    eprintln!(
+        "✅ pi 侧只有 orb_* 全集（{} 个）✓ · 无 MCP 裸名 ✓ · 无 perm CLI ✓ · 唯一命令出口 = orb_run_command ✓",
+        names.len()
+    );
+
+    let _ = std::fs::remove_dir_all(&agent_dir);
+}
+
+/// 🔴 守卫 B1：宿主**执行失败**时，pi 侧**如实把错误透出**，不能当成成功。
+///
+/// ## 为什么这条重要
+///
+/// 阻断规则是**后端**实现的（`command_policy` / `tools.rs` 那一侧）。
+/// 但**宿主失败之后，pi 怎么表现**是 pi 侧的活 ——
+/// 如果 pi 把失败吞掉、或者让模型以为「命令跑成功了」，
+/// 那阻断就等于没做（模型会以为已经处理完权限申请）。
+///
+/// ⇒ 本条让宿主真的执行一条**必然失败**的命令，
+/// 断言 pi 侧**如实看到失败语义**、**没有任何成功信号**。
+///
+/// ⚠️ 这条**不依赖后端的阻断实现** ⇒ 现在就能绿。
+#[tokio::test]
+async fn 宿主执行失败时_pip侧如实透出错误不当成成功() {
+    let Some(runtime) = runtime_dir() else {
+        eprintln!("跳过：runtime/ 未构建");
+        return;
+    };
+    let Some(real_data) = orbcat_data_dir() else {
+        eprintln!("跳过：找不到 orbcat 的 agent-data/");
+        return;
+    };
+
+    // 假模型必须**真的调一次工具** —— 否则宿主那边压根不会执行，失败语义也就不会出现。
+    // ⚠️ 用 `start_raw`（不加 `orb_` 前缀）⇒ 名字就写全 `orb_run_command`。
+    let fake = fake_model::FakeModel::start_raw(
+        "orb_run_command",
+        json!({ "command": "orbcat-perm-nonexistent-probe-xyz" }),
+        "（假装执行完了）",
+    )
+    .expect("假模型应能起");
+
+    let agent_dir = unique_tmp("pi-perm-cli-fail-agent");
+    let rt = PiRuntime::with_agent_dir(real_data, runtime, agent_dir.clone());
+    rt.set_model_override("fake-model", fake.base_url()).await;
+    rt.set_gate(Arc::new(|_t, _a, _sid| Box::pin(async { (true, String::new()) })));
+
+    let progress: ProgressFn = Arc::new(|_p| {});
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        rt.run("跑一条命令试试。", vec![], progress),
+    )
+    .await;
+    let steps_text = match r {
+        Err(_) => panic!("90 秒超时"),
+        Ok(Err(e)) => {
+            // 链路级失败也算「如实透出」—— 关键：**错误里要有失败语义**
+            eprintln!("（链路报错）: {e}");
+            format!("{e}")
+        }
+        Ok(Ok(res)) => {
+            eprintln!("=== 答复 ===\n{}", res.answer);
+            eprintln!("=== 步骤 ===\n{:#?}", res.steps);
+            format!("{:#?}", res.steps)
+        }
+    };
+
+    // ✅ 判据（**结构化**，不靠猜错误文案）：
+    //    宿主把命令跑起来了 ⇒ 退出码非 0 ⇒ pi 侧**如实**把退出码透出来。
+    let exit_codes: Vec<String> = exit_codes(&steps_text);
+    assert!(
+        !exit_codes.is_empty(),
+        "🔴 pi 侧**没有**把执行结果透出来 —— 宿主那边失败了，pi 却当没事发生\n{steps_text}"
+    );
+    assert!(
+        exit_codes.iter().all(|c| c != "0"),
+        "🔴 pi 侧把一次**失败**的执行报成了退出码 0（等于说「成功」）\n{steps_text}"
+    );
+    // ⚠️ 且不能出现「执行成功」这种反向信号
+    assert!(
+        !steps_text.contains("执行成功"),
+        "🔴 pi 侧把一次**失败**的执行说成了「执行成功」\n{steps_text}"
+    );
+
+    eprintln!(
+        "✅ 宿主执行失败 → pi 如实透出退出码 {:?} ✓（没有当成成功）",
+        exit_codes
+    );
+
+    let _ = std::fs::remove_dir_all(&agent_dir);
+}
+
+/// 🔴🔴 守卫 B2（**占位 · 现在红**）：宿主对 `orbcat-perm` CLI 路径**硬阻断**。
+///
+/// ## 🔴 这条现在为什么红
+///
+/// 用户硬线：「orbcat 内部 AI 不许访问这个 CLI，更不许用这个 CLI 通过用户没同意的命令」。
+/// ⇒ 阻断规则**由后端实现**（`command_policy` / `tools.rs` 那一侧，**不在 pi 域**）。
+///
+/// ⚠️ **后端还没实现这条阻断** ⇒ 现在宿主会真的去执行那个路径
+/// ⇒ 因为文件不存在，报的是「找不到」而不是「**被阻断**」
+/// ⇒ 本条断言「错误里含**阻断语义**」⇒ **现在红**。
+///
+/// ⇒ **这是故意的**：红着才能提醒后端「这条红线还差实现」。
+/// ⚠️ **别为了让这条变绿去改后端**（后端域）。
+/// ⇒ 后端实现硬阻断后，这条会**自动变绿**，不用改测试。
+///
+/// ## 判据
+///
+/// 跑 `bin\orbcat-perm.exe` ⇒ 宿主**必须**硬阻断（连申请都不行）
+/// ⇒ 错误里必须含**阻断语义**（「阻断」/「禁止」/「不允许」），而不是「找不到」。
+#[tokio::test]
+async fn 宿主对perm_cli路径硬阻断_而不是找不到() {
+    let Some(runtime) = runtime_dir() else {
+        eprintln!("跳过：runtime/ 未构建");
+        return;
+    };
+    let Some(real_data) = orbcat_data_dir() else {
+        eprintln!("跳过：找不到 orbcat 的 agent-data/");
+        return;
+    };
+
+    // 假模型去跑那个 CLI
+    let fake = fake_model::FakeModel::start_raw(
+        "orb_run_command",
+        json!({ "command": "bin\\orbcat-perm.exe --list" }),
+        "（假装执行完了）",
+    )
+    .expect("假模型应能起");
+
+    let agent_dir = unique_tmp("pi-perm-cli-block-agent");
+    let rt = PiRuntime::with_agent_dir(real_data, runtime, agent_dir.clone());
+    rt.set_model_override("fake-model", fake.base_url()).await;
+    rt.set_gate(Arc::new(|_t, _a, _sid| Box::pin(async { (true, String::new()) })));
+
+    let progress: ProgressFn = Arc::new(|_p| {});
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        rt.run("跑一下那个命令。", vec![], progress),
+    )
+    .await;
+    let seen = match r {
+        Err(_) => panic!("90 秒超时"),
+        Ok(Err(e)) => {
+            eprintln!("（链路报错）: {e}");
+            format!("{e}")
+        }
+        Ok(Ok(res)) => {
+            eprintln!("=== 答复 ===\n{}", res.answer);
+            eprintln!("=== 步骤 ===\n{:#?}", res.steps);
+            format!("{:#?}", res.steps)
+        }
+    };
+
+    // 🔴 判据：**那条命令根本没被执行**。
+    //
+    // 「执行了」的特征 = 出现了执行痕迹（`$ <命令>` + `退出码：N`）；
+    // 「被宿主挡住」的特征 = **没有执行痕迹**（命令压根没跑，只有宿主给的拒绝理由）。
+    //
+    // ⚠️ 现在后端**还没实现**这条阻断 ⇒ 宿主真的把命令跑了 ⇒ 有执行痕迹 ⇒ **本条红**。
+    //
+    // ⚠️⚠️ **给后端的行动信号**：这条现在会**真的执行** `bin\orbcat-perm.exe`
+    //   （现在该文件不存在 ⇒ PowerShell 报「不是模块」⇒ 无副作用）。
+    //   **一旦后端把 CLI 本体建出来、而阻断规则还没加** ⇒ 这条测试会**真的跑它**
+    //   ⇒ 副作用未知（它能代用户处理权限申请）。
+    // ⇒ **后端请优先实现阻断规则**，再把 CLI 本体放进包。
+    // ⇒ 这是**故意的占位**：红着提醒后端「这条红线还差实现」。
+    // ⇒ 后端把硬阻断加上后，本条**自动变绿**，不用改测试。
+    // ⚠️ **别为了让这条变绿去改后端**（后端域）。
+    let executed = seen.contains("退出码：");
+    assert!(
+        !executed,
+        "🔴 宿主对 `orbcat-perm` CLI **没有硬阻断** —— 那条命令真的被执行了（出现了执行痕迹）。\
+         说明后端的阻断规则还没实现（这条是占位，红着提醒后端；别改后端来凑绿）\n{seen}"
+    );
+
+    eprintln!("✅ 宿主对 perm CLI 硬阻断 ✓（命令根本没被执行）");
+
+    let _ = std::fs::remove_dir_all(&agent_dir);
+}
