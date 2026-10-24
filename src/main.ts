@@ -355,7 +355,7 @@ function ensureSessionLoaded(): Promise<void> {
  * ⚠️ 模式**只在建的时候**给，建完就钉死（"一个会话模式不能变"）——
  * 所以这个参数**没有**对应的"改"接口，别在这里加"切模式"的分支。
  */
-async function newSession(mode?: string): Promise<void> {
+async function newSession(mode?: string, projectId?: number | null): Promise<void> {
   // 多会话并行 run：新建会话**放行**（后端也不拦）—— 新会话不碰别的会话，
   // 而且你很可能正是因为"这边跑着、我还要开个新任务"才点它。
   try {
@@ -367,17 +367,29 @@ async function newSession(mode?: string): Promise<void> {
     // 新会话的模式可能跟上一个不同 → 模式缓存（含 MCP 组视图）要跟着这条会话重拉
     await loadModes(s.id);
     // 只绑**这一条新会话**，不动其它
-    if (activeProjectId != null) {
+    //
+    // ⚠️ `projectId` 三态（2026-10-24 会话页分组改造）：
+    //   undefined = 沿用**当前激活项目**（原来的行为）；
+    //   null      = **不挂任何项目**（「无任务空间」组里新建就是它）；
+    //   数字      = 挂到那个项目（组标题那颗 ＋ 用）。
+    const pid = projectId === undefined ? activeProjectId : projectId;
+    if (pid != null) {
       await data.projects.pmemBindSession( {
         sessionId: s.id,
-        projectId: activeProjectId,
+        projectId: pid,
       }).catch(() => {});
       await refreshSessionProjectTags();
     }
     view = "chat";
     renderBody();
     syncBusyUi();
-    showToast(`已新建「${currentModeName()}」会话`, "ok", 2200);
+    // ⚠️ 说清楚它落在哪 —— 在「无任务空间」组里新建的用户，
+    //    最怕的就是「建完不知道它去哪了」（真机反馈 2026-10-24）。
+    const where =
+      pid == null
+        ? "（未归入项目）"
+        : `（挂到「${projects.find((p) => p.id === pid)?.name ?? pid}」）`;
+    showToast(`已新建「${currentModeName()}」会话 ${where}`, "ok", 2200);
   } catch (e) {
     pushEntry("error", `新建会话失败：${e}`);
   }
@@ -878,13 +890,18 @@ async function resendPrompt(text: string, imgs: string[]): Promise<void> {
     if (run.interrupted) {
       const reason = run.stopReason && run.stopReason !== "已停止" ? run.stopReason : "";
       const canContinue = reason.includes("轮数上限") || reason.includes("上下文");
-      pushEntry(
-        "system",
-        reason ? `⚠️ ${reason}` : "⏹ 已停止，本轮已产出的内容保留在上面",
-        undefined,
-        undefined,
-        canContinue ? { continueRun: true } : undefined,
-      );
+      // ⚠️ 用户 2026-10-24 明确要求**删掉**「⏹ 已停止，本轮已产出的内容保留在上面」这行
+      //    ⇒ 没有 reason（= 用户自己按的停止）就**不插这一条**（纯噪声：是他自己停的，他清楚）。
+      //    有 reason（例如「轮数上限」「上下文」）才留 —— 那是真信息。
+      if (reason) {
+        pushEntry(
+          "system",
+          `⚠️ ${reason}`,
+          undefined,
+          undefined,
+          canContinue ? { continueRun: true } : undefined,
+        );
+      }
     }
   } catch (e) {
     if (runSid !== currentSessionId) return; // 切走了：别往别的会话塞红字
@@ -999,7 +1016,13 @@ const sessFoldOverride = new Map<string, boolean>();
  */
 function isSessGroupFolded(key: string, hasCurrent: boolean): boolean {
   const explicit = sessFoldOverride.get(key);
-  return explicit ?? !hasCurrent;
+  if (explicit !== undefined) return explicit;
+  // ⚠️ 「无任务空间」组（key = ""，装着主聊天）默认**展开**。
+  //    原因（真机反馈 2026-10-24）：默认折着 ⇒ 用户进会话页只看到一行标题，
+  //    以为「这一组用不了」（会话在里面看不见、点不进去）。
+  //    别的组仍然「没有当前会话就折起来」（项目组一多，全展开会很长）。
+  if (key === "") return false;
+  return !hasCurrent;
 }
 
 function renderSessionsView(): string {
@@ -1079,7 +1102,17 @@ function renderSessionsView(): string {
       const folded = isSessGroupFolded(k ?? "", hasCurrent);
       // 标题：项目名太长就靠 CSS 省略（`.sess-sep-name`），计数与「当前项目」另起一颗 span
       const name = k === null ? "无任务空间" : `📁 ${esc(k)}`;
-      const badge = `${list.length}${k === activeName ? " · 当前项目" : ""}`;
+      // ⚠️ 徽标口径（真机反馈 2026-10-24）：「· 当前项目」只给**真的激活项目**。
+      //    没有激活项目时 `activeName` 就是 null ⇒ 「无任务空间」会被误标成
+      //    「· 当前项目」（看着像「无任务空间是当前项目」，自相矛盾）。
+      //    ⇒ 激活的是项目 ⇒ 「· 当前项目」；激活的是「无任务空间」⇒ 「· 当前空间」。
+      const badge = `${list.length}${
+        activeName != null && k === activeName
+          ? " · 当前项目"
+          : activeName == null && k === null
+            ? " · 当前空间"
+            : ""
+      }`;
       const rows = list.map(itemRow).join("");
       const sepAttrs =
         k === null
@@ -1091,6 +1124,13 @@ function renderSessionsView(): string {
       <span class="sess-caret">${folded ? "▸" : "▾"}</span>
       <span class="sess-sep-name">${name}</span>
       <span class="sess-sep-n">${badge}</span>
+      <!-- ⚠️ 组标题右侧那颗「＋」= **在这一组里新建会话**（不折叠）。
+           为什么必须有（真机反馈 2026-10-24）：标题条那颗 ＋ 建出来的会话
+           只跟「当前激活项目」⇒ 在「无任务空间」组里按它，建出来的会话落到别的组去了
+           ⇒ 用户看到的现象是「这一组没法 new」。
+           ⚠️ 用 span 不用 button：组标题本身就是 button，button 套 button 是非法 HTML。
+           -->
+      <span class="sess-sep-new" title="在这组里新建会话">＋</span>
     </button>
     <div class="sess-group${k === activeName ? " cur-proj" : ""}"${folded ? " hidden" : ""}>${rows}</div>`;
     })
@@ -1098,11 +1138,14 @@ function renderSessionsView(): string {
 
   return `
     <div class="mem-head">会话
-      <!-- 「＋ 新建」挪到**标题条右组**了（设计稿 05:2:922）——
-           这里留一个 hidden 的同 id 元素：现有 UI 测试拿它当「会话页已打开」的锚点
-           （tests/ui/flow.sessions-entry.test.ts），删了会连累那几条用例。
-           界面上不显示，功能入口在标题条那颗 ＋ 上。 -->
-      <button class="mem-back" id="sess-new" hidden>＋ 新建</button>
+      <!-- ⚠️ 2026-10-24：这颗按钮从 hidden 改成**可见**。
+           原来它按设计稿 05:2:922 挪到了标题条右组（那顆 ＋ 仍然在，也仍然能用），
+           这里这份 hidden 副本只是留给 UI 测试当「会话页已打开」的锚点。
+           ⇒ 用户反馈「会话页要能 new 会话」「右上角那颗 ＋ 我没看见」⇒
+             **同一个页面再给一个看得见的入口**，别让人猜。
+             （标题条那颗保留：它建会话跟着「当前激活项目」；这颗建的是
+               **不挂项目**的会话 —— 对应「无任务空间」那一组。） -->
+      <button class="mem-back" id="sess-new" title="新建一个不归入项目的会话">＋ 新建会话</button>
     </div>
     <div class="set-hint" style="margin-bottom:8px">
       <b>按项目分组</b> · 点组标题收起/展开 · 右键会话挂靠/改挂靠 · 点一条进入对话
@@ -1133,7 +1176,19 @@ function bindSessionsView(root: HTMLElement): void {
   // 还带一次闪烁；而这里要做的只是「藏一个 div + 翻一个箭头」。
   // 真要重画也没错，只是这里的收益全是负的。
   root.querySelectorAll<HTMLButtonElement>(".sess-sep").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", (e) => {
+      // ⚠️ 组标题右侧那颗「＋」= **在这一组里新建会话**（不折叠）。
+      //    「无任务空间」组 ⇒ `projectId = null`（不挂项目）；
+      //    项目组 ⇒ 那个项目的 id（建出来就落在这一组里）。
+      if ((e.target as HTMLElement).closest(".sess-sep-new")) {
+        e.stopPropagation();
+        const key = btn.dataset.fold ?? "";
+        const pid = key === "" ? null : Number(btn.dataset.pid ?? "") || null;
+        // 走「＋ 菜单」⇒ **能选模式**（模式建完不能改 ⇒ 必须给选择机会）
+        const r = btn.getBoundingClientRect();
+        void showNewMenu(r.left, r.bottom + 4, pid);
+        return;
+      }
       const key = btn.dataset.fold ?? "";
       // 当前收/放状态从 DOM 读（`aria-expanded` 就是刚渲染出来的那份），
       // 不重算 `isSessGroupFolded` —— 那里要 `hasCurrent`，这里没必要再找一遍。
@@ -1148,7 +1203,11 @@ function bindSessionsView(root: HTMLElement): void {
       if (body?.classList.contains("sess-group")) body.hidden = folded;
     });
   });
-  document.getElementById("sess-new")?.addEventListener("click", () => void newSession());
+  document.getElementById("sess-new")?.addEventListener("click", (e) => {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    // 「＋ 新建会话」= 新建一条**不归入项目**的会话（就是「无任务空间」那一组）
+    void showNewMenu(r.left, r.bottom + 4, null);
+  });
   document.getElementById("sess-compact")?.addEventListener("click", () => void compactCurrent());
 
   // 右键会话 → 挂靠到项目（session 之上是项目记忆）
@@ -1191,7 +1250,7 @@ function closeOnOutsideClick(close: () => void): void {
  * 而默认就该是标准模式。
  * 界面上没有了改默认值的入口，就别再把默认值做成可配项。
  */
-async function showNewMenu(x: number, y: number): Promise<void> {
+async function showNewMenu(x: number, y: number, projectId?: number | null): Promise<void> {
   // 打开前重拉一次：`modes.json` 用户是可以手编的（热重载），菜单得跟上
   await loadModes(currentSessionId);
   document.getElementById("new-ctx")?.remove();
@@ -1245,7 +1304,9 @@ async function showNewMenu(x: number, y: number): Promise<void> {
     close();
     if (act === "sess") {
       // 空串 → undefined → `newSession` 用 `defaultModeId`
-      void newSession(mode || undefined);
+      // ⚠️ `projectId` 跟着菜单一起带下去：从某个组的 ＋ 进来的，
+      //    新会话就落在**那个组**里（null = 不挂项目 ⇒ 「无任务空间」组）。
+      void newSession(mode || undefined, projectId);
       return;
     }
     const got = await askFields(
@@ -1454,6 +1515,37 @@ function showSessionBindMenu(x: number, y: number, sid: string, kind: string): v
   closeOnOutsideClick(close);
 }
 
+/**
+ * 「无任务空间」组标题右键的菜单 —— **在这组新建会话**。
+ *
+ * ## 为什么需要它（真机反馈 2026-10-24）
+ *
+ * 这一组**没有项目** ⇒ 没有「重命名项目」可给 ⇒ 以前处理器直接 return，
+ * 而 document 级那个 contextmenu 闸又把**浏览器原生菜单**也拦掉了
+ * ⇒ 用户右键 = **完全没反应** ⇒ 看着就像「这一组是坏的」。
+ * ⇒ 现在给它一个**有意义**的动作：在这一组里新建会话（走「＋ 菜单」，能选模式）。
+ */
+function showSpaceMenu(x: number, y: number, projectId: number | null): void {
+  document.getElementById("sess-ctx")?.remove();
+  const menu = document.createElement("div");
+  menu.id = "sess-ctx";
+  menu.className = "ctx-menu";
+  menu.innerHTML = `
+    <div class="ctx-title">${projectId == null ? "无任务空间" : "📁"}</div>
+    <div class="ctx-item" data-act="new-in-space">＋ 在这组新建会话</div>`;
+  menu.style.left = `${Math.min(x, window.innerWidth - 190)}px`;
+  menu.style.top = `${Math.min(y, window.innerHeight - 80)}px`;
+  document.body.appendChild(menu);
+  const close = (): void => menu.remove();
+  menu.addEventListener("click", (ev) => {
+    const t = (ev.target as HTMLElement).closest<HTMLElement>(".ctx-item");
+    if (!t) return;
+    close();
+    void showNewMenu(x, y, projectId);
+  });
+  closeOnOutsideClick(close);
+}
+
 /** 拉 session→项目名 映射；顺带把误绑到项目上的主聊天解绑 */
 async function refreshSessionProjectTags(): Promise<void> {
   try {
@@ -1509,7 +1601,16 @@ function sessionProjectId(meta?: SessionMeta): number | null {
  * 主聊天恒不挂项目，所以天然不在任何项目里（`projectName === null` 过滤掉了）。
  */
 function latestSessionIn(projectId: number | null): SessionMeta | undefined {
-  if (projectId == null) return undefined;
+  // ⚠️ 「无任务空间」这一格以前**恒 undefined** ⇒ 顶栏选它唯独**不跳会话**
+  //    （选任何项目都会落到那个空间最新那条）⇒ 用户看到的现象是
+  //    「这一格点不进去 / 整组用不了」（真机反馈 2026-10-24）。
+  // ⇒ 这里必须按**与会话页分组同一套口径**取：
+  //    `kind === "main"`（主聊天）**或** `projectName == null` ⇒ 都在「无任务空间」。
+  if (projectId == null) {
+    return sessionList
+      .filter((s) => s.kind === "main" || s.projectName == null)
+      .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  }
   const name = projects.find((p) => p.id === projectId)?.name;
   if (!name) return undefined;
   return sessionList
@@ -1631,14 +1732,21 @@ function installSessionBindHandler(root: HTMLElement): void {
       });
     return;
   });
-  // 项目组标题右键 → 重命名项目
+  // 组标题右键 → 项目组：重命名项目；「无任务空间」组：在这组新建会话
   root.addEventListener("contextmenu", (e) => {
-    const sep = (e.target as HTMLElement).closest<HTMLElement>(".sess-sep[data-pname]");
+    const sep = (e.target as HTMLElement).closest<HTMLElement>(".sess-sep");
     if (!sep) return;
+    // ⚠️ 这一组以前**什么菜单都没有**（它没有 data-pname ⇒ 处理器直接 return），
+    //    而 document 级那个 contextmenu 闸又把**浏览器原生菜单也拦掉了**
+    //    ⇒ 用户右键 = 完全没反应 ⇒ 看着就像「这一组是坏的」（真机反馈 2026-10-24）。
+    // ⇒ 现在：这一组也给一个**有意义**的应用菜单（在这组新建会话）。
     e.preventDefault();
     const pname = sep.dataset.pname ?? "";
     const pid = Number(sep.dataset.pid ?? 0);
-    if (!pname || !pid) return;
+    if (!pname || !pid) {
+      showSpaceMenu(e.clientX, e.clientY, null);
+      return;
+    }
     document.getElementById("sess-ctx")?.remove();
     const menu = document.createElement("div");
     menu.id = "sess-ctx";
@@ -4503,7 +4611,16 @@ function paintModelsDropdown(anchorId = "model-chip"): void {
     <button class="mc-mi mc-mi-add" data-add="1" title="添加一个 OpenAI 兼容的模型（Base URL / 模型 ID / Key）">
       <span class="mc-mi-text"><span class="mc-mi-name">＋ 添加自定义模型</span></span>
     </button>`;
-  chip.appendChild(dd);
+  // ⚠️⚠️ 菜单挂到 **body**，**不**挂在锚点里面。
+  //
+  // 为什么（2026-10-24 真机报「模型下拉打不开」，实测盒模型证）：
+  // - 顶栏那颗 chip 是 `<button>`，**它自己 `overflow: hidden`**（为了让组别/模型名两行
+  //   ellipsis）⇒ 挂在它里面的绝对定位菜单**被自己裁掉**（实测：chip 底 212.9，
+  //   菜单底 501.5 ⇒ 整块裁没）⇒ 点了像没反应；
+  // - 设置页那行在 `.set-sec` 里，而 `.set-sec { overflow: hidden }` ⇒ 同样被裁。
+  // ⇒ 挂到 body + `position: fixed` ⇒ **不受任何祖先裁剪**，两处都修好。
+  document.body.appendChild(dd);
+  positionModelsDropdown(dd, chip);
   // 只给「模型」条目绑选择：`[data-id]` 把底部那颗添加按钮排除在外
   dd.querySelectorAll<HTMLButtonElement>(".mc-mi[data-id]").forEach((b) =>
     b.addEventListener("click", async (e) => {
@@ -4525,6 +4642,27 @@ function paintModelsDropdown(anchorId = "model-chip"): void {
     paintModelsDropdown();
     openModelsAdd();
   });
+}
+
+/**
+ * 把下拉菜单摆到锚点旁边（`position: fixed`，视口坐标）。
+ *
+ * ⚠️ 为什么自己算位置：菜单不在锚点里（见 `paintModelsDropdown` 里的注释）⇒
+ * 没有 `top/right` 锚点可依赖 ⇒ 按锚点的 `getBoundingClientRect` 算，
+ * 并做**视口收敛**（下方放不下就翻到上方 / 往里挪）。
+ */
+function positionModelsDropdown(dd: HTMLElement, anchor: HTMLElement): void {
+  const a = anchor.getBoundingClientRect();
+  const w = dd.offsetWidth || 214; // happy-dom 没有排版引擎 ⇒ 兜底用最小宽
+  const h = dd.offsetHeight || 0;
+  const pad = 8;
+  let left = a.right - w; // 右对齐锚点右缘
+  let top = a.bottom + 6;
+  if (left + w > window.innerWidth - pad) left = window.innerWidth - pad - w;
+  if (left < pad) left = pad;
+  if (top + h > window.innerHeight - pad) top = Math.max(pad, a.top - h - 6);
+  dd.style.left = `${Math.round(left)}px`;
+  dd.style.top = `${Math.round(top)}px`;
 }
 
 function renderPanel(): void {
@@ -6327,7 +6465,7 @@ function renderSettingsMenu(
         `
         ${row(
           "当前模型",
-          `${esc(curModelName)} <span class="set-val-caret">▾</span>`,
+          `<span id="set-model-chip">${esc(curModelName)}</span> <span class="set-val-caret">▾</span>`,
           "set-model",
         )}
         ${row("模型管理", `共 ${models.length} 个（独立窗口）`, "models")}
@@ -6761,8 +6899,13 @@ function bindSubBarActions(bar: HTMLElement): void {
   });
 
   // ---- 05 会话：新建会话 ----
-  bar.querySelector<HTMLButtonElement>("#sb-new-session")?.addEventListener("click", () => {
-    void newSession();
+  //
+  // ⚠️ 走 **showNewMenu**（能选模式），不是直接 `newSession()` ——
+  //    模式是「建会话时定、建完不能改」的参数（设计稿 05）⇒ 直接建会
+  //    默默用默认模式，用户没有选择的机会（真机反馈 2026-10-24）。
+  bar.querySelector<HTMLButtonElement>("#sb-new-session")?.addEventListener("click", (e) => {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    void showNewMenu(r.left, r.bottom + 4);
   });
 
   // ---- 04 设置：搜索设置项 ----
@@ -9669,9 +9812,9 @@ async function send(): Promise<void> {
   renderPreview();
   renderPathBar();
 
-  const pendingBefore = await data.memory.pending().catch(
-    () => [] as Candidate[],
-  );
+  // ⚠️ 这里原来还有一次 `memory.pending()` 快照（pendingBefore），
+  //    只用来判断「记忆候选是不是本轮新增了」⇒ 好在提示被用户要求删掉后
+  //    这次后端调用也省了（2026-10-24）。
   pushEntry("user", text || "（仅图片）", undefined, imgs);
 
   // 先放一个「进行中」气泡，进度事件会往里建时间线条目；结束后替换成最终结果
@@ -9724,13 +9867,18 @@ async function send(): Promise<void> {
       // 区分「用户主动停止」与「轮数/上下文降级」：后者 stopReason 会说明原因
       const reason = run.stopReason && run.stopReason !== "已停止" ? run.stopReason : "";
       const canContinue = reason.includes("轮数上限") || reason.includes("上下文");
-      pushEntry(
-        "system",
-        reason ? `⚠️ ${reason}` : "⏹ 已停止，本轮已产出的内容保留在上面",
-        undefined,
-        undefined,
-        canContinue ? { continueRun: true } : undefined,
-      );
+      // ⚠️ 用户 2026-10-24 明确要求**删掉**「⏹ 已停止，本轮已产出的内容保留在上面」这行
+      //    ⇒ 没有 reason（= 用户自己按的停止）就**不插这一条**（纯噪声：是他自己停的，他清楚）。
+      //    有 reason（例如「轮数上限」「上下文」）才留 —— 那是真信息。
+      if (reason) {
+        pushEntry(
+          "system",
+          `⚠️ ${reason}`,
+          undefined,
+          undefined,
+          canContinue ? { continueRun: true } : undefined,
+        );
+      }
     }
     // 没来得及送达的插话 → 塞回输入框。用户打的字不该因为"停得太快"白打。
     if (run.pendingSteers && run.pendingSteers.length) {
@@ -9792,20 +9940,11 @@ async function send(): Promise<void> {
     markRunEnd(runSid);
   }
 
-  // 记忆候选若在本轮增加 → 提醒去设置审批（做完后提议记忆的产品闭环）。
-  // 切走了就不往当前会话塞这条提示 —— 它属于刚才那轮。
-  if (runSid !== currentSessionId) return;
-  const pendingAfter = await data.memory.pending().catch(
-    () => [] as Candidate[],
-  );
-  if (pendingAfter.length > pendingBefore.length) {
-    const n = pendingAfter.length - pendingBefore.length;
-    // ⚠️ 这里**不**再自己贴底：`pushEntry` 内部已经按"用户在底部才跟随"的规矩
-    //    处理过了（会保住位置 + 给「↓」加计数）。在外面再无条件
-    //    `repaintChatToBottom()` 就等于把「不抢滚动」这个约定又破了 ——
-    //    用户正翻历史，看到的却是"被拽到底 + 数字在跳"。
-    pushEntry("system", `有 ${n} 条记忆候选待审批（设置 › 记忆，批了才会进长期记忆）`);
-  }
+  // ⚠️ 2026-10-24 用户明确要求**删掉**「有 N 条记忆候选待审批（设置 › 记忆…）」这条提示
+  //    （截图图5，用户原话「同四」= 不要这类「有 N 条候选待审批」的提示）。
+  //    ⇒ 整段连同它专用的 `pendingBefore` 快照一起去掉
+  //    （省掉一轮 `memory.pending()` 后端调用 —— 那次调用只服务于这条提示）。
+  //    ⚠️ 只删这一类；其它 toast / 提示一律不动。
 }
 
 /**
@@ -10411,7 +10550,11 @@ function boot(): void {
   document.addEventListener("mousedown", (e) => {
     if (!modelsDropdownOpen) return;
     const t = e.target as HTMLElement;
-    if (t.closest("#model-chip")) return;
+    // ⚠️ 菜单现在挂在 **body** 上（不在锚点里面 ⇒ 不会被祖先裁掉）⇒
+    //    点**菜单内部**必须放行，否则「点条目」会先被这里关掉 ⇒ 选不中。
+    if (t.closest("#models-dropdown")) return;
+    // 两个锚点都放行：顶栏 `#model-chip` / 设置页那行 `#set-model-chip`
+    if (t.closest("#model-chip") || t.closest("#set-model-chip")) return;
     modelsDropdownOpen = false;
     paintModelsDropdown();
   });
