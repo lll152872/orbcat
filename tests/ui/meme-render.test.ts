@@ -46,6 +46,38 @@ describe("表情包 markdown 穿过切气泡", () => {
     expect(html).toContain(`alt="双手比心卖萌，星星眼超开心"`);
   });
 
+  // ── 2026-10-24 真机回归：表情包变「破图图标 + alt 文字」──
+  //
+  // 本地路径的 <img> 必须是 **无 src 的占位**（路径挂 data-img）。
+  // ⚠️ 写 `src="D:\…"` 在 webview 里**必定加载失败** ⇒ 只留一个破图标。
+  it("本地路径必须渲染成无 src 的 data-img 占位（不许直接写 src）", () => {
+    const html = mdToHtml(IMG_MD);
+    expect(html).toContain(`class="md-img md-img-local"`);
+    expect(html).toContain(`data-img="${PATH}"`);
+    // ⚠️ 关键：本地路径**不许**出现 src=（那在 webview 里必定加载失败）
+    expect(
+      /<img[^>]*\ssrc=/.test(html),
+      `本地路径的 img 不许带 src：${html}`,
+    ).toBe(false);
+  });
+
+  it("路径里的反斜杠必须原样保留（不许被改写成无分隔符的畸形名）", () => {
+    const html = mdToHtml(IMG_MD);
+    expect(html).toContain(PATH);
+    // ⚠️ 不许出现「反斜杠被删掉」的畸形名
+    //    （真机现场：agent-data 根目录躺过 `D:orbcatagentscreenshotshw7_filled.png`
+    //      —— 那是 `D:\orbcat\agent-data\screenshots\hw7_filled.png` 去掉所有分隔符的结果）
+    const squashed = PATH.replace(/\\/g, "");
+    expect(
+      html.includes(squashed),
+      `路径被改写成了无分隔符的畸形名：${squashed}`,
+    ).toBe(false);
+    expect(
+      (html.match(/\\/g) || []).length >= PATH.split("\\").length - 1,
+      `路径里的反斜杠数量不对：${html}`,
+    ).toBe(true);
+  });
+
   it("alt 里带 `！` 也不能把图片切坏", () => {
     const src = `![哇！好耶](D:\\a\\b.jpg)`;
     const parts = splitBubbles(src);
