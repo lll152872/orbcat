@@ -206,7 +206,7 @@ fn flush_writes_pending_position_without_waiting_for_debounce() {
 
     schedule_orb_pos_save(&dir, (777, 888));
     // **不等**安静期，直接 flush
-    flush_orb_pos_save(&dir);
+    flush_orb_pos_save();
 
     assert_eq!(
         config::load_settings(&dir).orb_pos,
@@ -214,9 +214,78 @@ fn flush_writes_pending_position_without_waiting_for_debounce() {
         "退出前必须把待写的位置落盘"
     );
     // flush 后队列已空，再 flush 一次不能出事
-    flush_orb_pos_save(&dir);
+    flush_orb_pos_save();
     assert_eq!(config::load_settings(&dir).orb_pos, Some(config::OrbPos { x: 777, y: 888 }));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 🔴 回归：**待写槽里的值必须连目录一起走**。
+///
+/// ## 这是什么（2026-10-24 那条偶发红的根因）
+///
+/// `debounced_orb_pos_save_writes_only_the_last_position` 在整套并行跑时偶发红：
+/// `flush` 用例留下的 worker（还在睡 600ms 安静期）醒来后 `take()` 走了
+/// debounce 用例正等着写的值，却把它写进了**自己那个目录**
+/// ⇒ debounce 用例的目录永远等不到那个值 ⇒ 红。
+///
+/// 根因在**实现**：`ORB_SAVE_PENDING` 原来**只存坐标、不存目录**，
+/// 落盘的目标是「谁先 spawn 的那个 worker 捕获的目录」⇒ **目录与值对不上**。
+/// （生产里只有一个数据目录，所以这条平时看不出来 —— 正是"平时没事、
+/// 一进测试就偶发"的典型。）
+///
+/// ## 这条用例怎么**确定性地**复现那个交错
+///
+/// 不靠并行、不靠运气：直接把「值属于 dir_b、worker 却属于 dir_a」这个局面造出来。
+/// ① 给 dir_a 排一个值 ⇒ 起 worker_a（安静期 `ORB_SAVE_DEBOUNCE_MS`，
+///    它捕获的落盘目录 = dir_a）；
+/// ② 再给 dir_b 排一个值 ⇒ pending 非空 ⇒ **不会**再起 worker
+///    （所以活着的 worker 只有 worker_a，而值属于 dir_b）；
+/// ③ 等 worker_a 醒来。
+///
+/// ⇒ **旧实现**：worker_a 把 dir_b 的值写进 dir_a ⇒ dir_b 永远是空的 ⇒ **必红**；
+/// **修好后**：值连目录一起走 ⇒ worker_a 写进 dir_b ⇒ 绿。
+///
+/// 旧码下这条是**确定性失败**（不是 flaky）—— 这正是它能当判据的原因。
+#[test]
+fn 跨目录的待写值不许写错目录() {
+    let _serial = ORB_SAVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = std::env::temp_dir().join(format!(
+        "orbcat_orbmix_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir_a = root.join("a");
+    let dir_b = root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    // 先把槽清空 —— 保证本用例的「pending 为空 ⇒ 一定起 worker」这个前提成立
+    {
+        let mut g = ORB_SAVE_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        *g = None;
+    }
+
+    // ① 值属于 dir_a，起 worker_a
+    schedule_orb_pos_save(&dir_a, (11, 11));
+    // ② 值换成属于 dir_b —— pending 非空 ⇒ 不会再起 worker（只有 worker_a 活着）
+    schedule_orb_pos_save(&dir_b, (22, 22));
+
+    // ③ 等 worker_a 醒来（留余量，慢机器上也够）
+    std::thread::sleep(std::time::Duration::from_millis(
+        ORB_SAVE_DEBOUNCE_MS + 400,
+    ));
+
+    assert_eq!(
+        config::load_settings(&dir_b).orb_pos,
+        Some(config::OrbPos { x: 22, y: 22 }),
+        "dir_b 的值必须落到 dir_b —— 上一个 worker 不许把它写进别的目录"
+    );
+    assert_ne!(
+        config::load_settings(&dir_a).orb_pos,
+        Some(config::OrbPos { x: 22, y: 22 }),
+        "dir_a 不该拿到 dir_b 的值（落盘目标必须跟着值走）"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// 尺寸判据：只有**恰好**是球窗口大小才算球态。
