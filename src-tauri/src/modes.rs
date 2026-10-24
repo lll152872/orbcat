@@ -298,10 +298,16 @@ pub fn builtin() -> Vec<Mode> {
             mcp_groups_preload: GroupSel::Some(Vec::new()),
             tool_presentation: ToolPresentation::Native,
             image_replies: ImageReplies::Free,
+            // ⚠️ **这里刻意不提表情包**（2026-10-24）：`promptExtra` 是**静态文本**，
+            //    装在 `agent-data/modes.json` 里 ⇒ 它**不知道运行时状态**。
+            //    「默认要发表情包」是**有条件的**（库里有能表达当前情感的图才发），
+            //    条件判断在 `agent.rs::meme_policy_prompt` —— 那段每次现算，
+            //    库为空时会自动改口成「库是空的 ⇒ 别发」。
+            //    把「默认要发」写死在这儿 ⇒ 空库时场景段与表情包段**互相矛盾**。
             prompt_extra: "现在是**闲聊场景**，不是工作现场。放松一点，像熟人发消息那样说话：\
                            短句、口语、一次说一个念头，**别写小标题、别分点罗列**。想说几句就\
                            分成几段发出去 —— 界面会按你的分段显示成一条条消息，那才是聊天的样子。\
-                           情绪到了可以发一张表情包（用 `send_meme`）。仍然遵守红线。"
+                           仍然遵守红线。"
                 .into(),
             chatty: true,
         },
@@ -553,6 +559,27 @@ mod tests {
             .map(|m| m.id.as_str())
             .collect();
         assert!(others.is_empty(), "只有闲聊模式该开 chatty，实际还有 {others:?}");
+    }
+
+    /// 闲聊模式的 `promptExtra` **不许**写「默认要发表情包」。
+    ///
+    /// ## 为什么
+    ///
+    /// `promptExtra` 是**静态文本**（装在 `agent-data/modes.json` 里）
+    /// ⇒ 它**不知道运行时状态**。而「默认要发表情包」是**有条件的**
+    /// （库里有能表达当前情感的图才发，没合适的就不发）——
+    /// 条件判断在 `agent.rs::meme_policy_prompt`，那段**每次现算**，
+    /// 库为空时会自动改口成「库是空的 ⇒ 这一轮别发」。
+    ///
+    /// ⇒ 一旦把「默认要发」写进 `promptExtra`，**空库时**场景段与表情包段
+    /// **互相矛盾**（2026-10-24 实测：守卫用例当场变红）。
+    #[test]
+    fn chat_prompt_extra_does_not_carry_the_meme_policy() {
+        let chat = builtin().into_iter().find(|m| m.id == "chat").unwrap();
+        assert!(
+            !chat.prompt_extra.contains("默认要发表情包"),
+            "表情包口径是**条件**语义，装不进静态的 promptExtra"
+        );
     }
 
     /// 用户可以在自己的 `modes.json` 里写 `imageReplies` / `promptExtra`，
