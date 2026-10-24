@@ -26,6 +26,7 @@ mod memes;
 mod memory;
 mod modes;
 mod perm_request;
+mod perm_cli;
 mod permission;
 // pi 内核相关模块 —— `pub` 是为了让 `tests/pi_integration.rs` 能直接用
 // （集成测试只能访问 crate 的公开 API）。

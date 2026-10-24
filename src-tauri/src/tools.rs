@@ -1478,6 +1478,14 @@ async fn execute_inner(
     ctx: &ToolCtx<'_>,
     in_ptc_sub: bool,
 ) -> Result<ToolOutput, String> {
+
+    // ---- 层 1 · 路径阻断：内部 AI 碰「外部代批 CLI」一律直接停 ----
+    //
+    // ⚠️ 必须**在权限判定之前**：命中即拒 —— 不执行、不弹卡、不降级。
+    // ⚠️ 走的是**词法归一化之后**的判定（复用 command_policy::normalize）。
+    if let Err(e) = crate::perm_cli::block_tool_args(name, args, ctx.data_dir) {
+        return Err(e);
+    }
     // PTC 坍缩：模型直接发的调用只允许 run_code
     if !in_ptc_sub
         && name != crate::ptc::RUN_CODE
