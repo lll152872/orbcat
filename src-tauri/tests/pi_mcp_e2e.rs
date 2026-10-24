@@ -103,12 +103,28 @@ fn orbcat_data_dir() -> Option<PathBuf> {
 
 /// 找到 `fake_mcp_server.cjs`（源码在 `src-tauri/tests/` 下）。
 fn fake_mcp_script() -> Option<PathBuf> {
-    let mut p = std::env::current_exe().ok()?;
-    for _ in 0..6 {
-        p = p.parent()?.to_path_buf();
-        let cand = p.join("tests").join("fake_mcp_server.cjs");
-        if cand.is_file() {
-            return Some(cand);
+    // 主路径：测试 exe 在 target/debug/deps/ → 往上找到 src-tauri/
+    if let Ok(mut p) = std::env::current_exe() {
+        for _ in 0..6 {
+            p = p.parent()?.to_path_buf();
+            let cand = p.join("tests").join("fake_mcp_server.cjs");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    // 兜底：从 agent-data 往上找仓库根的 src-tauri/tests/
+    // ⚠️ 用**独立 target** 跑时 exe 不在仓库里 ⇒ 主路径找不到 ⇒ 用例会**静默跳过**
+    //    （绿着但什么都没验 = 假绿）。
+    let data = orbcat_data_dir()?;
+    for up in 0..4 {
+        let mut cand = data.clone();
+        for _ in 0..up {
+            cand = cand.parent()?.to_path_buf();
+        }
+        let c = cand.join("src-tauri").join("tests").join("fake_mcp_server.cjs");
+        if c.is_file() {
+            return Some(c);
         }
     }
     None
@@ -151,12 +167,27 @@ fn clean_data_dir(real: &Path) -> PathBuf {
 /// 从假模型的**请求历史**里取出模型实际看到的工具名。
 ///
 /// 这是端到端证据：请求体里的 `tools` 数组就是 provider 收到的声明。
+///
+/// ## 🔴 工具名有**两种**形态，都要认
+///
+/// 真实请求体里是 OpenAI function-calling：
+/// ```json
+/// [{"type":"function","function":{"name":"orb_read_file","description":"…","parameters":{…}}}]
+/// ```
+/// ⇒ 工具名在 **`t.function.name`**，`t.name` 是 `undefined`。
+/// 而 Anthropic 风格是扁平的 `{"name": …}`。
+/// ⇒ 只认 `t.name` ⇒ **一个都取不到** ⇒ 「模型看到的工具 0 个」（守门 2026-10-24 真机定位）。
 fn model_tool_names(fake: &fake_model::FakeModel) -> Vec<String> {
     let hist = fake.request_history();
     hist.iter()
         .filter_map(|r| r.get("tools").and_then(|t| t.as_array()))
         .flatten()
-        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .filter_map(|t| {
+            t.get("name")
+                .or_else(|| t.get("function").and_then(|f| f.get("name")))
+                .and_then(|n| n.as_str())
+                .map(String::from)
+        })
         .collect()
 }
 
@@ -225,6 +256,14 @@ async fn pi不再自己连mcp_server_模型只看得到orb前缀的工具() {
     //
     // ⚠️ 这是**最硬**的一条：它是「模型实际收到的东西」，
     // 不是我们自己的变量。
+    //
+    // ⚠️⚠️ **但这条在「没有宿主注入」的用例里是弱断言** ——
+    // 本用例**没有**注入宿主 MCP 注册表 ⇒ pi 侧本来就没有任何 MCP 工具
+    // ⇒ **天然没有 `mcp__` 裸名** ⇒ 这条**只能证明「没放行原生命名空间」**，
+    // **不能证明「MCP 工具确实进来了」**。
+    // ⇒ 「MCP 工具经宿主桥进 pi 工具表」由 crate 内单测
+    // `注入共享注册表后_清单里有mcp工具且名字是mcp前缀`（清单侧 + 白名单侧）
+    // + 守门真机证据（pi 侧真的注册了 34 个工具、含 `orb_mcp__*`）共同承担。
     let names = model_tool_names(&fake);
     eprintln!("=== 模型看到的工具（{} 个）===", names.len());
     let bare: Vec<&String> = names.iter().filter(|n| n.starts_with("mcp__")).collect();
