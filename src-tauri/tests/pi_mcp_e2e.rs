@@ -43,6 +43,36 @@ use std::sync::Arc;
 use orbcat_lib::agent::ProgressFn;
 use orbcat_lib::pi_runtime::PiRuntime;
 use serde_json::json;
+/// 本进程内**唯一**的临时目录名（pid + 进程内原子序号）。
+///
+/// ## 🔴 为什么 pid 不够、为什么固定名更糟
+///
+/// - 同一个 test target 里的多个 `#[tokio::test]` 是**同一个进程** ⇒ **同一个 pid**
+///   ⇒ 只带 pid 命名 ⇒ 两个用例拿到**同一个目录** ⇒ tokio 默认并发 ⇒
+///   A 的 `remove_dir_all` 把 B 正在用的目录删了 ⇒ B 静默跳过；反向 B 删了 A
+///   ⇒ A 的 pi 起不来 ⇒ **模型看到的工具 0 个**。
+/// - **完全不带 pid 的固定名更危险** ⇒ `cargo test --tests` 会**并行跑多个 target**
+///   （不同进程、不同 pid）⇒ 固定名**跨 target 也会互删**
+///   ⇒ 这正是「全跑红、逐 target 串行全绿」的真正原因。
+///
+/// ⇒ 统一用「pid + 进程内序号」⇒ 每次调用一个独立目录，彻底消除互删。
+fn unique_tmp(tag: &str) -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "orbcat-{tag}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    // ⚠️ **顺手把目录建出来** —— 以前这些路径直接用 `temp_dir()`（**一定存在**），
+    // 改成唯一目录后不建 ⇒ pi 起来时写 models.json 失败 ⇒ 「pi 应能起」直接挂。
+    //
+    // ⚠️ 造不出来要 **panic**，不许静默跳过 —— 静默跳过 = 测试绿着但什么都没验（假绿）。
+    std::fs::create_dir_all(&d).unwrap_or_else(|e| {
+        panic!("应能造出临时目录 {}：{e}", d.display());
+    });
+    d
+}
+
 
 fn runtime_dir() -> Option<PathBuf> {
     let mut p = std::env::current_exe().ok()?;
@@ -100,12 +130,22 @@ fn read_trace(path: &Path) -> Vec<serde_json::Value> {
 ///
 /// 清单通路会连真实的 MCP server（`resolve_mcp_servers` 读 `data_dir/mcp.json`）
 /// ⇒ 测试要**零网络**、零子进程，就必须让那个目录里没有 `mcp.json`。
-fn clean_data_dir(real: &Path) -> Option<PathBuf> {
-    let d = std::env::temp_dir().join(format!("orbcat-pi-mcp-data-{}", std::process::id()));
+///
+/// ## ⚠️ 造不出来要 **panic**，不许静默跳过
+///
+/// 以前是 `.ok()?` ⇒ 造目录失败就悄悄 `return` ⇒ **测试绿着但什么都没验**
+/// （假绿）。⇒ 失败就 panic 并带清晰消息。
+/// ⚠️ 但「runtime/ 未构建」那类**环境性跳过保留**（那是设计如此，不是缺陷）。
+fn clean_data_dir(real: &Path) -> PathBuf {
+    let d = unique_tmp("pi-mcp-data");
     let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).ok()?;
-    std::fs::copy(real.join("models.json"), d.join("models.json")).ok()?;
-    Some(d)
+    std::fs::create_dir_all(&d).unwrap_or_else(|e| {
+        panic!("应能造出临时数据目录 {}：{e}", d.display());
+    });
+    std::fs::copy(real.join("models.json"), d.join("models.json")).unwrap_or_else(|e| {
+        panic!("应能拷 models.json 到 {}：{e}", d.display());
+    });
+    d
 }
 
 /// 从假模型的**请求历史**里取出模型实际看到的工具名。
@@ -135,18 +175,15 @@ async fn pi不再自己连mcp_server_模型只看得到orb前缀的工具() {
         eprintln!("跳过：找不到 tests/fake_mcp_server.cjs");
         return;
     };
-    let Some(data_dir) = clean_data_dir(&real_data) else {
-        eprintln!("跳过：造不出干净的数据目录");
-        return;
-    };
+    let data_dir = clean_data_dir(&real_data);
 
     // ── trace 文件：假 MCP server 每次调用都往里写一行 ──
-    let trace_path = std::env::temp_dir().join(format!("orbcat-mcp-trace-{}.jsonl", std::process::id()));
+    let trace_path = unique_tmp("mcp-trace");
     let _ = std::fs::remove_file(&trace_path);
 
     let fake = fake_model::simple_text_model("好的。").expect("假模型应能起");
 
-    let agent_dir = std::env::temp_dir().join(format!("orbcat-pi-mcp-agent-{}", std::process::id()));
+    let agent_dir = unique_tmp("pi-mcp-agent");
     let _ = std::fs::remove_dir_all(&agent_dir);
     let _ = std::fs::create_dir_all(&agent_dir);
 
@@ -247,13 +284,10 @@ async fn mcp不可用时不卡死() {
         eprintln!("跳过：找不到 agent-data/");
         return;
     };
-    let Some(data_dir) = clean_data_dir(&real_data) else {
-        eprintln!("跳过：造不出干净的数据目录");
-        return;
-    };
+    let data_dir = clean_data_dir(&real_data);
 
     let fake = fake_model::simple_text_model("好的。").expect("假模型应能起");
-    let agent_dir = std::env::temp_dir().join(format!("orbcat-pi-mcp-bad-agent-{}", std::process::id()));
+    let agent_dir = unique_tmp("pi-mcp-bad-agent");
     let _ = std::fs::remove_dir_all(&agent_dir);
     let _ = std::fs::create_dir_all(&agent_dir);
 
@@ -300,4 +334,24 @@ async fn mcp不可用时不卡死() {
 
     let _ = std::fs::remove_dir_all(&agent_dir);
     let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// 🔴 回归用例：**同一 target 内的两次调用必须拿到不同目录**。
+///
+/// 背景（守门 2026-10-24 实测）：目录名只带 pid ⇒ 同一 target 的多个
+/// `#[tokio::test]` 是同一进程 ⇒ 同一 pid ⇒ 共用同一目录 ⇒ 并发时互相
+/// `remove_dir_all` ⇒ 一个用例静默跳过、另一个的 pi 起不来（工具 0 个）。
+/// 而**完全不带 pid 的固定名**还会跨 target 互删（cargo 并行跑多个 target）。
+///
+/// 这条用例**锁住「唯一」这个性质本身**，避免以后有人把序号去掉。
+#[test]
+fn 同一target内两次调用拿到不同目录() {
+    let a = unique_tmp("pi-mcp-uniq");
+    let b = unique_tmp("pi-mcp-uniq");
+    assert_ne!(a, b, "两次调用必须拿到不同目录（否则同 target 并发会互删）");
+    assert_ne!(
+        a.file_name(),
+        b.file_name(),
+        "目录名必须带进程内唯一序号"
+    );
 }

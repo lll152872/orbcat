@@ -40,6 +40,37 @@ use std::sync::Arc;
 use orbcat_lib::agent::ProgressFn;
 use orbcat_lib::pi_runtime::PiRuntime;
 use serde_json::json;
+/// 本进程内**唯一**的临时目录名（pid + 进程内原子序号）。
+///
+/// ## 🔴 为什么 pid 不够、为什么固定名更糟
+///
+/// - 同一个 test target 里的多个 `#[tokio::test]` 是**同一个进程** ⇒ **同一个 pid**
+///   ⇒ 只带 pid 命名 ⇒ 两个用例拿到**同一个目录** ⇒ tokio 默认并发 ⇒
+///   A 的 `remove_dir_all` 把 B 正在用的目录删了 ⇒ B 静默跳过；反向 B 删了 A
+///   ⇒ A 的 pi 起不来 ⇒ **模型看到的工具 0 个**。
+/// - **完全不带 pid 的固定名更危险** ⇒ `cargo test --tests` 会**并行跑多个 target**
+///   （不同进程、不同 pid）⇒ 固定名**跨 target 也会互删**
+///   ⇒ 这正是「全跑红、逐 target 串行全绿」的真正原因。
+///
+/// ⇒ 统一用「pid + 进程内序号」⇒ 每次调用一个独立目录，彻底消除互删。
+fn unique_tmp(tag: &str) -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "orbcat-{tag}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    // ⚠️ **顺手把目录建出来** —— 以前这些路径直接用 `temp_dir()`（**一定存在**），
+    // 改成唯一目录后不建 ⇒ pi 起来时写 models.json 失败 ⇒ 「pi 应能起」直接挂。
+    //
+    // ⚠️ 造不出来要 **panic**，不许静默跳过 —— 静默跳过 = 测试绿着但什么都没验（假绿）。
+    std::fs::create_dir_all(&d).unwrap_or_else(|e| {
+        panic!("应能造出临时目录 {}：{e}", d.display());
+    });
+    d
+}
+
+
 
 fn runtime_dir() -> Option<PathBuf> {
     let mut p = std::env::current_exe().ok()?;
@@ -63,7 +94,7 @@ fn setup_l1_project(fake_base_url: &str, tool_name: &str) -> (PathBuf, PathBuf) 
         .duration_since(std::time::UNIX_EPOCH)
         .map(|x| x.as_nanos())
         .unwrap_or(0);
-    let d = std::env::temp_dir().join(format!("orbcat_l1e2e_{stamp}"));
+    let d = unique_tmp("l1e2e");
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).expect("应能建临时数据目录");
 
@@ -101,7 +132,7 @@ fn setup_l1_project(fake_base_url: &str, tool_name: &str) -> (PathBuf, PathBuf) 
     std::fs::create_dir_all(bundle.join("tools")).expect("应能建项目目录");
 
     // 标记文件：脚本执行后会写它
-    let marker = std::env::temp_dir().join(format!("orbcat_l1_marker_{stamp}.txt"));
+    let marker = unique_tmp("l1-marker").with_extension("txt");
     let _ = std::fs::remove_file(&marker);
 
     // 脚本：把参数写到标记文件 + 回显

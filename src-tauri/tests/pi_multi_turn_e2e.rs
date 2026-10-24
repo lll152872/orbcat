@@ -37,6 +37,36 @@ use std::sync::Arc;
 use orbcat_lib::agent::ProgressFn;
 use orbcat_lib::pi_runtime::PiRuntime;
 use serde_json::json;
+/// 本进程内**唯一**的临时目录名（pid + 进程内原子序号）。
+///
+/// ## 🔴 为什么 pid 不够、为什么固定名更糟
+///
+/// - 同一个 test target 里的多个 `#[tokio::test]` 是**同一个进程** ⇒ **同一个 pid**
+///   ⇒ 只带 pid 命名 ⇒ 两个用例拿到**同一个目录** ⇒ tokio 默认并发 ⇒
+///   A 的 `remove_dir_all` 把 B 正在用的目录删了 ⇒ B 静默跳过；反向 B 删了 A
+///   ⇒ A 的 pi 起不来 ⇒ **模型看到的工具 0 个**。
+/// - **完全不带 pid 的固定名更危险** ⇒ `cargo test --tests` 会**并行跑多个 target**
+///   （不同进程、不同 pid）⇒ 固定名**跨 target 也会互删**
+///   ⇒ 这正是「全跑红、逐 target 串行全绿」的真正原因。
+///
+/// ⇒ 统一用「pid + 进程内序号」⇒ 每次调用一个独立目录，彻底消除互删。
+fn unique_tmp(tag: &str) -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "orbcat-{tag}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    // ⚠️ **顺手把目录建出来** —— 以前这些路径直接用 `temp_dir()`（**一定存在**），
+    // 改成唯一目录后不建 ⇒ pi 起来时写 models.json 失败 ⇒ 「pi 应能起」直接挂。
+    //
+    // ⚠️ 造不出来要 **panic**，不许静默跳过 —— 静默跳过 = 测试绿着但什么都没验（假绿）。
+    std::fs::create_dir_all(&d).unwrap_or_else(|e| {
+        panic!("应能造出临时目录 {}：{e}", d.display());
+    });
+    d
+}
+
 
 fn runtime_dir() -> Option<PathBuf> {
     let mut p = std::env::current_exe().ok()?;
@@ -81,7 +111,7 @@ async fn 同会话连发两轮_第二轮不炸且带上第一轮上下文() {
     const FIRST_MARK: &str = "第一轮唯一标记-MULTITURN-7f3a";
 
     // ── 目标文件（第一轮让模型去读它 ⇒ 会产生一条 tool 结果）──
-    let work = std::env::temp_dir().join("orbcat");
+    let work = unique_tmp("orbcat");
     let _ = std::fs::create_dir_all(&work);
     let target = work.join("pi-multiturn-target.txt");
     std::fs::write(&target, "MAGIC-MULTITURN-42").expect("应能写目标文件");
@@ -94,7 +124,7 @@ async fn 同会话连发两轮_第二轮不炸且带上第一轮上下文() {
     )
     .expect("假模型应能起");
 
-    let agent_dir = std::env::temp_dir().join("orbcat-pi-multiturn-agent");
+    let agent_dir = unique_tmp("pi-multiturn-agent");
     let _ = std::fs::remove_dir_all(&agent_dir);
     let _ = std::fs::create_dir_all(&agent_dir);
 
