@@ -10,6 +10,20 @@ description = "悬浮球形态的私人 agent（Windows 桌面）"
 authors = ["lll152"]
 edition = "2021"
 
+# ⚠️ 关闭 bin 自动发现：下面两个 bin **显式**声明。
+#
+# 为什么必须显式（2026-10-24 收尾）：
+#   自动发现会把 `src/bin/orbcat_perm.rs` 编译成 **`orbcat_perm.exe`**（下划线），
+#   而层 1 的路径阻断认的是**文件名 `orbcat-perm`**（`perm_cli::CLI_STEM`）
+#   ⇒ 产物名对不上 = 阻断规则在真机上形同虚设（用户装到的 CLI 叫 orbcat_perm，
+#   内部 AI 引用 `orbcat-perm.exe` 时扫不到）。
+#   ⇒ 必须显式写 `name = "orbcat-perm"`（连字符），产物才是 `orbcat-perm.exe`。
+#
+#   顺带：`autobins = false` 也避免了「显式 [[bin]] 与自动发现的同一个源文件
+#   同时存在 ⇒ 同一个路径属于两个 target ⇒ cargo 直接报
+#   `file found to be present in multiple build targets`」。
+autobins = false
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
@@ -18,6 +32,27 @@ edition = "2021"
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "orbcat_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# --- bin 目标（显式，见上面的 autobins = false）---------------------------
+#
+# ① 主程序（原来靠自动发现，名字 = 包名 orbcat）——
+#    ⚠️ 显式写出来是为了在 `autobins = false` 下保留原产物名 `orbcat.exe`
+#    （桌面快捷方式 / 启动器 / CI 全都按这个名字找）。
+[[bin]]
+name = "orbcat"
+path = "src/main.rs"
+
+# ② 外部代批 CLI（**名字带连字符，是硬要求**）——
+#
+#    部署形态：`<包根>\bin\orbcat-perm.exe`（`tools/package.mjs` 装配、
+#    `tools/build-release.sh` 部署到运行态）。
+#
+#    ⚠️ 名字必须精确是 `orbcat-perm`：
+#       层 1 阻断按**文件名**匹配（`perm_cli::CLI_STEM = "orbcat-perm"`，
+#       忽略 .exe/.cmd/.bat/.ps1/.com 后缀）⇒ 叫 `orbcat_perm` 就挡不住。
+[[bin]]
+name = "orbcat-perm"
+path = "src/bin/orbcat_perm.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

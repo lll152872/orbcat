@@ -19,12 +19,62 @@
 //! ⇒ L1 失效时（运行时拼路径），内部 AI 仍然**调不到「批准权限」这个能力**
 //!    —— 因为那个能力只在 L2 的独立通道里，而通道要凭证。
 //!
-//! # 凭证口径（为什么不落明文）
+//! # 凭证口径与**文件格式定稿**（2026-10-24 收尾）
 //!
-//! - **明文 token 只存在于 CLI 那一个子进程的环境变量**（`ORBCAT_PERM_TOKEN`）；
-//! - **orbcat 磁盘上只有 sha256 哈希**（`perm-cli-token.json`）；
-//! - ⇒ 内部 AI 即便读到 orbcat 的数据目录，**也造不出 token**（读不到明文）；
-//! - ⇒ 且 orbcat **自己的进程 env 里没有** token ⇒ 内部 AI 起的子进程继承不到。
+//! ## 文件格式（**定稿，不再改**）
+//!
+//! 状态目录 = [`cli_state_dir`]：
+//!
+//! | 平台 | 状态目录 |
+//! |---|---|
+//! | Windows | `%LOCALAPPDATA%\orbcat` |
+//! | 其它 | `$XDG_STATE_HOME/orbcat` 或 `~/.local/state/orbcat` |
+//!
+//! ⚠️ **状态目录故意不在 `agent-data/` 里** —— `D:\orbcat\agent-data`
+//!    一字节都不许动，且真数据目录也不该混进凭证文件。
+//!    可用 `ORBCAT_PERM_STATE_DIR` 覆盖（测试 / 便携场景）。
+//!
+//! ### ① token 文件：`<状态目录>\perm-token`
+//!
+//! **两行 UTF-8 文本**：
+//!
+//! ```text
+//! <明文 token>          ← 第 1 行：32 位小写 hex（random_hex(16)）
+//! <过期时间戳>          ← 第 2 行：Unix **毫秒**（u64）
+//! ```
+//!
+//! - 有效期 [`TOKEN_TTL_MS`] = **5 分钟**；
+//! - **用一次即轮换**：[`verify_token`] 比对成功后立刻 [`issue_token`]
+//!   写回新值 ⇒ 旧 token 立刻作废；
+//! - **明文落盘**（不是哈希）：因为要「用一次即轮换」，哈希没法轮换 —
+//!   哈希只能验「是不是这一枚」，没法换出下一枚。
+//! - ⚠️ 落明文 ⇒ **拿到这个文件就等于拿到当前凭证**。这份暴露面由
+//!   「状态目录不在 agent-data 里」+「内部 AI 读文件走网关（被拒）」收口，
+//!   但**不是**靠「文件内容保密」——别在注释里写成后者。
+//!
+//! ### ② 端口文件：`<状态目录>\perm-port`
+//!
+//! **一行**：十进制端口号（u16，纯 ASCII，无 BOM）。
+//!
+//! - orbcat 的外部通道监听 `127.0.0.1:0`（**随机端口**），
+//!   起服务时 [`write_port`] 写进来；
+//! - CLI 读它去连端点（读时 `trim()` ⇒ 有无换行都行）。
+//!
+//! ## 凭证怎么用
+//!
+//! - 明文 token 经 **环境变量 `ORBCAT_PERM_TOKEN`** 交给 CLI 进程
+//!   （只存在于那一个子进程的环境里）；
+//! - orbcat **自己的进程 env 里没有** token ⇒ 内部 AI 起的子进程继承不到；
+//! - 外部通道**只认 `approve`（一次性）/ `deny`** ⇒ 绝不扩大授权。
+//!
+//! ## ⚠️ 本轮**没接**的两处（等裁决，不许自己补）
+//!
+//! ① **谁签发 token**（设置页？外部 AI 自己取？）——接口留好了
+//!    （[`issue_token`]），**入口没接**；
+//! ② **`serve()` 什么时候起**（启动即起？还是用户开「外部代批」才起？）——
+//!    [`serve`] 已实现但**没有任何调用点**。
+//!
+//! ⇒ 这两处接线之前，层 2 通道**不会真的对外提供**能力（属预期，不是缺陷）。
 
 // ⚠️ 层 2 的入口函数（serve / issue_token / write_port …）本轮还没接线
 //    ⇒ 未被调用 ⇒ dead_code ⇒ 本模块整体先放行；**下一笔接完线后删掉这行**。
@@ -135,11 +185,6 @@ pub fn is_under_bin_dir(norm: &str, app_root: &Path) -> bool {
 /// ```
 /// ⇒ 这类由 **L2 通道鉴权**兜底（见模块头）。
 pub fn scan_command_for_cli(cmd: &str, cwd: &Path, app_root: &Path) -> Option<CliHit> {
-    // ⛔⛔ 临时骨架（只为取「先红」证据）—— 正式实现见本函数下方
-    if std::env::var("ORBCAT_PERM_CLI_SKELETON").is_ok() {
-        let _ = (cmd, cwd, app_root);
-        return None;
-    }
     let norm = crate::command_policy::normalize(cmd);
 
     // ① 归一化后的分段（已做过复合命令拆分与各种转义处理）
@@ -201,16 +246,26 @@ pub fn block_if_cli(
         "[硬阻断] 内部路径引用了外部代批 CLI（规则 {}：{}）—— 该能力只允许用户侧的外部 AI 使用",
         hit.rule, hit.evidence
     );
-    // 审计：阻断也要留痕（谁、什么、命中哪条规则）
+    // 审计：阻断也要留痕（谁 = 工具名、什么 = 命令、命中哪条规则）
+    audit_block(data_dir, tool, cmd, cwd, &hit);
+    Err(msg)
+}
+
+/// 阻断的审计落点（**两条阻断路径共用**）。
+///
+/// ⚠️ 为什么要抽出来：`block_if_cli`（命令路径）与 `block_tool_args`（工具网关路径）
+///    是**两条独立的入口**。以前只有前者写审计 ⇒ 工具网关那条**静默拦下不留痕**
+///    ⇒ 事后没法回答「内部 AI 今天试过几次 CLI」。
+fn audit_block(data_dir: &Path, tool: &str, what: &str, cwd: &Path, hit: &CliHit) {
     let rec = crate::command_policy::AuditRecord {
         ts: crate::permission::now_ms(),
         sequence: 0,
         prev_hash: String::new(),
         hash: String::new(),
         event: "cli-path-blocked".to_string(),
-        source: format!("perm-cli-guard/{}", hit.rule),
-        command: cmd.to_string(),
-        normalized: cmd.to_string(),
+        source: format!("perm-cli-guard/{}/{}", tool, hit.rule),
+        command: what.to_string(),
+        normalized: what.to_string(),
         cwd: cwd.to_string_lossy().to_string(),
         session_id: String::new(),
         risk: crate::command_policy::Risk::High.as_str().to_string(),
@@ -220,7 +275,6 @@ pub fn block_if_cli(
     if let Err(e) = crate::command_policy::audit_append(data_dir, rec) {
         eprintln!("[orbcat] ⚠️ 写 CLI 阻断审计失败: {e}");
     }
-    Err(msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -265,12 +319,17 @@ pub fn cli_state_dir() -> PathBuf {
     }
 }
 
-/// token 文件（**明文 + 过期时间戳**；短时效、用一次即轮换）。
+/// token 文件路径：`<状态目录>\perm-token`。
+///
+/// 格式（**定稿**）：**两行** —— 第 1 行 = 明文 token（32 位小写 hex），
+/// 第 2 行 = 过期时间戳（Unix 毫秒）。详见模块头「凭证口径与文件格式定稿」。
 pub fn token_path(state_dir: &Path) -> PathBuf {
     state_dir.join("perm-token")
 }
 
-/// 端口文件（CLI 靠它找到 orbcat 的端点）。
+/// 端口文件路径：`<状态目录>\perm-port`。
+///
+/// 格式（**定稿**）：**一行** = 十进制端口号（u16，纯 ASCII）。
 pub fn port_path(state_dir: &Path) -> PathBuf {
     state_dir.join("perm-port")
 }
@@ -279,6 +338,8 @@ pub fn port_path(state_dir: &Path) -> PathBuf {
 pub const TOKEN_TTL_MS: u64 = 5 * 60 * 1000;
 
 /// 签发 token（明文 + 过期时间）。返回明文（设置页显示一次给用户）。
+///
+/// ⚠️ **谁调用它（签发入口）本轮还没定** —— 见模块头「本轮没接的两处」。
 pub fn issue_token(state_dir: &Path, now_ms: u64) -> Result<String, String> {
     let token = random_hex(16);
     let expiry = now_ms.saturating_add(TOKEN_TTL_MS);
@@ -292,6 +353,7 @@ pub fn issue_token(state_dir: &Path, now_ms: u64) -> Result<String, String> {
 ///
 /// ⚠️ 名字保留了旧词「hash」，但语义已改：现在落的是**明文 token + 过期时间戳**
 ///    （短时效 + 用一次即轮换 ⇒ 落明文才轮换得动；哈希没法轮换）。
+///    文件格式（定稿）= 两行：`{token}\n{expiry_ms}`。
 pub fn write_token_hash(state_dir: &Path, token: &str) -> Result<(), String> {
     let expiry = crate::permission::now_ms().saturating_add(TOKEN_TTL_MS);
     std::fs::create_dir_all(state_dir).map_err(|e| format!("建状态目录失败: {e}"))?;
@@ -323,7 +385,10 @@ pub fn verify_token(state_dir: &Path, token: &str, now_ms: u64) -> bool {
     true
 }
 
-/// 写端口文件（orbcat 启动时把随机端口写进去，CLI 读它）。
+/// 写端口文件（orbcat 把随机端口写进去，CLI 读它）。
+///
+/// 格式（**定稿**）：一行十进制端口号。
+/// ⚠️ **本轮没有调用点** —— 谁在什么时候起通道（见模块头）还没定。
 pub fn write_port(state_dir: &Path, port: u16) -> Result<(), String> {
     std::fs::create_dir_all(state_dir).map_err(|e| format!("建状态目录失败: {e}"))?;
     std::fs::write(port_path(state_dir), port.to_string()).map_err(|e| format!("写端口失败: {e}"))
@@ -574,11 +639,14 @@ pub fn block_tool_args(
 ) -> Result<(), String> {
     let (cwd, app_root) = runtime_dirs();
     if let Some(hit) = hit_token(tool, &cwd, &app_root) {
+        audit_block(data_dir, tool, tool, &cwd, &hit);
         return Err(block_message(tool, &hit));
     }
     // 参数整体序列化后扫一遍（JSON 里含全部字符串值，比逐字段遍历省事且不漏）
     let blob = args.to_string();
     if let Some(hit) = scan_command_for_cli(&blob, &cwd, &app_root) {
+        // ⚠️ 这条路径以前**只拒不留痕** —— 现在补上：工具网关拦下的也进审计链。
+        audit_block(data_dir, tool, &blob, &cwd, &hit);
         return Err(block_message(tool, &hit));
     }
     Ok(())
@@ -603,6 +671,9 @@ fn block_message(tool: &str, hit: &CliHit) -> String {
 /// ```json
 /// {"token":"...","op":"list|approve|deny","arg":"<pending id>"}
 /// ```
+///
+/// ⚠️ **本轮没有调用点** —— 「什么时候起这个端点」等裁决（见模块头）。
+///    ⇒ 层 2 通道目前**不对外提供**能力（属预期，不是缺陷）。
 pub fn serve(
     state_dir: &Path,
     data_dir: &Path,

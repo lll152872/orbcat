@@ -40,6 +40,8 @@ import {
   DIST_ENTRY,
   DIST_SUBDIR,
   DATA_SUBDIR,
+  CLI_SUBDIR,
+  CLI_BIN_NAME,
 } from "../../tools/package.mjs";
 
 const REPO_ROOT = path.resolve(
@@ -88,6 +90,20 @@ function makeExe(base = tmp, name = "orbcat.exe"): string {
   const p = path.join(base, name);
   mkdirSync(path.dirname(p), { recursive: true });
   writeFileSync(p, "MZ fake executable");
+  return p;
+}
+
+/**
+ * 造一个假的「外部代批 CLI」。
+ *
+ * ⚠️ 默认名字必须**精确**是 `orbcat-perm.exe`（带连字符）——
+ *    层 1 阻断按文件名匹配（`perm_cli::CLI_STEM = "orbcat-perm"`），
+ *    名字对不上 = 阻断规则在真机上失效。
+ */
+function makeCli(base = tmp, name = CLI_BIN_NAME): string {
+  const p = path.join(base, name);
+  mkdirSync(path.dirname(p), { recursive: true });
+  writeFileSync(p, "MZ fake orbcat-perm");
   return p;
 }
 
@@ -677,5 +693,109 @@ describe("runtime extension 防漂移闸门", () => {
   it("构建脚本本身也得有「runtime/ 是构建产物」的认知（别把 runtime/ 提交进 git）", () => {
     const ignore = readFileSync(path.join(REPO_ROOT, ".gitignore"), "utf8");
     expect(ignore).toMatch(/^runtime\//m);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 外部代批 CLI（orbcat-perm）进包契约（2026-10-24）
+// ---------------------------------------------------------------------------
+//
+// ## 这组测试为什么存在
+//
+// 层 1 的路径阻断认的是**文件名 `orbcat-perm`**（`perm_cli::CLI_STEM`）。
+// 而 Cargo 的 bin 自动发现会把 `src/bin/orbcat_perm.rs` 编译成
+// **`orbcat_perm.exe`（下划线）** ⇒ 产物名对不上 ⇒ 用户装到的 CLI
+// 内部 AI 引用时**扫不到** ⇒ 阻断规则在真机上形同虚设，而构建日志全绿。
+//
+// ⇒ 三个环节各锁一条：
+//   ① Cargo.toml 显式 `[[bin]] name = "orbcat-perm"`（产物名的唯一来源）；
+//   ② 装配把它拷进 **包根的 bin/**（层 1 的 `is_under_bin_dir()` 认这个位置），
+//      且**不进 runtime/**（runtime/ 是 node + pi 的白名单分发目录）；
+//   ③ CI / 构建脚本都必须真的编它、传它、部署它。
+//
+// ⚠️ 反向用例（坏包不许放行）才是重点 —— 只测「正确布局能通过」是自说自话。
+// ---------------------------------------------------------------------------
+
+describe("外部代批 CLI 进包契约", () => {
+  it("外部代批 CLI 落在产物根的 bin/ 下，不在 runtime/ 里", () => {
+    const out = path.join(tmp, "out");
+    stageWindowsRelease({
+      exePath: makeExe(),
+      distDir: makeDist(),
+      outDir: out,
+      runtimeDir: makeRuntime(tmp, ["node", "pi"]),
+      cliExe: makeCli(),
+    });
+
+    expect(existsSync(path.join(out, CLI_SUBDIR, CLI_BIN_NAME))).toBe(true);
+    // ⚠️ 不许进 runtime/ —— 那是 node + pi 的白名单分发目录
+    expect(existsSync(path.join(out, "runtime", CLI_BIN_NAME))).toBe(false);
+    expect(existsSync(path.join(out, "runtime", CLI_SUBDIR))).toBe(false);
+  });
+
+  it("★ 反向：CLI 缺失时验包必须判不合格（不许放行坏包）", () => {
+    const out = path.join(tmp, "out-no-cli");
+    stageWindowsRelease({
+      exePath: makeExe(),
+      distDir: makeDist(),
+      outDir: out,
+      runtimeDir: makeRuntime(tmp, ["node", "pi"], "rt-no-cli"),
+    });
+
+    let msg = "";
+    try {
+      verifyReleaseLayout(out, { exeName: "orbcat.exe", wantRuntime: true, wantCli: true });
+    } catch (e) {
+      msg = String((e as Error).message ?? e);
+    }
+    expect(msg).toMatch(/orbcat-perm/);
+  });
+
+  it("文件名带下划线（orbcat_perm.exe）时当场拒绝 —— 名字对不上 = 阻断失效", () => {
+    expect(() =>
+      stageWindowsRelease({
+        exePath: makeExe(),
+        distDir: makeDist(),
+        outDir: path.join(tmp, "out-wrong-name"),
+        cliExe: makeCli(tmp, "orbcat_perm.exe"),
+      })
+    ).toThrow(/文件名不对/);
+  });
+
+  it("CLI 路径不存在时当场拒绝，不产出半成品目录", () => {
+    const out = path.join(tmp, "out-cli-missing");
+    expect(() =>
+      stageWindowsRelease({
+        exePath: makeExe(),
+        distDir: makeDist(),
+        outDir: out,
+        cliExe: path.join(tmp, "没有这个.exe"),
+      })
+    ).toThrow(/外部代批 CLI 不存在/);
+    expect(() => readFileSync(path.join(out, "orbcat.exe"))).toThrow();
+  });
+
+  it("Cargo.toml 显式声明 bin 名 = orbcat-perm（产物名必须带连字符）", () => {
+    const toml = readFileSync(path.join(REPO_ROOT, "src-tauri", "Cargo.toml"), "utf8");
+    expect(toml).toMatch(/\[\[bin\]\]\s*\nname = "orbcat-perm"/);
+    expect(toml).toMatch(/path = "src\/bin\/orbcat_perm\.rs"/);
+    // 自动发现必须关掉 —— 否则同一个源文件会同时产出 orbcat_perm.exe
+    expect(toml).toMatch(/^autobins = false$/m);
+  });
+
+  it("CI 会编 orbcat-perm 并把它传进装配脚本", () => {
+    const ci = readFileSync(path.join(REPO_ROOT, ".github", "workflows", "ci.yml"), "utf8");
+    expect(ci).toMatch(/--bin orbcat-perm/);
+    expect(ci).toMatch(/--cli-exe\s+\S*orbcat-perm\.exe/);
+  });
+
+  it("build-release.sh 会把 CLI 部署到运行态的 bin/，缺件当场失败", () => {
+    const sh = readFileSync(path.join(REPO_ROOT, "tools", "build-release.sh"), "utf8");
+    expect(sh).toContain("orbcat-perm.exe");
+    expect(sh).toMatch(/\$RUNTIME\/bin/);
+    // 找不到 CLI 时必须 exit 1（不许 warn 就放过）
+    const idx = sh.indexOf("找不到外部代批 CLI");
+    expect(idx).toBeGreaterThan(-1);
+    expect(sh.slice(idx, idx + 900)).toMatch(/exit 1/);
   });
 });

@@ -458,7 +458,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cargo build --release --manifest-path src-tauri/Cargo.toml --bin orbcat
+          # ⚠️ **两个 bin 都要编**：orbcat（主程序）+ orbcat-perm（外部代批 CLI）。
+          #    `--bin orbcat` 只会编主程序 ⇒ 少编一个 = 发布包里没有 CLI，
+          #    而构建日志一切正常（典型的「构建绿、线上坏」）。
+          #    CLI 的产物名必须是 **orbcat-perm.exe（带连字符）** ——
+          #    层 1 阻断按文件名匹配（perm_cli::CLI_STEM = "orbcat-perm"）。
+          cargo build --release --manifest-path src-tauri/Cargo.toml --bin orbcat --bin orbcat-perm
           # ⚠️ machine 字段在 **e_lfanew + 4**，不是固定的文件偏移 4。
           #    e_lfanew 存在 0x3C，指向 "PE\0\0" 签名。直接读偏移 4 读到的是
           #    DOS 头残留（实测 0x0003），会把好的产物误判成坏的。
@@ -485,7 +490,7 @@ jobs:
           #     铺真实 agent-data/ 会被 verifyNoUserData 拦下（那等于把 API key 打进发布包）。
           #   · 刻意**不放** models.json：用户填了 key 的那个在 <exe 旁>/agent-data/models.json，
           #     zip 里放同名文件的话，更新时覆盖解压会把它冲掉。首次启动由 bootstrap 建空数组。
-          node tools/package.mjs --exe src-tauri/target/release/orbcat.exe --dist dist --out pkg --skeleton src-tauri/skeleton --file README.md
+          node tools/package.mjs --exe src-tauri/target/release/orbcat.exe --dist dist --out pkg --skeleton src-tauri/skeleton --file README.md --cli-exe src-tauri/target/release/orbcat-perm.exe
           Compress-Archive -Path pkg/* -DestinationPath "orbcat-${{ matrix.artifact }}.zip" -Force
           # 解压后再验一次：真正发出去的是 zip，验的必须是 zip 的内容
           Remove-Item -Recurse -Force verify -ErrorAction SilentlyContinue

@@ -92,16 +92,45 @@ if [ "$MODE" = "--fast" ]; then
   echo "==> Rust 构建（release-fast profile：无 LTO + cgu=256，快速模式）"
   ( cd src-tauri && cargo build --profile release-fast )
   SRC_EXE=src-tauri/target/release-fast/orbcat.exe
+  CLI_SRC=src-tauri/target/release-fast/orbcat-perm.exe
 else
   echo "==> Rust 构建（release + fat LTO，正式模式）"
   ( cd src-tauri && cargo build --release )
   SRC_EXE=src-tauri/target/release/orbcat.exe
+  CLI_SRC=src-tauri/target/release/orbcat-perm.exe
 fi
 
 # --fast 的产物在 target/release-fast/，要落到 release/ 供桌面快捷方式使用
 if [ "$SRC_EXE" != "$REL/orbcat.exe" ]; then
   cp -f "$SRC_EXE" "$REL/orbcat.exe"
+  # CLI 同样落到 release/ —— 两个 exe 保持同源同代（别出现「主程序新的、CLI 旧的」）
+  cp -f "$CLI_SRC" "$REL/orbcat-perm.exe"
+  CLI_SRC="$REL/orbcat-perm.exe"
 fi
+
+# ---- 外部代批 CLI（orbcat-perm）----
+#
+# ⚠️ **文件名必须精确是 orbcat-perm.exe（带连字符）**：
+#    层 1 阻断按**文件名**匹配（`perm_cli::CLI_STEM = "orbcat-perm"`，
+#    忽略 .exe/.cmd/.bat/.ps1/.com 后缀）⇒ 名字对不上 = 阻断规则在真机上失效。
+#    （Cargo 自动发现会把它叫成 `orbcat_perm.exe` —— 所以 Cargo.toml 里是
+#      **显式** `[[bin]] name = "orbcat-perm"`。）
+#
+# ⚠️ 找不到 = **当场失败**，不许 warn 就放过（跟 runtime / photon 同一口径）：
+#    缺它 ⇒ 用户侧外部 AI（Codex / Claude Code）拿不到「代批权限申请」这个能力，
+#    而构建日志一切正常 —— 典型的「构建绿、线上坏」。
+if [ ! -f "$CLI_SRC" ]; then
+  echo "============================================================"
+  echo " ✗ 找不到外部代批 CLI：$CLI_SRC"
+  echo ""
+  echo "   发布包必须带 bin/orbcat-perm.exe —— 缺了它，用户侧外部 AI"
+  echo "   拿不到「代批权限申请」这个能力（链路整条断掉）。"
+  echo "   修法：cargo build --release --bin orbcat-perm"
+  echo "   （产物名必须带连字符：src-tauri/Cargo.toml 里的 [[bin]] name = \"orbcat-perm\"）"
+  echo "============================================================"
+  exit 1
+fi
+echo "  外部代批 CLI：$CLI_SRC"
 
 # ---- 内置运行时（node / pi 内核）----
 #
@@ -224,6 +253,20 @@ cp -f "$REL/orbcat.exe" "$RUNTIME/orbcat.exe"
 rm -rf "$RUNTIME/dist/assets" 2>/dev/null || true
 mkdir -p "$RUNTIME/dist"
 cp -rf "$REL/dist/." "$RUNTIME/dist/"
+
+# ---- 外部代批 CLI 部署到运行态（**包根的 bin/**，与 dist/、runtime/ 同级）----
+#
+# ⚠️ 位置契约：层 1 的 `is_under_bin_dir()` 认的正是 `<包根>/bin/`。
+# ⚠️ **不进 runtime/** —— runtime/ 是 node + pi 的**白名单分发目录**，
+#    塞个权限 CLI 进去会污染那个契约（pi::runtime_dir 只认 node/pi）。
+echo "==> 部署外部代批 CLI 到 $RUNTIME/bin"
+mkdir -p "$RUNTIME/bin"
+cp -f "$CLI_SRC" "$RUNTIME/bin/orbcat-perm.exe"
+# 部署后当场断言 —— 复制失败（exe 被占着）不许静默放过
+if [ ! -f "$RUNTIME/bin/orbcat-perm.exe" ]; then
+  echo "  ✗ 部署后缺 bin/orbcat-perm.exe —— 外部 AI 代批链路断链"
+  exit 1
+fi
 
 # 内置运行时同样部署到运行态 —— 位置契约同上（<exe 同目录>/runtime/）
 #
