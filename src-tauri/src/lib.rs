@@ -325,10 +325,17 @@ struct AppState {
 ///
 /// ⚠️ **命令授权不走这里**：它是**永久**的，
 /// 落 `command_grants.json`，跨会话、跨重启都保留 —— 换会话顺手清掉就白永久了。
+///
+/// ⚠️ **永久文件授权（`Forever`）也不走这里**：它落 `file_grants.json`，
+/// 同样跨会话、跨重启保留 ⇒ 换会话时必须**保留**（`replace_session_scoped` 干这件事）。
+/// ⚠️ 以前这里是**整体 replace** ⇒ 用户点完「永远允许」，切一次会话就没了
+/// —— **这正是用户报的「权限不会一直绑定」**（2026-10-24 真机反馈）。
 fn reload_grants_for_session(state: &AppState, id: &str) {
     let loaded = sessions::load_grants(&state.data_dir, id);
     match state.perm.grants().lock() {
-        Ok(mut store) => store.replace(loaded),
+        // ⚠️ 用 `replace_session_scoped`（不是 `replace`）：会话级整体换，
+        //    **永久档保留**。
+        Ok(mut store) => store.replace_session_scoped(loaded),
         Err(e) => eprintln!("[orbcat] ⚠️ 切换会话时重装授权失败: {e}"),
     }
     // 上个会话的"最近一次拒绝"不能继续用来解释本会话的申请；
@@ -4576,6 +4583,27 @@ fn perm_grant_revoke(
 }
 
 // ---------------------------------------------------------------------------
+// Tauri 命令 —— 永久文件授权（「永远允许这个路径」）
+// ---------------------------------------------------------------------------
+
+/// **永久文件授权**清单（设置页展示 + 撤销用）。
+///
+/// ⚠️ 只列 `Forever` 档 —— 也就是落 `file_grants.json` 的那批
+/// （跨会话、跨重启都生效）。会话级的临时授权在「当前生效的临时授权」那一节。
+#[tauri::command]
+fn file_grants_list(state: State<'_, AppState>) -> Vec<permission::Grant> {
+    state.perm.file_grants()
+}
+
+/// 撤销一条永久文件授权（按路径前缀）。返回撤销条数。
+///
+/// 撤销**同时落盘** —— 否则重启后它又回来了，用户会觉得"撤销没生效"。
+#[tauri::command]
+fn file_grants_revoke(state: State<'_, AppState>, prefix: String) -> Result<usize, String> {
+    Ok(state.perm.revoke_file_grant(&prefix))
+}
+
+// ---------------------------------------------------------------------------
 // Tauri 命令 —— 记忆
 // ---------------------------------------------------------------------------
 
@@ -5482,8 +5510,11 @@ pub fn run() {
             }
 
             // 命令授权是**永久**的：注入数据目录 + 把上次
-            // 落盘的永久档读回来。文件授权不在这里 —— 它按会话走
-            // `reload_grants_for_session`。
+            // 落盘的永久档读回来。
+            //
+            // ⚠️ **文件授权现在也有一部分是永久的**（`GrantTier::Forever`，
+            // 落 `file_grants.json`）⇒ 也要在这里读回来 ——
+            // 它不按会话走 `reload_grants_for_session`（那是会话级的）。
             perm.attach_data_dir(data_dir.clone());
             let lasting_cmds = command_policy::load_grants(&data_dir);
             if !lasting_cmds.is_empty() {
@@ -5495,6 +5526,26 @@ pub fn run() {
                     }
                     Err(e) => {
                         eprintln!("[orbcat] ⚠️ 命令授权表锁失败，永久授权未载入: {e}")
+                    }
+                }
+            }
+
+            // 永久**文件**授权（「永远允许这个路径」）—— 落 `file_grants.json`。
+            //
+            // ⚠️ 必须在启动时读回来：它活过会话，不走 `reload_grants_for_session`
+            //    （那个只管会话级 + 保留永久级）。
+            let lasting_files = permission::load_file_grants(&data_dir);
+            if !lasting_files.is_empty() {
+                match perm.grants().lock() {
+                    Ok(mut store) => {
+                        let n = lasting_files.len();
+                        for g in lasting_files {
+                            store.add(g);
+                        }
+                        eprintln!("[orbcat] 已载入 {n} 条永久文件授权");
+                    }
+                    Err(e) => {
+                        eprintln!("[orbcat] ⚠️ 授权表锁失败，永久文件授权未载入: {e}")
                     }
                 }
             }
@@ -5793,6 +5844,9 @@ pub fn run() {
             perm_cli_status,
             perm_grants_list,
             perm_grant_revoke,
+            // 永久文件授权（「永远允许这个路径」）—— 落 file_grants.json
+            file_grants_list,
+            file_grants_revoke,
             list_models,
             get_selected_model,
             set_selected_model,

@@ -311,6 +311,30 @@ export interface PermRule {
 }
 
 /**
+ * 一条**永久文件授权**（「永远允许这个路径」）。
+ *
+ * 落 `agent-data/file_grants.json` —— 跨会话、跨重启都生效，
+ * 在「设置 › 文件权限」里可以撤销。
+ *
+ * ⚠️ 与会话级的临时授权（一次 / 一轮 / 整个任务）**不是一回事**：
+ * 那些只活在内存里或 `sessions/<id>.grants.json`，会话一换就没了。
+ */
+export interface FileGrant {
+  /** 授权的路径前缀（已规范化） */
+  prefix: string;
+  /** 权限级别（`read` / `readwrite` / `full`） */
+  access: string;
+  /** 档位（这一批恒为 `forever`） */
+  tier: string;
+  /** 剩余次数（永久档恒为 null） */
+  remaining?: number | null;
+  /** 模型填的申请原因（展示用） */
+  reason: string;
+  /** 批准时间（epoch 毫秒） */
+  granted_at: number;
+}
+
+/**
  * 命令策略（`perm_cmd_policy`）
  *
  * ⚠️ 字段是 **snake_case**（`hard_block`），不是 camelCase ——

@@ -20,6 +20,7 @@ import type {
   CmdVerdictView,
   ContextCapability,
   FgCtx,
+  FileGrant,
   LifeStatus,
   McpServerCfg,
   McpStatus,
@@ -147,6 +148,9 @@ export class TauriSource implements DataSource {
     cmdTest: (args) => this.call<CmdVerdictView>("perm_cmd_test", args),
     grantsList: () => this.call<unknown[]>("perm_grants_list"),
     grantRevoke: (args) => this.call<number>("perm_grant_revoke", args),
+    // 永久文件授权（「永远允许这个路径」）—— 落 file_grants.json
+    fileGrantsList: () => this.call<FileGrant[]>("file_grants_list"),
+    fileGrantsRevoke: (args) => this.call<number>("file_grants_revoke", args),
     revokeLabel: (args) => this.call<number>("perm_revoke_label", args),
     setRules: (args) => this.call<void>("perm_set_rules", args),
     rulesPath: () => this.call<string>("perm_rules_path"),

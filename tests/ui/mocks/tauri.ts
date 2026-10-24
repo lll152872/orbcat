@@ -443,6 +443,14 @@ const emptyOk: Record<string, unknown> = {  set_window_mode: null,
   perm_rules: [],
   perm_rules_path: "C:\\mock\\permissions.json",
   perm_requests_list: [],
+  /** 永久文件授权（「永远允许这个路径」那批）—— 落 file_grants.json */
+  file_grants_list: [] as {
+    prefix: string;
+    access: string;
+    tier: string;
+    reason: string;
+    granted_at: number;
+  }[],
   perm_cmd_policy: { allow: [], hard_block: [] },
   perm_cmd_policy_path: "C:\\mock\\command_policy.json",
   perm_cmd_grants_list: [],
@@ -627,6 +635,15 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
     }
     case "perm_requests_list":
       return state.permPending as T;
+    // 永久文件授权（「永远允许这个路径」）
+    case "file_grants_list":
+      return state.file_grants_list as T;
+    case "file_grants_revoke": {
+      const prefix = String(args?.prefix ?? "");
+      const before = state.file_grants_list.length;
+      state.file_grants_list = state.file_grants_list.filter((g) => g.prefix !== prefix);
+      return (before - state.file_grants_list.length) as T;
+    }
     /**
      * 提交对一张待批卡的决定。
      *
@@ -641,6 +658,9 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
         "approve", "yes", "批准", "narrow", "收窄", "deny", "no", "拒绝",
         "prefix", "approve-prefix", "记住命令名", "full", "approve-full",
         "记住完整命令", "always", "总是允许",
+        // 「永远允许这个路径」＝**文件**的永久档（后端 parse 成 Decision::ApproveForever）
+        // ⚠️ 与上面的 "always" 是两回事：那个是**命令**语义。
+        "forever", "approve-forever", "always-file", "永远允许", "永久",
       ];
       if (!known.includes(decision)) {
         throw new Error(
