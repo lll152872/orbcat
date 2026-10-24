@@ -1342,6 +1342,91 @@ pub fn gate_bridge(name: &str, args: &Value, data_dir: &Path) -> Result<(bool, S
     }
 }
 
+/// 桥侧工具名闸门：内置工具 + （可选）MCP 工具 + L1 项目工具。
+///
+/// ## `allow_mcp` 为什么是个开关
+///
+/// - `true`（[`execute_bridge_full`]）：**MCP 工具名放行** —— 用户拍板「MCP 走宿主桥」
+///   ⇒ 桥必须能执行 `mcp__<server>__<tool>`。
+/// - `false`（老 [`execute_bridge`]）：**照旧拒掉**（错误文案逐字不变）——
+///   老路径的行为不能因为这次改动而变（Pi内核 那边此刻正在改 `pi_runtime.rs`）。
+fn bridge_name_gate(name: &str, data_dir: &Path, allow_mcp: bool) -> Result<(), String> {
+    // orbcat 内置工具：直接放行（裁决在 execute 内部）
+    if is_builtin_tool_name(name) {
+        return Ok(());
+    }
+
+    // MCP 工具（`mcp__<server>__<tool>`）：**不是内置工具名**
+    // （见 `is_builtin_tool_name` 的断言）⇒ 以前走桥会被直接拒成「未知工具」
+    // ⇒ 桥这条路历史上**根本没法执行 MCP 工具**。
+    // 现在它由宿主桥统一执行 ⇒ 必须放行给 `execute` 的 `mcp__*` 分支。
+    if allow_mcp && crate::mcp::parse_mcp_tool_name(name).is_some() {
+        return Ok(());
+    }
+
+    // L1 项目脚本工具（`check_homework` 这种）：**要放行** ——
+    // 它们的执行路径就在 `execute` 的 `other` 分支里（`run_project_tool`），
+    // 权限判定走的是项目自己的闸门（文件网关 + 命令策略，与 `run_command` 同套）。
+    if let Some(a) = crate::project::active(data_dir) {
+        if a.bundle.tools.iter().any(|t| t.name == name) {
+            return Ok(());
+        }
+    }
+    Err(format!("未知工具: {name}"))
+}
+
+/// 桥侧执行一个工具 —— **带真实 MCP 注册表 + 真实权限闸 + 真实会话**。
+///
+/// ## 这就是「MCP 走宿主桥」的执行侧落点
+///
+/// 用户拍板的口径：MCP 工具**经宿主桥**给 pi ⇒ 每次调用过 orbcat 的权限闸
+/// ⇒ **授权卡能出、审计有行、事后禁用能生效**。
+///
+/// 老 [`execute_bridge`] 传的是**空壳**（空 registry + 空 PermHub + 空 session_id）
+/// ⇒ 桥这条路**既认不出 MCP 工具，也没有权限闸、没有会话归属** ——
+/// MCP 工具在桥上只会撞到「所属的组当前**未启用**」。
+///
+/// ## 为什么要单独一个 `full` 函数（而不是改老函数的签名）
+///
+/// 老函数的**唯一调用点**在 `pi_runtime.rs`（Pi内核 的域，他同时在改那个文件）。
+/// 改签名 ⇒ 他那边**立刻编译不过** ⇒ 连带基线合并卡住。
+/// ⇒ 老函数保留为**兼容包装**（传空壳，行为与以前**完全一致**），
+/// Pi内核 那边只需把调用换成 [`execute_bridge_full`]（改一行）。
+pub async fn execute_bridge_full(
+    name: &str,
+    args: &Value,
+    data_dir: &Path,
+    mcp: &tokio::sync::Mutex<crate::mcp::ToolRegistry>,
+    perm: &crate::perm_request::PermHub,
+    session_id: &str,
+) -> Result<Value, String> {
+    bridge_name_gate(name, data_dir, true)?;
+
+    // 加载真实 gate（app_dir = data_dir 的父目录，与 lib.rs 同口径）
+    let app_dir = data_dir.parent().unwrap_or(data_dir);
+    let gate = crate::permission::load_gate(data_dir, app_dir);
+
+    let ctx = ToolCtx {
+        gate: &gate,
+        data_dir,
+        // 真实注册表 ⇒ `execute` 的 `mcp__*` 分支能查到组、能真调用
+        mcp,
+        // 真实会话 id ⇒ 权限卡带上会话归属（前端按它路由到对应窗口）
+        session_id,
+        // 真实授权表 ⇒ `ask_mcp_tool` 会登记待办、弹卡、等用户裁决
+        perm,
+        tick: None,
+        cancel: None,
+        turn_ref: None,
+    };
+    let out = execute(name, args, &ctx).await?;
+    Ok(json!({
+        "content": [{"type": "text", "text": out.text}],
+        "details": {},
+        "image": out.image,
+    }))
+}
+
 /// 桥侧执行一个工具（**带真实权限网关**）。
 ///
 /// 桥的调用来自 pi 子进程（另一个进程），拿不到 orbcat 的 `AppState`。
@@ -1357,52 +1442,33 @@ pub fn gate_bridge(name: &str, args: &Value, data_dir: &Path) -> Result<(bool, S
 /// 代价：gate 是**一次性加载的快照** —— 用户在设置里改了权限，
 /// 桥要重启才生效。（主进程那条热加载路在 `AppState::sync_perm_file`，
 /// 桥这边暂未接。）
+///
+/// ## 这条老路仍然是「空壳」
+///
+/// 它传的是**空 registry + 空 PermHub + 空 session_id** ⇒
+///
+/// - MCP 工具在桥上**认不出**（撞「所属的组当前未启用」）；
+/// - **没有权限闸**（`perm` 是空壳 ⇒ `ask_mcp_tool` 登记了待办但没人裁决 ⇒ 走超时 fail-closed）；
+/// - **没有会话归属**（`session_id = ""`）。
+///
+/// ⇒ **要真正执行 MCP 工具，走 [`execute_bridge_full`]**（传真实的
+/// registry / perm / session_id）。本函数保留是为了**不破坏现有调用点**
+/// （`pi_runtime.rs` 正在被 Pi内核 改，改签名会连带他编译不过）。
+///
+/// 行为与历史**完全一致**（老路径不许有任何行为变化 —— 包括错误文案）。
 pub async fn execute_bridge(
     name: &str,
     args: &Value,
     data_dir: &Path,
 ) -> Result<Value, String> {
-    // MCP 工具不走这里（pi 自己有 MCP client）
-    if !is_builtin_tool_name(name) {
-        // L1 项目脚本工具（`check_homework` 这种）：**要放行** ——
-        // 它们的执行路径就在 `execute` 的 `other` 分支里（`run_project_tool`），
-        // 权限判定走的是项目自己的闸门（文件网关 + 命令策略，与 `run_command` 同套）。
-        if let Some(a) = crate::project::active(data_dir) {
-            if a.bundle.tools.iter().any(|t| t.name == name) {
-                // 命中项目工具 → 继续往下走 `execute`
-            } else {
-                return Err(format!("未知工具: {name}"));
-            }
-        } else {
-            return Err(format!("未知工具: {name}"));
-        }
-    }
-
-    // 加载真实 gate（app_dir = data_dir 的父目录，与 lib.rs 同口径）
-    let app_dir = data_dir.parent().unwrap_or(data_dir);
-    let gate = crate::permission::load_gate(data_dir, app_dir);
-
+    // ⚠️ 老路的工具名闸门**照旧拒 MCP 工具名**（`allow_mcp = false`）
+    // ⇒ 错误文案仍是逐字相同的「未知工具: mcp__…」。
+    bridge_name_gate(name, data_dir, false)?;
     // MCP 注册表：内置工具不用它，给个空壳
     let mcp = tokio::sync::Mutex::new(crate::mcp::ToolRegistry::new(""));
     // 授权表：桥没有会话上下文，用空的
     let perm = crate::perm_request::PermHub::new();
-
-    let ctx = ToolCtx {
-        gate: &gate,
-        data_dir,
-        mcp: &mcp,
-        session_id: "",
-        perm: &perm,
-        tick: None,
-        cancel: None,
-        turn_ref: None,
-    };
-    let out = execute(name, args, &ctx).await?;
-    Ok(json!({
-        "content": [{"type": "text", "text": out.text}],
-        "details": {},
-        "image": out.image,
-    }))
+    execute_bridge_full(name, args, data_dir, &mcp, &perm, "").await
 }
 
 /// 同 [`execute`]，但标记这次调用来自 PTC 程序内部（跳过坍缩检查）。
@@ -1548,8 +1614,19 @@ async fn execute_inner(
                 if !loaded {
                     // 默认配置下所有组都直接给模型，走到这里通常意味着：
                     // 用户把这组关掉了（MCP 设置页的「给模型」开关），或组名对不上。
+                    //
+                    // ⚠️ **但还有第二种可能：宿主压根没把 MCP 注册表接进来**
+                    // （桥那半还是空壳）⇒ 整张表一个活跃组都没有。
+                    // 这两种情况的**修法完全不同**，报错必须分开说 ——
+                    // 否则用户会去设置页反复翻开关，而真正的问题在代码里。
+                    let hint = if reg.active_tools().is_empty() {
+                        "（提示：当前**一个 MCP 组都没加载** —— 大概率是宿主还没把 MCP 注册表接进 \
+                         pi 内核的桥，这不是设置开关的问题。）"
+                    } else {
+                        ""
+                    };
                     return Err(format!(
-                        "工具「{other}」所属的组当前**未启用**。\
+                        "工具「{other}」所属的组当前**未启用**。{hint}\n\
                          去设置 › MCP 外部工具 把该组的「给模型」打开（或用 load_tool_group 加载），\
                          再重试；也可以用 list_tool_groups 看当前有哪些组可用。"
                     ));
@@ -1562,24 +1639,43 @@ async fn execute_inner(
                 // ⚠️ 档位取 `project::effective_exec_trust`：拼装项目可以**预选**
                 // 档位。这是"预选"而非"绕过"—— `full` 本来就能由用户自己在设置里
                 // 打开，项目只是替用户预先选了；硬阻断与防骚扰逻辑完全不受影响。
-                let allowed = crate::mcp::is_mcp_tool_allowed(ctx.data_dir, other)
-                    || crate::project::effective_exec_trust(ctx.data_dir).auto_allows_mcp();
+                let granted = crate::mcp::is_mcp_tool_allowed(ctx.data_dir, other);
+                let trusted = crate::project::effective_exec_trust(ctx.data_dir).auto_allows_mcp();
+                let allowed = granted || trusted;
+                // 审计来源：这次放行到底走的哪条路（免问路径）/ 谁人工批的
+                let mut source = if granted { "grant" } else { "trust-auto" }.to_string();
                 if !allowed {
                     let verdict = ctx
                         .perm
                         .ask_mcp_tool(other.to_string(), crate::agent::summarize_args_pub(&args.to_string()), ctx.session_id)
                         .await?;
                     if !verdict.is_approved() {
+                        audit_mcp_tool(ctx, other, "rejected", "user-denied");
                         return Ok(ToolOutput::text(verdict.to_model_message()));
                     }
+                    source = "user-approved".to_string();
+                    audit_mcp_tool(ctx, other, "approved", &source);
                     // ApproveFull = 总是允许 → 落盘
                     if matches!(verdict.decision, crate::perm_request::Decision::ApproveFull) {
                         crate::mcp::allow_mcp_tool(ctx.data_dir, other)?;
                     }
+                } else {
+                    audit_mcp_tool(ctx, other, "allowed", &source);
                 }
 
-                let reg = ctx.mcp.lock().await;
-                let msg = reg.call_tool(&tool, args).await?;
+                // 锁只护住调用本身 —— 别把审计写盘也塞在锁里。
+                let call_result = {
+                    let reg = ctx.mcp.lock().await;
+                    reg.call_tool(&tool, args).await
+                };
+                let msg = match call_result {
+                    Ok(m) => m,
+                    Err(e) => {
+                        audit_mcp_tool(ctx, other, "error", &source);
+                        return Err(e);
+                    }
+                };
+                audit_mcp_tool(ctx, other, "executed", &source);
                 return Ok(ToolOutput::text(msg));
             }
             Err(format!("未知工具：{other}"))
@@ -4309,6 +4405,46 @@ fn audit_cmd(
     }
 }
 
+/// 写一条 **MCP 工具调用**的审计（自动补哈希链）。失败只记日志，不影响执行。
+///
+/// ## 为什么 MCP 调用也要审计
+///
+/// 用户拍板「MCP 走宿主桥，orbcat 自己当 MCP 网管」⇒ 每次 MCP 调用都**过权限闸**
+/// ⇒ 「用户批了什么」必须**可追溯**。
+///
+/// 而在这之前，**MCP 调用一行审计都没有**（全仓只有命令侧的 [`audit_cmd`] 写审计）
+/// ⇒ 一旦把 MCP 接到宿主桥上，执行侧就是个**审计盲区**。
+///
+/// ## `shell` 字段记什么
+///
+/// 记 **`"mcp"`** —— 这是**第三种真实情况**：MCP 工具既不是 pwsh 也不是 bash，
+/// 它是外部 server 上的一个函数调用。记空串（旧记录/未知）或 `argv` 都是含糊值。
+///
+/// ## `cwd` 为什么是空
+///
+/// MCP 调用没有工作目录概念（跑在外部 server 那边）。塞 `data_dir` 是**假信息**
+/// ⇒ 留空，让复盘的人一眼看出「这条没有 cwd」。
+fn audit_mcp_tool(ctx: &ToolCtx<'_>, tool: &str, event: &str, source: &str) {
+    let rec = command_policy::AuditRecord {
+        ts: crate::permission::now_ms(),
+        sequence: 0,
+        prev_hash: String::new(),
+        hash: String::new(),
+        event: event.to_string(),
+        source: source.to_string(),
+        command: tool.to_string(),
+        normalized: tool.to_string(),
+        cwd: String::new(),
+        session_id: ctx.session_id.to_string(),
+        risk: command_policy::Risk::Medium.as_str().to_string(),
+        shell: "mcp".to_string(),
+        exit_code: None,
+    };
+    if let Err(e) = command_policy::audit_append(ctx.data_dir, rec) {
+        eprintln!("[orbcat] ⚠️ 写 MCP 审计失败: {e}");
+    }
+}
+
 /// 把执行结果整理成给模型看的文本。
 fn format_command_output(
     cmd: &str,
@@ -6730,5 +6866,314 @@ Write-Output "ARG=[$msg]"
         let schema = serde_json::to_string(&sp.parameters).unwrap();
         assert!(schema.contains("text"), "要能指定删哪条");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ========================================================================
+    // MCP 执行侧（宿主桥）—— 用户拍板「MCP 走宿主桥，orbcat 自己当 MCP 网管」
+    //
+    // 这组用例锁的是**执行侧**那条链：
+    //   真实注册表 → 权限闸真的弹卡 → 批准后真执行 → 审计有行 → grants 落盘
+    //
+    // ⚠️ **为什么放在 `tools.rs` 的单测模块里**（而不是 `src-tauri/tests/`）：
+    //   ① `mod tools` / `mod mcp` / `mod perm_request` 在 `lib.rs` 里都是
+    //      **私有模块**（`mod X;` 而不是 `pub mod X;`）⇒ 集成测试（外部 crate）
+    //      **根本够不着** `execute_bridge_full`；
+    //   ② `ToolRegistry::from_tools_for_test` 是 `#[cfg(test)] pub(crate)`
+    //      ⇒ 只有 crate 内的单测能用；
+    //   ③ `lib.rs` 不是我的域（Pi内核 正在改）⇒ 不为了测试去改它的可见性。
+    // ========================================================================
+
+    /// 造一个**组已激活**的注册表。
+    ///
+    /// ⚠️ `from_tools_for_test` 只建组、**不激活**（`active` 仍是空集）
+    /// ⇒ 必须再 `restore_active_from_settings`（默认设置 `mcp_all_groups = true`）
+    /// ⇒ 否则 `active_tools()` 为空 ⇒ MCP 分支会撞「所属的组当前**未启用**」，
+    /// 那就测不到权限闸了（测的就不是同一件事）。
+    fn registry_with_active_tool(tool_name: &str) -> ToolRegistry {
+        let mut reg = ToolRegistry::from_tools_for_test(vec![McpTool {
+            name: tool_name.to_string(),
+            description: "测试用 MCP 工具".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            annotations: None,
+        }]);
+        reg.restore_active_from_settings(&crate::config::AgentSettings::default());
+        reg
+    }
+
+    /// 等权限卡出现（轮询待办表）。
+    async fn wait_for_perm_request(
+        perm: &PermHub,
+        timeout_ms: u64,
+    ) -> Option<crate::perm_request::PendingView> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if let Some(v) = perm.pending_views().into_iter().find(|v| v.kind == "mcp") {
+                return Some(v);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// PATH 上找 node（真起 MCP stdio server 用）。
+    fn find_node() -> Option<String> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            for name in ["node.exe", "node"] {
+                let p = dir.join(name);
+                if p.is_file() {
+                    return Some(p.to_string_lossy().into_owned());
+                }
+            }
+        }
+        None
+    }
+
+    /// 找 `tests/fake_mcp_server.cjs`。
+    ///
+    /// ⚠️ 用 `CARGO_MANIFEST_DIR`（编译期常量 = 本 crate 根）而不是从 exe 往上爬 ——
+    /// 共享 target 目录时 exe 不在本 crate 下，往上爬会找错地方。
+    fn fake_mcp_server_script() -> Option<PathBuf> {
+        let cand = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fake_mcp_server.cjs");
+        if cand.is_file() {
+            return Some(cand);
+        }
+        // 兜底：从 exe 往上找（万一 manifest 布局变了）
+        let mut p = std::env::current_exe().ok()?;
+        for _ in 0..6 {
+            p = p.parent()?.to_path_buf();
+            let cand = p.join("tests").join("fake_mcp_server.cjs");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+        None
+    }
+
+    /// 🔴 判据① + ②：桥带**真实注册表 + 真实 PermHub** 时，`mcp__*` **能走通**
+    /// （不再是「组未启用」），且**权限闸真的被触发**（perm 请求 > 0 条）。
+    ///
+    /// 这是「MCP 走宿主桥」的全部意义：调用过权限闸 ⇒ 授权卡能出、事后禁用能生效。
+    /// 旧桥传的是空壳（空 registry + 空 PermHub + 空 session_id）⇒ 这三样全没有。
+    #[tokio::test]
+    async fn 桥带真实注册表时_mcp_工具能走通且权限闸会触发() {
+        let dir = fresh_tmp("bridge_mcp_gate");
+        let tool = "get_marker";
+        let reg = registry_with_active_tool(tool);
+        // 组真的激活了吗（否则下面会撞「未启用」，测的就不是闸了）
+        assert!(
+            reg.active_tools().iter().any(|t| t.name == tool),
+            "夹具没激活组，测的就不是闸了"
+        );
+
+        let mcp = std::sync::Arc::new(tokio::sync::Mutex::new(reg));
+        let perm = std::sync::Arc::new(PermHub::new());
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        {
+            let ev = events.clone();
+            perm.attach_emitter(Box::new(move |event, _payload| {
+                ev.lock().unwrap().push(event.to_string());
+            }));
+        }
+
+        let mcp_c = mcp.clone();
+        let perm_c = perm.clone();
+        let dir_c = dir.clone();
+        let handle = tokio::spawn(async move {
+            execute_bridge_full(
+                "mcp__orbcat-test__get_marker",
+                &json!({}),
+                &dir_c,
+                &mcp_c,
+                &perm_c,
+                "sess-bridge-1",
+            )
+            .await
+        });
+
+        // 权限卡真的出现了？（perm 请求 > 0 条）
+        let view = wait_for_perm_request(&perm, 5_000)
+            .await
+            .expect("桥带真实 perm 时，MCP 调用必须弹权限卡");
+        assert_eq!(view.kind, "mcp", "这张卡必须是 MCP 申请：{view:?}");
+        assert_eq!(
+            view.session_id, "sess-bridge-1",
+            "卡必须带真实会话归属（旧桥是空串）"
+        );
+        let evs = events.lock().unwrap().clone();
+        assert!(
+            evs.iter().any(|e| e == "perm-request"),
+            "必须发 perm-request 事件（前端就靠它弹卡）：{evs:?}"
+        );
+
+        // 驳回 ⇒ 不执行（模型只拿到拒绝说明）
+        perm.decide_command(
+            &view.id,
+            crate::perm_request::Decision::Deny,
+            "不批".into(),
+        )
+        .unwrap();
+        let out = handle.await.unwrap().expect("驳回不是错误");
+        let text = out["content"][0]["text"].as_str().unwrap_or_default().to_string();
+        assert!(
+            text.contains("用户拒绝了本次申请"),
+            "驳回后模型只应看到拒绝说明：{text}"
+        );
+
+        // 审计有行，且记的是「被驳回」+ 真实会话 + 真实解释器
+        let audit = std::fs::read_to_string(dir.join("audit-commands.jsonl")).unwrap_or_default();
+        assert!(
+            audit.contains("mcp__orbcat-test__get_marker"),
+            "审计要记工具名：{audit}"
+        );
+        assert!(audit.contains("\"rejected\""), "审计要记被驳回：{audit}");
+        assert!(
+            audit.contains("sess-bridge-1"),
+            "审计要带真实会话（旧桥记的是空串）：{audit}"
+        );
+        assert!(
+            audit.contains("\"shell\":\"mcp\""),
+            "审计要记真实解释器（mcp 是第三种真实情况，不是含糊的 argv）：{audit}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 判据③：批准 ⇒ 工具**真执行** + 审计有 executed 行 + `mcp_grants.json` 建了。
+    ///
+    /// 这条要**真起一个 MCP stdio server**（`tests/fake_mcp_server.cjs`）⇒ 需要 node。
+    /// node 找不到就跳过（不把环境问题算成失败 —— 与本仓其它 e2e 的做法一致）。
+    #[tokio::test]
+    async fn 桥批准后_mcp_工具真执行_且留审计与_grants() {
+        let Some(node) = find_node() else {
+            eprintln!("跳过：PATH 上找不到 node");
+            return;
+        };
+        let Some(script) = fake_mcp_server_script() else {
+            eprintln!("跳过：找不到 tests/fake_mcp_server.cjs");
+            return;
+        };
+
+        let dir = fresh_tmp("bridge_mcp_exec");
+        let trace = dir.join("mcp-trace.jsonl");
+        let cfg = crate::config::McpServerCfg {
+            id: "orbcat-test".into(),
+            url: String::new(),
+            enabled: true,
+            label: "orbcat-test".into(),
+            transport: crate::config::McpTransport::Stdio,
+            command: node,
+            args: vec![script.to_string_lossy().into_owned()],
+            env: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(
+                    "MCP_TRACE_FILE".into(),
+                    trace.to_string_lossy().into_owned(),
+                );
+                m
+            },
+        };
+        let mut reg = ToolRegistry::with_servers(&[cfg]);
+        let clients = reg.clients_clone();
+        let snap = ToolRegistry::fetch_snapshot(&clients).await;
+        let groups = reg.apply_snapshot_with_settings(
+            snap,
+            &crate::config::AgentSettings::default(),
+        );
+        if groups == 0 || !reg.active_tools().iter().any(|t| t.name == "get_marker") {
+            eprintln!("跳过：假 MCP server 没起来（拉不到工具清单）");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let mcp = std::sync::Arc::new(tokio::sync::Mutex::new(reg));
+        let perm = std::sync::Arc::new(PermHub::new());
+        let mcp_c = mcp.clone();
+        let perm_c = perm.clone();
+        let dir_c = dir.clone();
+        let handle = tokio::spawn(async move {
+            execute_bridge_full(
+                "mcp__orbcat-test__get_marker",
+                &json!({}),
+                &dir_c,
+                &mcp_c,
+                &perm_c,
+                "sess-bridge-2",
+            )
+            .await
+        });
+
+        let view = wait_for_perm_request(&perm, 10_000)
+            .await
+            .expect("MCP 调用必须先弹权限卡");
+        // 「总是允许」⇒ 批准后落 mcp_grants.json
+        perm.decide_command(
+            &view.id,
+            crate::perm_request::Decision::ApproveFull,
+            "总是允许".into(),
+        )
+        .unwrap();
+
+        let out = handle
+            .await
+            .unwrap()
+            .expect("批准后不应是错误");
+        let text = out["content"][0]["text"].as_str().unwrap_or_default().to_string();
+        assert!(
+            text.contains("MCP-MARKER-42"),
+            "批准后工具要真执行（这是假 server 回的固定串）：{text}"
+        );
+
+        // 留痕：假 server 真的被调了
+        let tr = std::fs::read_to_string(&trace).unwrap_or_default();
+        assert!(
+            tr.contains("tools/call"),
+            "假 server 应该收到 tools/call：{tr}"
+        );
+
+        // grants 落盘
+        let grants = dir.join("mcp_grants.json");
+        assert!(grants.is_file(), "「总是允许」必须落 mcp_grants.json");
+        let g = std::fs::read_to_string(&grants).unwrap_or_default();
+        assert!(
+            g.contains("mcp__orbcat-test__get_marker"),
+            "grants 要记全名：{g}"
+        );
+
+        // 审计有 executed 行
+        let audit = std::fs::read_to_string(dir.join("audit-commands.jsonl")).unwrap_or_default();
+        assert!(
+            audit.contains("\"executed\""),
+            "审计要记已执行：{audit}"
+        );
+        assert!(
+            audit.contains("\"approved\""),
+            "审计要记用户批过：{audit}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 判据⑤：**老 `execute_bridge` 行为逐字不变**（Pi内核 现在就能编译）。
+    ///
+    /// 老路传空壳（空 registry + 空 PermHub + 空 session_id）⇒ MCP 工具名照旧
+    /// 被名字闸门拒成「未知工具」—— 错误文案与改动前**逐字相同**。
+    #[tokio::test]
+    async fn 老_execute_bridge_对_mcp_工具名仍逐字报未知工具() {
+        let dir = fresh_tmp("bridge_legacy");
+        let err = execute_bridge("mcp__orbcat-test__get_marker", &json!({}), &dir)
+            .await
+            .expect_err("老路没有真实注册表 ⇒ 必须拒绝");
+        assert_eq!(
+            err, "未知工具: mcp__orbcat-test__get_marker",
+            "老路的错误文案不许变"
+        );
+        // 老路也**不该**写出任何 MCP 审计行（它压根没走到 MCP 分支）
+        let audit = std::fs::read_to_string(dir.join("audit-commands.jsonl")).unwrap_or_default();
+        assert!(
+            !audit.contains("mcp__orbcat-test__get_marker"),
+            "老路不该记 MCP 审计：{audit}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
