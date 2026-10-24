@@ -210,14 +210,26 @@ body {
 }
 
 /* ---- ② 工作中：靛蓝壳醒猫（A/B 两帧交替 = 摇尾巴）----
-   呼吸加速到 2.2s，比待命更活跃 */
+   呼吸加速到 2.2s，比待命更活跃
+
+   ⚠️⚠️ **可见性必须写在规则里**（`opacity: 1`），不能只靠 keyframes。
+   原因（2026-10-24 真机报「工作时球几乎看不见」，实测复现）：
+   `@media (prefers-reduced-motion: reduce)` 会把 `animation-duration` 压到
+   0.001ms、`animation-iteration-count` 压到 1 ⇒ **动画立刻结束** ⇒ 帧回到
+   基础样式 `opacity: 0` ⇒ **醒猫两帧全隐形** ⇒ 球只剩那圈淡环 = 「球消失了」。
+   （实测：reduce=on 时 awake-a / awake-b 的 computed opacity 都是 0。）
+   ⇒ 其它状态（idle/pending/mem/error）的 `opacity: 1` 都写在规则里，
+     **只有「工作中」把可见性押在了动画上** ⇒ 只有它会消失。
+   ⇒ 动画只管 A/B 交替，不管「看得见」。 */
 .orb--thinking .orb-frame-awake-a {
+  opacity: 1;
   animation:
     orb-wag-a 0.9s steps(1) infinite,
     orb-breathe 2.2s ease-in-out infinite;
 }
 
 .orb--thinking .orb-frame-awake-b {
+  opacity: 1;
   animation:
     orb-wag-b 0.9s steps(1) infinite,
     orb-breathe 2.2s ease-in-out infinite;
@@ -1754,6 +1766,31 @@ body {
 .sess-sep-n {
   flex: 0 0 auto;
   color: var(--g3);
+}
+
+/* 组标题右侧那颗「＋」= **在这组里新建会话**（2026-10-24 真机反馈加的）。
+   ⚠️ 为什么是 `<span>` 不是 `<button>`：`.sess-sep` 本身就是 button，
+      button 套 button 是非法 HTML（浏览器会把内层 button 拆出来，事件也会乱）。
+   ⚠️ 色值全部走 :root token（新增裸色值 = 0）。 */
+.sess-sep-new {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-left: 4px;
+  border-radius: var(--r-xs);
+  font-size: var(--fs-2);
+  line-height: 1;
+  color: var(--g2);
+  background: var(--bg-3);
+  cursor: pointer;
+}
+
+.sess-sep-new:hover {
+  color: var(--g1);
+  background: var(--bg-4);
 }
 
 .sess-item {
@@ -4838,10 +4875,14 @@ body.models-page {
 }
 
 .mc-menu {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0; /* chip 挂在工具栏最右，菜单向左展开 */
-  left: auto;
+  /* ⚠️ `fixed`（不是 `absolute`）：菜单挂在 **body** 上，不挂锚点里面 ⇒
+     锚点那些 `overflow: hidden` 的祖先就裁不到它了
+     （顶栏 chip 是 `<button>`、**它自己 overflow:hidden**；设置页那行在
+     `.set-sec` 里、也是 overflow:hidden ⇒ 挂里面会被整块裁掉 ⇒ 点了像没反应）。
+     位置由 `positionModelsDropdown()` 按锚点 rect + 视口收敛算好后写内联 left/top。 */
+  position: fixed;
+  left: 0;
+  top: 0;
   min-width: 214px;
   max-width: 300px;
   z-index: 4000; /* 与既有 overlay 惯例对齐 */

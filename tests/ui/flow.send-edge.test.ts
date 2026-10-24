@@ -76,6 +76,12 @@ describe("发送边界", () => {
   it("跑完：过程条目折成折叠行，默认闭合且展开状态可保持", async () => {
     await bootApp();
     await openPanel();
+    // ⚠️ 必须给 chat 加一点延迟：mock 默认 `chatDelayMs = 0` ⇒ chat **瞬间**返回
+    //    ⇒ 「正在思考…」那个 running 气泡只闪 <1ms ⇒ `waitFor(running)` 纯靠运气
+    //    （2026-10-24 实测：send() 里少了一个 await，这条就稳定超时）。
+    //    给 40ms 让「运行中」这段**确定可见** —— 真机上网络/模型延迟天然提供这个窗口。
+    //    ⚠️ 要在 bootApp **之后**设：bootApp 会把 mock 状态重置回去。
+    state.chatDelayMs = 40;
     await sendText("做点事");
     await waitFor(() => !!document.querySelector(".msg.running"), 2000, "running");
     await waitFor(

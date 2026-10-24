@@ -59,6 +59,16 @@ type MockState = {
   chatReply: string;
   chatError: string | null;
   chatDelayMs: number;
+  /**
+   * 这一轮是不是「被停掉了」（用户按停止 / 轮数上限 / 上下文降级）。
+   *
+   * ⚠️ 为什么要能模拟它（2026-10-24 加）：
+   *   「⏹ 已停止，本轮已产出的内容保留在上面」那行是**被用户要求删掉**的，
+   *   而「有原因」（轮数上限…）那行要留着 ⇒ 必须能分别模拟两种情况。
+   */
+  chatInterrupted: boolean;
+  /** 被停掉的原因（空 = 用户自己按的停止） */
+  chatStopReason: string;
   selectedModel: string | null;
   /**
    * 设置里记的 Base URL（身份键 = (Base URL, 接口 id) 的另一半）。
@@ -228,6 +238,8 @@ function defaultState(): MockState {
     chatReply: "这是 mock 回复 MOCK_OK。",
     chatError: null,
     chatDelayMs: 0,
+    chatInterrupted: false,
+    chatStopReason: "",
     // 身份 = (Base URL, 接口 id)：selectedModel 存**接口 id**，
     // get_selected_model 返回 {id, url} 双字段；显示名已废弃
     selectedModel: "mock-1",
@@ -823,7 +835,8 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
           { kind: "tool_result", name: "read_file", detail: "FILE_BODY_MARKER\n" + "x".repeat(300) },
         ],
         iterations: 1,
-        interrupted: false,
+        interrupted: state.chatInterrupted,
+        stopReason: state.chatStopReason || undefined,
         usage: { prompt: 1, completion: 2, total: 3 },
       } as T;
     }
