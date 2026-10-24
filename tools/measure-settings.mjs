@@ -127,18 +127,35 @@ while (Date.now() < deadline) {
 await new Promise((r) => setTimeout(r, 600));
 
 /**
- * 进设置页：点齿轮 → 展开「行为与安全」组 → 滚到该组。
- * ⚠️ 场景不一定跳到设置页（`?scenario=settings` 落在对话流），
- *    所以这里**按真实交互路径**走一遍。
+ * 进设置页。
+ *
+ * ⚠️ **两种落点都得认**：
+ * - 场景**直接落在设置页**（`?scenario=settings` 现在会切到设置视图）⇒ **别再点齿轮**
+ *   （点了会把它切回对话流 ⇒ 量到 0 行）；
+ * - 场景落在对话流（其它场景）⇒ 才需要点齿轮。
+ * ⇒ 先**等**设置页的行出现，等到就算已经在设置页；等不到再点齿轮。
  */
-await p("Runtime.evaluate", {
-  expression: `(() => {
-    document.getElementById("btn-gear")?.click();
-    return true;
-  })()`,
-  returnByValue: true,
-});
-await new Promise((r) => setTimeout(r, 900));
+{
+  const until = Date.now() + 4000;
+  while (Date.now() < until) {
+    const r = await p("Runtime.evaluate", {
+      expression: "document.querySelectorAll('.set-row').length",
+      returnByValue: true,
+    });
+    if ((r?.result?.value ?? 0) > 0) break;
+    await new Promise((r2) => setTimeout(r2, 150));
+  }
+  const r = await p("Runtime.evaluate", {
+    expression: `(() => {
+      if (!document.querySelector(".set-row")) {
+        document.getElementById("btn-gear")?.click();
+      }
+      return true;
+    })()`,
+    returnByValue: true,
+  });
+  await new Promise((r) => setTimeout(r, 900));
+}
 
 /** 展开**所有**组（折叠着的话）—— 每组都要量，不能只看一组 */
 await p("Runtime.evaluate", {
