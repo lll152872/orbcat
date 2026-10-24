@@ -1291,6 +1291,17 @@ export const SCENARIOS: MockScenario[] = [
     goto: "sessions",
   },
   {
+    id: "settings",
+    label: "设置入口页（4 组手风琴）",
+    desc: "模型与接入 / 记忆与数据 / 行为与安全 / 系统 —— 目视核对每行右列是否被裁",
+    cover: () => {},
+    // ⚠️ `goto: "settings"` = 设置**入口页**（4 组手风琴）。
+    //    「行为与安全」组里有「执行位置 / 内核 / 项目目录自动读写 / 命令策略 / 失焦自动收起」
+    //    这几行 —— 2026-10-24 真机 bug（右列被裁）就出在这里。
+    //    ⇒ 预览件会**自动展开所有组**（见 src/preview.ts 的 5b 步），方便目视核对。
+    goto: "settings",
+  },
+  {
     id: "perm",
     label: "权限卡（文件/命令/问用户）",
     desc: "三种待批申请同时在列",

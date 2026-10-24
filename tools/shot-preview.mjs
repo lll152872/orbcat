@@ -205,6 +205,26 @@ while (Date.now() < deadline) {
 }
 if (!ready) console.warn("[shot] ⚠️ 预览件没在 20s 内标记就绪（可能场景名不存在）");
 
+// 可选：把某个组滚到视野中央（目视核对某一屏时用）
+// 用法：node tools/shot-preview.mjs <scenario> <out.png> [宽] [高] [组名关键词]
+const group = process.argv[6] ?? "";
+if (group) {
+  await pageSend("Runtime.evaluate", {
+    expression: `(() => {
+      for (const sec of document.querySelectorAll(".set-sec")) {
+        const head = sec.querySelector(".set-sec-head");
+        if ((head?.textContent || "").includes(${JSON.stringify(group)})) {
+          sec.scrollIntoView({ block: "center" });
+          return true;
+        }
+      }
+      return false;
+    })()`,
+    returnByValue: true,
+  });
+  await new Promise((r) => setTimeout(r, 500));
+}
+
 // 再等一拍，让最后一次重画落地
 await new Promise((r) => setTimeout(r, 500));
 

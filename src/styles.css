@@ -6618,6 +6618,29 @@ details.run-reason > summary::before,
   font: inherit;
   text-align: left;
   cursor: pointer;
+  /* ⚠️⚠️ **必须 border-box**（2026-10-24 真机 bug 修）
+   *
+   * 现象：设置页「行为与安全」组**右列整列被切掉** —— 开关只剩左半截。
+   *
+   * 根因（实测，不是猜）：项目**没有**全局的 `box-sizing: border-box` 规则
+   *   （默认 content-box，见 .model-chip 那条注释里写的同一个坑）。
+   *   而 `.set-row` 是 `width: 100%` + `padding-left: 17px` ⇒
+   *   content-box 下**总宽 = 100% + 17px**，比容器宽 17px。
+   *
+   * 为什么**一半的行没事、一半的行被切**（实测 460 宽下的盒模型）：
+   *   - `row()` helper 是 `const tag = act ? "button" : "div"`（main.ts）
+   *     ⇒ **有 act 的行是 `<button>`**，浏览器 UA 样式表给 button **默认 border-box**
+   *       ⇒ 宽度正常（右缘 455）；
+   *   - **没有 act 的行是 `<div>`** ⇒ 落回默认 content-box
+   *     ⇒ 总宽 407（= 390 + 17），右缘 **472**，**超出面板右缘 17px**
+   *       ⇒ 被祖先 `.set-sec` 的 `overflow: hidden` 切掉
+   *       ⇒ 34px 的开关（438..472）正好被切掉 17px ⇒ **只剩左半截**。
+   *
+   * ⇒ 这里显式补 border-box：**所有行统一**，与 `<button>` 行行为一致，
+   *    不再依赖「这行恰好是 button」这种隐式巧合。
+   *    （实测修前：行为与安全组 + 系统组 .set-sec 的 scrollWidth 416 > clientWidth 408 ⇒ 溢出 8px）
+   */
+  box-sizing: border-box;
 }
 .set-row:hover {
   background: rgba(255, 255, 255, 0.03);
@@ -6660,13 +6683,25 @@ details.run-reason > summary::before,
    彩色只给状态点这种图形元素）。 */
 
 /* 值 + 开关并排（「内核」那一行：左边开关是「我要用 pi」，
-   右边是「实际在跑的是什么」） */
+   右边是「实际在跑的是什么」）
+   ⚠️ `flex: 0 1 auto`（不是 `none`）：这一组要**能收缩** ——
+      值文字长时应该**它自己**省略，而不是把右边的开关挤出面板。
+      `min-width: 0` 是 flex 子项能收缩的前提（否则 min-content 兜底）。 */
 .set-row-right {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
   margin-left: auto;
+}
+
+/* 组里的值：可收缩 + 省略号收尾（开关 `flex:none` 不参与收缩，始终完整） */
+.set-row-right .set-row-val {
+  flex: 0 1 auto;
+  min-width: 0;
+  /* 55% 是按「组」的宽度算的，而组宽度由内容定 ⇒ 百分比失效 ⇒ 这里放开 */
+  max-width: none;
 }
 
 /* 静默回落 ⇒ 这一行用危险色描边 + 值变红 */

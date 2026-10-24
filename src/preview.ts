@@ -172,6 +172,17 @@ async function boot(): Promise<void> {
     if (sw) await sw(target);
   }
 
+  // 5b) 设置页场景：**展开所有组**（默认只展开当前会话所在的那组），
+  //     否则「行为与安全」组是折着的 ⇒ 目视核对看不到那几行。
+  if (target === "settings") {
+    for (const sec of Array.from(
+      document.querySelectorAll<HTMLElement>(".set-sec.folded"),
+    )) {
+      sec.querySelector<HTMLElement>(".set-sec-head")?.click();
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+
   // 状态条/标题条有时是异步补的，等一拍再收尾
   await new Promise((r) => setTimeout(r, 250));
 
