@@ -18,6 +18,11 @@
 //! ——必须**问用户**才能写，那是模型就绪之后的事，属于第二段，
 //! 由 agent 读项目根的 `初始化.md` 自行推进。
 //!
+//! ⚠️ 但**骨架区里这四个文件是有的**（0 字节占位，用户拍板「有文件、
+//! 不带内容」）—— 只放占位，不预置任何人格/红线内容。
+//! 「存在但空」在判定上**视同缺失**（见 `agent.rs` 的 `missing_persona`）
+//! ⇒ 那段「初始化未完成」的引导照常出现 ⇒ agent 仍会问用户。
+//!
 //! ## 骨架从哪来：`src-tauri/skeleton/`
 //!
 //! 骨架正文不再硬写在本文件里，而是躺在 `src-tauri/skeleton/` 下，
@@ -328,8 +333,14 @@ pub fn bootstrap_agent_data(data_dir: &Path) -> Result<BootstrapReport, String> 
 
     // ── 四、骨架区物化 ─────────────────────────────────────────
     // 目录已存在则跳过；文件已存在则**绝不覆盖**；版本化的模板文件在
-    // seed 变化时只补缺失小节。人格文件（RULES/SOUL/IDENTITY/USER）
-    // 故意**不在这里建**：那是第二段、要问过用户才能写的东西。
+    // seed 变化时只补缺失小节。
+    //
+    // ⚠️ 人格文件（RULES/SOUL/IDENTITY/USER）**在骨架区里，但内容是空的**
+    // （0 字节占位，用户拍板「有文件、不带内容」）：
+    //   · 铺出来 ⇒ 新用户一眼看得见「这四个文件该由谁来写」（agent 会问）；
+    //   · 空 ⇒ `agent.rs` 的 `missing_persona` 判定（存在**且**非空才算有）
+    //     仍判成「缺」⇒ 那段「初始化未完成」的引导照常出现 ⇒ agent 会问用户；
+    //   · 已存在（有内容）⇒ **绝不覆盖**（用户写的人格不能被升级冲掉）。
     let mut applied: Vec<String> = Vec::new();
     for asset in SKELETON_ASSETS {
         let p = data_dir.join(asset.rel);
@@ -716,9 +727,22 @@ mod tests {
             assert!(d.join(f).is_file(), "{f} 应存在");
         }
 
-        // 人格文件是第二段的事，代码凭空造不出"你是谁"
+        // 人格文件：骨架区**有**这四个文件，但**内容是空的**
+        // （用户拍板「有文件、不带内容」）⇒ 只放占位，不预置任何人格/红线。
+        //
+        // ⚠️ 这里原先断言的是「**不该**由 bootstrap 创建」—— 那条设计已经翻了：
+        //   「存在但空」在判定上**视同缺失**（`agent.rs` 的 `missing_persona`）
+        //   ⇒ 那段「初始化未完成」的引导照常出现 ⇒ agent 仍会问用户要内容。
+        // 现在要锁的是：① 文件在 ② **内容是空的**（没被偷偷预置人格）。
         for f in ["RULES.md", "SOUL.md", "IDENTITY.md", "USER.md"] {
-            assert!(!d.join(f).exists(), "{f} 不该由 bootstrap 创建");
+            let p = d.join(f);
+            assert!(p.is_file(), "{f} 应作为占位存在");
+            let body = std::fs::read_to_string(&p).unwrap_or_default();
+            assert!(
+                body.trim().is_empty(),
+                "{f} 必须是空的（人格/红线只能问过用户后写），实际有 {} 字节",
+                body.len()
+            );
         }
 
         // ── `boot_state` 的 needsInit 判据（2026-10-12 用户反馈）──

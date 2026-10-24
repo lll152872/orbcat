@@ -39,6 +39,27 @@
     },
 
     {
+      "src": "RULES.md",
+      "rel": "RULES.md",
+      "template": true
+    },
+    {
+      "src": "SOUL.md",
+      "rel": "SOUL.md",
+      "template": true
+    },
+    {
+      "src": "IDENTITY.md",
+      "rel": "IDENTITY.md",
+      "template": true
+    },
+    {
+      "src": "USER.md",
+      "rel": "USER.md",
+      "template": true
+    },
+
+    {
       "src": "skills/dual-token-dashboard/SKILL.md",
       "rel": "skills/dual-token-dashboard/SKILL.md",
       "render": ["DATA_DIR", "SKILL_DIR"]

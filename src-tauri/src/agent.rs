@@ -2830,9 +2830,22 @@ fn build_prompt_segments(
     //
     // 前缀稳定性：这个条件在一次安装内最多翻转四次（每建一个 persona
     // 文件翻转一次缓存）—— 一次性成本，可接受。
+    // ⚠️ **存在 ≠ 有**：空文件视同缺失。
+    //
+    // 骨架里这四个文件是 **0 字节占位**（用户拍板「有文件、不带内容」）
+    // ⇒ 只按 `exists()` 判的话，空文件也算「有」⇒ `missing_persona = false`
+    // ⇒ 这段「初始化未完成」的引导**永远不出现** ⇒ agent 不再主动问人格红线
+    // ⇒ 全新用户永远没人格。
+    //
+    // 与下面 `read()` 的口径**必须一致**（它是 trim 之后过滤空串）：
+    // 两处判据不同就会出现「prompt 说缺、正文其实在」这种自相矛盾。
     let missing_persona = ["RULES.md", "SOUL.md", "IDENTITY.md", "USER.md"]
         .iter()
-        .any(|f| !data_dir.join(f).exists());
+        .any(|f| match std::fs::read_to_string(data_dir.join(f)) {
+            // 只有「读得到**且**有内容」才算有；读不到（不存在/读不了）一律当缺
+            Ok(s) => s.trim().is_empty(),
+            Err(_) => true,
+        });
     if missing_persona {
         let dir_note = if !data_dir.exists() {
             "注意：数据目录本身还不存在。这种情况你**什么都做不了**\n（没有模型你也收不到消息）。界面上会有「建出目录结构」按钮，\n引导用户去点它 —— **不要试图自己建目录**。"
@@ -3690,6 +3703,41 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let p = build_system_prompt(&tmp);
         assert!(p.contains("运行环境"));
+    }
+
+    /// 🔴 判据：**空文件视同缺失** ⇒ 那段「初始化未完成」的引导必须照常出现。
+    ///
+    /// 为什么这是生死线：骨架里那四个人格文件是 **0 字节占位**
+    /// （用户拍板「有文件、不带内容」）⇒ 旧判据只看 `exists()`，
+    /// 空文件也算「有」⇒ `missing_persona = false` ⇒ 全新用户**永远**看不到
+    /// 初始化引导 ⇒ agent 不再问人格红线 ⇒ 全新用户永远没人格。
+    #[test]
+    fn 四个空人格文件仍算缺失_初始化引导照常出现() {
+        let tmp = std::env::temp_dir().join("orbcat_prompt_empty_persona");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("memory")).unwrap();
+        // 骨架铺出来的样子：四个文件**都在**，但**都是 0 字节**
+        for f in ["RULES.md", "SOUL.md", "IDENTITY.md", "USER.md"] {
+            std::fs::write(tmp.join(f), "").unwrap();
+        }
+
+        let p = build_system_prompt(&tmp);
+        assert!(
+            p.contains("# 初始化未完成"),
+            "空文件必须视同缺失（否则全新用户永远没人格）：\n{p}"
+        );
+
+        // 反向：四个文件都有内容 ⇒ 那段引导**不该**再出现
+        for f in ["RULES.md", "SOUL.md", "IDENTITY.md", "USER.md"] {
+            std::fs::write(tmp.join(f), "有内容").unwrap();
+        }
+        let p2 = build_system_prompt(&tmp);
+        assert!(
+            !p2.contains("# 初始化未完成"),
+            "四个文件都有内容时不该再喊「初始化未完成」"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// 🔴 前缀稳定性：所有**会变的内容**必须排在所有**不变的内容**之后

@@ -208,6 +208,7 @@ export function stageWindowsRelease({
   skeletonDir = null,
   files = [],
   runtimeDir = null,
+  initDoc = null,
 }) {
   if (!isFile(exePath)) {
     throw new Error(`exe 不存在：${exePath}`);
@@ -296,6 +297,21 @@ export function stageWindowsRelease({
   for (const f of files) {
     if (!isFile(f)) throw new Error(`附加文件不存在：${f}`);
     copyFileSync(f, path.join(outDir, path.basename(f)));
+  }
+
+  // ── 初始化指引（**包根**，与 agent-data/ 同级）──
+  //
+  // ⚠️ 位置不是随便定的：
+  //   · prompt 的原话是「读**项目根**的 `初始化.md`（和 `agent-data/` 同级）」；
+  //   · 启动器 `tools/orbcat-launch.ps1` 用 `-WorkingDirectory <exe 目录>` 起进程
+  //     ⇒ 运行时 cwd = 包根 ⇒ agent 按相对路径就找得到。
+  //
+  // 放进 `agent-data/` 里 agent 是**找不到**的（那里不是 cwd）⇒ 初始化链路断链。
+  if (initDoc) {
+    if (!isFile(initDoc)) {
+      throw new Error(`初始化指引不存在：${initDoc}`);
+    }
+    copyFileSync(initDoc, path.join(outDir, path.basename(initDoc)));
   }
 
   return { outDir, exeName };
@@ -503,6 +519,30 @@ function parseArgs(argv) {
 }
 
 /**
+ * 初始化指引（`初始化.md`）的默认位置 —— **仓库根**。
+ *
+ * ## 为什么它必须进「包根」，不是 `agent-data/` 下面
+ *
+ * 1. prompt 的原话（`src-tauri/src/agent.rs` 的「初始化未完成」段）：
+ *    「读**项目根**的 `初始化.md`（和 `agent-data/` 同级）」——
+ *    「同级」= 包根，与 `agent-data/` 并列。
+ * 2. 启动器 `tools/orbcat-launch.ps1` 用 `-WorkingDirectory <exe 目录>` 起进程
+ *    ⇒ 运行时 cwd = 包根 ⇒ agent 按相对路径就能找到它。
+ *
+ * 找不到返回 null —— **调用方必须自己决定要不要报错**：
+ * 缺它 ⇒ 新用户点完「建出目录结构」后，agent 被引导去读一个不存在的文件
+ * ⇒ 初始化链路直接断链 ⇒ 发布包不能这么发出去。
+ */
+export function defaultInitDoc() {
+  const p = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "初始化.md"
+  );
+  return isFile(p) ? p : null;
+}
+
+/**
  * 内置运行时的默认位置：仓库根的 `runtime/`。
  *
  * 找不到就返回 null —— **调用方必须自己决定要不要报错**：
@@ -563,6 +603,27 @@ function main() {
     process.exit(2);
   }
 
+  // ── 初始化指引（包根，与 agent-data/ 同级）──
+  //
+  // ⚠️ **必须进包根**，不能塞进 `agent-data/`：prompt 让 agent 读的是
+  // 「项目根的 `初始化.md`（和 `agent-data/` 同级）」，而启动器把 cwd 设成
+  // exe 目录（`tools/orbcat-launch.ps1` 的 `-WorkingDirectory`）
+  // ⇒ 只有包根那份找得到。
+  //
+  // 缺它 ⇒ 新用户初始化链路断链（agent 去读一个不存在的文件）
+  // ⇒ **当场报错**，不许 warn 就放过（跟 runtime / photon 同一口径）。
+  const initDoc = defaultInitDoc();
+  if (!initDoc) {
+    console.error(
+      "找不到初始化指引（仓库根的 初始化.md）\n" +
+        "  发布包必须带它（**包根**，与 agent-data/ 同级）—— 缺了它，新用户\n" +
+        "  点完「建出目录结构」后，agent 被 prompt 引导去读一个不存在的文件\n" +
+        "  ⇒ 初始化链路直接断链。\n" +
+        "  修法：确认仓库根有 初始化.md（它是入库文件，不是生成物）。"
+    );
+    process.exit(2);
+  }
+
   const { exeName } = stageWindowsRelease({
     exePath: args.exe,
     distDir: args.dist,
@@ -570,6 +631,7 @@ function main() {
     skeletonDir: args.skeleton ?? null,
     files: args.file ?? [],
     runtimeDir,
+    initDoc,
   });
   const { notes } = verifyReleaseLayout(args.out, {
     exeName,
