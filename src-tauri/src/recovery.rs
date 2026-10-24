@@ -507,12 +507,18 @@ pub fn prune(data_dir: &Path, keep: Retention) -> Result<PruneOutcome, String> {
     let mut recs = list_backups(data_dir);
     // list 已是新→旧；保留前 keep_items 条，其余里超过 keep_days 的删掉
     for r in recs.iter().skip(keep.keep_items) {
-        if r.at > cutoff && r.at != 0 {
+        // ⚠️ `at == 0` = 时间**未知**（文件名解析不出时间戳）⇒ **不当作超期**。
+        //    判不出新旧 ⇒ 宁可多留，不可误删（与「空 original 一律不动」同一口径）。
+        if r.at == 0 {
+            continue;
+        }
+        if r.at > cutoff {
             continue; // 还没超期
         }
-        let p = PathBuf::from(&r.backup);
-        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-        if std::fs::remove_file(&p).is_ok() {
+        // ⚠️ **只删 `backups/` 里**的副本（复用 `remove_backup_copy` 的目录闸）。
+        //    旧写法直接 `remove_file(r.backup)` ⇒ 清单被改坏时，
+        //    `backups/` **之外**的用户文件也会被照删不误。
+        if let Some(size) = remove_backup_copy(data_dir, r) {
             out.backups_removed += 1;
             out.bytes_freed += size;
         }
@@ -521,12 +527,22 @@ pub fn prune(data_dir: &Path, keep: Retention) -> Result<PruneOutcome, String> {
     recs.clear();
 
     // ---- 归档 ----
+    let tdir = trash_dir(data_dir);
     let trecs = list_trash(data_dir);
     for r in trecs.iter().skip(keep.keep_items) {
-        if r.at > cutoff && r.at != 0 {
+        // ⚠️ 同上：时间未知 ⇒ 不当作超期
+        if r.at == 0 {
+            continue;
+        }
+        if r.at > cutoff {
             continue;
         }
         let p = PathBuf::from(&r.trashed);
+        // ⚠️ **只删 `.trash/` 里**的东西（与 `tools.rs::delete_file` 的归档目录同源）。
+        //    清单被改坏时，宁可留着也不误删用户文件。
+        if !p.starts_with(&tdir) {
+            continue;
+        }
         if !p.exists() {
             continue;
         }
@@ -670,8 +686,15 @@ const RETAIN_HEAD_TAIL_KEEP: usize = 2;
 ///    （清单被改坏时，宁可留着也不误删用户文件）。
 fn remove_backup_copy(data_dir: &Path, rec: &BackupRec) -> Option<u64> {
     let dir = backups_dir(data_dir);
+    // ⚠️ `id` 来自清单（**用户可能用记事本改过它**）⇒ 必须先验「没有路径分隔符」，
+    //    否则 `dir.join(id)` 能拼出 `backups/` 之外的路（如 `../../victim.txt`）。
+    //    规则与 [`delete_backup`] 一致：只接受单层文件名。
+    let id_ok = !rec.id.is_empty()
+        && !rec.id.contains('/')
+        && !rec.id.contains('\\')
+        && !rec.id.contains("..");
     let by_id = dir.join(&rec.id);
-    let path = if by_id.is_file() {
+    let path = if id_ok && by_id.is_file() {
         by_id
     } else {
         let p = PathBuf::from(&rec.backup);
@@ -1123,6 +1146,161 @@ mod tests {
         assert_eq!(out.backups_removed, 2, "只该删两条超期的老备份");
         let left = list_backups(&d);
         assert_eq!(left.len(), 3, "未超期的三条必须留下");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 🔴 **手动清理绝不能删到 `backups/` 之外** —— 清单被改坏时的最后一道闸
+    ///
+    /// 旧写法直接 `remove_file(r.backup)` ⇒ 清单里的 `backup` 字段指向哪就删哪。
+    /// 而清单是**用户可能用记事本改过**的 JSONL ⇒ 这是一条真实的数据丢失面。
+    #[test]
+    fn prune_never_deletes_outside_backups_dir() {
+        let d = tmp("prune_gate");
+        let dir = backups_dir(&d);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 用户自己的文件（**不在 backups/ 里**）
+        let victim = d.join("victim.txt");
+        std::fs::write(&victim, "重要").unwrap();
+
+        // 清单被改坏：backup 指向 backups/ 之外
+        append_jsonl(
+            &backups_manifest(&d),
+            &BackupRec {
+                id: "1600000000000__victim.txt".into(),
+                at: 1_600_000_000_000,
+                original: d.join("victim.txt").display().to_string(),
+                backup: victim.display().to_string(),
+                size: 6,
+                legacy: false,
+            },
+        )
+        .unwrap();
+
+        let out = prune(
+            &d,
+            Retention {
+                keep_days: 0,
+                keep_items: 0,
+            },
+        )
+        .unwrap();
+        assert!(victim.is_file(), "backups/ 之外的用户文件绝不能被清理删掉");
+        assert_eq!(out.backups_removed, 0, "闸门生效时不该删任何一份");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 🔴 `id` 带路径分隔符 ⇒ `dir.join(id)` 会拼出 `backups/` 之外的路
+    ///
+    /// 这条闸同时保护**自动保留策略**（`remove_backup_copy`）与手动清理。
+    /// 旧写法只校验了退路（`rec.backup`），没校验首选路（`dir.join(id)`）。
+    #[test]
+    fn remove_backup_copy_refuses_path_traversal_id() {
+        let d = tmp("prune_traversal");
+        let dir = backups_dir(&d);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // `d/outside.txt`：在 `backups/` **外面**，但 `dir.join("../outside.txt")` 正好指到它
+        let outside = d.join("outside.txt");
+        std::fs::write(&outside, "别删我").unwrap();
+
+        let rec = BackupRec {
+            id: "../outside.txt".into(),
+            at: 1_600_000_000_000,
+            original: d.join("outside.txt").display().to_string(),
+            backup: outside.display().to_string(),
+            size: 9,
+            legacy: false,
+        };
+        assert!(
+            remove_backup_copy(&d, &rec).is_none(),
+            "带 `..` 的 id 必须被拒 —— 否则 `dir.join(id)` 能逃出 backups/"
+        );
+        assert!(outside.is_file(), "`backups/` 之外的文件不能被删");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 🔴 时间**未知**（文件名解析不出时间戳）⇒ **不当作超期**
+    ///
+    /// 旧判据 `if r.at > cutoff && r.at != 0` ⇒ `at == 0` 时不 continue ⇒
+    /// 「不知道多老」被当成「老得该删」。判不出 ⇒ 宁可多留。
+    #[test]
+    fn prune_keeps_records_with_unknown_timestamp() {
+        let d = tmp("prune_unknown_at");
+        let dir = backups_dir(&d);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 文件名里没有 `__毫秒` 前缀 ⇒ `parse_legacy_name` 解不出时间 ⇒ at = 0
+        let unknown = dir.join("notime.txt");
+        std::fs::write(&unknown, "x").unwrap();
+
+        // 再造一条**确实超期**的作为对照：它必须被删
+        let old_id = "1600000000000__old.txt";
+        std::fs::write(dir.join(old_id), "x").unwrap();
+        append_jsonl(
+            &backups_manifest(&d),
+            &BackupRec {
+                id: old_id.into(),
+                at: 1_600_000_000_000,
+                original: d.join("old.txt").display().to_string(),
+                backup: dir.join(old_id).display().to_string(),
+                size: 1,
+                legacy: false,
+            },
+        )
+        .unwrap();
+
+        let out = prune(
+            &d,
+            Retention {
+                keep_days: 0,
+                keep_items: 0,
+            },
+        )
+        .unwrap();
+        assert!(unknown.is_file(), "时间未知的备份不能被当成超期删掉");
+        assert!(!dir.join(old_id).exists(), "确实超期的那份必须删掉");
+        assert_eq!(out.backups_removed, 1, "只该删那一份确实超期的");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 🔴 手动清理**归档**时也只能删 `.trash/` 里的东西
+    ///
+    /// `.trash/` 与 `tools.rs::delete_file` 的归档目录同源（`data_dir/.trash`）。
+    #[test]
+    fn prune_trash_never_deletes_outside_trash_dir() {
+        let d = tmp("prune_trash_gate");
+        let trash = trash_dir(&d);
+        std::fs::create_dir_all(&trash).unwrap();
+
+        // 不在 .trash/ 里的用户文件
+        let victim = d.join("keepme.txt");
+        std::fs::write(&victim, "重要").unwrap();
+
+        append_jsonl(
+            &trash_manifest(&d),
+            &TrashRec {
+                at: 1_600_000_000_000,
+                original: d.join("keepme.txt").display().to_string(),
+                trashed: victim.display().to_string(),
+                kind: "file".into(),
+                count: 1,
+                present: true,
+                size: 6,
+            },
+        )
+        .unwrap();
+
+        let out = prune(
+            &d,
+            Retention {
+                keep_days: 0,
+                keep_items: 0,
+            },
+        )
+        .unwrap();
+        assert!(victim.is_file(), "`.trash/` 之外的用户文件绝不能被清理删掉");
+        assert_eq!(out.trash_removed, 0, "闸门生效时不该删任何一份归档");
         let _ = std::fs::remove_dir_all(&d);
     }
 
