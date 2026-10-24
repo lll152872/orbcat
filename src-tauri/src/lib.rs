@@ -5556,6 +5556,19 @@ pub fn run() {
                             },
                         );
                         pool.set_confirm_hook(confirm_hook);
+
+                        // ── 宿主 MCP 上下文接线（单通道）──
+                        //
+                        // pi 内核不再自己连 MCP server ⇒ 工具清单与执行都回宿主：
+                        //   · 清单侧：pi 从**宿主那一份**注册表取 MCP 工具（单一来源、实时）
+                        //   · 执行侧：桥走 `tools::execute_bridge_full` ⇒ 每次调用都过
+                        //             宿主权限闸 ⇒ 确认卡能出、审计有行、禁用能生效
+                        //
+                        // ⚠️ 没接 ⇒ pi 侧清单为空（安全降级，但等于没有 MCP 工具）。
+                        // ⚠️ 传的是**同一个** Arc（`shared` / `perm` 随后原样进了
+                        //    `AppState`）⇒ 授权记录、审计、grants 全部共享；
+                        //    **不要**在这里另造一个 hub（那样授权就断链了）。
+                        pool.set_host_mcp_perm(shared.clone(), perm.clone());
                         Some(pool)
                     }
                     None => {
