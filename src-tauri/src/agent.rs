@@ -3420,29 +3420,75 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// ⚠️ 「后台桌面 vs 本机」与「用哪种 shell」是**两个正交维度**：
 /// 前者决定**在哪儿跑**，后者决定**用哪种解释器**。
 fn exec_location_note(data_dir: &Path) -> String {
-    let shell = crate::config::load_settings(data_dir).exec_shell;
-    let on_bg_desk = crate::win32desk::is_enabled();
-    let place = if on_bg_desk {
-        "**后台桌面**（一个独立的隐藏 Windows 桌面会话，不是用户当前正在看的桌面）"
-    } else {
-        "**本机**（用户当前使用的桌面）"
+    exec_location_note_for_target(data_dir, crate::win32desk::is_enabled())
+}
+
+/// 按「执行目标」现算提示（**可测版本**：后台桌面开关是进程级的，测不了 ⇒ 传进来）。
+///
+/// ⚠️ **以执行器为准**：`resolve_exec_target` 是「实际怎么跑」的唯一事实源。
+///
+/// 以前这里**自己**读 `settings.exec_shell` + `win32desk::is_enabled()`，
+/// 与 `resolve_exec_target` 是两套判断 ⇒ 两者会打架：
+/// ① 选了 Git Bash 时，解释器可能是 WSL 的 bash（提示说 Git Bash、实际是 Ubuntu）；
+/// ② `bg_desk=true` 且选了 Git Bash ⇒ 执行器其实走**本机**，
+///    旧提示却写「后台桌面」⇒ 模型按错误的位置/语法写命令。
+fn exec_location_note_for_target(data_dir: &Path, bg_desk: bool) -> String {
+    let target = crate::shell::resolve_exec_target(data_dir, bg_desk);
+    // Git Bash 时把**实际解释器路径**也点出来 ⇒ 提示与实际执行器严格一致
+    let bash = match target {
+        crate::shell::ExecTarget::LocalGitBash => crate::shell::resolve_git_bash().ok(),
+        _ => None,
     };
-    let (shell_name, syntax) = match shell {
-        crate::config::ExecShell::Gitbash => (
-            "**Git Bash**（`bash.exe`，GNU 语法）",
-            "用 GNU 语法：`ls` / `cat` / `rm -rf` / `find` / `grep` / `chmod`。\n\
-             多条命令用 `&&` / `||` / `;` 串联。**不要**用 PowerShell 的 \
-             `Get-ChildItem` / `Select-String` / `Remove-Item`。",
-        ),
-        crate::config::ExecShell::Pwsh => (
+    exec_location_note_for(target, bash.as_deref())
+}
+
+/// 提示正文（**纯函数** ⇒ 可测）。
+///
+/// `bash` = 已解析出来的**真实** Git Bash 可执行文件（`None` = 没找到）。
+fn exec_location_note_for(target: crate::shell::ExecTarget, bash: Option<&Path>) -> String {
+    let (place, shell_name, syntax) = match target {
+        crate::shell::ExecTarget::BackgroundDesktop => (
+            "**后台桌面**（一个独立的隐藏 Windows 桌面会话，不是用户当前正在看的桌面）",
             "**PowerShell**（`pwsh`，Windows 语法）",
             "用 PowerShell 语法：`Get-ChildItem` / `Select-String` / `Remove-Item -Recurse -Force`。\n\
              **不要**用 GNU 的 `ls` / `grep` / `rm -rf` / `find`。",
         ),
+        crate::shell::ExecTarget::LocalPwsh => (
+            "**本机**（用户当前使用的桌面）",
+            "**PowerShell**（`pwsh`，Windows 语法）",
+            "用 PowerShell 语法：`Get-ChildItem` / `Select-String` / `Remove-Item -Recurse -Force`。\n\
+             **不要**用 GNU 的 `ls` / `grep` / `rm -rf` / `find`。",
+        ),
+        crate::shell::ExecTarget::LocalGitBash => (
+            "**本机**（用户当前使用的桌面）",
+            "**Git Bash**（`bash.exe`，GNU 语法）",
+            "用 GNU 语法：`ls` / `cat` / `rm -rf` / `find` / `grep` / `chmod`。\n\
+             多条命令用 `&&` / `||` / `;` 串联。**不要**用 PowerShell 的 \
+             `Get-ChildItem` / `Select-String` / `Remove-Item`。\n\
+             路径写法是 **MSYS2 风格**：`/c/...`（C 盘）、`/d/...`（D 盘）—— \
+             **不是** WSL 的 `/mnt/c/...`。\n\
+             ⚠️ **路径一律用正斜杠 `/`** —— Windows 风格的反斜杠路径在 MSYS 下\
+             会被**改写成怪文件名**（用户那边就是一个 Win32 打不开的垃圾文件）；\
+             而且**没有前导 `/` 的路径**是相对路径 ⇒ 会落在当前目录，不是你写的地方。",
+        ),
+    };
+    // Git Bash 的**实际解释器**：找到就把路径点出来（提示与执行器严格一致）；
+    // 没找到就明说「会报错、不会回落 pwsh」（fail-closed，别让模型以为在 bash 里跑）。
+    let interpreter = match (target, bash) {
+        (crate::shell::ExecTarget::LocalGitBash, Some(p)) => format!(
+            "\n\n实际解释器：`{}`（Git for Windows 的 MSYS2 bash，**不是** WSL 的 bash）。",
+            p.display()
+        ),
+        (crate::shell::ExecTarget::LocalGitBash, None) => {
+            "\n\n⚠️ **本机没找到 Git Bash**（`bash.exe`）—— 执行命令会直接报错，\
+             **不会**悄悄回落到 PowerShell 或 WSL。"
+                .to_string()
+        }
+        _ => String::new(),
     };
     format!(
         "# 当前执行位置\n\n\
-         你在 {place} 上执行命令，shell 是 {shell_name}。\n\n\
+         你在 {place} 上执行命令，shell 是 {shell_name}。{interpreter}\n\n\
          {syntax}\n\n\
          ⚠️ 写命令前先按上面的 shell 选语法 —— 语法不对的命令会直接失败，\
          或在另一种 shell 下产生**完全不同的效果**。"
@@ -3512,6 +3558,7 @@ mod tests {
             "表情包提示必须点明标签清单**不是文件名**（否则模型会照标签编文件名）"
         );
     }
+
 
     use super::*;
 
@@ -5081,5 +5128,163 @@ mod tests {
         assert!(!has_dev, "没有执行基准标题 ⇒ 不该报 has_dev");
         assert!(red.contains("用户没要求的操作，不做。"));
     }
+
+    // ---- 系统提示里的 shell 描述必须与执行器严格一致（2026-10-24 真机 bug）----
+    //
+    // 以前提示自己读 `settings.exec_shell` + `win32desk::is_enabled()`，
+    // 与 `resolve_exec_target`（执行器的唯一事实源）是两套判断 ⇒ 会打架：
+    // ① 选了 Git Bash 但实际起的是 WSL bash；② bg_desk=true 且选了 Git Bash
+    //    ⇒ 执行器走**本机**，旧提示却写「后台桌面」。
+
+    #[test]
+    fn exec_location_note_names_the_actual_git_bash() {
+        let note = exec_location_note_for(
+            crate::shell::ExecTarget::LocalGitBash,
+            Some(Path::new(r"C:\Program Files\Git\bin\bash.exe")),
+        );
+        assert!(note.contains("Git Bash"), "{note}");
+        assert!(
+            note.contains(r"C:\Program Files\Git\bin\bash.exe"),
+            "提示里要点名实际解释器: {note}"
+        );
+        assert!(note.contains("本机"), "Git Bash 走本机: {note}");
+        assert!(
+            note.contains("/c/"),
+            "要教 MSYS2 路径写法（不是 WSL 的 /mnt/c）: {note}"
+        );
+    }
+
+    #[test]
+    fn exec_location_note_says_when_git_bash_is_missing() {
+        let note = exec_location_note_for(crate::shell::ExecTarget::LocalGitBash, None);
+        assert!(note.contains("没找到 Git Bash"), "{note}");
+        assert!(note.contains("不会"), "要说清不会回落: {note}");
+    }
+
+    #[test]
+    fn exec_location_note_background_desktop_never_claims_git_bash() {
+        let note = exec_location_note_for(crate::shell::ExecTarget::BackgroundDesktop, None);
+        assert!(note.contains("后台桌面"), "{note}");
+        assert!(note.contains("PowerShell"), "{note}");
+        assert!(
+            !note.contains("Git Bash"),
+            "后台桌面走 pwsh，不能提 Git Bash: {note}"
+        );
+    }
+
+    #[test]
+    fn exec_location_note_local_pwsh_is_pwsh() {
+        let note = exec_location_note_for(crate::shell::ExecTarget::LocalPwsh, None);
+        assert!(note.contains("本机"), "{note}");
+        assert!(note.contains("PowerShell"), "{note}");
+    }
+
+    /// Git Bash 分支必须要求「路径一律用正斜杠 `/`」。
+    ///
+    /// ## 为什么（Pi内核 `70abda2` 的口径，并进本函数）
+    ///
+    /// 真机踩过的坑：`D:\orbcat\agent\screenshots\hw7_filled.png` 这种
+    /// **Windows 反斜杠路径**丢给 Git Bash ⇒ **落盘成了一个 Win32 打不开的怪文件名**。
+    ///
+    /// ⚠️ **机制解释以 Chief 2026-10-24 的码位实测为准**（初判「bash 当转义符吃掉」**是错的**）：
+    /// 那个文件的真名里那些"反斜杠"**不是** `\`(U+005C) 而是 **`U+F05C`**、
+    /// 冒号是 **`U+F03A`** ⇒ **MSYS2 把 Win32 保留字符映射到 UTF-8 私用区
+    /// U+F000–U+F0FF** ⇒ 是有人把**整条路径当成文件名**交给了 MSYS 运行时，
+    /// MSYS 为落盘避开 Win32 保留字符而编码成 PUA ⇒ Win32 完全打不开它
+    /// （`cmd /x` 显示成 `D??orbcat?...`，PowerShell / `stat` / `Test-Path` 全 NOT_FOUND）。
+    ///
+    /// ⇒ 提示词里**不能**再写「被 bash 当转义符吃掉」—— 模型会照错误因果自己想
+    ///    （比如以为只有 `\a` `\s` 这类才危险）⇒ 反而削弱「一律用正斜杠」这条口径。
+    /// ⇒ 写对：反斜杠路径在 MSYS 下**会被改写成怪文件名**。
+    ///
+    /// ⚠️ 另外**没有前导 `/`** 的路径是**相对路径** ⇒ 会落在当前目录。
+    ///
+    /// ⚠️ 断言的是**本函数**（`exec_location_note_for`）——
+    ///    Pi内核 改的是旧函数名（`exec_location_note`），两边改的是同一处，
+    ///    Chief 合线时只取本分支 ⇒ 口径必须在本分支**逐字在位**。
+    #[test]
+    fn 执行位置段_必须要求gitbash下路径用正斜杠() {
+        let note = exec_location_note_for(
+            crate::shell::ExecTarget::LocalGitBash,
+            Some(Path::new(r"C:\Program Files\Git\bin\bash.exe")),
+        );
+        assert!(
+            note.contains("正斜杠"),
+            "Git Bash 分支必须要求路径用正斜杠 `/`: {note}"
+        );
+        // 🔴 机制解释必须**说对**，否则模型会照错误因果自己想
+        //    （比如以为只有 `\a` `\s` 这类才危险）。
+        //    真机制（Chief 2026-10-24 码位实测纠正）：那些"反斜杠"**不是** `\`(U+005C)
+        //    而是 **`U+F05C`**、冒号是 **`U+F03A`** ⇒ **MSYS2 把 Win32 保留字符映射到
+        //    UTF-8 私用区 U+F000–U+F0FF** ⇒ 是有人把**整条路径当成文件名**交给 MSYS
+        //    运行时，MSYS 为落盘避开 Win32 保留字符而编码成 PUA ⇒ Win32 完全打不开它。
+        //    ⇒ 不是「bash 当转义符吃掉」。
+        assert!(
+            !note.contains("转义符"),
+            "Git Bash 段的机制解释不准（真实机制是 MSYS2 私用区编码改写文件名，不是 bash 转义）：\n{note}"
+        );
+        assert!(
+            note.contains("改写"),
+            "要说明反斜杠路径在 MSYS 下会被**改写**（这才是真机制）: {note}"
+        );
+        assert!(
+            note.contains("相对路径"),
+            "必须说清没有前导 `/` 的是相对路径（会落在当前目录）: {note}"
+        );
+        // ⚠️ pwsh 那侧**不加**这条 —— PowerShell 不吃 `\`。
+        let pwsh = exec_location_note_for(crate::shell::ExecTarget::LocalPwsh, None);
+        assert!(
+            !pwsh.contains("正斜杠"),
+            "pwsh 分支不该出现正斜杠要求（PowerShell 不吃反斜杠）: {pwsh}"
+        );
+    }
+
+
+    // ---- 提示的「位置 + shell」必须与执行器一致（2026-10-24 真机 bug）--------
+
+    /// 造一个「执行位置 = Git Bash」的设置目录。
+    fn data_dir_with_exec_shell(shell: crate::config::ExecShell) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "orbcat_note_{:?}_{}",
+            shell,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut s = crate::config::load_settings(&d);
+        s.exec_shell = shell;
+        crate::config::save_settings(&d, &s).unwrap();
+        d
+    }
+
+    /// 选了 Git Bash 时，**即使后台桌面开着**，执行器也走**本机**
+    /// （隐形桌面那条路只实现了 pwsh）⇒ 提示必须说「本机」，
+    /// 不能说「后台桌面」（旧提示就是这里说错的）。
+    #[test]
+    fn exec_location_note_follows_the_executor_not_the_raw_settings() {
+        let d = data_dir_with_exec_shell(crate::config::ExecShell::Gitbash);
+        let note = exec_location_note_for_target(&d, true);
+        assert!(note.contains("Git Bash"), "{note}");
+        assert!(note.contains("本机"), "执行器走本机，提示也得说本机: {note}");
+        assert!(
+            !note.contains("后台桌面"),
+            "隐形桌面 × Git Bash 实际走本机，提示不能写后台桌面: {note}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// pwsh + 后台桌面 ⇒ 提示说后台桌面 + PowerShell。
+    #[test]
+    fn exec_location_note_background_desktop_pwsh() {
+        let d = data_dir_with_exec_shell(crate::config::ExecShell::Pwsh);
+        let note = exec_location_note_for_target(&d, true);
+        assert!(note.contains("后台桌面"), "{note}");
+        assert!(note.contains("PowerShell"), "{note}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
 }
 
