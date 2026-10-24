@@ -568,9 +568,18 @@ pub fn prune(data_dir: &Path, keep: Retention) -> Result<PruneOutcome, String> {
 /// ## 分组口径
 ///
 /// 按 `BackupRec.original`（**原路径**）分组 —— 同一个原路径 = 同一个文件的连续版本。
-/// `original` 为空的（加清单之前的老备份、手工丢进目录的副本）**原路径无从得知**
-/// ⇒ 一律归进「未知原路径」这一组，按时间只留首末两份（同一口径），
-/// **不瞎猜**它们是不是同一个文件。
+///
+/// ### ⚠️ `original` 为空的记录：**一律不动**（不进任何组、一份都不删）
+///
+/// 判不出是不是同一个文件 ⇒ 就不按「同一文件」处理。三条理由：
+/// 1. 设计稿 §7「同一文件连续修改只保留首尾两份」的**前提**是「**同一文件可判定**」——
+///    前提不成立时，这条规则**不适用**；
+/// 2. 老备份的文件名是 `{毫秒}__{原文件名}` —— **只带文件名、不带目录**。
+///    两个项目各有一个 `main.js` ⇒ 按文件名分组 = **跨项目误删**用户别的项目的备份；
+/// 3. **宁可多留备份，不可误删** —— 后者的代价（用户丢数据）远大于前者（多占点磁盘）。
+///
+/// ⇒ 空 `original` 的记录**整条跳过**：既不互删、也不当「未知组」处理。
+/// （「未知组」那种口径 = 把所有判不出原路径的备份当成同一个文件 ⇒ 正是上面第 2 条的坑。）
 ///
 /// ## 回收站（trash）为什么不一起处理 —— **结论：维持现状，不动**
 ///
@@ -601,14 +610,21 @@ fn retain_head_tail_except(data_dir: &Path, keep_id: Option<&str>) -> Result<Pru
     let recs = list_backups(data_dir); // 新→旧
 
     // ---- 按原路径分组 ----
-    // ⚠️ `original` 为空 ⇒ 「未知原路径」组（key = 空串），**不瞎分组**。
+    // ⚠️ 分组必须作用在 **`list_backups` 返回的完整集合**上 —— 它 = 清单记录
+    //    **+** 磁盘上没进清单的老备份（legacy 分支补录，`original` 为空）。
+    //    实测用户备份区顶层 457 个文件（= 456 份备份副本 + 清单 `backups.jsonl` 本身），
+    //    清单里只有 246 条 ⇒ 另有 **210** 个「孤儿副本」（17.41 MB）
+    //    **只可能从 `list_backups` 的返回值里看得到**
+    //    ⇒ 若改成自己读清单，下面那条「空 original 不动」的补修就白做了。
     let mut groups: Vec<(String, Vec<BackupRec>)> = Vec::new();
     for r in recs {
-        let key = if r.original.trim().is_empty() {
-            String::new()
-        } else {
-            r.original.clone()
-        };
+        let key = r.original.trim().to_string();
+        if key.is_empty() {
+            // 空 `original` ⇒ **判不出是不是同一个文件 ⇒ 一律不动**（理由见上面「分组口径」）。
+            // 注意是「不进任何组」，不是「归进一个未知组」—— 后者会把不同项目的同名文件
+            // 判成同一个文件 ⇒ 跨项目误删用户别的项目的备份。
+            continue;
+        }
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, g)) => g.push(r),
             None => groups.push((key, vec![r])),
@@ -1286,9 +1302,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// `original` 为空的一组（老备份 / 手工丢进目录的副本）⇒ **也只留首末 2 份**
+    /// 🔴 **`original` 为空 ⇒ 一律不动**（既不互删、也不当「未知组」处理）
+    ///
+    /// 这条改的是上一版的口径：老备份只带**文件名**、不带目录 ⇒ 判不出是不是同一个文件
+    /// ⇒ 按「未知组」处理会**跨项目误删**（两个项目各有一个 `main.js` 会被当成同一个文件）。
+    /// 3 份空 `original` 的老备份 ⇒ **一份都不该删**。
     #[test]
-    fn retain_head_tail_unknown_original_keeps_two() {
+    fn retain_head_tail_unknown_original_keeps_all() {
         let d = recovery_tmp("retain_unknown");
         let dir = backups_dir(&d);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1310,12 +1330,225 @@ mod tests {
         );
 
         let out = retain_head_tail(&d).unwrap();
-        assert_eq!(out.backups_removed, 1, "3 份未知原路径的只该删中间的 1 份");
+        assert_eq!(
+            out.backups_removed, 0,
+            "空 original 的一份都不该删（判不出是不是同一个文件）"
+        );
         let left = list_backups(&d);
-        assert_eq!(left.len(), 2);
-        assert!(left.iter().any(|r| r.id == ids[0]), "最旧那份留着");
-        assert!(left.iter().any(|r| r.id == ids[2]), "最新那份留着");
+        assert_eq!(left.len(), 3, "3 份空 original 的必须全留");
+        for id in ids {
+            assert!(dir.join(id).exists(), "{id} 必须还在盘上");
+        }
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 🔴 **补修必须作用在 `list_backups` 返回的完整集合上**（含 legacy 孤儿）
+    ///
+    /// 实测用户备份区顶层 457 个文件（= 456 份备份副本 + 清单 `backups.jsonl` 本身），
+    /// 清单里只有 246 条 ⇒ **210 个是「孤儿副本」**（不在清单里，靠 `list_backups` 的
+    /// legacy 分支补录、`original` 为空，共 17.41 MB）。
+    /// ⇒ 若分组只拿「清单记录」做，这 210 个孤儿不会被补修覆盖 ⇒ **补修白做**。
+    ///
+    /// 本例造：清单里 3 条 `original` 非空（三个不同的原路径 ⇒ 每组 1 份 ⇒ 全留）
+    /// + 磁盘上 2 个 legacy 孤儿（`original` 为空、文件名不同）
+    /// ⇒ 跑 `retain_head_tail` ⇒ **5 份一个都没被删**（重点：2 个孤儿绝不能被删）。
+    #[test]
+    fn retain_head_tail_covers_legacy_orphans_from_list_backups() {
+        let d = recovery_tmp("retain_orphans");
+        let dir = backups_dir(&d);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // ---- 清单里 3 条 `original` 非空（三个不同的原路径 ⇒ 三个组，每组 1 份 ⇒ 全留）----
+        let known: Vec<String> = ["a.md", "b.md", "c.md"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let id = format!("17000000010{i:02}__{name}");
+                std::fs::write(dir.join(&id), "known").unwrap();
+                let original = d.join("proj").join(name).display().to_string();
+                append_jsonl(
+                    &backups_manifest(&d),
+                    &BackupRec {
+                        id: id.clone(),
+                        at: 1_700_000_001_000 + i as u64,
+                        original,
+                        backup: dir.join(&id).display().to_string(),
+                        size: 5,
+                        legacy: false,
+                    },
+                )
+                .unwrap();
+                id
+            })
+            .collect();
+
+        // ---- 磁盘上 2 个 legacy 孤儿（不在清单里 ⇒ `original` 为空、文件名不同）----
+        let orphans = ["1700000009000__P1396.cpp", "1700000009001__SKILL.md"];
+        for id in orphans {
+            std::fs::write(dir.join(id), "孤儿").unwrap();
+        }
+
+        // 前提：孤儿确实被 `list_backups` 的 legacy 分支补录进来了（`original` 为空）
+        let listed = list_backups(&d);
+        assert_eq!(listed.len(), 5, "3 条清单 + 2 个孤儿都该被列出来");
+        assert_eq!(
+            listed.iter().filter(|r| r.original.trim().is_empty()).count(),
+            2,
+            "两个孤儿该是空 original"
+        );
+
+        let out = retain_head_tail(&d).unwrap();
+        assert_eq!(out.backups_removed, 0, "5 份一个都不该被删");
+
+        // 逐个核对磁盘状态（不只看返回值）
+        for id in &known {
+            assert!(dir.join(id).exists(), "清单里的 {id} 必须还在");
+        }
+        for id in orphans {
+            assert!(
+                dir.join(id).exists(),
+                "孤儿 {id} 必须还在（判不出是不是同一个文件 ⇒ 不动）"
+            );
+        }
+        assert_eq!(list_backups(&d).len(), 5);
+
+        // ---- 第二段（让这条用例**真的能咬住回归**）----
+        // 上面的「5 份一个都没被删」在旧口径（空 original 归进「未知组」）下**也成立**：
+        // 2 个孤儿凑成 1 组，组大小 2 ≤ 保留 2 ⇒ 组内全留 ⇒ 断言照样过。
+        // ⇒ 再加第 3 个孤儿（组大小 3 > 2）⇒ 旧口径会删掉中间那个 ⇒ 这里必须失败。
+        let orphan3 = "1700000009002__main.js";
+        std::fs::write(dir.join(orphan3), "孤儿").unwrap();
+        let out2 = retain_head_tail(&d).unwrap();
+        assert_eq!(
+            out2.backups_removed, 0,
+            "3 个空 original 的孤儿一个都不该删（旧口径会删掉 1 个）"
+        );
+        for id in orphans.iter().chain(std::iter::once(&orphan3)) {
+            assert!(dir.join(id).exists(), "孤儿 {id} 必须还在");
+        }
+        assert_eq!(list_backups(&d).len(), 6);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 🔴 **`by_id` 分支必须能删**（部署态的真实路径）
+    ///
+    /// 部署后 `id = {毫秒}__{原名}` ⇒ `backups_dir.join(&rec.id)` **天然就在备份目录里**
+    /// ⇒ 清单里的 `backup` 字段就算指向别处（主工作区路径），**也照样删得掉**。
+    ///
+    /// 这条钉住的事实：`starts_with` 那道闸**只管回退分支**
+    /// （`rec.backup` 指向别处、且盘上没有同名副本），**不是**部署态的主路径。
+    #[test]
+    fn retain_head_tail_deletes_by_id_even_when_manifest_points_elsewhere() {
+        let d = recovery_tmp("retain_by_id");
+        let dir = backups_dir(&d);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 同一原路径的 3 份备份 ⇒ 中间那份会被删
+        let ids = [
+            "1700000001000__doc.md",
+            "1700000002000__doc.md",
+            "1700000003000__doc.md",
+        ];
+        let original = d.join("proj").join("doc.md").display().to_string();
+        let elsewhere = d
+            .join("other-workspace")
+            .join("agent-data")
+            .join("backups");
+        for (i, id) in ids.iter().enumerate() {
+            std::fs::write(dir.join(id), "v").unwrap();
+            // ⚠️ 中间那条的 `backup` 指向**别处**（模拟主工作区路径），但副本确实在备份目录里
+            let backup = if i == 1 {
+                elsewhere.join(id).display().to_string()
+            } else {
+                dir.join(id).display().to_string()
+            };
+            append_jsonl(
+                &backups_manifest(&d),
+                &BackupRec {
+                    id: id.to_string(),
+                    at: 1_700_000_000_000 + i as u64 * 1000,
+                    original: original.clone(),
+                    backup,
+                    size: 1,
+                    legacy: false,
+                },
+            )
+            .unwrap();
+        }
+        // 前提：`backup` 指向的那个路径**不存在**（只有备份目录里有副本）
+        assert!(
+            !elsewhere.join(ids[1]).exists(),
+            "别处那个副本不该存在"
+        );
+
+        let out = retain_head_tail(&d).unwrap();
+        assert_eq!(out.backups_removed, 1, "中间那份该被删（走 by_id 分支）");
         assert!(!dir.join(ids[1]).exists(), "中间那份必须从盘上删掉");
+        assert!(dir.join(ids[0]).exists(), "最旧那份留着");
+        assert!(dir.join(ids[2]).exists(), "最新那份留着");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 🔴 **回退分支必须被 `starts_with` 闸拦下**（不能删到备份目录外面去）
+    ///
+    /// 副本**不在** `backups_dir` 里（只在 `rec.backup` 指向的别处）⇒ 删不掉。
+    /// 与上一条成对：**by_id 命中 ⇒ 删得掉；by_id 不命中且路径在目录外 ⇒ 删不掉**。
+    /// 代价是那一组多留一份 —— 宁可多留，不可误删。
+    #[test]
+    fn retain_head_tail_refuses_to_delete_outside_backups_dir() {
+        let d = recovery_tmp("retain_outside");
+        let dir = backups_dir(&d);
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = d.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // 同一原路径的 3 份备份 ⇒ 中间那份本来该被删
+        let ids = [
+            "1700000001000__doc.md",
+            "1700000002000__doc.md",
+            "1700000003000__doc.md",
+        ];
+        let original = d.join("proj").join("doc.md").display().to_string();
+        for (i, id) in ids.iter().enumerate() {
+            // ⚠️ 中间那条的副本**只在别处**（备份目录里没有同名文件）
+            let p = if i == 1 {
+                let p = outside.join(id);
+                std::fs::write(&p, "在备份目录外面").unwrap();
+                p
+            } else {
+                let p = dir.join(id);
+                std::fs::write(&p, "v").unwrap();
+                p
+            };
+            append_jsonl(
+                &backups_manifest(&d),
+                &BackupRec {
+                    id: id.to_string(),
+                    at: 1_700_000_000_000 + i as u64 * 1000,
+                    original: original.clone(),
+                    backup: p.display().to_string(),
+                    size: 1,
+                    legacy: false,
+                },
+            )
+            .unwrap();
+        }
+
+        let out = retain_head_tail(&d).unwrap();
+        assert_eq!(out.backups_removed, 0, "备份目录外的副本删不得");
+        assert!(
+            outside.join(ids[1]).exists(),
+            "备份目录外的文件绝不能被自动保留策略删掉"
+        );
+        for id in ids {
+            assert!(
+                dir.join(id).exists() || outside.join(id).exists(),
+                "{id} 必须还在"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&d);
     }
