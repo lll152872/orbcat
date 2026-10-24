@@ -662,6 +662,26 @@ export function defaultRuntimeDir() {
  */
 
 function main() {
+  // ⛔ `--cli-exe` **已移除** —— 本版不随包分发外部代批 CLI（用户 2026-10-24 拍板）。
+  //
+  //    为什么必须**显式报错**而不是静默忽略：
+  //    `parseArgs` 不拒未知 flag（任意 `--k v` 都收）⇒ 若传了 `--cli-exe X` 被静默忽略，
+  //    就是「看起来通过、实际什么也没发生」—— 构建链里最阴的**假绿陷阱**：
+  //    以后谁想给包里加 CLI 时不会报错，只会得到一个**没有 CLI** 的包。
+  //    ⇒ 当场拒绝（exit 2）。
+  //
+  //    判据：命令行里出现 `--cli-exe` 或 `--cli-exe=…` **两种写法都拦**。
+  //    ⚠️ 只拦这一个 flag —— `parseArgs` 的通用逻辑一行没动。
+  if (process.argv.slice(2).some((a) => a === "--cli-exe" || a.startsWith("--cli-exe="))) {
+    console.error(
+      "本版外部代批 CLI **不随包分发**（用户 2026-10-24 拍板：只在测试中存在）\n" +
+        "  ⇒ 装配命令**不接受** --cli-exe（该参数已移除）。\n" +
+        "  开发者本地想用 ⇒ 自己把 orbcat-perm.exe 放进 <包根>\\bin\\，\n" +
+        "  宿主检测到它就会起端点；删掉即停用（perm_cli::serve 的真开关）。"
+    );
+    process.exit(2);
+  }
+
   const args = parseArgs(process.argv.slice(2));
 
   if (args.verify) {
