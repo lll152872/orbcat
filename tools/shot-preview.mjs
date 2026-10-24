@@ -1,128 +1,224 @@
+#!/usr/bin/env node
 /**
- * 预览件截图 —— 把「纯 HTML 渲染件」里的某一屏抓成 PNG。
+ * 预览件截图 —— 驱动**本机的 Chromium**（headless + CDP）把某一屏抓成 PNG。
  *
  * 用法：node tools/shot-preview.mjs <scenario> <out.png> [宽] [高]
- * 例：  node tools/shot-preview.mjs behavior D:/out/behavior.png 690 900
+ * 例：  node tools/shot-preview.mjs pi-perm D:/out/pi-perm.png 520 700
  *
- * ## 为什么走 Playwright 而不是让人自己看
+ * ## 为什么不用 Playwright
  *
- * 用户要**目视核对**「三选一的选择器和 690px 下的设置面板」。
- * 截图能一眼看出：① 三个选项都在；② 选中项对不对；③ 690px 下有没有挤/换行/溢出。
+ * 本机 `ms-playwright/` 里装的 chromium 是 1181/1223/1243，
+ * 而 npx 缓存里的 playwright 要的是 1200/1208/1247/1248 ⇒ **版本对不上**，
+ * `chromium.launch()` 直接报「Please run npx playwright install」。
+ * ⇒ 这里直接用 **Chromium 自带的 headless + CDP**（DevTools 协议），
+ * 零依赖、零安装、版本永远匹配。
  *
- * ## 为什么用本地静态服务器而不是 file://
- *
- * 预览件已经是自包含单文件（build-preview.mjs 把 JS/CSS 都内联了），
- * 但 file:// 下某些资源的加载受 CORS 限制，用 http 更稳。
+ * ## 流程
+ * 1) 起一个本地静态服务器（服务 preview/ 目录）—— file:// 下 ES module 会被 CORS 挡；
+ * 2) 起 chromium --headless --remote-debugging-port=0；
+ * 3) 用 CDP（WebSocket）开页、等 `document.body.dataset.previewReady`、截图。
  */
-import { createRequire } from "node:module";
+import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const previewDir = path.join(root, "preview");
 
-/**
- * playwright 解析 —— 它不在本仓库的 node_modules 里（是 npx 缓存里的全局副本）。
- *
- * 做法：先按正常方式 import；失败就去 npx 缓存里找版本最高的那个。
- * ⚠️ 不写死路径 —— npx 缓存目录名会变（带 hash）。
- * ⚠️ 必须用**同步**读版本号（fs/promises 的 readFile 返回 Promise，
- *    JSON.parse(Promise) 会抛 ⇒ 候选全被跳过 ⇒ 永远「找不到 playwright」）。
- */
-function loadPlaywright() {
-  try {
-    return require("playwright");
-  } catch {
-    const req = createRequire(import.meta.url);
-    const cacheRoot = path.join(process.env.LOCALAPPDATA ?? "", "npm-cache", "_npx");
-    if (!existsSync(cacheRoot)) throw new Error("找不到 playwright（npx 缓存里也没有）");
-    const candidates = [];
-    for (const dir of readdirSync(cacheRoot)) {
-      const p = path.join(cacheRoot, dir, "node_modules", "playwright");
-      if (!existsSync(p)) continue;
-      try {
-        const v = JSON.parse(readFileSync(path.join(p, "package.json"), "utf8")).version;
-        candidates.push({ p, v });
-      } catch {
-        /* 跳过坏的 */
-      }
-    }
-    if (!candidates.length) throw new Error("npx 缓存里没有 playwright");
-    candidates.sort((a, b) => (a.v < b.v ? 1 : -1));
-    return req(candidates[0].p);
-  }
-}
-
-const require = createRequire(import.meta.url);
-const { chromium } = loadPlaywright();
-
-const scenario = process.argv[2] ?? "behavior";
+const scenario = process.argv[2] ?? "default";
 const outPath = process.argv[3] ?? path.join(root, "tmp", `preview-${scenario}.png`);
-const width = Number(process.argv[4] ?? 690);
-const height = Number(process.argv[5] ?? 900);
+const width = Number(process.argv[4] ?? 520);
+const height = Number(process.argv[5] ?? 700);
+
+/** 找本机 chromium（ms-playwright 下的任一版本）。 */
+function findChromium() {
+  const base = path.join(process.env.LOCALAPPDATA ?? "", "ms-playwright");
+  if (!existsSync(base)) return null;
+  const dirs = readdirSync(base)
+    .filter((d) => d.startsWith("chromium-"))
+    .sort()
+    .reverse();
+  for (const d of dirs) {
+    for (const sub of ["chrome-win64", "chrome-win"]) {
+      const exe = path.join(base, d, sub, "chrome.exe");
+      if (existsSync(exe)) return exe;
+    }
+  }
+  return null;
+}
 
 const htmlPath = path.join(previewDir, "preview.html");
 if (!existsSync(htmlPath)) {
   console.error(`[shot] 没有预览件：${htmlPath}（先跑 npm run build:preview）`);
   process.exit(1);
 }
+const chrome = findChromium();
+if (!chrome) {
+  console.error("[shot] 找不到本机 chromium（ms-playwright 下）");
+  process.exit(1);
+}
 
-/** 极简静态服务器（只服务 preview/ 目录） */
+/** 极简静态服务器（只服务 preview/ 目录）。 */
 const server = createServer(async (req, res) => {
   const url = (req.url ?? "/").split("?")[0];
-  const rel = url === "/" ? "/preview.html" : url;
-  const file = path.join(previewDir, rel);
+  const file = path.join(previewDir, url === "/" ? "/preview.html" : url);
   if (!existsSync(file)) {
     res.writeHead(404).end("not found");
     return;
   }
   const ext = path.extname(file);
   const type =
-    ext === ".html"
-      ? "text/html; charset=utf-8"
-      : ext === ".png"
-        ? "image/png"
-        : ext === ".js"
-          ? "text/javascript"
-          : "application/octet-stream";
+    ext === ".html" ? "text/html; charset=utf-8"
+    : ext === ".png" ? "image/png"
+    : ext === ".js" ? "text/javascript"
+    : "application/octet-stream";
   res.writeHead(200, { "content-type": type });
   res.end(await readFile(file));
 });
-
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const port = server.address().port;
-const url = `http://127.0.0.1:${port}/preview.html?scenario=${encodeURIComponent(scenario)}`;
+const url = `http://127.0.0.1:${port}/preview.html?scenario=${encodeURIComponent(scenario)}&harness=0`;
 
-const browser = await chromium.launch();
-const page = await browser.newPage({
-  viewport: { width, height },
+/** 起 chromium（headless + CDP）。 */
+const chromeProc = spawn(
+  chrome,
+  [
+    "--headless=new",
+    "--disable-gpu",
+    "--hide-scrollbars",
+    "--remote-debugging-port=0",
+    `--window-size=${width},${height}`,
+    "--user-data-dir=" + path.join(root, "tmp", "chrome-shot-profile"),
+    "about:blank",
+  ],
+  { stdio: ["ignore", "pipe", "pipe"] },
+);
+
+/** 从 stderr 里抠出 CDP 端口（`DevTools listening on ws://...`）。 */
+const wsUrl = await new Promise((resolve, reject) => {
+  let buf = "";
+  const t = setTimeout(() => reject(new Error("等 chromium 起来超时")), 20000);
+  chromeProc.stderr.on("data", (d) => {
+    buf += d.toString();
+    const m = buf.match(/DevTools listening on (ws:\/\/\S+)/);
+    if (m) {
+      clearTimeout(t);
+      resolve(m[1]);
+    }
+  });
+  chromeProc.on("exit", (c) => {
+    clearTimeout(t);
+    reject(new Error(`chromium 退出（code ${c}）：${buf.slice(-400)}`));
+  });
+});
+
+/** 连浏览器级 WS，建一个 target 并拿它的 page WS。 */
+const browser = {
+  onMessage: null,
+  onEvent: null,
+  connect() {
+    this.ws = new WebSocket(wsUrl);
+    this.opened = new Promise((resolve, reject) => {
+      this.ws.addEventListener("open", resolve, { once: true });
+      this.ws.addEventListener("error", reject, { once: true });
+    });
+    this.ws.addEventListener("message", (ev) => {
+      const m = JSON.parse(ev.data);
+      if (m.id && pending.has(m.id)) {
+        const { resolve, reject } = pending.get(m.id);
+        pending.delete(m.id);
+        m.error ? reject(new Error(JSON.stringify(m.error))) : resolve(m.result);
+        return;
+      }
+      this.onEvent?.(ev.data);
+    });
+  },
+  send(obj) {
+    // ⚠️ 必须等 socket **真的 open** —— Node 的全局 WebSocket 在 open 前 send()
+    //    直接抛 InvalidStateError("Sent before connected")。
+    return this.opened.then(
+      () =>
+        new Promise((resolve, reject) => {
+          pending.set(obj.id, { resolve, reject });
+          this.ws.send(JSON.stringify(obj));
+        }),
+    );
+  },
+  close() {
+    try {
+      this.ws.close();
+    } catch {
+      /* 已关 */
+    }
+  },
+};
+browser.connect();
+
+let msgId = 0;
+const pending = new Map();
+const send = (method, params = {}, sessionId) =>
+  browser.send({ id: ++msgId, method, params, sessionId });
+
+const { targetId } = await send("Target.createTarget", { url: "about:blank" });
+const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
+
+const pageSend = (method, params = {}) => send(method, params, sessionId);
+await pageSend("Page.enable");
+await pageSend("Runtime.enable");
+await pageSend("Emulation.setDeviceMetricsOverride", {
+  width,
+  height,
   deviceScaleFactor: 1,
+  mobile: false,
 });
 
 const errors = [];
-page.on("pageerror", (e) => errors.push(String(e)));
-page.on("console", (m) => {
-  if (m.type() === "error") errors.push(`console: ${m.text()}`);
-});
+await pageSend("Log.enable").catch(() => {});
+browser.onEvent = (raw) => {
+  const m = JSON.parse(raw);
+  if (m.method === "Log.entryAdded" && m.params?.entry?.level === "error") {
+    errors.push(m.params.entry.text);
+  }
+  if (m.method === "Runtime.exceptionThrown") {
+    errors.push(m.params?.exceptionDetails?.text ?? "exception");
+  }
+};
 
-await page.goto(url, { waitUntil: "load" });
-// 等预览件自己标记就绪
-await page.waitForFunction(() => document.body.dataset.previewReady === "1", null, {
-  timeout: 15000,
-});
+await pageSend("Page.navigate", { url });
+
+/** 等预览件自己标记就绪（最多 20s）。 */
+const deadline = Date.now() + 20000;
+let ready = false;
+while (Date.now() < deadline) {
+  const r = await pageSend("Runtime.evaluate", {
+    expression: "document.body && document.body.dataset.previewReady === '1'",
+    returnByValue: true,
+  });
+  if (r?.result?.value) {
+    ready = true;
+    break;
+  }
+  await new Promise((r2) => setTimeout(r2, 120));
+}
+if (!ready) console.warn("[shot] ⚠️ 预览件没在 20s 内标记就绪（可能场景名不存在）");
+
 // 再等一拍，让最后一次重画落地
-await page.waitForTimeout(400);
+await new Promise((r) => setTimeout(r, 500));
 
-await page.screenshot({ path: outPath, fullPage: false });
+const shot = await pageSend("Page.captureScreenshot", { format: "png" });
+await mkdir(path.dirname(outPath), { recursive: true });
+await writeFile(outPath, Buffer.from(shot.data, "base64"));
 
 console.log(`[shot] ${scenario} @${width}x${height} → ${outPath}`);
 if (errors.length) {
   console.log(`[shot] ⚠️ 页面报错 ${errors.length} 条：`);
-  for (const e of errors.slice(0, 8)) console.log(`  ${e}`);
+  for (const e of errors.slice(0, 6)) console.log(`  ${e}`);
 }
 
-await browser.close();
+browser.close();
+chromeProc.kill();
 server.close();
+process.exit(0);

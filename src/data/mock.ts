@@ -543,7 +543,25 @@ export class MockSource implements DataSource {
       case "perm_requests_list":
         return this.settle<PendingPerm[]>(cmd, d.permRequests);
       case "perm_request_decide": {
-        const id = a.id as string;
+        const id = String(a.id ?? "");
+        const decision = String(a.decision ?? "").trim().toLowerCase();
+        // ⚠️ **与后端同形**（`perm_request.rs` 的 `Decision::parse`）：
+        //   未知决定要**报错**，不能默默接受 ⇒ 前端的错误路径能被测到。
+        const ok = ["approve", "yes", "批准", "narrow", "收窄", "deny", "no", "拒绝",
+                    "prefix", "approve-prefix", "记住命令名", "full", "approve-full",
+                    "记住完整命令", "always", "总是允许"];
+        if (!ok.includes(decision)) {
+          throw new Error(`未知的决定：${decision}（只能是 approve / narrow / prefix / full / always / deny）`);
+        }
+        // ⚠️ **pi 卡（`pp*`）只接受 approve / deny** ——
+        //   pi 的确认通道只回一个布尔（`confirmed`），
+        //   其余决定在 pi 侧一律按**拒绝**处理（后端 `pi_runtime.rs` 的钩子）。
+        //   ⇒ mock 这里也拒，让「误发 always」的路径在前端就能测出来。
+        const target = d.permRequests.find((p) => p.id === id);
+        if (target?.kind === "pi" && decision !== "approve" && decision !== "deny" &&
+            decision !== "yes" && decision !== "no" && decision !== "批准" && decision !== "拒绝") {
+          throw new Error("pi 确认只支持允许 / 拒绝");
+        }
         d.permRequests = d.permRequests.filter((p) => p.id !== id);
         return this.settle<void>(cmd, undefined as never);
       }

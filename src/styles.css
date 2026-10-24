@@ -2258,6 +2258,35 @@ body {
   min-width: 120px;
 }
 
+/* ---- pi 确认卡（kind = "pi"）----
+   ⚠️ 设计稿的「权限卡」是**用户维护区**（用户气泡 / 助手左细线 / 过程折叠块 /
+      权限卡 / 三个权限按钮，R-060）—— 本轮**不碰**那张卡的结构与色值。
+      这里只新增 pi 这一支：**中性白边**（区别于 pm* 卡的蓝边），
+      语义上「pi 请求确认」与「模型提问」同属中性、不带风险色。
+
+   色值全部走 :root 变量（文字 --g1/--g2，描边用白低透明）——
+   与设计稿 02:2:610 权限卡的「白 .16 描边 + 深色底」同族，
+   但**不覆盖**用户维护的那张卡。 */
+.perm-card-pi {
+  border-color: rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.perm-card-pi .perm-title {
+  color: var(--g1);
+}
+
+/* pi 的正文（message）—— 可能是任意自然语言（不是命令），
+   所以用普通文字样式而不是等宽的 .perm-cmd */
+.perm-pi-msg {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--g1);
+  margin-bottom: 8px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 /* 工具执行心跳（toolTick）：跟在"调用 X"行后面的一行小字 */
 .tl-tick {
   display: block;

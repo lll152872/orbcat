@@ -20,6 +20,41 @@ export interface MockInvokeCall {
   args: Record<string, unknown> | undefined;
 }
 
+/**
+ * 待拍板的权限申请（与后端 `perm_request::PendingView` **同形**）。
+ *
+ * ⚠️ 字段名必须照后端 —— 否则 mock 渲染出来的卡 ≠ 真机那张，
+ *    测出来的是「假绿」。后端 serde 是 camelCase。
+ */
+export interface PermRequestFixture {
+  id: string;
+  /** "file" | "command" | "ask" | "mcp" | "pi"（后端按 id 前缀推导） */
+  kind: string;
+  // ---- 文件级 ----
+  path: string;
+  access: string;
+  deniedPath: string | null;
+  widenLevels: number | null;
+  widened: boolean;
+  // ---- 命令级 ----
+  command: string;
+  normalized: string;
+  risk: string;
+  headFp: string;
+  fullFp: string;
+  // ---- 公共 ----
+  tier: string;
+  reason: string;
+  sessionId: string;
+  createdAt: number;
+  timeoutMs: number;
+  // ---- ask ----
+  question: string;
+  options: string[];
+  // ---- pi（后端这轮才补的字段，没进基线时为 undefined）----
+  message?: string;
+}
+
 type MockState = {
   chatReply: string;
   chatError: string | null;
@@ -54,7 +89,30 @@ type MockState = {
   }[];
   currentSessionId: string;
   memPending: { id: string; content: string; source: string; created_at: string }[];
-  permPending: unknown[];
+  /**
+   * 待拍板的权限申请（`perm_requests_list` 的返回）。
+   *
+   * ⚠️ 以前是 `unknown[]` —— 改成了**与后端 `PendingView` 同形**的形状，
+   *    因为现在要测 `kind === "pi"` 的卡（pi 内核的确认框）：
+   *    字段名对不上 ⇒ mock 渲染出来的卡 ≠ 真机那张 ⇒ 这种测试是假绿。
+   *
+   * ⚠️ `kind` 由 **id 前缀**决定（后端 `perm_request.rs`）：
+   *    `pm*`→mcp、`pa*`→ask、`pp*`→pi、其余→command（文件卡是另一张表）。
+   */
+  permPending: PermRequestFixture[];
+  /**
+   * 让某条命令**抛错**（命令名 → 错误文案）。
+   *
+   * ## 为什么需要
+   *
+   * 前端的错误路径必须能被测到 —— 特别是「后端还没有这条命令」这种情况：
+   * 例如 `perm_request_decide` 在后端那条合入前会回 unknown command，
+   * 那时界面**必须弹一个看得见的错误 toast，不能静默**。
+   * 没有这个注入器，这条路径就只能靠人眼在真机上点。
+   *
+   * ⚠️ 与 `invokeOverrides` 的区别：那个是**换返回值**，这个是**让命令失败**。
+   */
+  failures: Map<string, string>;
   /**
    * **当前会话**的 agent 模式（`modes_get({sessionId})` 读它）。
    *
@@ -174,6 +232,7 @@ function defaultState(): MockState {
     currentSessionId: "sess-main",
     memPending: [],
     permPending: [],
+    failures: new Map<string, string>(),
     sessionMode: "standard",
     defaultMode: "standard",
     modeSetError: null,
@@ -443,6 +502,13 @@ export function setMock(cmd: string, value: unknown): void {
 export async function invoke<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   bag.calls.push({ cmd, args });
 
+  // ⚠️ 强制失败优先（见 `MockState.failures`）——
+  //    用来测「后端还没有这条命令」这类错误路径。
+  const forced = state.failures.get(cmd);
+  if (forced !== undefined) {
+    throw new Error(forced);
+  }
+
   // 逐命令覆盖优先（见 `MockState.invokeOverrides` 的说明）
   if (cmd in state.invokeOverrides) {
     return state.invokeOverrides[cmd] as T;
@@ -535,6 +601,36 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
     }
     case "perm_requests_list":
       return state.permPending as T;
+    /**
+     * 提交对一张待批卡的决定。
+     *
+     * ⚠️ **与后端同形**（`perm_request.rs` 的 `Decision::parse`）：
+     *   未知决定要**报错**、pi 卡只接受 approve/deny ——
+     *   没有这条，「点错了会怎样」就测不到（前端可能默默发一个后端会当拒绝的决定）。
+     */
+    case "perm_request_decide": {
+      const id = String(args?.id ?? "");
+      const decision = String(args?.decision ?? "").trim().toLowerCase();
+      const known = [
+        "approve", "yes", "批准", "narrow", "收窄", "deny", "no", "拒绝",
+        "prefix", "approve-prefix", "记住命令名", "full", "approve-full",
+        "记住完整命令", "always", "总是允许",
+      ];
+      if (!known.includes(decision)) {
+        throw new Error(
+          `未知的决定：${decision}（只能是 approve / narrow / prefix / full / always / deny）`,
+        );
+      }
+      const target = state.permPending.find((p) => p.id === id);
+      if (
+        target?.kind === "pi" &&
+        !["approve", "yes", "批准", "deny", "no", "拒绝"].includes(decision)
+      ) {
+        throw new Error("pi 确认只支持允许 / 拒绝");
+      }
+      state.permPending = state.permPending.filter((p) => p.id !== id);
+      return null as T;
+    }
     // 数据源：默认返回 state.lifeStatus（测试可以塞一个"已接学习通"的形态）。
     // 为什么不留成静态空表：这张页要测的三件事（条数、过期标黄、读取失败）
     // 全都只在**有源**时才出现，静态空表只能测出"还没有数据源"。
