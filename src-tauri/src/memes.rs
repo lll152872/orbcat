@@ -105,6 +105,20 @@ pub fn tag_index(data_dir: &Path) -> Vec<(String, usize)> {
 
 /// 生成注入系统提示的那段摘要。**库为空时返回空串**（调用方据此跳过注入，
 /// 不往 prompt 里塞一段"你有一个空库"的废话）。
+///
+/// ## ⚠️ 这里**绝对不能**出现库目录路径（2026-10-24 真机破图根因）
+///
+/// 真机现场：模型**压根没调 `send_meme`**，而是照着系统提示里给的
+/// 「库根绝对路径 + 标签清单」**自己拼**了一个路径：
+/// 标签是「开心」⇒ 它编出 `happy\deyi.jpg`（`happy/` 目录里根本没有这个文件）
+/// ⇒ 用户那边只看到一个**破图**。
+///
+/// ⇒ **提示词里给出的每一样能拼路径的原料，都是编造的素材库。**
+/// 这里以前写了 ``你的表情包库：`{dir}` `` —— 目录 + 标签 + 中文词三样凑齐，
+/// 模型正好能拼出一条「看起来几乎对」的路径 ⇒ **最危险的那种错**。
+///
+/// ⇒ 现在只给：**总张数 + 标签清单**（标签是**语义词**，不是路径的一级）。
+/// **文件名与目录层级只有工具知道** ⇒ 模型拿不到、也猜不出。
 pub fn prompt_section(data_dir: &Path) -> String {
     let items = collect(data_dir);
     if items.is_empty() {
@@ -125,13 +139,17 @@ pub fn prompt_section(data_dir: &Path) -> String {
 
     format!(
         "# 表情包库\n\n\
-         你有自己的表情包库：`{dir}`（共 {total} 张）。可用标签（括号里是张数）：{list}{more}\n\n\
+         你有自己的表情包库，共 {total} 张。可用标签（括号里是张数）：{list}{more}\n\n\
+         ⚠️ 上面这些是**标签**（哪个表情合适），**不是文件名、也不是目录名**。\
+         标签是**语义词**（开心/无语/得意…），实际文件名**是另一套名字**\
+         （音译、缩写、编号都可能）—— 标签「开心」下面**没有一个文件**叫「开心」。\n\
+         **目录层级和文件名只有工具知道**：你在提示词里拿不到、也猜不出；\
+         **你自己写的路径 100% 是破图**。\n\
          用法：直接调 `send_meme`，`query` 填一个标签，例如 `send_meme(query=\"无语\")`。\
          系统会在该标签下**随机挑一张**发给你（同一个标签通常有好几张，不会老是同一张）。\n\
          ⚠️ **不要**自己 `list_dir` 再手写图片路径：路径写错只会渲染成「图（读不出来）」，\
          比干脆不发更难看。标签对不上时 `send_meme` 会把可用标签列回来，照着换一个就行。\n\
          ⚠️ 表情包是调味品不是主菜：一次一张，整轮最多一两张，别刷屏。",
-        dir = memes_dir(data_dir).display(),
         total = items.len(),
     )
 }
@@ -619,6 +637,126 @@ mod tests {
         assert!(collect(&d).is_empty());
         assert!(tag_index(&d).is_empty());
         assert!(prompt_section(&d).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 造一个**图库包形态**的夹具（照真机库的结构）：`<包>/index.db` + `<包>/memes/<tag>/<图>`。
+    ///
+    /// ⚠️ **必须是包形态**（有 `index.db`）⇒ 走 `collect_pack`，标签只来自
+    ///    索引里的 `tag`/`keywords` ⇒ **不含包目录名、不含文件名主干**。
+    ///    散图形态（无 `index.db`）走 `walk()` ⇒ 路径上**每一级目录名 + 文件名分词**
+    ///    都会变成标签 ⇒ 那条路本来就会把 `dafeiyu-001` / `deyi` 泄进提示词。
+    fn make_pack_fixture(d: &Path) {
+        let pack = d.join("memes").join("dafeiyu-001");
+        let tag_dir = pack.join("memes").join("happy");
+        std::fs::create_dir_all(&tag_dir).unwrap();
+        std::fs::write(tag_dir.join("deyi.jpg"), b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let conn = rusqlite::Connection::open(pack.join("index.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memes (path TEXT, tag TEXT, keywords TEXT, caption TEXT);\
+             INSERT INTO memes VALUES ('memes/happy/deyi.jpg', 'happy', '得意 好耶', '');",
+        )
+        .unwrap();
+    }
+
+    /// 🔴 表情包库摘要**绝不能**泄露库目录路径（2026-10-24 真机破图根因）。
+    ///
+    /// ## 真机现场
+    ///
+    /// 模型**压根没调 `send_meme`**，而是照着系统提示里给的「库根绝对路径 + 标签清单」
+    /// **自己拼**了一条路径：标签是「开心」⇒ 它编出 `happy\deyi.jpg`
+    /// ⇒ 用户那边只看到一个**破图**。
+    ///
+    /// ## 根因
+    ///
+    /// 提示词里给出了**能拼路径的原料**：① 库根绝对路径 ② 标签清单
+    /// ③ 标签本身长得像目录名（`happy`/`confused`/`sigh`）④ 标签里 **87% 是中文**
+    /// 而目录名是英文（`happy`）⇒ 模型**音译**标签造目录名。
+    /// ⇒ 四样凑齐，正好能编出一条**看起来几乎对**的路径 —— 那是最危险的错。
+    ///
+    /// ⇒ 修法 = **撤掉原料**（路径一律不给）+ 明确「文件名只有工具知道」。
+    ///
+    /// ## 这条测试守什么
+    ///
+    /// 断言摘要里**既不含库根路径形态、也不含包目录形态**，
+    /// **连真实文件名都不许有**（`deyi` 一旦出现 ⇒ 模型就能编 `deyi2.jpg`）。
+    #[test]
+    fn prompt_section_never_leaks_the_library_path() {
+        let d = tmp("leak");
+        make_pack_fixture(&d);
+
+        let p = prompt_section(&d);
+        assert!(!p.is_empty(), "库非空 ⇒ 摘要应有内容: {p}");
+
+        // ① 不含盘符形态（`X:\...`）—— 任何 Windows 绝对路径都不许出现
+        assert!(
+            !p.contains(":\\"),
+            "摘要里不许出现盘符绝对路径（那是拼路径的原料）: {p}"
+        );
+        // ①b 连一个反斜杠都不许有（bash 会把它当转义符吃掉）
+        assert!(
+            !p.contains('\\'),
+            "摘要里不许出现任何反斜杠: {p}"
+        );
+        // ② 不含库根目录名 `memes`（任何形态）
+        assert!(
+            !p.contains("memes"),
+            "摘要里不许出现库目录名 `memes`（模型会拿它当路径一级）: {p}"
+        );
+        // ③ 不含包目录名 `dafeiyu-001`（真机上的包名）
+        assert!(
+            !p.contains("dafeiyu-001"),
+            "摘要里不许出现包目录名（模型会拿它当路径一级）: {p}"
+        );
+        // ④ 🔴 不含**真实文件名** —— 模型见过 `deyi` 就能编出 `deyi2.jpg`
+        assert!(
+            !p.contains("deyi"),
+            "摘要里不许出现真实文件名（模型会照着加工）: {p}"
+        );
+        // ⑤ 反向：标签与张数**必须还在**（撤原料 ≠ 撤信息）
+        assert!(
+            p.contains("标签"),
+            "必须还告诉模型「这些是标签」: {p}"
+        );
+        assert!(
+            p.contains("只有工具知道"),
+            "必须说清文件名/目录层级只有工具知道: {p}"
+        );
+        assert!(
+            p.contains("得意"),
+            "标签本身必须还在（那是 send_meme 的 query 原料）: {p}"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 摘要里**不许**给任何「可以自己写路径」的暗示 —— 唯一的路是调工具。
+    #[test]
+    fn prompt_section_points_to_send_meme_only() {
+        let d = tmp("onlytool");
+        let dir = d.join("memes").join("happy");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("deyi.jpg"), b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let p = prompt_section(&d);
+        assert!(
+            p.contains("send_meme"),
+            "必须点名唯一的路是调 send_meme: {p}"
+        );
+        assert!(
+            p.contains("不是文件名"),
+            "必须点明标签不是文件名: {p}"
+        );
+        assert!(
+            p.contains("猜不出"),
+            "必须说清文件名猜不出: {p}"
+        );
+        assert!(
+            p.contains("100% 是破图"),
+            "必须说清自己写的路径必然破图: {p}"
+        );
+
         let _ = std::fs::remove_dir_all(&d);
     }
 
