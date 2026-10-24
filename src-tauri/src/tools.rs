@@ -7176,4 +7176,65 @@ Write-Output "ARG=[$msg]"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 🔴 宿主接线：**池子注入后，运行时能拿到宿主那一份注册表 + 授权表**。
+    ///
+    /// 为什么是生死线：
+    /// ① 宿主不接 ⇒ pi 侧清单为空 ⇒ 模型看不到任何 MCP 工具；
+    /// ② 池子不继承 ⇒ 已建出来的会话拿不到 ⇒ MCP 授权静默降级成静态拒绝
+    ///    （用户永远等不到确认卡，且没有任何日志）—— 这就是 P2。
+    ///
+    /// 用**局部** pool（不是全局静态槽）⇒ 零污染：不影响同进程其它用例。
+    #[tokio::test]
+    async fn 池子注入宿主注册表后_新运行时继承_已存在的也补上() {
+        let dir = fresh_tmp("pool_host_mcp");
+        let reg = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::mcp::ToolRegistry::new("host"),
+        ));
+        let perm = std::sync::Arc::new(crate::perm_request::PermHub::new());
+        let pool = crate::pi_runtime::PiPool::new(dir.clone(), dir.join("runtime"));
+
+        // ① 先建一个运行时（模拟「已经存在」的会话）
+        let old_rt = pool.acquire("sess-old").await.unwrap();
+        assert!(
+            old_rt.host_mcp_arc().is_none(),
+            "没注入前必须是 None（否则等于偷偷备了一份假注册表）"
+        );
+
+        // ② 宿主接线（= lib.rs 里那行做的事）
+        pool.set_host_mcp_perm(reg.clone(), perm.clone());
+
+        // ③ 已存在的运行时被补上（P2 那个坑：池里的运行时是懒创建的）
+        assert!(
+            old_rt.host_mcp_arc().is_some(),
+            "已存在的运行时必须被补上宿主注册表"
+        );
+        assert!(
+            old_rt.host_perm_arc().is_some(),
+            "已存在的运行时必须被补上宿主授权表"
+        );
+
+        // ④ 新建的运行时从池子继承
+        let new_rt = pool.acquire("sess-new").await.unwrap();
+        assert!(
+            new_rt.host_mcp_arc().is_some(),
+            "新建的运行时必须继承宿主注册表"
+        );
+        assert!(
+            new_rt.host_perm_arc().is_some(),
+            "新建的运行时必须继承宿主授权表"
+        );
+
+        // ⑤ 是**同一份** Arc（不是复制品 ⇒ 批过的授权查得到、审计不断链）
+        assert!(
+            std::sync::Arc::ptr_eq(new_rt.host_mcp_arc().as_ref().unwrap(), &reg),
+            "必须是宿主那一份注册表"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(new_rt.host_perm_arc().as_ref().unwrap(), &perm),
+            "必须是宿主那一份授权表（不是新 hub ⇒ 授权记录会断链）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
