@@ -2150,6 +2150,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// 🔴 **身份断言**：注入的槽里就是**传进去那两份**（不是副本、不是空壳）。
+    ///
+    /// ## 为什么这条是生死线
+    ///
+    /// 桥执行 MCP 工具要靠**真注册表**（查组）和**真 PermHub**（弹卡）。
+    /// 槽里若是空壳 ⇒ MCP 工具调不动、或**绕过权限闸**（P2 静默降级）。
+    ///
+    /// ## 为什么不用全局 `OnceLock`
+    ///
+    /// 全局槽一旦 set 就对**整个测试进程**永久生效 ⇒ 同进程后续测试行为漂移。
+    /// ⇒ 这里用**实例字段**（每个运行时一份）⇒ 天然零污染；
+    /// 纯逻辑在 [`PiRuntime::set_host_mcp_perm`]，**不碰任何全局状态**。
+    #[tokio::test]
+    async fn 注入后槽里的注册表与授权表就是传进去那两份() {
+        let tmp = std::env::temp_dir().join("orbcat_host_mcp_identity");
+        let rt = PiRuntime::new(tmp.clone(), tmp.clone());
+
+        // 没注入 ⇒ 槽空（宿主还没接 ⇒ 安全的降级）
+        assert!(rt.host_mcp_arc().is_none(), "没注入时槽应为空");
+        assert!(rt.host_perm_arc().is_none(), "没注入时槽应为空");
+
+        let mut reg = crate::mcp::ToolRegistry::from_tools_for_test(vec![
+            crate::mcp::McpTool {
+                name: "x_1mcp_do".into(),
+                description: "do".into(),
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                annotations: None,
+            },
+        ]);
+        reg.restore_active_from_settings_unrestricted(&crate::config::AgentSettings::default());
+        let reg = Arc::new(tokio::sync::Mutex::new(reg));
+        let perm = Arc::new(crate::perm_request::PermHub::new());
+
+        rt.set_host_mcp_perm(reg.clone(), perm.clone());
+
+        // 🔴 身份：就是那两份（同一个 Arc，不是重建的）
+        let got_reg = rt.host_mcp_arc().expect("注入后槽应非空");
+        let got_perm = rt.host_perm_arc().expect("注入后槽应非空");
+        assert!(
+            Arc::ptr_eq(&got_reg, &reg),
+            "槽里的注册表必须是传进去那一份（身份断言，不是内容断言）"
+        );
+        assert!(
+            Arc::ptr_eq(&got_perm, &perm),
+            "槽里的授权表必须是传进去那一份"
+        );
+        // 里面也确实是那份 registry 的内容
+        let r = got_reg.lock().await;
+        assert_eq!(r.groups().len(), 1, "槽里那份 registry 的组应还在");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 🔴 PiPool 版：**已存在的运行时**也必须被套上（P2 的教训）。
+    ///
+    /// 池里的运行时是**懒创建**的（首次对话才建）⇒ 「先 acquire、后 set」是
+    /// **常见顺序**，不是边角情况 ⇒ 只写池子那份 = 已经建出来的运行时永远拿不到
+    /// ⇒ MCP 授权静默降级成静态拒绝（用户等不到确认卡，且**没有日志**）。
+    #[tokio::test]
+    async fn pool注入后_已存在的运行时也被套上() {
+        let tmp = std::env::temp_dir().join("orbcat_pool_host_mcp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let pool = PiPool::new(tmp.clone(), tmp.clone());
+
+        // 先建出一个运行时（模拟用户先聊了一句）
+        let rt = pool.acquire("s1").await.expect("应能建出运行时");
+        assert!(rt.host_mcp_arc().is_none(), "还没注入时槽应为空");
+
+        let mut reg = crate::mcp::ToolRegistry::from_tools_for_test(vec![
+            crate::mcp::McpTool {
+                name: "x_1mcp_do".into(),
+                description: "do".into(),
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                annotations: None,
+            },
+        ]);
+        reg.restore_active_from_settings_unrestricted(&crate::config::AgentSettings::default());
+        let reg = Arc::new(tokio::sync::Mutex::new(reg));
+        let perm = Arc::new(crate::perm_request::PermHub::new());
+
+        pool.set_host_mcp_perm(reg.clone(), perm.clone());
+
+        // 🔴 已存在的运行时被套上了
+        let got = rt.host_mcp_arc().expect("已存在的运行时必须被套上（P2 教训）");
+        assert!(Arc::ptr_eq(&got, &reg), "必须是同一份 registry");
+        assert!(rt.host_perm_arc().is_some(), "授权表也要被套上");
+
+        // 新建的运行时也要被套上
+        let rt2 = pool.acquire("s2").await.expect("应能建出第二个运行时");
+        let got2 = rt2.host_mcp_arc().expect("新建的运行时也要被套上");
+        assert!(Arc::ptr_eq(&got2, &reg), "必须是同一份 registry");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// 🔴 白名单里**不许**有 `mcp__*` 裸名（单通道的硬要求）。
     ///
     /// `mcp__*` 是 **pi 原生 MCP** 的命名空间 ⇒ 白名单里放它 = 放行原生那条路
