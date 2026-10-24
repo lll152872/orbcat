@@ -3958,7 +3958,14 @@ function renderPermCards(): string {
           ? renderCommandPermCard(p)
           : p.kind === "mcp"
             ? renderMcpPermCard(p)
-            : renderFilePermCard(p),
+            : // ⚠️ `kind === "pi"` 必须**在兜底之前**分出去。
+              //   兜底是「文件卡」—— 而 pi 确认框的 path/access 全是空串
+              //   ⇒ 掉进兜底 = 用户看到一张**什么都没有的空卡**。
+              //   （后端 kind 按 id 前缀推导：`pm*`→mcp、`pa*`→ask、`pp*`→pi、
+              //     其余→command；文件卡是**另一张单独的表**，kind 恒 "file"。）
+              p.kind === "pi"
+              ? renderPiPermCard(p)
+              : renderFilePermCard(p),
     )
     .join("");
 }
@@ -4086,6 +4093,58 @@ function renderMcpPermCard(p: PendingPerm): string {
       <button type="button" class="perm-btn why" data-act="deny-why" title="拒绝并说明理由">拒绝并说明</button>
     </div>
     <div class="perm-hint">Enter 允许一次 · Esc 拒绝 · Shift+Enter 总是允许</div>
+  </div>`;
+}
+
+/**
+ * **pi 确认卡**（`kind === "pi"`）—— pi 内核的 `ctx.ui.confirm(title, message)`。
+ *
+ * ## 为什么单独一张卡（而不是复用 pm* / pc* 卡）
+ *
+ * pi 的确认载荷**只有 title + message 两个字符串**：
+ * - 没有命令、没有参数摘要、没有风险等级（`risk` 恒 `medium`）；
+ * - **没有「记住这类/这条」那套粒度**（pi 侧没有对应的授权表，
+ *   硬接会造第三套口径 —— Chief 2026-10-23 18:30 拍板 Q5）。
+ * ⇒ 复用命令卡会渲染出一堆**空行**（command/normalized 全是空串），
+ *   而且按钮语义是错的（用户点「记住这条」，pi 那边只认 approve/deny，
+ *   其余一律按拒绝 ⇒ 很难排查）。
+ *
+ * ## 口径（照 `docs/10-PI-CONFIRM-CONTRACT.md` §6 + `docs/11-PI-CONFIRM-UI-CONTRACT.md`）
+ *
+ * - **只两个动作**：允许 / 拒绝 ⇒ `decide(id, "approve" | "deny")`，**不带 reason**；
+ * - **不给「拒绝并说明理由」输入框** —— pi 的确认通道只回一个布尔
+ *   （`extension_ui_response { confirmed }`），填的 reason 停在 Rust 侧、
+ *   **到不了模型上下文** ⇒ 提供了就是「看着能用、其实没用」；
+ * - **超时 3 分钟**（与 pm* 一致）：超时由**后端**判成拒绝并发 `perm-resolved`，
+ *   前端**什么都不用做**（也不许补发 decide）；
+ * - 倒计时沿用**通用机制**（`.perm-timer` + `data-deadline`，
+ *   `startPermTimer()` 每秒扫一遍）⇒ 与 pm* 卡同一套，不写第二套。
+ */
+function renderPiPermCard(p: PendingPerm): string {
+  // 倒计时：与 pm* 卡同一套口径（createdAt + timeoutMs）
+  const deadline = p.createdAt + p.timeoutMs;
+  const rest = Math.max(0, deadline - Date.now());
+  const mm = Math.floor(rest / 60000);
+  const ss = String(Math.floor((rest % 60000) / 1000)).padStart(2, "0");
+
+  // ⚠️ title 落在 `question`（后端把 pi 的 title 存那儿），
+  //    正文落在 `message`（**后端这轮才补的字段，还没进基线**）
+  //    ⇒ message 缺失时**不渲染那一行**，不留空行。
+  const title = p.question || "pi 请求确认";
+  const body = p.message?.trim() ?? "";
+
+  return `
+  <div class="perm-card perm-card-pi" data-perm="${esc(p.id)}">
+    <div class="perm-head">
+      <span class="perm-title">🛡 ${esc(title)}</span>
+      <span class="perm-timer" data-deadline="${deadline}">⏱ ${mm}:${ss}</span>
+    </div>
+    ${body ? `<div class="perm-pi-msg">${esc(body)}</div>` : ""}
+    <div class="perm-actions">
+      <button type="button" class="perm-btn ok" data-act="approve">允许</button>
+      <button type="button" class="perm-btn no" data-act="deny">拒绝</button>
+    </div>
+    <div class="perm-hint">Enter 允许 · Esc 拒绝 · 3 分钟不处理按拒绝</div>
   </div>`;
 }
 
@@ -10212,6 +10271,15 @@ function boot(): void {
         // MCP 卡：Shift+Enter =「总是允许」（跨会话持久），不是「本轮不再问」
         if (top.kind === "mcp" && e.shiftKey) {
           void decidePerm(top.id, "always");
+          return;
+        }
+        // ⚠️ **pi 卡只有「允许 / 拒绝」两个结局**（Chief 2026-10-23 拍板 Q5）——
+        //    Shift+Enter 那套「本轮不再问」（mute）语义**对 pi 不存在**：
+        //    pi 侧只认 confirmed 布尔，没有「本轮」这个粒度。
+        //    ⇒ Shift+Enter 在 pi 卡上**等同普通 Enter（允许）**，
+        //    绝不能落到 mute 分支去发 deny（用户按 Shift 是想"确认"，结果被拒）。
+        if (top.kind === "pi") {
+          void decidePerm(top.id, "approve");
           return;
         }
         const mute = e.shiftKey;

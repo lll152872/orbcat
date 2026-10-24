@@ -171,6 +171,20 @@ export interface PendingPerm {
   question: string;
   /** 快捷选项（点一下即回答；空 = 自由输入） */
   options: string[];
+  /**
+   * pi 确认框的**正文**（`kind = "pi"`）。
+   *
+   * ⚠️ **可选字段**（后端这轮才补上，还没进 release 基线）：
+   *   pi 的 `ctx.ui.confirm(title, message)` 只有 title + message 两个字符串，
+   *   其中**实质内容在 message**（「允许执行 rm -rf ~/project 吗？」在 message 里，
+   *   不在 title 里）⇒ 后端把 message 落进卡片结构（`PendingCmd.message`）。
+   *   在后端 cherry-pick 进来之前，这个字段恒为 `undefined`
+   *   ⇒ **卡要能容忍它缺失**（空则不渲染那一行）。
+   *
+   * ⚠️ 语义上**不属于** `question`（那是 ask_user 的问题正文）、也不属于
+   *   `normalized`（那是「归一化后的命令」）—— 复用会让前端在三种语义间猜字段。
+   */
+  message?: string;
 }
 
 /** 流式过程事件（后端 emit 的 progress 事件载荷） */

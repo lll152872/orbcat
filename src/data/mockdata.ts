@@ -470,6 +470,48 @@ const permRequests: PendingPerm[] = [
     question: "这次改动要落到 feat/frontend/ 下的新分支，还是直接并进当前的 pi 分支？",
     options: ["开新分支", "直接并进当前分支", "先只留在工作区"],
   },
+  /**
+   * **pi 确认卡**（`kind = "pi"`）—— pi 内核的 `ctx.ui.confirm(title, message)`。
+   *
+   * ⚠️ **字段严格照后端 `PendingView`**（不是照前端想象）：
+   *  - `id` 用 **`pp` 前缀** —— 后端靠 id 前缀推 kind（`pm*`→mcp、`pa*`→ask、
+   *    **`pp*`→pi**、其余→command）⇒ mock 的 id 也得守这个约定，
+   *    否则 mock 场景渲染出来的卡 ≠ 真机那张（判据⑧要的就是这个）；
+   *  - `question` = pi 的 **title**（后端把 title 存进 question 字段）；
+   *  - `message` = pi 的 **message**（**后端这轮才补的字段，还没进基线**
+   *    ⇒ 前端必须容忍它缺失，卡上不渲染那一行）；
+   *  - `command`/`normalized`/`path`/`access`/`headFp`/`fullFp` **全空**
+   *    （pi 侧没有这些概念）⇒ 渲染时**不许**显示这些行；
+   *  - `risk` 恒 `medium`、`reason` 恒「pi 内核请求确认」、`tier` 恒 `once`；
+   *  - `timeoutMs` = **180000**（3 分钟，与 pm* 一致）。
+   */
+  {
+    id: "pp1",
+    kind: "pi",
+    path: "",
+    access: "",
+    deniedPath: null,
+    widenLevels: null,
+    widened: false,
+    command: "",
+    normalized: "",
+    risk: "medium",
+    headFp: "",
+    fullFp: "",
+    tier: "once",
+    reason: "pi 内核请求确认",
+    sessionId: "s-main",
+    // ⚠️ **这里用相对当前时刻，不用 `at()`** ——
+    //    倒计时 = `createdAt + timeoutMs - now`，
+    //    固定基准（BASE 是 2026-10-23 16:20）⇒ 倒计时恒为 0:00，
+    //    预览里看到的就永远是「已超时」的样子，看不出 3 分钟倒计时长什么样。
+    //    ⇒ 只这一张卡用「8 秒前到达」，其余 fixture 仍用固定基准（可复现）。
+    createdAt: Date.now() - 8_000,
+    timeoutMs: 180000,
+    question: "pi 要做一件事",
+    message: "允许执行 rm -rf ~/project 吗？",
+    options: ["允许", "拒绝"],
+  },
 ];
 
 const permRules: PermRule[] = [
@@ -1145,6 +1187,36 @@ const permCover = (d: MockData): void => {
   d.memStats = { pending: 0, handled: 37 };
 };
 
+/**
+ * **pi 确认卡场景** —— 只挂一张 `kind="pi"` 的卡。
+ *
+ * ## 为什么单独一个场景
+ *
+ * 权限卡渲染在**对话流**里（`renderMessages()` 的 `.perm-cards` 容器），
+ * 而现有的 `perm` 场景跳到的是设置›文件权限页（规则列表）⇒ **看不到卡**。
+ * ⇒ 这条场景专门用来在纯 HTML 预览里**目视核对 pi 卡**
+ * （判据⑧：mock 场景能渲染出同一张卡 ⇒ 证明渲染逻辑不依赖真 invoke）。
+ *
+ * 只放 pi 一张（不混别的卡）—— 混了截图里就看不清这张卡对不对。
+ */
+const piPermCover = (d: MockData): void => {
+  d.permRequests = permRequests
+    .filter((p) => p.kind === "pi")
+    .map((p) => ({ ...p }));
+  // 顺便给条上下文消息，让卡不是孤零零地贴在最上面
+  d.session = {
+    ...mainSession,
+    messages: [
+      ...msgs,
+      {
+        role: "assistant" as const,
+        text: "这一步需要你确认一下。",
+        at: at(15, 10),
+      },
+    ],
+  };
+};
+
 /** 记忆审批：四条候选 + 统计 */
 const memCover = (d: MockData): void => {
   d.pending = pendingCandidates.map((c) => ({ ...c }));
@@ -1203,6 +1275,13 @@ export const SCENARIOS: MockScenario[] = [
     desc: "三种待批申请同时在列",
     cover: permCover,
     goto: "perm",
+  },
+  {
+    id: "pi-perm",
+    label: "pi 确认卡（kind=pi）",
+    desc: "pi 内核的确认框：标题 + 正文 + 只「允许 / 拒绝」",
+    cover: piPermCover,
+    goto: "chat",
   },
   {
     id: "mem",
