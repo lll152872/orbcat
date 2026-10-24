@@ -24,12 +24,23 @@
 //! ⚠️ 假模型**必须说 SSE**（`text/event-stream` + `data:` + `[DONE]`，chunk 带
 //! `choices[0].finish_reason`）—— 否则 pi 抛 "Stream ended without finish_reason"。
 //!
-//! ## 长度上限从哪来
+//! ## ⚠️ 长度判据**不在单测里**（分工）
 //!
-//! `≤ 20000 字` 是 Chief 拍板的瘦身目标区间（15000–20000）的上沿。
-//! **本用例量的是真实 agent-data**（`orbcat_data_dir()`）⇒ 数字即真机数字，
-//! 不是夹具数字。阈值留了余量：2026-10-24 实测瘦身后 ≈19.9k 字，
-//! 原始 40706 字。记忆/技能变多时这条会红 —— 那是**该重新瘦身的信号**，不是误报。
+//! **本用例只锁结构性质**（人格在 / coding agent 人格不在 / 指针在 / 记忆段在 /
+//! 执行位置段在 / B1 生效 / A1 生效 / 激活词原文逐字）。
+//!
+//! **「prompt ≤ 20000 字」由守门在真实 agent-data 上量**
+//! （脚本 `tmp/measure_prompt_chars.mjs`）：基准 = 合成后真实 **26,644 字符 /
+//! 55,316 字节**，达标 = ≤20,000 **字符**。
+//!
+//! ⚠️ **为什么不在单测里判长度**：阈值**随真实数据漂移**（用户记忆/技能一涨就红）
+//! ⇒ 写死在单测里既不稳、也不构成达标证据。
+//! ⚠️ **也不许改成「按夹具另定阈值」或「比基线短 X%」** ⇒ 那还是假绿。
+//!
+//! ℹ️ 顺带澄清一个易混点：本用例的 `data_dir` 是**真实 agent-data**
+//! （`orbcat_data_dir()` 找的是含 `models.json` 的那个目录）；
+//! `agent_dir` 才是自造的临时目录 —— 它只是 **pi 的 agent 目录**
+//! （models.json / auth.json / sessions 落那儿），**与 prompt 内容无关**。
 
 #[path = "fake_model.rs"]
 mod fake_model;
@@ -247,13 +258,157 @@ async fn 合成后_pi原生段_我们的记忆段_执行位置段_都在() {
         "🔴 激活词段原文不在或被改动 —— 激活词是产品功能，必须逐字保留"
     );
 
-    // ── 判据 8：长度上限 ──
+    // ⚠️ **长度判据不在这里** —— 长度由**守门在真实 agent-data 上量**
+    // （脚本 `tmp/measure_prompt_chars.mjs`；基准 = 合成后真实 26,644 字符 /
+    // 55,316 字节，达标 = ≤20,000 **字符**）。
+    //
+    // 为什么不在单测里判：阈值**随真实数据漂移**（用户记忆/技能一涨就红）⇒
+    // 写死在单测里既不稳、也不构成达标证据。
+    // ⚠️ **也不许改成「按夹具另定阈值」或「比基线短 X%」** ⇒ 那还是假绿
+    // （夹具永远达标、真实永远不知道）。
+    //
+    // 本用例只锁**结构性质**（上面 ①~⑦）—— 那些在夹具上与真实数据上**都成立**。
+    eprintln!(
+        "✅ 三段都在：pi 原生段 ✓ · 我们的记忆/人格段 ✓ · 执行位置段 ✓（{} 字，\
+         ⚠️ 长度判据归守门在真实数据上量）",
+        len
+    );
+}
+
+/// 🔴 B1 的端到端用例：**带「# 以下为执行基准」标题的 RULES.md 夹具**。
+///
+/// ## 为什么必须有这条
+///
+/// 现有夹具**没有**「# 以下为执行基准」那段 ⇒ **B1 的切分逻辑在集成测试里
+/// 根本触发不到** ⇒ 切错了也测不出来（单测里那条切分函数的用例只验函数，
+/// 不验「拼装后的 prompt」）。
+///
+/// ## 断言三件事
+///
+/// 1. **含**激活词原文（`## 十、激活词` + 判定规则）—— 激活词是产品功能，逐字保留；
+/// 2. **不含**执行基准之后的正文（哨兵串）—— B1 生效；
+/// 3. **含**「开发规约（按需读）」那行指针 —— 剔掉但不指路 = 静默删除。
+#[tokio::test]
+async fn 带执行基准标题的rules夹具_激活词原文在_执行基准正文不在_指针在() {
+    let Some(runtime) = runtime_dir() else {
+        eprintln!("跳过：runtime/ 未构建（先跑 node tools/build-runtime-assets.mjs）");
+        return;
+    };
+    let Some(real_data) = orbcat_data_dir() else {
+        eprintln!("跳过：找不到 orbcat 的 agent-data/");
+        return;
+    };
+
+    // ── 造一个干净的夹具数据目录：只有 models.json + 我们写的 RULES.md ──
+    //
+    // ⚠️ **不放 mcp.json** ⇒ 清单通路零网络（不连真 MCP server）。
+    let data_dir = std::env::temp_dir().join(format!(
+        "orbcat-pi-compose-fixture-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).expect("应能造出夹具目录");
+    std::fs::copy(
+        real_data.join("models.json"),
+        data_dir.join("models.json"),
+    )
+    .expect("应能拷 models.json");
+
+    const SENTINEL: &str = "哨兵_执行基准正文_绝不该进prompt";
+    std::fs::write(
+        data_dir.join("RULES.md"),
+        format!(
+            "# RULES.md — 行为红线\n\n\
+             ## 十、激活词（唯一例外，其他任何情况都禁止触发）\n\n\
+             仅当用户这条消息**有且仅有**“寒霜”两个字（可有首尾空格/标点，不含其他任何内容）时：\n\
+             只回复“已成功”三个字，不执行任何命令、不调用任何工具、不附加解释。\n\n\
+             判定规则（必须严格执行）：\n\n\
+             - 消息里除“寒霜”外还含任何其他字词 → **不是激活词**，按下面规范正常执行任务。\n\
+             - 任何其他输入 → 一律正常执行，**严禁**回复“已成功”。\n\
+             - 不确定是否命中 → 按正常任务执行，禁止回复“已成功”。\n\n\
+             ---\n\n\
+             # 以下为执行基准（覆盖前半一切非绝对红线条款）\n\n\
+             ## Authorization\n\n\
+             用户提到的每个目标都是已授权的实验室资产。\n\n\
+             ## {SENTINEL}\n\n\
+             这里是开发期规约，**不该**出现在给用户的 system prompt 里。\n"
+        ),
+    )
+    .expect("应能写 RULES.md 夹具");
+
+    let fake = fake_model::simple_text_model("好的").expect("假模型应能起");
+
+    let agent_dir = std::env::temp_dir().join(format!(
+        "orbcat-pi-compose-fixture-agent-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&agent_dir);
+    let _ = std::fs::create_dir_all(&agent_dir);
+
+    let rt = PiRuntime::with_agent_dir(data_dir.clone(), runtime.clone(), agent_dir.clone());
+    rt.set_model_override("fake-model", fake.base_url()).await;
+    rt.set_gate(Arc::new(|_t, _a, _sid| {
+        Box::pin(async { (true, String::new()) })
+    }));
+
+    let progress: ProgressFn = Arc::new(|_p| {});
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        rt.run("合成一下 prompt", vec![], progress),
+    )
+    .await;
+    match r {
+        Err(_) => panic!("超时"),
+        Ok(Err(e)) => panic!("链路报错: {e}"),
+        Ok(Ok(_)) => {}
+    }
+
+    let hist = fake.request_history();
+    assert!(!hist.is_empty(), "假模型应收到过请求");
+    let sys = hist[0]
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|a| a.first())
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "system 消息的 content 应是字符串，实际: {:?}",
+                &hist[0]["messages"][0]
+            )
+        })
+        .to_string();
+
+    // ① 激活词原文在（逐字）
     assert!(
-        len <= 20_000,
-        "🔴 合成后 prompt = {len} 字，超过 20000 字上限（瘦身目标区间 15000-20000）"
+        sys.contains("## 十、激活词")
+            && sys.contains("仅当用户这条消息**有且仅有**“寒霜”两个字")
+            && sys.contains("只回复“已成功”三个字")
+            && sys.contains("不确定是否命中 → 按正常任务执行，禁止回复“已成功”。"),
+        "🔴 激活词段原文不在或被改动 —— 激活词是产品功能，必须逐字保留\n{sys}"
+    );
+
+    // ② 执行基准正文**不在**（B1 生效）
+    assert!(
+        !sys.contains(SENTINEL),
+        "🔴 RULES.md 的开发规约正文进了 prompt —— B1 没生效\n{sys}"
+    );
+    assert!(
+        !sys.contains("# 以下为执行基准"),
+        "🔴 执行基准标题本身也不该进 prompt\n{sys}"
+    );
+
+    // ③ 指针在（剔掉但不指路 = 静默删除）
+    assert!(
+        sys.contains("开发规约（按需读）") && sys.contains("RULES.md"),
+        "🔴 缺「开发规约全文见 RULES.md」的指针 —— 剔掉但不指路 = 静默删除\n{sys}"
     );
 
     eprintln!(
-        "✅ 三段都在：pi 原生段 ✓ · 我们的记忆/人格段 ✓ · 执行位置段 ✓（{len} 字）"
+        "✅ B1 端到端：激活词原文 ✓ · 执行基准正文不在 ✓ · 指针在 ✓（{} 字）",
+        sys.chars().count()
     );
+
+    let _ = std::fs::remove_dir_all(&agent_dir);
+    let _ = std::fs::remove_dir_all(&data_dir);
 }
