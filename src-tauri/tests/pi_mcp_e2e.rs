@@ -394,3 +394,126 @@ fn 同一target内两次调用拿到不同目录() {
         "目录名必须带进程内唯一序号"
     );
 }
+
+/// 🔴🔴 **端到端守卫用例**：**MCP 工具经宿主桥进 pi 的工具表**。
+///
+/// ## 这条锁的是什么
+///
+/// 「MCP 单通道」是**安全红线**：
+/// 模型看到的 MCP 工具必须只有 `orb_mcp__<server>__<tool>`（宿主桥那一路），
+/// **不能**有 `mcp__<server>__<tool>` 裸名（pi 原生 MCP 那一路 ⇒ 绕过宿主权限闸）。
+///
+/// 之前的覆盖只有两层：
+/// - crate 内单测（清单侧 + 白名单侧）—— **没到「模型实际收到的 tools 数组」**；
+/// - 守门真机证据 —— **不是仓库里的守卫用例**。
+///
+/// ⇒ **红线的端到端层没有守卫** ⇒ 这条补上。
+///
+/// ## 走的是哪条路
+///
+/// 1. `orbcat_lib::test_support::mcp_registry_with_stdio_server(...)`
+///    —— **真连**一个 stdio 假 MCP server，造出「已连接、有工具」的**宿主**注册表；
+/// 2. `PiRuntime::set_host_mcp_perm(...)` —— 注入宿主注册表 + 授权表；
+/// 3. 跑一轮 ⇒ pi 的工具表由宿主那份清单生成 ⇒ 模型收到的 `tools` 数组里
+///    **必须出现** `orb_mcp__<server>__<tool>`。
+///
+/// ## ⚠️ 断言不能写成「无裸名就绿」
+///
+/// 「没有 `mcp__` 裸名」在**没注入**的用例里是**弱断言**（本来就没有 MCP 工具）
+/// ⇒ 绿了也说明不了什么。
+/// ⇒ 本条**同时**断言「`orb_mcp__*` 确实在表里」—— **这才是这条用例存在的意义**。
+#[tokio::test]
+async fn 宿主注入注册表后_模型看得到orb_mcp工具且没有mcp裸名() {
+    let Some(runtime) = runtime_dir() else {
+        eprintln!("跳过：runtime/ 未构建");
+        return;
+    };
+    let Some(real_data) = orbcat_data_dir() else {
+        eprintln!("跳过：找不到 orbcat 的 agent-data/");
+        return;
+    };
+    let Some(script) = fake_mcp_script() else {
+        eprintln!("跳过：找不到 tests/fake_mcp_server.cjs");
+        return;
+    };
+
+    // ── trace：假 server 每次调用都往里写一行（这里只是让它能起）──
+    let trace_path = unique_tmp("pi-mcp-inj-trace").with_extension("jsonl");
+    let _ = std::fs::remove_file(&trace_path);
+    let mut env = BTreeMap::new();
+    env.insert(
+        "MCP_TRACE_FILE".to_string(),
+        trace_path.display().to_string(),
+    );
+
+    // ── ① 造宿主的 MCP 注册表（**真连** stdio 假 server）──
+    let node = runtime.join("node").join("node.exe");
+    let reg = orbcat_lib::test_support::mcp_registry_with_stdio_server(
+        "fakemcp",
+        &node.display().to_string(),
+        vec![script.display().to_string()],
+        env,
+    )
+    .await
+    .expect("应能造出宿主 MCP 注册表");
+    assert!(
+        !reg.active_tools().is_empty(),
+        "🔴 宿主注册表里应该有工具 —— 连不上假 server 就测不到这条红线"
+    );
+
+    let fake = fake_model::simple_text_model("好的").expect("假模型应能起");
+
+    let agent_dir = unique_tmp("pi-mcp-inj-agent");
+    let rt = PiRuntime::with_agent_dir(real_data.clone(), runtime.clone(), agent_dir.clone());
+    rt.set_model_override("fake-model", fake.base_url()).await;
+    rt.set_gate(Arc::new(|_t, _a, _sid| {
+        Box::pin(async { (true, String::new()) })
+    }));
+    // ── ② 注入宿主注册表 + 授权表 ──
+    //
+    // ⚠️ **必须在 run 之前** —— pi 的 `--tools` 白名单是**起进程时**构造的
+    //    （白名单里要列全 `orb_mcp__*`，否则模型看不到那些工具）。
+    rt.set_host_mcp_perm(
+        Arc::new(tokio::sync::Mutex::new(reg)),
+        Arc::new(orbcat_lib::perm_request::PermHub::new()),
+    );
+
+    let progress: ProgressFn = Arc::new(|_p| {});
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        rt.run("你好。", vec![], progress),
+    )
+    .await;
+    match r {
+        Err(_) => panic!("90 秒超时"),
+        Ok(Err(e)) => panic!("链路报错: {e}"),
+        Ok(Ok(_)) => {}
+    }
+
+    // ── ③ 断言：模型实际收到的 tools 数组里**有** orb_mcp__*、**无** mcp__ 裸名 ──
+    let names = model_tool_names(&fake);
+    eprintln!("=== 模型看到的工具（{} 个）===", names.len());
+    let orb_mcp: Vec<&String> = names
+        .iter()
+        .filter(|n| n.starts_with("orb_mcp__"))
+        .collect();
+    assert!(
+        !orb_mcp.is_empty(),
+        "🔴 模型看到的工具表里**没有** `orb_mcp__*` —— MCP 工具没经宿主桥进 pi 工具表\n\
+         全部工具名：{names:?}"
+    );
+    let bare: Vec<&String> = names.iter().filter(|n| n.starts_with("mcp__")).collect();
+    assert!(
+        bare.is_empty(),
+        "🔴 模型看到了 MCP 裸名 {bare:?} —— pi 原生 MCP 还在放行（单通道失效，闸门可绕）\n\
+         全部工具名：{names:?}"
+    );
+
+    eprintln!(
+        "✅ 端到端：orb_mcp__* {} 个在表里 ✓ · mcp__ 裸名 0 条 ✓",
+        orb_mcp.len()
+    );
+
+    let _ = std::fs::remove_file(&trace_path);
+    let _ = std::fs::remove_dir_all(&agent_dir);
+}

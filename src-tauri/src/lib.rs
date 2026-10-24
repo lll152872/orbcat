@@ -12,7 +12,7 @@ mod test_hooks;
 mod bootstrap;
 mod capture;
 mod command_policy;
-mod config;
+pub mod config;
 mod context;
 mod disk_assets;
 mod distill;
@@ -21,11 +21,11 @@ mod history;
 mod images;
 mod life;
 mod llm;
-mod mcp;
+pub mod mcp;
 mod memes;
 mod memory;
 mod modes;
-mod perm_request;
+pub mod perm_request;
 mod permission;
 // pi 内核相关模块 —— `pub` 是为了让 `tests/pi_integration.rs` 能直接用
 // （集成测试只能访问 crate 的公开 API）。
@@ -36,6 +36,18 @@ pub mod pi;
 pub mod pi_bridge;
 mod pi_run;
 pub mod pi_runtime;
+/// **测试支持入口** —— 刻意暴露给集成测试（`src-tauri/tests/`）用。
+///
+/// 集成测试是**独立 crate** ⇒ 编译时**不带 `cfg(test)`** ⇒
+/// 标了 `#[cfg(test)]` 的东西在 `tests/` 里**不存在**
+/// （典型例子：`ToolRegistry::from_tools_for_test`）；
+/// 且 `mcp` / `config` / `perm_request` 原本是私有模块 ⇒ 类型在 `tests/` 里不可达
+/// ⇒ 集成测试**造不出**宿主 MCP 注册表 ⇒「MCP 工具经宿主桥进 pi 工具表」这条
+/// **安全红线**只能靠 crate 内单测 + 真机证据，**没有端到端守卫用例**。
+///
+/// ⇒ 本模块提供**不依赖 `cfg(test)`** 的构造入口。
+/// ⚠️ 它**会进正式二进制** ⇒ 只放**纯构造**能力，不含任何测试逻辑/断言。
+pub mod test_support;
 mod pmem;
 mod project;
 mod ptc;
