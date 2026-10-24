@@ -15,6 +15,36 @@ use std::sync::Arc;
 
 use orbcat_lib::pi_runtime::PiRuntime;
 use serde_json::{json, Value};
+/// 本进程内**唯一**的临时目录名（pid + 进程内原子序号）。
+///
+/// ## 🔴 为什么 pid 不够、为什么固定名更糟
+///
+/// - 同一个 test target 里的多个 `#[tokio::test]` 是**同一个进程** ⇒ **同一个 pid**
+///   ⇒ 只带 pid 命名 ⇒ 两个用例拿到**同一个目录** ⇒ tokio 默认并发 ⇒
+///   A 的 `remove_dir_all` 把 B 正在用的目录删了 ⇒ B 静默跳过；反向 B 删了 A
+///   ⇒ A 的 pi 起不来 ⇒ **模型看到的工具 0 个**。
+/// - **完全不带 pid 的固定名更危险** ⇒ `cargo test --tests` 会**并行跑多个 target**
+///   （不同进程、不同 pid）⇒ 固定名**跨 target 也会互删**
+///   ⇒ 这正是「全跑红、逐 target 串行全绿」的真正原因。
+///
+/// ⇒ 统一用「pid + 进程内序号」⇒ 每次调用一个独立目录，彻底消除互删。
+fn unique_tmp(tag: &str) -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "orbcat-{tag}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    // ⚠️ **顺手把目录建出来** —— 以前这些路径直接用 `temp_dir()`（**一定存在**），
+    // 改成唯一目录后不建 ⇒ pi 起来时写 models.json 失败 ⇒ 「pi 应能起」直接挂。
+    //
+    // ⚠️ 造不出来要 **panic**，不许静默跳过 —— 静默跳过 = 测试绿着但什么都没验（假绿）。
+    std::fs::create_dir_all(&d).unwrap_or_else(|e| {
+        panic!("应能造出临时目录 {}：{e}", d.display());
+    });
+    d
+}
+
 
 fn runtime_dir() -> Option<PathBuf> {
     let mut p = std::env::current_exe().ok()?;
@@ -61,7 +91,7 @@ async fn pi_runtime能跑完整一轮并调通rust工具() {
     };
 
     // 用一个**临时的** agent 目录（别污染真实数据）
-    let tmp_agent = std::env::temp_dir().join("orbcat-pi-e2e-agent");
+    let tmp_agent = unique_tmp("pi-e2e-agent");
     let _ = std::fs::remove_dir_all(&tmp_agent);
     let _ = std::fs::create_dir_all(&tmp_agent);
 
@@ -162,7 +192,7 @@ async fn pi能调到orbcat的真实工具() {
     };
 
     // 准备一个真实的文件，让 read_file 能读到
-    let tmp_agent = std::env::temp_dir().join("orbcat-pi-e2e-agent2");
+    let tmp_agent = unique_tmp("pi-e2e-agent2");
     let _ = std::fs::remove_dir_all(&tmp_agent);
     let _ = std::fs::create_dir_all(&tmp_agent);
 
@@ -198,7 +228,7 @@ async fn pi能调到orbcat的真实工具() {
     // 目标文件 —— 必须放在**已授权目录**里，否则权限网关会正确拦掉
     // （实测：%TEMP% 根目录不在授权范围，read_file 被拒 —— 网关工作正常）。
     // 授权区：`C://Users//DELL//AppData//Local//Temp//orbcat`（readwrite）。
-    let work = std::env::temp_dir().join("orbcat");
+    let work = unique_tmp("orbcat");
     let _ = std::fs::create_dir_all(&work);
     let target = work.join("pi-e2e-target.txt");
     std::fs::write(&target, "MAGIC-ORBCAT-42").unwrap();
