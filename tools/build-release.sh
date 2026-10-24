@@ -103,9 +103,12 @@ fi
 # --fast 的产物在 target/release-fast/，要落到 release/ 供桌面快捷方式使用
 if [ "$SRC_EXE" != "$REL/orbcat.exe" ]; then
   cp -f "$SRC_EXE" "$REL/orbcat.exe"
-  # CLI 同样落到 release/ —— 两个 exe 保持同源同代（别出现「主程序新的、CLI 旧的」）
-  cp -f "$CLI_SRC" "$REL/orbcat-perm.exe"
-  CLI_SRC="$REL/orbcat-perm.exe"
+  # ⚠️ CLI 只在**构建目录**里留一份给测试/内部场景用 —— **不随包分发**
+  #    （用户 2026-10-24 拍板：只在测试中存在）。⇒ 没有就跳过，不失败。
+  if [ -f "$CLI_SRC" ]; then
+    cp -f "$CLI_SRC" "$REL/orbcat-perm.exe"
+    CLI_SRC="$REL/orbcat-perm.exe"
+  fi
 fi
 
 # ---- 外部代批 CLI（orbcat-perm）----
@@ -116,21 +119,15 @@ fi
 #    （Cargo 自动发现会把它叫成 `orbcat_perm.exe` —— 所以 Cargo.toml 里是
 #      **显式** `[[bin]] name = "orbcat-perm"`。）
 #
-# ⚠️ 找不到 = **当场失败**，不许 warn 就放过（跟 runtime / photon 同一口径）：
-#    缺它 ⇒ 用户侧外部 AI（Codex / Claude Code）拿不到「代批权限申请」这个能力，
-#    而构建日志一切正常 —— 典型的「构建绿、线上坏」。
+# ⚠️ 找不到 = **不再失败**（用户 2026-10-24 拍板：CLI 只在测试中存在、不随包分发）
+#    ⇒ 找不到就打印一行说明，继续往下走；发布包**不含** bin/orbcat-perm.exe。
+#    ⚠️ 层 1 阻断按**文件名**匹配（`perm_cli::CLI_STEM = "orbcat-perm"`）⇒
+#    这个名字**要留着**（构建目录里照旧产出，供测试/内部场景用）。
 if [ ! -f "$CLI_SRC" ]; then
-  echo "============================================================"
-  echo " ✗ 找不到外部代批 CLI：$CLI_SRC"
-  echo ""
-  echo "   发布包必须带 bin/orbcat-perm.exe —— 缺了它，用户侧外部 AI"
-  echo "   拿不到「代批权限申请」这个能力（链路整条断掉）。"
-  echo "   修法：cargo build --release --bin orbcat-perm"
-  echo "   （产物名必须带连字符：src-tauri/Cargo.toml 里的 [[bin]] name = \"orbcat-perm\"）"
-  echo "============================================================"
-  exit 1
+  echo "  外部代批 CLI：未构建（$CLI_SRC）—— 不随包分发（仅测试存在），继续"
+else
+  echo "  外部代批 CLI：$CLI_SRC（仅构建目录保留，**不随包分发**）"
 fi
-echo "  外部代批 CLI：$CLI_SRC"
 
 # ---- 内置运行时（node / pi 内核）----
 #
@@ -259,14 +256,9 @@ cp -rf "$REL/dist/." "$RUNTIME/dist/"
 # ⚠️ 位置契约：层 1 的 `is_under_bin_dir()` 认的正是 `<包根>/bin/`。
 # ⚠️ **不进 runtime/** —— runtime/ 是 node + pi 的**白名单分发目录**，
 #    塞个权限 CLI 进去会污染那个契约（pi::runtime_dir 只认 node/pi）。
-echo "==> 部署外部代批 CLI 到 $RUNTIME/bin"
-mkdir -p "$RUNTIME/bin"
-cp -f "$CLI_SRC" "$RUNTIME/bin/orbcat-perm.exe"
-# 部署后当场断言 —— 复制失败（exe 被占着）不许静默放过
-if [ ! -f "$RUNTIME/bin/orbcat-perm.exe" ]; then
-  echo "  ✗ 部署后缺 bin/orbcat-perm.exe —— 外部 AI 代批链路断链"
-  exit 1
-fi
+# ⚠️ 用户 2026-10-24 拍板：**外部代批 CLI 不随包分发**（只在测试中存在）
+#    ⇒ 这里**不再部署**到运行态 ⇒ 运行态 $RUNTIME/bin/orbcat-perm.exe 由 Chief 手动移走。
+echo "==> 外部代批 CLI：不随包分发（仅测试存在）—— 跳过部署"
 
 # 内置运行时同样部署到运行态 —— 位置契约同上（<exe 同目录>/runtime/）
 #

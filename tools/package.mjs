@@ -358,11 +358,24 @@ export function stageWindowsRelease({
   // ⚠️ 位置是**包根的 bin/**（与 dist/、runtime/ 同级），**不进 runtime/**：
   //    runtime/ 是白名单分发目录（RUNTIME_COMPONENTS = node + pi）。
   //
-  // `cliExe` 传 null = 调用方**明确不要**这个组件（开发态 / 单测）；
-  // 发布包走 main() 的路径 ⇒ 那条路**强制要求**它存在。
+  // `cliExe` 传 null = 调用方**明确不要**这个组件。
+  //
+  // ⚠️ 用户 2026-10-24 拍板：外部代批 CLI **只在测试中存在、不随包分发**、不放快捷方式
+  //    ⇒ 默认（不传 --cli-exe）= **不拷 CLI、不报错**。
+  //    传了 --cli-exe ⇒ 仍然拷贝（测试 / 内部场景照旧可用）。
   if (cliExe) {
     mkdirSync(path.join(outDir, CLI_SUBDIR), { recursive: true });
     copyFileSync(cliExe, path.join(outDir, CLI_SUBDIR, CLI_BIN_NAME));
+    console.log(`  已拷外部代批 CLI → ${CLI_SUBDIR}/${CLI_BIN_NAME}`);
+  } else {
+    // ⚠️ 顺手**清掉旧残留**：上一次装配拷过 CLI 时留下 <out>/bin/，
+    //    这次不拷却不清 ⇒ 旧 exe 会跟着进包（用户拍板「不随包分发」）。
+    const binDir = path.join(outDir, CLI_SUBDIR);
+    if (existsSync(binDir)) {
+      rmSync(binDir, { recursive: true, force: true });
+      console.log(`  已移除旧的 ${CLI_SUBDIR}/（外部代批 CLI 不随包分发）`);
+    }
+    console.log("  外部代批 CLI 未随包分发（仅测试存在）");
   }
 
   // ── 初始化指引（**包根**，与 agent-data/ 同级）──
@@ -517,23 +530,25 @@ export function verifyReleaseLayout(
     }
   }
 
-  // ---- 外部代批 CLI：<包根>/bin/orbcat-perm.exe 必查 -------------------
+  // ---- 外部代批 CLI：<包根>/bin/orbcat-perm.exe（**可选**）-----------------
   //
-  // `wantCli` 由调用方传入：验发布包时传 true，单测 / 开发态不传。
-  //
-  // ⚠️ 缺它的后果不是「功能差一点」，而是**外部 AI 代批这条链路整条断掉**
-  //    （用户侧 Codex / Claude Code 拿不到 CLI）。
-  //    且**当场红**，不许放过 —— 跟 runtime / photon 同一口径。
+  // ⚠️ 用户 2026-10-24 拍板：外部代批 CLI **只在测试中存在、不随包分发**。
+  //    ⇒ wantCli 为真（测试 / 内部场景）⇒ **必查**，缺了当场红；
+  //      wantCli 为假（发布包）⇒ **不算失败**，只打印一行说明。
   if (wantCli) {
     const cli = path.join(dir, CLI_SUBDIR, CLI_BIN_NAME);
     if (!isFile(cli)) {
       errors.push(
         `产物里没有 ${CLI_SUBDIR}/${CLI_BIN_NAME}：${cli} 不存在。\n` +
-          `        发布包必须带外部代批 CLI（用户侧外部 AI 靠它代批权限申请）。\n` +
+          `        该场景要求带外部代批 CLI（测试 / 内部代批场景）。\n` +
           `        修法：cargo build --release --bin orbcat-perm（产物名必须带连字符），\n` +
           `              再用 --cli-exe <路径> 传给装配脚本。`
       );
+    } else {
+      notes.push(`外部代批 CLI 在位：${CLI_SUBDIR}/${CLI_BIN_NAME}`);
     }
+  } else {
+    notes.push("外部代批 CLI 未随包分发（仅测试存在）—— 这是预期行为，不算失败");
   }
 
   if (errors.length > 0) {
@@ -660,11 +675,11 @@ function main() {
   const args = parseArgs(process.argv.slice(2));
 
   if (args.verify) {
-    // 验发布包 = 必须有内置运行时（node + pi）+ 外部代批 CLI —— 与装配时同一套契约
+    // 验发布包 = 必须有内置运行时（node + pi）；外部代批 CLI **不随包分发** ⇒ 不查
     const r = verifyReleaseLayout(args.verify, {
       exeName: args["exe-name"] ?? null,
       wantRuntime: true,
-      wantCli: true,
+      wantCli: false,
     });
     verifyNoUserData(args.verify);
     console.log(`OK: 产物布局合法 ${path.join(args.verify, DIST_SUBDIR, DIST_ENTRY)}`);
@@ -682,8 +697,8 @@ function main() {
         "\n" +
         "  --cli-exe   外部代批 CLI 的路径（产物名必须精确是\n" +
         "              orbcat-perm.exe，带连字符）。拷成 <out>/bin/orbcat-perm.exe。\n" +
-        "              缺省找 src-tauri/target/{release,release-fast}/。\n" +
-        "              **发布包必须有**：缺了它，外部 AI 代批链路整条断掉。\n" +
+        "              **可选**：用户 2026-10-24 拍板 —— 它**只在测试中存在、\n" +
+        "              不随包分发** ⇒ 缺省不拷、不报错；传了才拷并必查。\n" +
         "  --runtime   内置运行时目录（node / pi 内核），\n" +
         "              拷成 <out>/runtime/。缺省找仓库根的 runtime/。\n" +
         "              **发布包必须有**：找不到会当场报错，不许发出坏包\n" +
@@ -733,17 +748,11 @@ function main() {
 
   // ── 外部代批 CLI（orbcat-perm）——
   //
-  // ⚠️ **找不到 = 当场报错**，跟 runtime 同一口径：
-  //    缺它 ⇒ 发布包里没有 bin/orbcat-perm.exe ⇒ 用户侧外部 AI（Codex / Claude Code）
-  //    根本拿不到「代批权限申请」这个能力 ⇒ 链路整条断掉，而构建日志一切正常。
-  const cliExe = args["cli-exe"] ?? defaultCliExe();
-  if (!cliExe || !isFile(cliExe)) {
-    console.error(
-      `找不到外部代批 CLI：${args["cli-exe"] ?? `src-tauri/target/{release,release-fast}/${CLI_BIN_NAME}`}\n` +
-        `  发布包必须带 ${CLI_SUBDIR}/${CLI_BIN_NAME} —— 缺了它，用户侧外部 AI 拿不到代批能力。\n` +
-        `  修法：cargo build --release --bin orbcat-perm（产物名必须带连字符）`
-    );
-    process.exit(2);
+  // ⚠️ 用户 2026-10-24 拍板：**只在测试中存在、不随包分发** ⇒ 默认**不找、不报错**。
+  //    显式传 --cli-exe ⇒ 仍要求它存在（见上方的存在性 + 文件名校验）。
+  const cliExe = args["cli-exe"] ?? null;
+  if (!cliExe) {
+    console.log("  外部代批 CLI：未随包分发（仅测试存在）—— 用户 2026-10-24 拍板");
   }
 
   const { exeName } = stageWindowsRelease({
@@ -760,12 +769,14 @@ function main() {
     exeName,
     wantSkeleton: !!args.skeleton,
     wantRuntime: true,
-    wantCli: true,
+    // ⚠️ 只有**传了** --cli-exe 才必查（用户 2026-10-24 拍板：CLI 不随包分发）
+    wantCli: !!cliExe,
   });
   verifyNoUserData(args.out);
   console.log(
     `OK: 已装配并自检通过 ${args.out}（${exeName} + ${DIST_SUBDIR}/` +
-      `${args.skeleton ? ` + ${DATA_SUBDIR}/` : ""} + ${CLI_SUBDIR}/${CLI_BIN_NAME}）`
+      `${args.skeleton ? ` + ${DATA_SUBDIR}/` : ""}` +
+      `${cliExe ? ` + ${CLI_SUBDIR}/${CLI_BIN_NAME}` : ""}）`
   );
   for (const n of notes ?? []) console.log(`  提示: ${n}`);
 }
