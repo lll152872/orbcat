@@ -3432,7 +3432,11 @@ fn exec_location_note(data_dir: &Path) -> String {
             "**Git Bash**（`bash.exe`，GNU 语法）",
             "用 GNU 语法：`ls` / `cat` / `rm -rf` / `find` / `grep` / `chmod`。\n\
              多条命令用 `&&` / `||` / `;` 串联。**不要**用 PowerShell 的 \
-             `Get-ChildItem` / `Select-String` / `Remove-Item`。",
+             `Get-ChildItem` / `Select-String` / `Remove-Item`。\n\
+             ⚠️ **路径一律用正斜杠 `/`**（`D:/orbcat/agent-data/x.png`）—— \
+             反斜杠会被 bash 当**转义符**吃掉（`\\a`→`a`）⇒ 写成 \
+             `D:orbcatagent-datax.png` 这种畸形文件名；而且**没有前导 `/` 的路径** \
+             是相对路径 ⇒ 会落在当前目录，不是你写的地方。",
         ),
         crate::config::ExecShell::Pwsh => (
             "**PowerShell**（`pwsh`，Windows 语法）",
@@ -3476,6 +3480,49 @@ fn clock_line(ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// 🔴 Git Bash 下**路径必须用正斜杠** —— 真机回归（2026-10-24）。
+    ///
+    /// ## 真机现场
+    ///
+    /// `D:\orbcat\agent-data\` 根目录躺着一个畸形文件
+    /// `D:orbcatagentscreenshotshw7_filled.png`（75,933 B @16-24 16:23）。
+    ///
+    /// ## 根因（代码 + 文件系统双向实证）
+    ///
+    /// 1. **不是 orbcat 代码删的 `\`** —— 全仓扫 11 处「路径清洗」**全是 `\`→`/`**，
+    ///    **没有一处是删除**；
+    /// 2. **是 Git Bash(MSYS) 的转义语义** —— `shell.rs` 的 `git_bash_argv` 把**命令本身**
+    ///    作为 `bash -c` 的参数 ⇒ bash 解析 `\` ⇒ `D:\orbcat\agent\screenshots\hw7_filled.png`
+    ///    里的 `\a`→`a`、`\s`→`s`、`\h`→`h` ⇒ 文件名 `D:orbcatagentscreenshotshw7_filled.png`；
+    /// 3. **MSYS 允许文件名含 `:`**（POSIX 语义，Win32 不允许）⇒ **落盘成功**
+    ///    ⇒ 而 Python / Win32 **根本打不开它**（实测 `FileNotFoundError`）；
+    /// 4. **路径无前导 `/`** ⇒ 相对路径 ⇒ 落在 cwd（= data_dir）⇒ 落在 agent-data 根目录。
+    ///
+    /// ⇒ 修法（最小）：**执行位置段**在 Git Bash 分支明确要求「路径用正斜杠」——
+    /// 这条提示是模型唯一能看到的口径来源。
+    #[test]
+    fn 执行位置段_必须要求gitbash下路径用正斜杠() {
+        let tmp = std::env::temp_dir().join("orbcat_exec_loc_bash");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // 注入 Git Bash 设置（set_exec_shell 在 config 里；这里直接用 settings 文件写）
+        let mut st = crate::config::load_settings(&tmp);
+        st.exec_shell = crate::config::ExecShell::Gitbash;
+        crate::config::save_settings(&tmp, &st).expect("应能写设置");
+
+        let note = super::exec_location_note(&tmp);
+        assert!(
+            note.contains("正斜杠"),
+            "Git Bash 的执行位置段必须要求**路径用正斜杠**（反斜杠会被 bash 当转义符吃掉）：\n{note}"
+        );
+        assert!(
+            note.contains("转义"),
+            "Git Bash 的执行位置段必须点明「反斜杠会被当转义符」：\n{note}"
+        );
+        // pwsh 那侧**不需要**这条（PowerShell 不吃反斜杠）
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// 🔴 表情包**路径不许自己拼** —— 真机回归（2026-10-24 用户报「表情包变破图」）。
     ///
     /// ## 真机现场
