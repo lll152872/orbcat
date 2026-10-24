@@ -174,6 +174,18 @@ pub struct PiRuntime {
     prompt_ctx: Arc<std::sync::Mutex<PromptCtx>>,
     /// 这个 pi 进程**属于哪个会话**（多会话并行时用于路由权限裁决）。
     session_id: Option<String>,
+    /// 宿主的 MCP 工具注册表（真身）—— 桥执行 MCP 工具要靠它查组、真调用。
+    ///
+    /// ⚠️ 必须是 `Arc`（`AppState.mcp` 就是 `Arc<Mutex<ToolRegistry>>`）
+    /// ⇒ 闭包是 move 的 ⇒ **先 clone 出来**再用。
+    /// ⚠️ 用 `Option` 包一层是为了能**替换**（`set_host_mcp_perm`）——
+    /// 与 `gate` 字段同款；`None` = 宿主还没注入（⇒ 桥走老路的空壳）。
+    mcp: std::sync::Arc<std::sync::Mutex<Option<Arc<tokio::sync::Mutex<crate::mcp::ToolRegistry>>>>>,
+    /// 宿主的授权表 —— 桥执行要靠它登记权限申请、弹确认卡、等用户裁决。
+    ///
+    /// ⚠️ `PermHub` 是**进程级单例**（内部状态自带 Mutex）⇒ 共享没问题；
+    /// 会话归属靠**请求载荷里带 session_id**，不需要「按会话找 hub」。
+    perm: std::sync::Arc<std::sync::Mutex<Option<Arc<crate::perm_request::PermHub>>>>,
     /// pi 的会话文件目录（`--session-dir`）。`None` = 用 `agent_dir/sessions`。
     ///
     /// 多会话并行时每个会话一个 pi 进程 ⇒ 各自的 session 文件必须**分目录**，
@@ -230,6 +242,8 @@ impl PiRuntime {
             session_id: None,
             session_dir: None,
             busy: AtomicBool::new(false),
+            mcp: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            perm: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -260,6 +274,8 @@ impl PiRuntime {
             session_id: Some(session_id.to_string()),
             session_dir: Some(session_dir),
             busy: AtomicBool::new(false),
+            mcp: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            perm: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -378,6 +394,64 @@ impl PiRuntime {
         // 同 set_gate：不走 blocking_lock（async 里会 panic），poison 也继续用。
         *self.confirm_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
     }
+
+    /// 注入宿主真实的 MCP 注册表 + 授权表。
+    ///
+    /// ## 为什么必须有它
+    ///
+    /// MCP 走**宿主桥**（单通道）⇒ 桥执行 MCP 工具时要靠宿主的注册表**查组**、
+    /// 靠宿主的 PermHub **弹确认卡**。没有它们 ⇒ MCP 工具要么调不动，
+    /// 要么（更糟）绕过了权限闸。
+    ///
+    /// ## 同步 —— 与 [`Self::set_gate`] 同口径
+    ///
+    /// 宿主在 `setup`（同步闭包）里调它 ⇒ 没法 await。
+    /// ⚠️ **不要用 `blocking_lock`**（在 async 上下文里会 panic）；
+    /// 用 `std::sync::Mutex` + `lock().unwrap_or_else(|e| e.into_inner())`
+    /// （poison 也要继续用 —— 静默跳过 = 没注入 = 权限闸失明）。
+    pub fn set_host_mcp_perm(
+        &self,
+        mcp: Arc<tokio::sync::Mutex<crate::mcp::ToolRegistry>>,
+        perm: Arc<crate::perm_request::PermHub>,
+    ) {
+        *self.mcp.lock().unwrap_or_else(|e| e.into_inner()) = Some(mcp);
+        *self.perm.lock().unwrap_or_else(|e| e.into_inner()) = Some(perm);
+    }
+
+    /// 取宿主真实的 MCP 注册表（**没注入 ⇒ None**）。
+    pub fn host_mcp_arc(&self) -> Option<Arc<tokio::sync::Mutex<crate::mcp::ToolRegistry>>> {
+        self.mcp.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 取宿主真实的授权表（**没注入 ⇒ None**）。
+    pub fn host_perm_arc(&self) -> Option<Arc<crate::perm_request::PermHub>> {
+        self.perm.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+/// MCP 工具清单（**从宿主共享的注册表现取**）。
+///
+/// ## 为什么是「共享的那份」
+///
+/// 单通道：orbcat 是唯一 MCP 网关 ⇒ 宿主自己有那份注册表 ⇒
+/// 直接用它（**单一来源**）⇒ 不会出现第二个 MCP 客户端、server 侧只有一个 session。
+///
+/// ## ⚠️ 宿主还没注入 ⇒ 清单为空
+///
+/// `set_host_mcp_perm` 没被调（宿主还没接）⇒ pi 侧**看不到任何 MCP 工具**。
+/// 这是**安全的降级**：宁可不给，也不给一条绕过宿主权限闸的路
+/// （那正是「关原生 MCP」要消灭的东西）。
+///
+/// ## 实时
+///
+/// 直接读宿主那份 ⇒ 宿主改了 MCP 配置 / 开关了某个组 ⇒ **下一轮就生效**
+/// （不需要重启、不需要缓存失效逻辑）。
+async fn host_mcp_specs(&self) -> Vec<crate::tools::ToolSpec> {
+    let Some(reg) = self.host_mcp_arc() else {
+        return Vec::new();
+    };
+    let reg = reg.lock().await;
+    mcp_tool_specs(&reg)
+}
 
     /// 内置 runtime 目录。
     pub fn runtime_dir(&self) -> &Path {
@@ -509,7 +583,7 @@ impl PiRuntime {
         //    防止 `--tools` 语义将来被 pi 改动后漏回去。
         let bridge_specs = crate::tools::bridge_specs_for_dir(&self.data_dir);
         // MCP 工具清单由**宿主**取（进程内直连），pi 自己不连 MCP server。
-        let mcp_specs = fetch_mcp_tool_specs(&self.data_dir).await;
+        let mcp_specs = self.host_mcp_specs().await;
         let tools = build_tools_whitelist(&bridge_specs, &mcp_specs);
         // 🔴 **关掉 pi 的原生 MCP（单通道，硬要求）**
         //
@@ -518,7 +592,7 @@ impl PiRuntime {
         // 不进 Rust 的 execute）⇒ 授权卡出不来、审计没行、事后禁用对
         // 在跑的 pi 无效 —— 宿主对 MCP **完全失明**。
         //
-        // 现在：① 清单由宿主取（上面 `fetch_mcp_tool_specs`），
+        // 现在：① 清单由宿主取（上面 `host_mcp_specs`），
         //      ② 执行回宿主 bridge ⇒ 每次调用都过权限闸。
         //
         // ⚠️ 光「不调 sync_mcp」**不够** —— agent 目录里可能还留着上一轮写的
@@ -1299,6 +1373,14 @@ impl PiRuntime {
             return Ok(b);
         }
         let data_dir = self.data_dir.clone();
+        // ⚠️ **执行侧要的是宿主真实的注册表 + 真实的授权表**（不是空壳）——
+        // MCP 工具必须能查到组、能弹确认卡、能留审计行。
+        // 闭包是 move 的 ⇒ 这里先把 Arc **clone 出来**再搬进去。
+        let host_mcp = self.host_mcp_arc();
+        let host_perm = self.host_perm_arc();
+        // ⚠️ **会话 id 要用「这个 pi 进程自己的」**，不是用户当前正在看的那个
+        // （多会话并行时两者会不一样）。权限申请靠它路由到对的窗口。
+        let sid = self.session_id.clone().unwrap_or_default();
         let handler: ToolHandler = Arc::new(move |tool, args| {
             // 工具名去掉 `orb_` 前缀 —— 那是给 pi 侧避免撞名用的
             let real = tool.strip_prefix("orb_").unwrap_or(tool);
@@ -1308,12 +1390,30 @@ impl PiRuntime {
             let args = args.clone();
             let name = real.to_string();
             let dd = data_dir.clone();
+            let mcp = host_mcp.clone();
+            let perm = host_perm.clone();
+            let sid = sid.clone();
             match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
             {
                 Ok(rt) => rt.block_on(async move {
-                    crate::tools::execute_bridge(&name, &args, &dd).await
+                    match (mcp, perm) {
+                        (Some(m), Some(p)) => {
+                            // ✅ 真实注册表 + 真实授权表 + 真实会话 id
+                            //    ⇒ MCP 工具走宿主网关分支（查组 → 授权卡 → 执行）
+                            crate::tools::execute_bridge_full(
+                                &name, &args, &dd, &m, &p, &sid,
+                            )
+                            .await
+                        }
+                        _ => {
+                            // 宿主还没注入 ⇒ 退回老路（空壳）。
+                            // ⚠️ 此时 MCP 工具名会被报「未知工具」——
+                            //    **这是安全的降级**（宁可不给，也不给一条绕过权限闸的路）。
+                            crate::tools::execute_bridge(&name, &args, &dd).await
+                        }
+                    }
                 }),
                 Err(e) => Err(format!("起工具执行 runtime 失败: {e}")),
             }
@@ -1411,55 +1511,6 @@ pub(crate) fn build_gate(
 // 会话池（多会话并行）
 // ---------------------------------------------------------------------------
 
-/// 宿主共享的 MCP 上下文（**进程级**）。
-///
-/// ## 为什么要有这个
-///
-/// (c) 形态：PiRuntime 自己连一次 MCP server 取清单 ⇒ 宿主出现**两个** MCP 客户端
-/// （server 侧两个 session）⇒ 执行路径唯一（不漏权限闸），但**不干净**。
-/// (a) 形态：宿主把**自己的** registry 与 perm hub 共享出来 ⇒ **单一来源**。
-///
-/// ## 共享安全吗
-///
-/// - `ToolRegistry` 内部可变状态自带锁（`Arc<Mutex<_>>`）⇒ 共享没问题。
-/// - `PermHub` 内部所有可变状态也自带 Mutex，`emitter` 是 `OnceLock`（setup 注入）
-///   ⇒ **它本来就是设计成进程级共享的**。
-/// - 权限请求靠 **`session_id` 区分**（`ask_mcp_tool(name, args, session_id)` 的第三个参数）
-///   ⇒ 不需要「按会话找 hub」那套东西：一个共享 hub + 真实 session_id 就够。
-pub struct HostMcp {
-    /// 宿主的 MCP 注册表（`Arc<Mutex<ToolRegistry>>`）
-    pub mcp: Arc<tokio::sync::Mutex<crate::mcp::ToolRegistry>>,
-    /// 宿主的权限中枢（进程级单例）
-    pub perm: Arc<crate::perm_request::PermHub>,
-}
-
-static HOST_MCP: std::sync::OnceLock<HostMcp> = std::sync::OnceLock::new();
-
-/// 注册宿主共享的 MCP 上下文（**宿主在 `setup` 里调一次**）。
-///
-/// ```ignore
-/// // lib.rs 的 setup 里：
-/// pi_runtime::register_host_mcp(state.mcp.clone(), state.perm.clone());
-/// ```
-///
-/// ## 现在是什么状态
-///
-/// ⚠️ **宿主还没接**（后端在做 `execute_bridge_full`）⇒ 静态槽是空的
-/// ⇒ 清单侧自动回落 (c)（自建 registry + 5s 超时 + 降级）⇒ 行为不变、零风险。
-/// 宿主一接上，这里**自动**切到 (a) —— **不需要再改任何代码**。
-pub fn register_host_mcp(
-    mcp: Arc<tokio::sync::Mutex<crate::mcp::ToolRegistry>>,
-    perm: Arc<crate::perm_request::PermHub>,
-) {
-    let _ = HOST_MCP.set(HostMcp { mcp, perm });
-    eprintln!("[orbcat][pi] 已注册宿主共享 MCP 上下文（MCP 清单走单一来源）");
-}
-
-/// 取宿主共享的 MCP 上下文（**未注册 ⇒ None** ⇒ 调用方走 (c) 兜底）。
-pub fn host_mcp() -> Option<&'static HostMcp> {
-    HOST_MCP.get()
-}
-
 /// MCP 工具规格（**只给 pi 一份声明，不给它一条执行路**）。
 ///
 /// ## 为什么要有这个函数
@@ -1499,117 +1550,6 @@ pub fn mcp_tool_specs(reg: &crate::mcp::ToolRegistry) -> Vec<crate::tools::ToolS
     specs
 }
 
-/// 拉一份 MCP 工具清单（**进程内直连**，不走 HTTP 端口）。
-///
-/// ## 为什么在 Rust 侧拉，而不是让 pi 自己连
-///
-/// 单通道：pi **不再自己连 MCP server**（执行一律回宿主桥）。
-/// 但 pi 仍需要工具**声明**才能把 MCP 工具告诉模型 ⇒ 清单由宿主取、宿主给。
-///
-/// ## ⚠️ 这是「第二份」MCP 连接
-///
-/// 宿主自己的 registry（`AppState.mcp`）在 `lib.rs` 里，而 `PiRuntime`
-/// 只有 `data_dir` ⇒ 这里只能**自己连一次**取清单。
-/// **执行仍然只有一条路**（宿主 bridge ⇒ 宿主 registry）⇒ 权限闸不失明。
-///
-/// 若后端后续把宿主 registry 共享出来（`PiPool` 注入），
-/// 这里应改成直接读那份 —— 单一来源，也省掉一次连接。
-///
-/// ## 失败必须降级，不能连累 pi
-///
-/// MCP server 挂了 / 超时 ⇒ 清单为空 ⇒ pi 照常起（只是这轮没有 MCP 工具）。
-/// 反过来做就会变成「MCP 不可用 ⇒ 整个 pi 起不来」。
-pub async fn fetch_mcp_tool_specs(data_dir: &Path) -> Vec<crate::tools::ToolSpec> {
-    // ── ① 宿主共享的 registry（(a) 形态）优先 ──
-    //
-    // 单一来源、实时（宿主改了 MCP 配置下一轮就生效）、**零额外连接**。
-    // 宿主还没注册 ⇒ 落到下面的 (c) 兜底。
-    if let Some(h) = host_mcp() {
-        let reg = h.mcp.lock().await;
-        return mcp_tool_specs(&reg);
-    }
-
-    // ── 缓存命中就直接用（别每个会话都连一遍 MCP server）──
-    //
-    // ⚠️ (c) 的代价：这里是**第二份** MCP 连接（宿主自己的 registry 在
-    // `lib.rs` 里，`PiRuntime` 拿不到）⇒ 每个 pi 进程都去连一次的话，
-    // 开 N 个会话就是 N 次连接 + N 组 stdio 子进程。
-    // ⇒ 进程级缓存 + TTL 把它压成「一个宿主进程最多一次」。
-    //
-    // ⚠️ TTL 到期或 MCP 配置变更后清单会过期 ⇒ (a) 落地后（宿主共享 registry）
-    // 这里应改成直接读那份 ⇒ 既是单一来源，也永远不过期。
-    {
-        let g = MCP_SPEC_CACHE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some((at, raw)) = g.as_ref() {
-            if at.elapsed() < MCP_SPEC_TTL {
-                return raw
-                    .iter()
-                    .map(|(n, d, p)| crate::tools::ToolSpec {
-                        name: n.clone(),
-                        description: d.clone(),
-                        parameters: p.clone(),
-                    })
-                    .collect();
-            }
-        }
-    }
-    let raw = fetch_mcp_tool_specs_raw(data_dir).await;
-    *MCP_SPEC_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some((std::time::Instant::now(), raw.clone()));
-    raw.into_iter()
-        .map(|(n, d, p)| crate::tools::ToolSpec {
-            name: n,
-            description: d,
-            parameters: p,
-        })
-        .collect()
-}
-
-/// 清单缓存（进程级）。`(时刻, 工具规格三元组)`。
-///
-/// ⚠️ 存的是**三元组**而不是 `ToolSpec` —— `ToolSpec` 没有 `Clone`
-/// （它在 `tools.rs`，后端域），缓存一份就克隆不出来。
-static MCP_SPEC_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<(String, String, Value)>)>> =
-    std::sync::Mutex::new(None);
-
-/// 清单缓存有效期。
-const MCP_SPEC_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// 真去拉一次清单（**不做缓存**）。
-async fn fetch_mcp_tool_specs_raw(data_dir: &Path) -> Vec<(String, String, Value)> {
-    let servers = crate::config::resolve_mcp_servers(data_dir);
-    if servers.is_empty() {
-        return Vec::new();
-    }
-    let mut reg = crate::mcp::ToolRegistry::with_servers(&servers);
-    let clients = reg.clients_clone();
-    // ⚠️ **不要提前解包 Result** —— `apply_snapshot_with_settings` 吃的就是
-    // `Result<(..)>`，它内部负责「拉取失败 ⇒ 清空组」这条降级路径。
-    let snap = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        crate::mcp::ToolRegistry::fetch_snapshot(&clients),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(_) => {
-            eprintln!("[orbcat][pi] MCP 工具清单拉取超时 5s（本轮没有 MCP 工具）");
-            return Vec::new();
-        }
-    };
-    if let Err(e) = &snap {
-        eprintln!("[orbcat][pi] MCP 工具清单拉取失败（本轮没有 MCP 工具）：{e}");
-    }
-    let settings = crate::config::load_settings(data_dir);
-    reg.apply_snapshot_with_settings(snap, &settings);
-    mcp_tool_specs(&reg)
-        .into_iter()
-        .map(|s| (s.name, s.description, s.parameters))
-        .collect()
-}
 
 /// pi 的 `--tools` 白名单。
 ///
@@ -1705,6 +1645,12 @@ pub struct PiPool {
     gate: std::sync::Arc<std::sync::Mutex<Option<GateFn>>>,
     /// 宿主确认钩子（pi 的确认框 → 我们的确认卡）
     confirm_hook: std::sync::Arc<std::sync::Mutex<Option<ConfirmFn>>>,
+    /// 宿主真实的 MCP 注册表（创建新运行时时套上）
+    host_mcp: std::sync::Arc<
+        std::sync::Mutex<Option<Arc<tokio::sync::Mutex<crate::mcp::ToolRegistry>>>>,
+    >,
+    /// 宿主真实的授权表（创建新运行时时套上）
+    host_perm: std::sync::Arc<std::sync::Mutex<Option<Arc<crate::perm_request::PermHub>>>>,
     /// 最多同时存在几个 pi 进程
     max_live: std::sync::atomic::AtomicUsize,
 }
@@ -1722,6 +1668,8 @@ impl PiPool {
             )),
             gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
             confirm_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            host_mcp: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            host_perm: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_live: std::sync::atomic::AtomicUsize::new(2),
         })
     }
@@ -1764,6 +1712,56 @@ impl PiPool {
         };
         if applied > 0 {
             eprintln!("[orbcat] pi 内核：已把宿主权限闸套到 {applied} 个已存在的运行时");
+        }
+    }
+
+    /// 注入宿主真实的 MCP 注册表 + 授权表。
+    ///
+    /// ## 🔴 必须**同时套到「已经存在」的运行时上**
+    ///
+    /// 这是 P2 的教训：池里的运行时是**懒创建**的（首次对话才建）⇒
+    /// 「先 acquire、后 set」是**常见顺序**，不是边角情况。
+    /// 只写池子那份 ⇒ 已经建出来的运行时永远拿不到 ⇒
+    /// **MCP 授权静默降级**成静态拒绝（用户永远等不到确认卡，且**没有任何日志**）。
+    ///
+    /// 与 [`PiPool::set_gate`] 同口径：同步、std Mutex、抢不到锁时**打一行显式日志**
+    ///（不许静默跳过）。
+    pub fn set_host_mcp_perm(
+        &self,
+        mcp: Arc<tokio::sync::Mutex<crate::mcp::ToolRegistry>>,
+        perm: Arc<crate::perm_request::PermHub>,
+    ) {
+        {
+            let mut slot = self.host_mcp.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(mcp.clone());
+        }
+        {
+            let mut slot = self.host_perm.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(perm.clone());
+        }
+        let sessions = self.sessions.clone();
+        let applied: usize = match sessions.try_lock() {
+            Ok(map) => {
+                let n = map.len();
+                for rt in map.values() {
+                    rt.set_host_mcp_perm(mcp.clone(), perm.clone());
+                }
+                n
+            }
+            Err(_) => {
+                // ⚠️ **不能静默跳过** —— 那些会话的 MCP 调用会退化成静态拒绝
+                //（用户等不到确认卡）。抢不到锁 ⇒ 至少要留下一行日志。
+                eprintln!(
+                    "[orbcat] ⚠️ pi 内核：宿主 MCP 注册表/授权表**没套到**已有运行时上\
+                     （会话表锁被占）—— 那些会话的 MCP 授权会退化成静态拒绝。"
+                );
+                0
+            }
+        };
+        if applied > 0 {
+            eprintln!(
+                "[orbcat] pi 内核：已把宿主 MCP 注册表/授权表套到 {applied} 个已存在的运行时"
+            );
         }
     }
 
@@ -1881,6 +1879,15 @@ impl PiPool {
             let hook = self.confirm_hook.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if let Some(hook) = hook {
                 rt.set_confirm_hook(hook);
+            }
+        }
+        {
+            // 宿主的 MCP 注册表 + 授权表同样要套到新运行时上
+            //（否则这个会话的 MCP 工具走不进宿主网关 ⇒ 授权卡出不来）。
+            let mcp = self.host_mcp.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let perm = self.host_perm.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let (Some(mcp), Some(perm)) = (mcp, perm) {
+                rt.set_host_mcp_perm(mcp, perm);
             }
         }
         g.insert(session_id.to_string(), rt.clone());
@@ -2099,6 +2106,46 @@ mod tests {
             "名字口径必须是 mcp__<组名>__<工具名>：{:?}",
             mine.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 🔴 注入宿主**共享**的注册表后，清单里就该有 MCP 工具。
+    ///
+    /// 这是「单一来源」的正向证据：清单**不自己连 MCP server**，
+    /// 只读宿主那份 ⇒ 不会出现第二个 MCP 客户端。
+    #[tokio::test]
+    async fn 注入共享注册表后_清单里有mcp工具且名字是mcp前缀() {
+        let mut reg = crate::mcp::ToolRegistry::from_tools_for_test(vec![
+            crate::mcp::McpTool {
+                name: "github_1mcp_create_issue".into(),
+                description: "Create an issue".into(),
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                annotations: None,
+            },
+        ]);
+        reg.restore_active_from_settings_unrestricted(&crate::config::AgentSettings::default());
+
+        let tmp = std::env::temp_dir().join("orbcat_host_mcp_specs");
+        let rt = PiRuntime::new(tmp.clone(), tmp.clone());
+        // 没注入 ⇒ 清单为空（安全的降级：宁可不给，也不给绕过权限闸的路）
+        assert!(rt.host_mcp_specs().await.is_empty(), "没注入时清单应为空");
+
+        rt.set_host_mcp_perm(
+            Arc::new(tokio::sync::Mutex::new(reg)),
+            Arc::new(crate::perm_request::PermHub::new()),
+        );
+        let specs = rt.host_mcp_specs().await;
+        assert_eq!(specs.len(), 1, "注入后清单里应有一条 MCP 工具：{:?}", specs.iter().map(|s| &s.name).collect::<Vec<_>>());
+        assert_eq!(specs[0].name, "mcp__default__github_1mcp_create_issue");
+
+        // 白名单：只有 orb_ 前缀版，没有 MCP 裸名
+        let wl = super::build_tools_whitelist(&[], &specs);
+        assert!(
+            wl.iter().any(|t| t == "orb_mcp__default__github_1mcp_create_issue"),
+            "{wl:?}"
+        );
+        assert!(!wl.iter().any(|t| t.starts_with("mcp__")), "{wl:?}");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
