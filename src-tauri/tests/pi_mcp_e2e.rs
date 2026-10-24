@@ -1,43 +1,43 @@
-//! **MCP 端到端** —— 验证 pi 真的能连 MCP server、真的能调到 MCP 工具。
+//! **MCP 端到端（单通道）** —— 验证「MCP 走宿主桥、pi 不再自己连 MCP server」。
 //!
-//! ## 为什么必须测这条
+//! ## 架构背景（2026-10-24 用户拍板）
 //!
-//! MCP 是**唯一没被验证过的代码路径**：
-//! - `sync_mcp()` 把 orbcat 的 `mcp.json` 转成 pi 的格式
-//! - 白名单加 `mcp__*` 让工具直接声明给模型
-//! - `pi_host_gate` 里对 `mcp__*` 走 grants / 确认卡
+//! 「走宿主桥，orbcat 本身作为 mcp 网管给 pi 提供 mcp」⇒
+//! ① **orbcat 是唯一 MCP 网关**，pi 不再自己连 MCP server；
+//! ② **单通道** —— pi 的原生 MCP 必须关掉
+//!    （否则模型有两条路能调 MCP，宿主权限闸形同虚设）；
+//! ③ MCP 工具经宿主的桥给 pi ⇒ 每次调用都过 orbcat 的权限闸。
 //!
-//! 上面三条都"看起来对"，但**没有一次「pi 连上 server → 列出工具 →
-//! 模型调工具 → 工具真的执行」的实测**。代码路径没跑过 ≠ 能跑。
+//! ## 这条锁的是什么
 //!
-//! ## 怎么测
+//! **关原生**这件事有两个坑，少做一个都不算关掉：
 //!
-//! 起一个**本地假 MCP server**（`tests/fake_mcp_server.cjs`，JSON-RPC over stdio），
-//! 再起**假模型**（`tests/fake_model.rs`）驱动它去调 MCP 工具：
-//!
-//! ```text
-//! 假模型（第一轮）→ 回 tool_calls: mcp__orbcat-test__get_marker
-//!                          ↓
-//!   pi 的 MCP client（真）→ 真的连上假 server（真 stdio JSON-RPC）
-//!                          ↓
-//!   假 server 执行 → 回 "MCP-MARKER-42" + 往 trace 文件留痕
-//!                          ↓
-//! 假模型（第二轮）→ 看到结果 → 给最终答复
-//! ```
+//! - **坑 1**：光「不调 `sync_mcp()`」**不够** —— pi 的 agent 目录里可能还留着
+//!   上一轮写的 `mcp.json` ⇒ pi 照样读它、照样注册原生 MCP 工具。
+//!   ⇒ 必须**显式删掉那个文件**（`disable_native_mcp`）。
+//! - **坑 2**：白名单里若还留着 `mcp__*`（裸名或通配），pi 仍会放行原生那条路。
+//!   ⇒ 白名单里**只准有 `orb_mcp__*`**（桥侧加 `orb_` 前缀后的名字）。
 //!
 //! ## 断言什么
 //!
-//! 1. **假 server 真的被连上了**（trace 里有 `initialize`）
-//! 2. **`tools/list` 真的被问了**（trace 里有 `tools/list`）
-//! 3. **工具真的被调了、参数真的是那个**（trace 里有 `tools/call` + name）
-//! 4. **pi 侧看到了工具结果**（`MCP-MARKER-42` 出现在 steps 里）
-//! 5. **`mcp.json` 格式对**（pi 真的能读）
+//! 1. **模型实际看到的工具表里没有任何 `mcp__` 裸名**（判据 4，闸门不可绕）
+//! 2. pi 的 agent 目录里**没有** `mcp.json`
+//! 3. 注入的假 MCP server **一次都没被连过**（没有 initialize / tools/list）
+//! 4. orbcat 私有工具（`orb_read_file`）照旧在工具表里（判据 6）
+//! 5. MCP 不可用时**不连累**主链路（pi 照常起、照常答）
+//!
+//! ## ⚠️ 还没覆盖的（要后端的执行侧通路就绪）
+//!
+//! 「模型调 MCP 工具 ⇒ 宿主权限请求 > 0 条 / 批准后真执行 / 驳回不执行 /
+//! 宿主禁用后在跑的 pi 立刻调不动」—— 这四条**依赖宿主桥能把 MCP 工具
+//! 送进 `execute` 的网关分支**（`tools.rs` 的 `execute_bridge_full`，
+//! 后端在做）。在那之前，这里只锁**清单侧与通道侧**。
 
 #[path = "fake_model.rs"]
 mod fake_model;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use orbcat_lib::agent::ProgressFn;
@@ -73,7 +73,6 @@ fn orbcat_data_dir() -> Option<PathBuf> {
 
 /// 找到 `fake_mcp_server.cjs`（源码在 `src-tauri/tests/` 下）。
 fn fake_mcp_script() -> Option<PathBuf> {
-    // 测试 exe 在 target/debug/deps/ → 往上找到 src-tauri/
     let mut p = std::env::current_exe().ok()?;
     for _ in 0..6 {
         p = p.parent()?.to_path_buf();
@@ -86,7 +85,7 @@ fn fake_mcp_script() -> Option<PathBuf> {
 }
 
 /// 读 trace 文件里某一类记录。
-fn read_trace(path: &std::path::Path) -> Vec<serde_json::Value> {
+fn read_trace(path: &Path) -> Vec<serde_json::Value> {
     let Ok(txt) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -95,14 +94,40 @@ fn read_trace(path: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// MCP 全链路：pi 连上 server → 列出工具 → 模型调用 → 工具真的执行。
+/// 造一个**干净**的数据目录：只有 `models.json`，**没有 `mcp.json`**。
+///
+/// ## 为什么
+///
+/// 清单通路会连真实的 MCP server（`resolve_mcp_servers` 读 `data_dir/mcp.json`）
+/// ⇒ 测试要**零网络**、零子进程，就必须让那个目录里没有 `mcp.json`。
+fn clean_data_dir(real: &Path) -> Option<PathBuf> {
+    let d = std::env::temp_dir().join(format!("orbcat-pi-mcp-data-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).ok()?;
+    std::fs::copy(real.join("models.json"), d.join("models.json")).ok()?;
+    Some(d)
+}
+
+/// 从假模型的**请求历史**里取出模型实际看到的工具名。
+///
+/// 这是端到端证据：请求体里的 `tools` 数组就是 provider 收到的声明。
+fn model_tool_names(fake: &fake_model::FakeModel) -> Vec<String> {
+    let hist = fake.request_history();
+    hist.iter()
+        .filter_map(|r| r.get("tools").and_then(|t| t.as_array()))
+        .flatten()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect()
+}
+
+/// 🔴 单通道的核心用例：pi **不再自己连** MCP server。
 #[tokio::test]
-async fn pi能连上mcp并真的调到mcp工具() {
+async fn pi不再自己连mcp_server_模型只看得到orb前缀的工具() {
     let Some(runtime) = runtime_dir() else {
         eprintln!("跳过：runtime/ 未构建");
         return;
     };
-    let Some(data_dir) = orbcat_data_dir() else {
+    let Some(real_data) = orbcat_data_dir() else {
         eprintln!("跳过：找不到 agent-data/");
         return;
     };
@@ -110,32 +135,22 @@ async fn pi能连上mcp并真的调到mcp工具() {
         eprintln!("跳过：找不到 tests/fake_mcp_server.cjs");
         return;
     };
+    let Some(data_dir) = clean_data_dir(&real_data) else {
+        eprintln!("跳过：造不出干净的数据目录");
+        return;
+    };
 
     // ── trace 文件：假 MCP server 每次调用都往里写一行 ──
-    let trace_path = std::env::temp_dir().join("orbcat-mcp-trace.jsonl");
+    let trace_path = std::env::temp_dir().join(format!("orbcat-mcp-trace-{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&trace_path);
 
-    // ── 假模型：第一轮让模型调 **MCP 工具**，第二轮给答复 ──
-    //
-    // ⚠️ 工具全名是 `mcp__<server>__<tool>`：
-    //   server 名 = `orbcat-test`（`-` 在命名空间里会换 `_`）
-    //   工具名   = `get_marker`
-    // 所以模型看到的是 `mcp__orbcat-test__get_marker`。
-    //
-    // 注意：`FakeModel::start` 会自己加 `orb_` 前缀，
-    // 所以这里传的 tool_name 需要**绕过**那个前缀 —— 用 `start_raw()`。
-    let fake = fake_model::FakeModel::start_raw(
-        "mcp__orbcat_test__get_marker",
-        json!({}),
-        "MCP 工具返回了 MCP-MARKER-42。",
-    )
-    .expect("假模型应能起");
+    let fake = fake_model::simple_text_model("好的。").expect("假模型应能起");
 
-    let agent_dir = std::env::temp_dir().join("orbcat-pi-mcp-agent");
+    let agent_dir = std::env::temp_dir().join(format!("orbcat-pi-mcp-agent-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&agent_dir);
     let _ = std::fs::create_dir_all(&agent_dir);
 
-    // 假 server 需要内置 node 跑（用户机器上没有裸 node 也能跑）
+    // 假 server 需要内置 node 跑
     let node = runtime.join("node").join("node.exe");
 
     let rt = PiRuntime::with_agent_dir(data_dir.clone(), runtime.clone(), agent_dir.clone());
@@ -143,7 +158,7 @@ async fn pi能连上mcp并真的调到mcp工具() {
     rt.set_gate(Arc::new(|_t, _a, _sid| {
         Box::pin(async { (true, String::new()) })
     }));
-    // 注入假 MCP server（不写用户的 agent-data/mcp.json）
+    // 注入假 MCP server —— 只用来证明「pi 没有去连它」
     let mut env = BTreeMap::new();
     env.insert(
         "MCP_TRACE_FILE".to_string(),
@@ -158,110 +173,91 @@ async fn pi能连上mcp并真的调到mcp工具() {
     .await;
 
     let progress: ProgressFn = Arc::new(|_p| {});
-
-    let result = tokio::time::timeout(
+    let r = tokio::time::timeout(
         std::time::Duration::from_secs(90),
-        rt.run("调用 get_marker 工具，告诉我它返回了什么。", vec![], progress),
+        rt.run("你好。", vec![], progress),
     )
     .await;
-
-    // ── 先看 pi 的 mcp.json 写成什么样（不管成败都能查）──
-    let mcp_json = agent_dir.join("mcp.json");
-    let mcp_txt = std::fs::read_to_string(&mcp_json).unwrap_or_default();
-    eprintln!("=== pi 的 mcp.json ===\n{mcp_txt}");
-
-    let trace = read_trace(&trace_path);
-    eprintln!("=== MCP trace（{} 条）===", trace.len());
-    for t in &trace {
-        eprintln!("{}", t);
+    match r {
+        Err(_) => panic!("90 秒超时"),
+        Ok(Err(e)) => panic!("链路报错: {e}"),
+        Ok(Ok(_)) => {}
     }
 
-    let result = match result {
-        Err(_) => panic!(
-            "90 秒超时 —— 假模型 + 假 MCP server 都是本地的，超时说明链路卡住。\n\
-             trace: {trace:?}"
-        ),
-        Ok(Err(e)) => panic!("链路报错: {e}\n trace: {trace:?}"),
-        Ok(Ok(r)) => r,
-    };
-
-    eprintln!("=== 最终答复 ===\n{}", result.answer);
-    eprintln!("=== 步骤 ===\n{:#?}", result.steps);
-
-    // ── 验收 1：pi 的 mcp.json 里有注入的 server，且 exposure=direct ──
+    // ── 判据 4：模型实际看到的工具表里**没有任何 `mcp__` 裸名** ──
+    //
+    // ⚠️ 这是**最硬**的一条：它是「模型实际收到的东西」，
+    // 不是我们自己的变量。
+    let names = model_tool_names(&fake);
+    eprintln!("=== 模型看到的工具（{} 个）===", names.len());
+    let bare: Vec<&String> = names.iter().filter(|n| n.starts_with("mcp__")).collect();
     assert!(
-        mcp_txt.contains("orbcat-test") || mcp_txt.contains("orbcat_test"),
-        "pi 的 mcp.json 里应有注入的 server，实际:\n{mcp_txt}"
-    );
-    assert!(
-        mcp_txt.contains("\"direct\""),
-        "exposure 必须是 direct（否则工具不直接给模型），实际:\n{mcp_txt}"
+        bare.is_empty(),
+        "🔴 模型看到了 MCP 裸名 {bare:?} —— pi 原生 MCP 还在放行（单通道失效，闸门可绕）\n\
+         全部工具名：{names:?}"
     );
 
-    // ── 验收 2：假 server 真被**连上**了（initialize）──
+    // ── 判据 6：orbcat 私有工具照旧在工具表里 ──
+    assert!(
+        names.iter().any(|n| n == "orb_read_file"),
+        "orb_read_file 应在工具表里：{names:?}"
+    );
+
+    // ── 坑 1：pi 的 agent 目录里**没有** mcp.json ──
+    let mcp_json = agent_dir.join("mcp.json");
+    assert!(
+        !mcp_json.exists(),
+        "🔴 pi 的 agent 目录里还有 mcp.json —— 原生 MCP 通道还开着（pi 照样会读它）"
+    );
+
+    // ── 坑 2：注入的假 server **一次都没被连过** ──
+    let trace = read_trace(&trace_path);
     let kinds: Vec<String> = trace
         .iter()
         .filter_map(|v| v.get("kind").and_then(|k| k.as_str()).map(|s| s.to_string()))
         .collect();
     assert!(
-        kinds.iter().any(|k| k == "initialize"),
-        "MCP server 应该收到 initialize（说明 pi 真的连上了），实际 trace kinds: {kinds:?}"
+        !kinds.iter().any(|k| k == "initialize"),
+        "🔴 pi 仍然自己去连 MCP server（原生通道没关掉）：{kinds:?}"
     );
     assert!(
-        kinds.iter().any(|k| k == "tools/list"),
-        "MCP server 应该收到 tools/list（说明 pi 真的列了工具），实际: {kinds:?}"
+        !kinds.iter().any(|k| k == "tools/list"),
+        "🔴 pi 仍然自己去列 MCP 工具：{kinds:?}"
     );
 
-    // ── 验收 3：工具**真的被调了**，名字对 ──
-    let call = trace.iter().find(|v| {
-        v.get("kind").and_then(|k| k.as_str()) == Some("tools/call")
-    });
-    let Some(call) = call else {
-        panic!("MCP 工具应该被调用过（trace 里没有 tools/call），实际 trace: {trace:?}");
-    };
-    let called_name = call
-        .get("payload")
-        .and_then(|p| p.get("name"))
-        .and_then(|n| n.as_str())
-        .unwrap_or("");
-    assert_eq!(
-        called_name, "get_marker",
-        "调用的应该是 get_marker，实际: {called_name}"
-    );
-
-    // ── 验收 4：工具结果回到了 pi（模型看到了 MCP-MARKER-42）──
-    let saw_marker = result
-        .steps
-        .iter()
-        .any(|s| s.detail.contains("MCP-MARKER-42"));
-    assert!(
-        saw_marker,
-        "步骤里应出现 MCP 工具返回的 MCP-MARKER-42，实际: {:#?}",
-        result.steps
-    );
+    let _ = std::fs::remove_file(&trace_path);
+    let _ = std::fs::remove_dir_all(&agent_dir);
+    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
-/// 对照测试：MCP server **连不上**时，不该把整轮拖死。
+/// 对照测试：MCP **不可用**时，不该把整轮拖死。
 ///
-/// 现实场景：用户在设置里配了一个 server 但其进程没起（或路径错了）。
-/// 这时 pi 应该报错但**不卡**，而 orbcat 应该能把错误传出来。
+/// 现实场景：用户在设置里配了一个 server，但它挂了 / 路径错了。
+///
+/// ⚠️ 单通道之后，这条路的形态变了：
+/// **清单拉不到 ⇒ 清单为空 ⇒ pi 照常起（只是这轮没有 MCP 工具）**。
+/// 关键不是「报错」，而是**主链路不被连累**。
 #[tokio::test]
-async fn mcp_server连不上时不卡死() {
+async fn mcp不可用时不卡死() {
     let Some(runtime) = runtime_dir() else {
         eprintln!("跳过：runtime/ 未构建");
         return;
     };
-    let Some(data_dir) = orbcat_data_dir() else {
+    let Some(real_data) = orbcat_data_dir() else {
         eprintln!("跳过：找不到 agent-data/");
+        return;
+    };
+    let Some(data_dir) = clean_data_dir(&real_data) else {
+        eprintln!("跳过：造不出干净的数据目录");
         return;
     };
 
     let fake = fake_model::simple_text_model("好的。").expect("假模型应能起");
-    let agent_dir = std::env::temp_dir().join("orbcat-pi-mcp-bad-agent");
+    let agent_dir = std::env::temp_dir().join(format!("orbcat-pi-mcp-bad-agent-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&agent_dir);
     let _ = std::fs::create_dir_all(&agent_dir);
 
-    let rt = PiRuntime::with_agent_dir(data_dir.clone(), runtime.clone(), agent_dir);
+    let rt = PiRuntime::with_agent_dir(data_dir.clone(), runtime.clone(), agent_dir.clone());
     rt.set_model_override("fake-model", fake.base_url()).await;
     rt.set_gate(Arc::new(|_t, _a, _sid| {
         Box::pin(async { (true, String::new()) })
@@ -287,7 +283,7 @@ async fn mcp_server连不上时不卡死() {
     eprintln!("=== 耗时 {:?} ===", elapsed);
 
     match r {
-        Err(_) => panic!("90 秒超时 —— MCP 连不上不该把整轮拖死"),
+        Err(_) => panic!("90 秒超时 —— MCP 不可用不该把整轮拖死"),
         Ok(Err(e)) => {
             // 报错可以接受（连接失败是真实错误），关键是要**快速**报错
             eprintln!("链路报错（可接受）: {e}");
@@ -301,4 +297,7 @@ async fn mcp_server连不上时不卡死() {
             eprintln!("对话照常完成（MCP 故障没影响主链路）: {}", run.answer);
         }
     }
+
+    let _ = std::fs::remove_dir_all(&agent_dir);
+    let _ = std::fs::remove_dir_all(&data_dir);
 }

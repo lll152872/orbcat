@@ -491,31 +491,40 @@ impl PiRuntime {
         // ⚠️ 另有一道独立的闸：`--exclude-tools`（见 `pi::PiConfig::exclude_tools`），
         //    优先级最高，把这 8 个从 registry 里**整个剔除** —— 双保险，
         //    防止 `--tools` 语义将来被 pi 改动后漏回去。
-        let mut tools: Vec<String> = Vec::new();
-        // orbcat 的工具用 `orb_` 前缀注册，避免和 pi 内置撞名
-        for name in crate::tools::BUILTIN_TOOL_NAMES {
-            tools.push(format!("orb_{name}"));
-        }
-        // L1 项目脚本工具（`check_homework` 这种）：名字随 bundle 变，
-        // 所以要**从当前项目现取** —— 换项目后白名单也要跟着变。
+        // ── 工具清单：orbcat 私有工具 + 项目 L1 工具 + MCP 工具 ──
         //
-        // ⚠️ 白名单是 `--tools`（**替换**语义），漏了就等于工具没注册。
-        for spec in crate::tools::bridge_specs_for_dir(&self.data_dir) {
-            // `fetch_url` / `web_search` 已在 BUILTIN_TOOL_NAMES 里（上面加过了）
-            if crate::tools::BUILTIN_TOOL_NAMES.contains(&spec.name.as_str()) {
-                continue;
-            }
-            tools.push(format!("orb_{}", spec.name));
-        }
-        // MCP 工具：pi 原生连自己的 MCP server。
+        // ⚠️ **绝不列 pi 的内置工具**（read/bash/edit/write/grep/find/ls/powershell）——
         //
-        // ⚠️ **必须显式加 `mcp__*`** —— pi 的 allowlist 逻辑是：
-        // 白名单里**没有** `mcp__` 开头的条目时，MCP 工具虽然仍被注册，
-        // 但只给 codemode / tool_search 用，**不直接声明给模型**
-        // （`agent-session.ts:1557` `_isAllowedTool`）。
-        // orbcat 的用户预期是「像别的工具一样直接调」→ 所以显式放行。
-        if self.sync_mcp().await? > 0 {
-            tools.push("mcp__*".into());
+        // `--tools` 是**替换语义**：列进去它就进 pi 的 registry，模型能直接调，
+        // 而它们**原生执行**，**不经过** orbcat 的 `permission.rs` 文件网关与
+        // `command_policy.rs` 命令策略 ⇒ 权限体系出现旁路。
+        //
+        // 实测（2026-10-23）：pi 的 `bash` RPC 真的执行了命令并返回结果。
+        //
+        // orbcat 有全套等价物（`orb_read_file` / `orb_write_file` / `orb_edit_file` /
+        // `orb_grep_files` / `orb_list_dir` / `orb_run_command`），**都走网关**。
+        //
+        // ⚠️ 另有一道独立的闸：`--exclude-tools`（见 `pi::PiConfig::exclude_tools`），
+        //    优先级最高，把这 8 个从 registry 里**整个剔除** —— 双保险，
+        //    防止 `--tools` 语义将来被 pi 改动后漏回去。
+        let bridge_specs = crate::tools::bridge_specs_for_dir(&self.data_dir);
+        // MCP 工具清单由**宿主**取（进程内直连），pi 自己不连 MCP server。
+        let mcp_specs = fetch_mcp_tool_specs(&self.data_dir).await;
+        let tools = build_tools_whitelist(&bridge_specs, &mcp_specs);
+        // 🔴 **关掉 pi 的原生 MCP（单通道，硬要求）**
+        //
+        // 用户 2026-10-24 拍板「走宿主桥，orbcat 本身作为 mcp 网管给 pi 提供 mcp」：
+        // 原生那条路**绕过宿主权限闸**（工具调用走 pi 的 MCP client，
+        // 不进 Rust 的 execute）⇒ 授权卡出不来、审计没行、事后禁用对
+        // 在跑的 pi 无效 —— 宿主对 MCP **完全失明**。
+        //
+        // 现在：① 清单由宿主取（上面 `fetch_mcp_tool_specs`），
+        //      ② 执行回宿主 bridge ⇒ 每次调用都过权限闸。
+        //
+        // ⚠️ 光「不调 sync_mcp」**不够** —— agent 目录里可能还留着上一轮写的
+        // `mcp.json` ⇒ pi 照样会连 ⇒ 必须显式删掉。
+        if disable_native_mcp(&self.agent_dir) {
+            eprintln!("[orbcat][pi] 已移除 pi 的原生 MCP 配置（单通道：MCP 走宿主桥）");
         }
         cfg.tools = tools;
 
@@ -531,6 +540,14 @@ impl PiRuntime {
                 ));
             }
         }
+        // 🔴 单通道自检：白名单里**不许**有 `mcp__*` 裸名。
+        // 有 = pi 原生 MCP 还在放行 = 模型有第二条路能调 MCP = 闸门形同虚设。
+        if let Some(bad) = cfg.tools.iter().find(|t| t.starts_with("mcp__")) {
+            return Err(format!(
+                "--tools 白名单里出现了 MCP 裸名 `{bad}` —— pi 原生 MCP 必须关掉（MCP 只能走宿主桥）"
+            ));
+        }
+        // 排除闸也必须真的带上（`PiConfig::new` 默认就有，但别被谁清掉了）
         // 排除闸也必须真的带上（`PiConfig::new` 默认就有，但别被谁清掉了）
         for b in crate::pi::PI_BUILTIN_TOOLS {
             if !cfg.exclude_tools.iter().any(|t| t == b) {
@@ -542,7 +559,11 @@ impl PiRuntime {
 
         // 桥端口 + 工具清单 → 通过环境变量传给 extension
         cfg.bridge_port = bridge.port();
-        cfg.tool_specs = specs_to_json(&crate::tools::bridge_specs_for_dir(&self.data_dir));
+        // ⚠️ MCP 规格也要进来 —— 桥侧（`orbcat-tools.ts`）给所有工具加 `orb_` 前缀
+        // ⇒ 模型看到的是 `orb_mcp__<server>__<tool>`。
+        let mut all_specs = bridge_specs;
+        all_specs.extend(mcp_specs);
+        cfg.tool_specs = specs_to_json(&all_specs);
 
         // 权限闸门 extension（走 --extension 一次性加载）
         let ext = self.runtime.join("pi").join("extensions").join("orbcat-gate.ts");
@@ -842,6 +863,8 @@ impl PiRuntime {
     /// pi 默认 `exposure: "codemode"` —— 工具**不直接声明给模型**，
     /// 只能通过 codemode / tool_search 调。orbcat 的习惯是**直接调**，
     /// 所以这里显式写 `"exposure": "direct"`。
+
+
     async fn sync_mcp(&self) -> Result<usize, String> {
         let servers = crate::config::resolve_mcp_servers(&self.data_dir);
         let extra = self.extra_mcp.lock().await.clone();
@@ -1388,6 +1411,265 @@ pub(crate) fn build_gate(
 // 会话池（多会话并行）
 // ---------------------------------------------------------------------------
 
+/// 宿主共享的 MCP 上下文（**进程级**）。
+///
+/// ## 为什么要有这个
+///
+/// (c) 形态：PiRuntime 自己连一次 MCP server 取清单 ⇒ 宿主出现**两个** MCP 客户端
+/// （server 侧两个 session）⇒ 执行路径唯一（不漏权限闸），但**不干净**。
+/// (a) 形态：宿主把**自己的** registry 与 perm hub 共享出来 ⇒ **单一来源**。
+///
+/// ## 共享安全吗
+///
+/// - `ToolRegistry` 内部可变状态自带锁（`Arc<Mutex<_>>`）⇒ 共享没问题。
+/// - `PermHub` 内部所有可变状态也自带 Mutex，`emitter` 是 `OnceLock`（setup 注入）
+///   ⇒ **它本来就是设计成进程级共享的**。
+/// - 权限请求靠 **`session_id` 区分**（`ask_mcp_tool(name, args, session_id)` 的第三个参数）
+///   ⇒ 不需要「按会话找 hub」那套东西：一个共享 hub + 真实 session_id 就够。
+pub struct HostMcp {
+    /// 宿主的 MCP 注册表（`Arc<Mutex<ToolRegistry>>`）
+    pub mcp: Arc<tokio::sync::Mutex<crate::mcp::ToolRegistry>>,
+    /// 宿主的权限中枢（进程级单例）
+    pub perm: Arc<crate::perm_request::PermHub>,
+}
+
+static HOST_MCP: std::sync::OnceLock<HostMcp> = std::sync::OnceLock::new();
+
+/// 注册宿主共享的 MCP 上下文（**宿主在 `setup` 里调一次**）。
+///
+/// ```ignore
+/// // lib.rs 的 setup 里：
+/// pi_runtime::register_host_mcp(state.mcp.clone(), state.perm.clone());
+/// ```
+///
+/// ## 现在是什么状态
+///
+/// ⚠️ **宿主还没接**（后端在做 `execute_bridge_full`）⇒ 静态槽是空的
+/// ⇒ 清单侧自动回落 (c)（自建 registry + 5s 超时 + 降级）⇒ 行为不变、零风险。
+/// 宿主一接上，这里**自动**切到 (a) —— **不需要再改任何代码**。
+pub fn register_host_mcp(
+    mcp: Arc<tokio::sync::Mutex<crate::mcp::ToolRegistry>>,
+    perm: Arc<crate::perm_request::PermHub>,
+) {
+    let _ = HOST_MCP.set(HostMcp { mcp, perm });
+    eprintln!("[orbcat][pi] 已注册宿主共享 MCP 上下文（MCP 清单走单一来源）");
+}
+
+/// 取宿主共享的 MCP 上下文（**未注册 ⇒ None** ⇒ 调用方走 (c) 兜底）。
+pub fn host_mcp() -> Option<&'static HostMcp> {
+    HOST_MCP.get()
+}
+
+/// MCP 工具规格（**只给 pi 一份声明，不给它一条执行路**）。
+///
+/// ## 为什么要有这个函数
+///
+/// MCP 走**宿主桥**（单通道）⇒ pi 侧不再自己连 MCP server ⇒
+/// pi 必须**从宿主拿到工具声明**才能把 MCP 工具声明给模型
+/// （否则模型只看到 orbcat 私有工具，完全不知道有 MCP 能力）。
+///
+/// ## 口径必须与 `tools::all_tool_specs` 的 MCP 段**逐项同源**
+///
+/// 同名、同描述、同 schema —— 否则模型在 pi 侧按 A 的参数调，
+/// 宿主网关按 B 解析 ⇒ 表现为「参数莫名其妙」。有测试守着
+/// （`mcp_tool_specs_与tools_all_tool_specs同源`）。
+///
+/// ## 为什么不能直接调 `tools::all_tool_specs`
+///
+/// 那个函数返回**全部**工具（内置 + 项目 + MCP），
+/// 而 `cfg.tool_specs` 这条通道**已经**由 `bridge_specs_for_dir` 提供了前两批
+/// ⇒ 再塞一遍会重复注册（同名后者覆盖前者）。
+pub fn mcp_tool_specs(reg: &crate::mcp::ToolRegistry) -> Vec<crate::tools::ToolSpec> {
+    let mut specs = Vec::new();
+    for g in reg.groups().iter().filter(|g| reg.is_active(&g.name)) {
+        for t in &g.tools {
+            // 组名 = server id，工具名原样透传（与 tools.rs 的 MCP 段同一口径）
+            let full = crate::mcp::mcp_tool_full_name(&g.server_id, &t.name);
+            let mut desc = t.description.trim().to_string();
+            if t.is_destructive() {
+                desc.push_str(" ⚠️ 此操作会修改数据或执行命令，调用前请确认用户意图。");
+            }
+            specs.push(crate::tools::ToolSpec {
+                name: full,
+                description: desc,
+                parameters: t.input_schema.clone(),
+            });
+        }
+    }
+    specs
+}
+
+/// 拉一份 MCP 工具清单（**进程内直连**，不走 HTTP 端口）。
+///
+/// ## 为什么在 Rust 侧拉，而不是让 pi 自己连
+///
+/// 单通道：pi **不再自己连 MCP server**（执行一律回宿主桥）。
+/// 但 pi 仍需要工具**声明**才能把 MCP 工具告诉模型 ⇒ 清单由宿主取、宿主给。
+///
+/// ## ⚠️ 这是「第二份」MCP 连接
+///
+/// 宿主自己的 registry（`AppState.mcp`）在 `lib.rs` 里，而 `PiRuntime`
+/// 只有 `data_dir` ⇒ 这里只能**自己连一次**取清单。
+/// **执行仍然只有一条路**（宿主 bridge ⇒ 宿主 registry）⇒ 权限闸不失明。
+///
+/// 若后端后续把宿主 registry 共享出来（`PiPool` 注入），
+/// 这里应改成直接读那份 —— 单一来源，也省掉一次连接。
+///
+/// ## 失败必须降级，不能连累 pi
+///
+/// MCP server 挂了 / 超时 ⇒ 清单为空 ⇒ pi 照常起（只是这轮没有 MCP 工具）。
+/// 反过来做就会变成「MCP 不可用 ⇒ 整个 pi 起不来」。
+pub async fn fetch_mcp_tool_specs(data_dir: &Path) -> Vec<crate::tools::ToolSpec> {
+    // ── ① 宿主共享的 registry（(a) 形态）优先 ──
+    //
+    // 单一来源、实时（宿主改了 MCP 配置下一轮就生效）、**零额外连接**。
+    // 宿主还没注册 ⇒ 落到下面的 (c) 兜底。
+    if let Some(h) = host_mcp() {
+        let reg = h.mcp.lock().await;
+        return mcp_tool_specs(&reg);
+    }
+
+    // ── 缓存命中就直接用（别每个会话都连一遍 MCP server）──
+    //
+    // ⚠️ (c) 的代价：这里是**第二份** MCP 连接（宿主自己的 registry 在
+    // `lib.rs` 里，`PiRuntime` 拿不到）⇒ 每个 pi 进程都去连一次的话，
+    // 开 N 个会话就是 N 次连接 + N 组 stdio 子进程。
+    // ⇒ 进程级缓存 + TTL 把它压成「一个宿主进程最多一次」。
+    //
+    // ⚠️ TTL 到期或 MCP 配置变更后清单会过期 ⇒ (a) 落地后（宿主共享 registry）
+    // 这里应改成直接读那份 ⇒ 既是单一来源，也永远不过期。
+    {
+        let g = MCP_SPEC_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((at, raw)) = g.as_ref() {
+            if at.elapsed() < MCP_SPEC_TTL {
+                return raw
+                    .iter()
+                    .map(|(n, d, p)| crate::tools::ToolSpec {
+                        name: n.clone(),
+                        description: d.clone(),
+                        parameters: p.clone(),
+                    })
+                    .collect();
+            }
+        }
+    }
+    let raw = fetch_mcp_tool_specs_raw(data_dir).await;
+    *MCP_SPEC_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some((std::time::Instant::now(), raw.clone()));
+    raw.into_iter()
+        .map(|(n, d, p)| crate::tools::ToolSpec {
+            name: n,
+            description: d,
+            parameters: p,
+        })
+        .collect()
+}
+
+/// 清单缓存（进程级）。`(时刻, 工具规格三元组)`。
+///
+/// ⚠️ 存的是**三元组**而不是 `ToolSpec` —— `ToolSpec` 没有 `Clone`
+/// （它在 `tools.rs`，后端域），缓存一份就克隆不出来。
+static MCP_SPEC_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<(String, String, Value)>)>> =
+    std::sync::Mutex::new(None);
+
+/// 清单缓存有效期。
+const MCP_SPEC_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 真去拉一次清单（**不做缓存**）。
+async fn fetch_mcp_tool_specs_raw(data_dir: &Path) -> Vec<(String, String, Value)> {
+    let servers = crate::config::resolve_mcp_servers(data_dir);
+    if servers.is_empty() {
+        return Vec::new();
+    }
+    let mut reg = crate::mcp::ToolRegistry::with_servers(&servers);
+    let clients = reg.clients_clone();
+    // ⚠️ **不要提前解包 Result** —— `apply_snapshot_with_settings` 吃的就是
+    // `Result<(..)>`，它内部负责「拉取失败 ⇒ 清空组」这条降级路径。
+    let snap = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::mcp::ToolRegistry::fetch_snapshot(&clients),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("[orbcat][pi] MCP 工具清单拉取超时 5s（本轮没有 MCP 工具）");
+            return Vec::new();
+        }
+    };
+    if let Err(e) = &snap {
+        eprintln!("[orbcat][pi] MCP 工具清单拉取失败（本轮没有 MCP 工具）：{e}");
+    }
+    let settings = crate::config::load_settings(data_dir);
+    reg.apply_snapshot_with_settings(snap, &settings);
+    mcp_tool_specs(&reg)
+        .into_iter()
+        .map(|s| (s.name, s.description, s.parameters))
+        .collect()
+}
+
+/// pi 的 `--tools` 白名单。
+///
+/// ## 口径
+///
+/// - **orbcat 私有工具**：`orb_<name>`（前缀避免撞 pi 内置名）
+/// - **项目 L1 工具**：`orb_<name>`（名字随 bundle 变 ⇒ 现取）
+/// - **MCP 工具**：`orb_mcp__<server>__<tool>`（**只有 `orb_` 前缀版**）
+///
+/// ## 🔴 为什么 MCP 必须是 `orb_mcp__*` 而不是 `mcp__*`
+///
+/// `mcp__*` 是 **pi 原生 MCP** 的命名空间 ⇒ 白名单里放它 = 放行原生那条路
+/// ⇒ 模型有两条路能调 MCP，宿主权限闸形同虚设。
+/// 桥侧（`orbcat-tools.ts`）给所有工具加 `orb_` 前缀，
+/// Rust 侧收到后用 `strip_prefix("orb_")` 还原 ⇒ 宿主 execute 看到的仍是
+/// `mcp__<server>__<tool>` ⇒ **正好进 `mcp::parse_mcp_tool_name` 的网关分支**。
+fn build_tools_whitelist(
+    bridge_specs: &[crate::tools::ToolSpec],
+    mcp_specs: &[crate::tools::ToolSpec],
+) -> Vec<String> {
+    let mut tools: Vec<String> = Vec::new();
+    for name in crate::tools::BUILTIN_TOOL_NAMES {
+        tools.push(format!("orb_{name}"));
+    }
+    for spec in bridge_specs {
+        // `fetch_url` / `web_search` 已在 BUILTIN_TOOL_NAMES 里（上面加过了）
+        if crate::tools::BUILTIN_TOOL_NAMES.contains(&spec.name.as_str()) {
+            continue;
+        }
+        tools.push(format!("orb_{}", spec.name));
+    }
+    for spec in mcp_specs {
+        tools.push(format!("orb_{}", spec.name));
+    }
+    tools
+}
+
+/// 🔴 关掉 pi 的原生 MCP（**单通道**，硬要求）。
+///
+/// ## 为什么不能只是「不调 `sync_mcp`」
+///
+/// pi 的 agent 目录里**可能还留着**上一轮写的 `mcp.json`
+/// ⇒ pi 照样会连、原生通道照样开着 ⇒ 模型有两条路能调 MCP。
+/// ⇒ 必须**显式删掉**那个文件。
+///
+/// ⚠️ `sync_mcp()` **函数本身保留**（别处可能用），只是不再用它给 pi 配 MCP。
+fn disable_native_mcp(agent_dir: &Path) -> bool {
+    let cfg = agent_dir.join("mcp.json");
+    if !cfg.is_file() {
+        return false;
+    }
+    match std::fs::remove_file(&cfg) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[orbcat][pi] ⚠️ 删不掉 pi 的原生 MCP 配置（原生通道可能还开着）：{e}");
+            false
+        }
+    }
+}
+
 /// pi 内核的**会话池** —— 每个会话一个 pi 进程。
 ///
 /// ## 为什么必须是「一进程一会话」
@@ -1765,6 +2047,159 @@ fn parse_usage(v: &Value) -> crate::llm::TokenUsage {
 
 #[cfg(test)]
 mod tests {
+
+    // ---------------- MCP 清单通路（单通道）----------------
+
+    /// 🔴 MCP 规格必须与 `tools::all_tool_specs` 的 MCP 段**逐项同源**。
+    ///
+    /// 为什么：模型在 pi 侧按 A 的参数调，宿主网关按 B 解析 ⇒ 表现为
+    /// 「参数莫名其妙」。两份构造逻辑各写一遍必然漂移 ⇒ 用测试钉住。
+    #[test]
+    fn mcp_tool_specs_与tools_all_tool_specs同源() {
+        let tmp = std::env::temp_dir().join("orbcat_mcp_specs_same");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut reg = crate::mcp::ToolRegistry::from_tools_for_test(vec![
+            crate::mcp::McpTool {
+                name: "github_1mcp_create_issue".into(),
+                description: "Create a new issue in a GitHub repository".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "title": { "type": "string" } }
+                }),
+                annotations: None,
+            },
+            crate::mcp::McpTool {
+                name: "ssh_1mcp_run-command".into(),
+                description: "在远程主机上执行命令".into(),
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                annotations: None,
+            },
+        ]);
+        let settings = crate::config::AgentSettings::default();
+        reg.restore_active_from_settings_unrestricted(&settings);
+
+        let mine = super::mcp_tool_specs(&reg);
+        let theirs = crate::tools::all_tool_specs(Some(&reg), false, &tmp, None)
+            .into_iter()
+            .filter(|s| s.name.starts_with("mcp__"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(mine.len(), 2, "两条 MCP 工具都要在：{:?}", mine.iter().map(|s| &s.name).collect::<Vec<_>>());
+        assert_eq!(mine.len(), theirs.len(), "条数必须与 tools.rs 的 MCP 段一致");
+        for (a, b) in mine.iter().zip(theirs.iter()) {
+            assert_eq!(a.name, b.name, "工具名必须一致");
+            assert_eq!(a.description, b.description, "描述必须一致");
+            assert_eq!(a.parameters, b.parameters, "参数 schema 必须一致");
+        }
+        // 名字口径：组名 = server id，工具名原样透传
+        assert!(
+            mine.iter()
+                .any(|s| s.name == "mcp__default__github_1mcp_create_issue"),
+            "名字口径必须是 mcp__<组名>__<工具名>：{:?}",
+            mine.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 🔴 白名单里**不许**有 `mcp__*` 裸名（单通道的硬要求）。
+    ///
+    /// `mcp__*` 是 **pi 原生 MCP** 的命名空间 ⇒ 白名单里放它 = 放行原生那条路
+    /// ⇒ 模型有两条路能调 MCP，宿主权限闸形同虚设。
+    #[test]
+    fn build_tools_whitelist_只列orb前缀_没有mcp裸名() {
+        let bridge = vec![crate::tools::ToolSpec {
+            name: "read_file".into(),
+            description: "读文件".into(),
+            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        }];
+        let mcp = vec![crate::tools::ToolSpec {
+            name: "mcp__1mcp__github_1mcp_create_issue".into(),
+            description: "建 issue".into(),
+            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        }];
+        let wl = super::build_tools_whitelist(&bridge, &mcp);
+
+        // MCP 工具带 orb_ 前缀（模型看到的是 orb_mcp__<组>__<工具>）
+        assert!(
+            wl.iter()
+                .any(|t| t == "orb_mcp__1mcp__github_1mcp_create_issue"),
+            "MCP 工具应以 orb_ 前缀进白名单：{wl:?}"
+        );
+        // 🔴 没有任何 mcp__ 裸名
+        assert!(
+            !wl.iter().any(|t| t.starts_with("mcp__")),
+            "白名单里不许有 MCP 裸名：{wl:?}"
+        );
+        // 🔴 也不许有 mcp__* 通配（那是放行整条原生路）
+        assert!(
+            !wl.iter().any(|t| t == "mcp__*"),
+            "白名单里不许有 mcp__* 通配：{wl:?}"
+        );
+        // orbcat 私有工具照旧
+        assert!(wl.iter().any(|t| t == "orb_read_file"), "{wl:?}");
+    }
+
+    /// 🔴 桥侧加 `orb_` 前缀后，**必须还能被宿主的 `parse_mcp_tool_name` 解析**。
+    ///
+    /// 为什么这条是生死线：模型看到的是 `orb_mcp__<server>__<tool>`；
+    /// 桥把它原样传给 Rust（`callRust(name, …)`）⇒ Rust 侧先
+    /// `strip_prefix("orb_")` 还原成 `mcp__<server>__<tool>`
+    /// ⇒ 才能进 `tools.rs` 的 MCP 网关分支。
+    /// **对不上 ⇒ 宿主 execute 认不出、走不进网关分支 ⇒ MCP 工具调不动。**
+    #[test]
+    fn 白名单里的orb_mcp名_能被宿主parse_mcp_tool_name解析() {
+        let full = "mcp__1mcp__github_1mcp_create_issue";
+        let orb = format!("orb_{full}");
+
+        // 桥侧：注册给 pi 的名字带 orb_ 前缀
+        assert!(orb.starts_with("orb_"), "模型侧看到的名字必须带 orb_ 前缀");
+
+        // Rust 侧：还原后正好是宿主的口径
+        let stripped = orb.strip_prefix("orb_").unwrap();
+        let (server, tool) =
+            crate::mcp::parse_mcp_tool_name(stripped).expect("还原后必须能解析");
+        assert_eq!(server, "1mcp", "组名 = server id");
+        assert_eq!(tool, "github_1mcp_create_issue", "工具名原样透传");
+
+        // ⚠️ 反面：`mcp__*` 裸名在 pi 侧是**原生 MCP 命名空间** ⇒ 绝不能进白名单
+        assert!(
+            !full.starts_with("orb_"),
+            "裸名不是模型侧该看到的名字"
+        );
+    }
+
+    /// 🔴 关原生 MCP 必须**删掉残留的 `mcp.json`**。
+    ///
+    /// 为什么：光「不调 `sync_mcp`」不够 —— agent 目录里可能还留着上一轮写的
+    /// `mcp.json` ⇒ pi 照样读它、照样注册原生 MCP 工具 ⇒ 判据 4 直接失效。
+    #[test]
+    fn disable_native_mcp_删掉残留的mcp_json() {
+        let d = std::env::temp_dir().join("orbcat_disable_native_mcp");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let cfg = d.join("mcp.json");
+        std::fs::write(
+            &cfg,
+            r#"{"mcpServers":{"x":{"url":"http://127.0.0.1:1/mcp"}}}"#,
+        )
+        .unwrap();
+
+        assert!(super::disable_native_mcp(&d), "有残留文件时该删掉并返回 true");
+        assert!(
+            !cfg.exists(),
+            "mcp.json 必须被删掉（否则 pi 照样连原生 MCP）"
+        );
+        // 幂等：再删一次不报错、返回 false
+        assert!(
+            !super::disable_native_mcp(&d),
+            "没有文件时返回 false（幂等）"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     use super::*;
 
     #[test]
