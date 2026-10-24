@@ -39,7 +39,7 @@
 //! **两行 UTF-8 文本**：
 //!
 //! ```text
-//! <明文 token>          ← 第 1 行：32 位小写 hex（random_hex(16)）
+//! <明文 token>          ← 第 1 行：128..256 位小写 hex（random_hex(16)）
 //! <过期时间戳>          ← 第 2 行：Unix **毫秒**（u64）
 //! ```
 //!
@@ -67,20 +67,30 @@
 //! - orbcat **自己的进程 env 里没有** token ⇒ 内部 AI 起的子进程继承不到；
 //! - 外部通道**只认 `approve`（一次性）/ `deny`** ⇒ 绝不扩大授权。
 //!
-//! ## ⚠️ 本轮**没接**的两处（等裁决，不许自己补）
+//! ## ✅ 已接上（2026-10-24，用户拍板「接上通道 + 提醒 + 可选删除」）
 //!
-//! ① **谁签发 token**（设置页？外部 AI 自己取？）——接口留好了
-//!    （[`issue_token`]），**入口没接**；
-//! ② **`serve()` 什么时候起**（启动即起？还是用户开「外部代批」才起？）——
-//!    [`serve`] 已实现但**没有任何调用点**。
+//! ① **token 自动签发** —— 宿主启动时 [`serve`] 直接签发（用户不用手动开）；
+//!    另有**续期线程**每 `TTL/2` 重新签发 ⇒ 文件里的 token 不会过期。
+//! ② **`serve()` 在宿主进程起**（`lib.rs` 的 `setup` 里）—— **不是**在 pi 运行时起
+//!    （那条是工具桥，内部 AI 够得着）。
+//! ③ **链式续期** —— 每次**成功**响应都带**新 token**（旧的作废）⇒ 外部 AI
+//!    每次调用都拿到新的 ⇒ **不新增任何子命令**（命令面仍是三条）。
+//! ④ **代批提醒** —— 决定被采纳时发 [`EVENT_DECISION`]（`perm-cli-decision`）事件
+//!    给前端，approve 与 deny **都发**。
+//! ⑤ **状态查询** —— [`status_at`] / [`status_current`]：CLI 文件在不在、通道起没起。
 //!
-//! ⇒ 这两处接线之前，层 2 通道**不会真的对外提供**能力（属预期，不是缺陷）。
+//! ## ⚠️ 残余风险（**交付说明必须照实写**）
+//!
+//! 内部 AI 与外部 AI **同用户、同完整性级别 ⇒ 共享同一安全主体** ⇒ 内部 AI
+//! **理论上**也能读到 token 文件并自己直调端点（层 1 只挡「直接调用 CLI」）。
+//! ⇒ 本版按用户拍板**不做内核级隔离**，用「**每次代批都有界面提醒 + CLI 可随时删除**」兜底。
 
-// ⚠️ 层 2 的入口函数（serve / issue_token / write_port …）本轮还没接线
-//    ⇒ 未被调用 ⇒ dead_code ⇒ 本模块整体先放行；**下一笔接完线后删掉这行**。
-#![allow(dead_code)]
+// ⚠️ 曾经这里有 `#![allow(dead_code)]`（层 2 还没接线时加的）——
+//    现在通道**已接上**（宿主 setup 调 serve）⇒ 那行整体放行已收窄为
+//    下面几个函数的 `#[cfg(test)]`（它们只被用例用，非测试构建里没人调）。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// CLI 可执行文件名（不含扩展名）。
 ///
@@ -321,7 +331,7 @@ pub fn cli_state_dir() -> PathBuf {
 
 /// token 文件路径：`<状态目录>\perm-token`。
 ///
-/// 格式（**定稿**）：**两行** —— 第 1 行 = 明文 token（32 位小写 hex），
+/// 格式（**定稿**）：**两行** —— 第 1 行 = 明文 token（128..256 位小写 hex），
 /// 第 2 行 = 过期时间戳（Unix 毫秒）。详见模块头「凭证口径与文件格式定稿」。
 pub fn token_path(state_dir: &Path) -> PathBuf {
     state_dir.join("perm-token")
@@ -339,15 +349,29 @@ pub const TOKEN_TTL_MS: u64 = 5 * 60 * 1000;
 
 /// 签发 token（明文 + 过期时间）。返回明文（设置页显示一次给用户）。
 ///
-/// ⚠️ **谁调用它（签发入口）本轮还没定** —— 见模块头「本轮没接的两处」。
+/// ⚠️ **签发入口 = 宿主启动时自动签发**（见 [`serve`]）—— 用户不用手动开。
 pub fn issue_token(state_dir: &Path, now_ms: u64) -> Result<String, String> {
     let token = random_hex(16);
     let expiry = now_ms.saturating_add(TOKEN_TTL_MS);
     std::fs::create_dir_all(state_dir).map_err(|e| format!("建状态目录失败: {e}"))?;
-    std::fs::write(token_path(state_dir), format!("{token}\n{expiry}"))
-        .map_err(|e| format!("写 token 失败: {e}"))?;
+    write_atomic(&token_path(state_dir), &format!("{token}\n{expiry}"))?;
     Ok(token)
 }
+
+/// **原子写**（先写临时文件再 rename）。
+///
+/// ⚠️ 为什么必须原子：token 文件同时被**三个**角色写 ——
+///    ① 启动时自动签发 ② 每次成功请求后的轮换 ③ 续期线程。
+///    `fs::write` 是「截断 → 写」⇒ 并发时读者可能读到**空文件或半截**，
+///    于是「明明有 token 却被判无效」。
+///    rename 是原子的 ⇒ 读者要么看到旧的完整内容，要么看到新的完整内容。
+fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content).map_err(|e| format!("写临时文件失败: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("替换文件失败: {e}"))?;
+    Ok(())
+}
+#[cfg(test)]
 
 /// 写入 token（**明文 + 过期时间**）到状态目录。
 ///
@@ -357,32 +381,57 @@ pub fn issue_token(state_dir: &Path, now_ms: u64) -> Result<String, String> {
 pub fn write_token_hash(state_dir: &Path, token: &str) -> Result<(), String> {
     let expiry = crate::permission::now_ms().saturating_add(TOKEN_TTL_MS);
     std::fs::create_dir_all(state_dir).map_err(|e| format!("建状态目录失败: {e}"))?;
-    std::fs::write(token_path(state_dir), format!("{token}\n{expiry}"))
-        .map_err(|e| format!("写 token 失败: {e}"))
+    write_atomic(&token_path(state_dir), &format!("{token}\n{expiry}"))
 }
 
-/// 校验凭证：**明文比对 + 未过期**；**用一次即轮换**（消费后立刻写回新值）。
+/// 校验凭证**并轮换**：成功时返回**新的**明文 token，失败返回 `None`。
 ///
-/// ⚠️ 这是「短时效 + 一次性」两道限制的落点：
-/// 过期 ⇒ 拒；已被消费过 ⇒ 旧值已失效 ⇒ 拒。
-pub fn verify_token(state_dir: &Path, token: &str, now_ms: u64) -> bool {
+/// ⚠️ 这是「短时效 + 一次性 + 链式续期」三道限制的落点：
+/// - 错凭证 / 已过期 / 文件不在 ⇒ `None`（一律拒，**不看 op**）；
+/// - 对 ⇒ **用一次即轮换**（立刻签发新 token 写回文件）。
+///
+/// ## 链式续期（为什么不加 `renew` 子命令）
+///
+/// 外部 AI 每次成功调用都拿到**新 token**（响应里带回）⇒ 下一次继续用新的
+/// ⇒ token 链不断。**不需要**新增任何子命令，命令面仍是
+/// `list` / `approve <id>` / `deny <id>` 三条。
+pub fn verify_token_rotate(state_dir: &Path, token: &str, now_ms: u64) -> Option<String> {
     let Ok(s) = std::fs::read_to_string(token_path(state_dir)) else {
-        return false;
+        return None;
     };
     let mut it = s.lines();
     let (Some(cur), Some(exp)) = (it.next(), it.next()) else {
-        return false;
+        return None;
     };
     if cur.trim() != token {
-        return false;
+        return None;
     }
     let expiry: u64 = exp.trim().parse().unwrap_or(0);
     if now_ms > expiry {
-        return false;
+        return None;
     }
-    // 用一次即轮换
-    let _ = issue_token(state_dir, now_ms);
-    true
+    // 用一次即轮换 —— 签发失败也**不**放行（拿不到新 token ⇒ 链断了 ⇒ 拒）
+    issue_token(state_dir, now_ms).ok()
+}
+#[cfg(test)]
+
+/// 只要一个 bool 的薄包装（不关心新 token 的调用方 / 旧用例用）。
+pub fn verify_token(state_dir: &Path, token: &str, now_ms: u64) -> bool {
+    verify_token_rotate(state_dir, token, now_ms).is_some()
+}
+
+/// 读当前 token 文件里的**过期时间戳**（Unix 毫秒）。文件不在/格式不对 ⇒ `None`。
+pub fn token_expiry(state_dir: &Path) -> Option<u64> {
+    let s = std::fs::read_to_string(token_path(state_dir)).ok()?;
+    s.lines().nth(1)?.trim().parse::<u64>().ok()
+}
+
+/// 当前 token 是否还在有效期内（**不消费**它 ⇒ 只是状态查询）。
+pub fn token_is_valid(state_dir: &Path, now_ms: u64) -> bool {
+    match token_expiry(state_dir) {
+        Some(exp) => now_ms <= exp,
+        None => false,
+    }
 }
 
 /// 写端口文件（orbcat 把随机端口写进去，CLI 读它）。
@@ -415,6 +464,96 @@ pub fn random_hex(nbytes: usize) -> String {
     out
 }
 
+/// 外部代批决定的**事件名**（前端 `listen('perm-cli-decision', …)`）。
+///
+/// ⚠️ 命名沿用既有约定（`perm-request` / `perm-resolved` 都是 kebab-case）。
+pub const EVENT_DECISION: &str = "perm-cli-decision";
+
+/// CLI 在包根下的子目录（与 `tools/package.mjs` 的 `CLI_SUBDIR` 逐字对应）。
+pub const CLI_SUBDIR: &str = "bin";
+
+/// 代批决定事件（= 前端「代批提醒」）。
+///
+/// ## 字段（**camelCase**，前端按这些名字渲染）
+///
+/// | 字段 | 类型 | 含义 |
+/// |---|---|---|
+/// | `pendingId` | string | 被批的那条 pending 的 id |
+/// | `kind` | string | pending 的 kind（`command` / `mcp_tool` / …） |
+/// | `command` | string | 命令原文；MCP / pi 类则是工具名 / 调用摘要 |
+/// | `decision` | string | **只有** `approve` / `deny` |
+/// | `cliInstance` | string | CLI 实例标识（`orbcat-perm/<pid>`）——**仅展示用，不是安全边界** |
+/// | `at` | number | Unix 毫秒（决定被采纳的那一刻） |
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermCliDecision {
+    pub pending_id: String,
+    pub kind: String,
+    pub command: String,
+    pub decision: String,
+    pub cli_instance: String,
+    pub at: u64,
+}
+
+/// 外部代批 CLI 的状态（前端设置页用）。
+///
+/// ⚠️ `available` = 「CLI 文件在」**且**「通道起着」——
+///    用户删掉 `bin\orbcat-perm.exe` 之后，这里必须**如实报不可用**，
+///    而不是继续显示「可用」让人以为还能用。
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermCliStatus {
+    /// CLI 文件在不在（`<包根>/bin/orbcat-perm.exe`）
+    pub cli_present: bool,
+    /// 通道起没起（**以内存里的端口为准**，不看端口文件 ——
+    /// 端口文件可能是上一轮进程留下的 ⇒ 文件在 ≠ 通道在）
+    pub channel_up: bool,
+    /// 两者都满足才可用
+    pub available: bool,
+    /// CLI 的预期路径
+    pub cli_path: String,
+    /// 状态目录（token / 端口文件所在）
+    pub state_dir: String,
+    /// 当前通道端口
+    pub port: Option<u16>,
+    /// token 是否还在有效期内
+    pub token_valid: bool,
+    /// token 的过期时间戳
+    pub token_expires_at: Option<u64>,
+}
+
+/// CLI 的预期安装位置：`<包根>\bin\orbcat-perm.exe`。
+pub fn cli_install_path(app_root: &Path) -> PathBuf {
+    app_root.join(CLI_SUBDIR).join(format!("{CLI_STEM}.exe"))
+}
+
+/// 查状态（路径显式传 ⇒ **可测**）。
+pub fn status_at(app_root: &Path, state_dir: &Path) -> PermCliStatus {
+    let cli_path = cli_install_path(app_root);
+    let cli_present = cli_path.is_file();
+    let port = channel_port();
+    let channel_up = channel_up();
+    PermCliStatus {
+        cli_present,
+        channel_up,
+        available: cli_present && channel_up,
+        cli_path: cli_path.to_string_lossy().to_string(),
+        state_dir: state_dir.to_string_lossy().to_string(),
+        port,
+        token_valid: token_is_valid(state_dir, crate::permission::now_ms()),
+        token_expires_at: token_expiry(state_dir),
+    }
+}
+
+/// 查状态（用**运行时的** exe 目录 + 默认状态目录）—— 给 Tauri 命令用。
+pub fn status_current() -> PermCliStatus {
+    let app_root = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    status_at(&app_root, &cli_state_dir())
+}
+
 /// 处理一次外部通道请求。
 ///
 /// ## 口径
@@ -422,7 +561,8 @@ pub fn random_hex(nbytes: usize) -> String {
 /// - **先验凭证**（不对 ⇒ 一律拒，**不看 op**）；
 /// - op 只有 `list` / `approve <id>` / `deny <id>` ⇒ **没有**任何能改授权表的 op；
 /// - 决定只有 `approve`（一次性）/ `deny`；
-/// - 每个动作（含**只读**的 `list`）都进审计链。
+/// - 每个动作（含**只读**的 `list`）都进审计链；
+/// - **成功**响应里带**新 token**（链式续期）⇒ 外部 AI 下次用新的。
 pub fn handle_op(
     state_dir: &Path,
     data_dir: &Path,
@@ -430,12 +570,14 @@ pub fn handle_op(
     token: &str,
     op: &str,
     arg: &str,
+    client: &str,
 ) -> Result<String, String> {
-    if !verify_token(state_dir, token, crate::permission::now_ms()) {
+    // 凭证对了就**轮换**（旧的立刻作废）⇒ 成功响应里把新的带回去
+    let Some(new_token) = verify_token_rotate(state_dir, token, crate::permission::now_ms()) else {
         let msg = "凭证无效：外部通道只接受带正确 token 的请求".to_string();
         audit_cli(data_dir, "denied", op, arg, &msg);
         return Err(msg);
-    }
+    };
 
     match op {
         "list" => {
@@ -457,7 +599,12 @@ pub fn handle_op(
                 })
                 .collect();
             audit_cli(data_dir, "listed", op, arg, "列出 pending");
-            Ok(serde_json::json!({ "ok": true, "pending": items }).to_string())
+            Ok(serde_json::json!({
+                "ok": true,
+                "pending": items,
+                "token": new_token,
+            })
+            .to_string())
         }
         "approve" | "deny" => {
             let Some(decision) = external_decision(op) else {
@@ -471,12 +618,36 @@ pub fn handle_op(
                 audit_cli(data_dir, "denied", op, arg, &msg);
                 return Err(msg);
             }
+            // 先取这条 pending 的 kind / command（提醒事件要用）——
+            // ⚠️ 取不到**不阻断**决定（提醒信息不全 ≠ 不该批）。
+            let view = perm.pending_views().into_iter().find(|v| v.id == id);
+            let kind = view.as_ref().map(|v| v.kind.clone()).unwrap_or_default();
+            let command = view.as_ref().map(|v| v.command.clone()).unwrap_or_default();
             let reason = format!("外部 CLI 代批（{op}）");
             let res = decide_pending(perm, id, decision, reason.clone());
             match res {
                 Ok(()) => {
                     audit_cli(data_dir, op, id, arg, "外部代批成功");
-                    Ok(serde_json::json!({ "ok": true, "id": id, "decision": op }).to_string())
+                    // ── 代批提醒（用户要的「检测提醒」）──
+                    // approve 与 deny **都发** ⇒ 拒绝也是用户该知道的事。
+                    let ev = PermCliDecision {
+                        pending_id: id.to_string(),
+                        kind,
+                        command,
+                        decision: op.to_string(),
+                        cli_instance: client.to_string(),
+                        at: crate::permission::now_ms(),
+                    };
+                    if let Ok(v) = serde_json::to_value(&ev) {
+                        perm.emit_event(EVENT_DECISION, v);
+                    }
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "id": id,
+                        "decision": op,
+                        "token": new_token,
+                    })
+                    .to_string())
                 }
                 Err(e) => {
                     audit_cli(data_dir, "failed", id, arg, &e);
@@ -533,6 +704,7 @@ fn audit_cli(data_dir: &Path, event: &str, target: &str, arg: &str, note: &str) 
 // ---------------------------------------------------------------------------
 // sha256（自实现：Cargo.toml 里没有 sha2 依赖）
 // ---------------------------------------------------------------------------
+#[cfg(test)]
 
 /// sha256 十六进制摘要。
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -669,11 +841,24 @@ fn block_message(tool: &str, hit: &CliHit) -> String {
 ///
 /// 协议：一行 JSON 进、一行 JSON 出。
 /// ```json
-/// {"token":"...","op":"list|approve|deny","arg":"<pending id>"}
+/// {"token":"...","op":"list|approve|deny","arg":"<pending id>","client":"orbcat-perm/1234"}
 /// ```
+/// - `client` = **CLI 实例标识**（仅用于提醒里显示「谁批的」，**不是安全边界** ——
+///   客户端可自称）。
+/// - 响应里带 `token` = **轮换后的新 token**（链式续期，见 [`verify_token_rotate`]）。
 ///
-/// ⚠️ **本轮没有调用点** —— 「什么时候起这个端点」等裁决（见模块头）。
-///    ⇒ 层 2 通道目前**不对外提供**能力（属预期，不是缺陷）。
+/// ## ⚠️ 已知弱点（**写清楚，别当成没有**）
+///
+/// 端口文件与 token 文件**同用户可读** ⇒ **内部 AI 理论上能读到 token 并自己直调端点**
+/// （层 1 的路径阻断只挡「直接调用 CLI」）。这是**用户 2026-10-24 拍板后接受的残余风险**：
+/// 本版**不做内核级隔离**，用「① 每次代批都有界面提醒 ② CLI 可随时删掉」兜底。
+/// 要彻底封死需下一版做匿名 Job Object / 命名管道那一层。
+///
+/// ## 启动即自动签发 + 续期
+///
+/// - 启动时**自动签发**一个 token（用户不用手动开）；
+/// - 后台线程每 `TTL/2` **重新签发** ⇒ 文件里的 token 不会过期
+///   ⇒ 外部 AI 隔很久再来也能用（否则 5 分钟后链就断了）。
 pub fn serve(
     state_dir: &Path,
     data_dir: &Path,
@@ -685,6 +870,15 @@ pub fn serve(
     let state_dir = state_dir.to_path_buf();
     let data_dir = data_dir.to_path_buf();
 
+    // ① 启动即自动签发 token（不签发 ⇒ 外部 AI 一上来就全拒）
+    match issue_token(&state_dir, crate::permission::now_ms()) {
+        Ok(t) => eprintln!(
+            "[orbcat] 外部代批通道：已自动签发 token（{}…）",
+            &t[..8.min(t.len())]
+        ),
+        Err(e) => eprintln!("[orbcat] ⚠️ 外部代批通道：自动签发 token 失败: {e}"),
+    }
+
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
         .map_err(|e| format!("起外部通道失败: {e}"))?;
     let port = listener
@@ -692,6 +886,28 @@ pub fn serve(
         .map_err(|e| format!("取端口失败: {e}"))?
         .port();
     write_port(&state_dir, port)?;
+    CHANNEL_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+
+    // ② 续期线程：每 TTL/2 重新签发 ⇒ 文件里的 token 不会过期
+    {
+        let sd = state_dir.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        register_serve(&state_dir, stop.clone());
+        std::thread::spawn(move || {
+            let step = 200u64;
+            let mut waited = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(step));
+                waited += step;
+                if waited >= TOKEN_TTL_MS / 2 {
+                    waited = 0;
+                    if let Err(e) = issue_token(&sd, crate::permission::now_ms()) {
+                        eprintln!("[orbcat] ⚠️ 外部代批通道：token 续期失败: {e}");
+                    }
+                }
+            }
+        });
+    }
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -713,7 +929,9 @@ pub fn serve(
                         let token = v.get("token").and_then(|x| x.as_str()).unwrap_or("");
                         let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("");
                         let arg = v.get("arg").and_then(|x| x.as_str()).unwrap_or("");
-                        match handle_op(&state_dir, &data_dir, &perm, token, op, arg) {
+                        // CLI 实例标识（**仅展示**，客户端可自称 ⇒ 不是安全边界）
+                        let client = v.get("client").and_then(|x| x.as_str()).unwrap_or("unknown");
+                        match handle_op(&state_dir, &data_dir, &perm, token, op, arg, client) {
                             Ok(s) => s,
                             Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
                         }
@@ -728,6 +946,50 @@ pub fn serve(
     });
 
     Ok(port)
+}
+
+/// 当前运行中的通道端口（0 = 没起）。
+static CHANNEL_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// 通道起没起（**以内存里的端口为准**，不看端口文件 ——
+/// 端口文件可能是上一轮进程留下的 ⇒ 文件在 ≠ 通道在）。
+pub fn channel_up() -> bool {
+    channel_port().is_some()
+}
+
+/// 当前通道端口（没起 ⇒ `None`）。
+pub fn channel_port() -> Option<u16> {
+    match CHANNEL_PORT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        p => Some(p),
+    }
+}
+
+/// 已启动的通道（按状态目录索引）—— 用来停掉续期线程。
+static SERVES: std::sync::OnceLock<
+    std::sync::Mutex<Vec<(PathBuf, Arc<std::sync::atomic::AtomicBool>)>>,
+> = std::sync::OnceLock::new();
+
+fn register_serve(state_dir: &Path, stop: Arc<std::sync::atomic::AtomicBool>) {
+    let v = SERVES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut g) = v.lock() {
+        g.push((state_dir.to_path_buf(), stop));
+    }
+}
+#[cfg(test)]
+
+/// 停掉某个状态目录上的**续期线程**（主要是给测试用：
+/// 测试结束不收线程 ⇒ 它会一直往已删的临时目录里写 token）。
+pub fn stop_serve(state_dir: &Path) {
+    if let Some(v) = SERVES.get() {
+        if let Ok(g) = v.lock() {
+            for (d, stop) in g.iter() {
+                if d == state_dir {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -851,7 +1113,7 @@ mod tests {
         let hub = crate::perm_request::PermHub::new();
         write_token_hash(&dir, "secret-token").unwrap();
 
-        handle_op(&dir, &dir, &hub, "secret-token", "list", "")
+        handle_op(&dir, &dir, &hub, "secret-token", "list", "", "test")
             .expect("凭证正确应当放行");
 
         let audit = std::fs::read_to_string(crate::command_policy::audit_path(&dir)).unwrap_or_default();
@@ -888,7 +1150,7 @@ mod tests {
             "clear-audit",
         ] {
             assert!(
-                handle_op(&dir, &dir, &hub, "secret-token", op, "").is_err(),
+                handle_op(&dir, &dir, &hub, "secret-token", op, "", "test").is_err(),
                 "外部通道不该有 {op} 这个操作"
             );
         }
@@ -951,14 +1213,14 @@ mod tests {
         // 错凭证 ⇒ 一律拒（且**不看 op**）
         for op in ["list", "approve", "deny"] {
             assert!(
-                handle_op(&dir, &dir, &hub, "wrong-token", op, "pm1").is_err(),
+                handle_op(&dir, &dir, &hub, "wrong-token", op, "pm1", "test").is_err(),
                 "错凭证必须被拒（op={op}）"
             );
         }
         // 没写 token 文件 ⇒ 也拒
         let empty = tmp_dir("fallback-empty");
         assert!(
-            handle_op(&empty, &empty, &hub, "anything", "list", "").is_err(),
+            handle_op(&empty, &empty, &hub, "anything", "list", "", "test").is_err(),
             "没配 token 时必须全拒"
         );
     }
@@ -977,5 +1239,272 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // 守卫用例 ⑧ ~ ⑭（2026-10-24 收尾：通道接上 + 代批提醒 + 可选删除）
+    // -------------------------------------------------------------------
+
+    /// 造一条待办（`ask_user` 是 async ⇒ 放后台线程跑），返回 pending id。
+    fn spawn_pending(
+        hub: &std::sync::Arc<crate::perm_request::PermHub>,
+        q: &str,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let hub2 = hub.clone();
+        let q = q.to_string();
+        let h = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let _ = hub2
+                    .ask_user(q, vec!["是".to_string()], String::new(), "s-test")
+                    .await;
+            });
+        });
+        let mut id = String::new();
+        for _ in 0..300 {
+            if let Some(v) = hub.pending_views().first() {
+                id = v.id.clone();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!id.is_empty(), "待办应当冒出来");
+        (id, h)
+    }
+
+    /// 读一个**代批提醒**事件（跳过 `perm-request` 之类的其它事件）。
+    fn recv_decision(
+        rx: &std::sync::mpsc::Receiver<(String, serde_json::Value)>,
+    ) -> serde_json::Value {
+        for _ in 0..20 {
+            let (ev, payload) = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("必须收到事件");
+            if ev == EVENT_DECISION {
+                return payload;
+            }
+        }
+        panic!("没等到代批提醒事件（{EVENT_DECISION}）");
+    }
+
+    /// ⑧ 通道在宿主起来后**确实能连**（不是「函数写好了」而已）。
+    #[test]
+    fn 外部代批通道在宿主起来后端点可连() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = tmp_dir("serve");
+        let hub = std::sync::Arc::new(crate::perm_request::PermHub::new());
+        let port = serve(&dir, &dir, hub).expect("通道应当起得来");
+        assert!(port > 0, "端口得是真的");
+
+        // 端口文件必须写出来（CLI 靠它找端点）
+        let port_file = std::fs::read_to_string(port_path(&dir)).unwrap_or_default();
+        assert_eq!(
+            port_file.trim().parse::<u16>().unwrap(),
+            port,
+            "端口文件里的值必须等于真实端口"
+        );
+
+        // 用**自动签发**的 token 真连一次
+        let raw = std::fs::read_to_string(token_path(&dir)).expect("启动应当自动签发 token");
+        let token = raw.lines().next().unwrap().trim().to_string();
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("端点应当能连");
+        let req = format!(
+            "{{\"token\":\"{token}\",\"op\":\"list\",\"arg\":\"\",\"client\":\"test\"}}\n"
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("响应不是 JSON：{line}（{e}）"));
+        assert_eq!(v["ok"], true, "带正确 token 的 list 应当成功：{line}");
+        assert!(
+            v.get("token").and_then(|x| x.as_str()).is_some(),
+            "成功响应必须带新 token（链式续期）：{line}"
+        );
+        stop_serve(&dir);
+    }
+
+    /// ⑨ token **自动签发**，落盘格式 = 明文 + 过期戳（已定稿）。
+    #[test]
+    fn token自动签发_落盘是明文加过期戳() {
+        let dir = tmp_dir("autotoken");
+        let now = crate::permission::now_ms();
+        let token = issue_token(&dir, now).expect("应当签发得出来");
+
+        let raw = std::fs::read_to_string(token_path(&dir)).expect("token 文件应当存在");
+        let mut lines = raw.lines();
+        let l1 = lines.next().unwrap().trim().to_string();
+        let l2 = lines.next().unwrap().trim().to_string();
+        assert_eq!(l1, token, "第 1 行 = 明文 token");
+        assert!(
+            (128..=256).contains(&l1.len()),
+            "token = random_hex(16) ⇒ 16 段 × (8..16) 位小写 hex，实际 {}",
+            l1.len()
+        );
+        assert!(
+            l1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "token 只能是小写 hex：{l1}"
+        );
+        let expiry: u64 = l2.parse().expect("第 2 行 = 过期时间戳（数字）");
+        assert_eq!(expiry, now + TOKEN_TTL_MS, "过期时间 = 签发时刻 + TTL");
+        assert!(lines.next().is_none(), "只有两行，不许多写");
+    }
+
+    /// ⑩ approve 响应里带**新 token** ⇒ 旧 token 作废 ⇒ 链式续期可用。
+    #[test]
+    fn approve响应带新token_旧token作废_链式续期可用() {
+        let dir = tmp_dir("chain");
+        let hub = std::sync::Arc::new(crate::perm_request::PermHub::new());
+        let (id, _h) = spawn_pending(&hub, "要不要装这个包");
+        let old = issue_token(&dir, crate::permission::now_ms()).unwrap();
+
+        let resp =
+            handle_op(&dir, &dir, &hub, &old, "approve", &id, "orbcat-perm/1").expect("应当成功");
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let new_token = v["token"]
+            .as_str()
+            .expect("成功响应必须带新 token")
+            .to_string();
+        assert_ne!(new_token, old, "新 token 必须与旧的不同");
+
+        // 旧 token 作废（用一次即轮换）
+        assert!(
+            !verify_token(&dir, &old, crate::permission::now_ms()),
+            "旧 token 必须立刻作废"
+        );
+        // 新 token 可用 ⇒ 链没断
+        let resp2 = handle_op(&dir, &dir, &hub, &new_token, "list", "", "orbcat-perm/1").unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&resp2).unwrap();
+        assert_eq!(v2["ok"], true);
+        assert!(
+            v2.get("token").and_then(|x| x.as_str()).is_some(),
+            "list 也要带新 token（否则调用方手里的 token 会作废）"
+        );
+    }
+
+    /// ⑪ 外部通道**仍然只允许一次性决定**（always / prefix / full / narrow 全拒）。
+    #[test]
+    fn 外部通道仍只允许一次性决定_always等全拒() {
+        for op in [
+            "always",
+            "full",
+            "prefix",
+            "narrow",
+            "approve-always",
+            "approve-full",
+            "approve-prefix",
+            "remember",
+            "总是允许",
+        ] {
+            assert!(
+                external_decision(op).is_none(),
+                "外部通道不该接受 {op}（那是扩大授权）"
+            );
+        }
+        // 通道层也要拒（不是只在白名单函数里拒）
+        let dir = tmp_dir("oneshot");
+        let hub = std::sync::Arc::new(crate::perm_request::PermHub::new());
+        for op in ["always", "full", "prefix", "narrow"] {
+            // 每次都要重签（成功请求会轮换 token）
+            let t = issue_token(&dir, crate::permission::now_ms()).unwrap();
+            let err = handle_op(&dir, &dir, &hub, &t, op, "", "test")
+                .expect_err("扩大授权的决定必须被拒");
+            assert!(
+                err.contains(op) || err.contains("不支持该决定"),
+                "错误信息要说清是哪个 op 被拒：{err}"
+            );
+        }
+    }
+
+    /// ⑫ 代批提醒事件会发（approve 与 deny **都发**，字段齐全）。
+    #[test]
+    fn 代批提醒事件会发_approve与deny都发且字段齐全() {
+        let dir = tmp_dir("notify");
+        let hub = std::sync::Arc::new(crate::perm_request::PermHub::new());
+        let (tx, rx) = std::sync::mpsc::channel::<(String, serde_json::Value)>();
+        hub.attach_emitter(Box::new(move |ev, payload| {
+            let _ = tx.send((ev.to_string(), payload));
+        }));
+
+        // ① approve ⇒ 必须有提醒
+        let (id1, _h1) = spawn_pending(&hub, "第一条申请");
+        let t1 = issue_token(&dir, crate::permission::now_ms()).unwrap();
+        handle_op(&dir, &dir, &hub, &t1, "approve", &id1, "orbcat-perm/42").unwrap();
+        let p1 = recv_decision(&rx);
+        assert_eq!(p1["pendingId"], id1.as_str(), "pendingId 要对得上");
+        assert_eq!(p1["decision"], "approve");
+        assert_eq!(p1["cliInstance"], "orbcat-perm/42", "CLI 实例标识要带上来");
+        assert!(
+            !p1["kind"].as_str().unwrap_or("").is_empty(),
+            "kind 字段不能空：{p1}"
+        );
+        assert!(p1["at"].as_u64().unwrap_or(0) > 0, "时间戳要有：{p1}");
+
+        // ② deny ⇒ **也**必须有提醒（拒绝也是用户该知道的事）
+        let (id2, _h2) = spawn_pending(&hub, "第二条申请");
+        let t2 = issue_token(&dir, crate::permission::now_ms()).unwrap();
+        handle_op(&dir, &dir, &hub, &t2, "deny", &id2, "orbcat-perm/43").unwrap();
+        let p2 = recv_decision(&rx);
+        assert_eq!(p2["pendingId"], id2.as_str());
+        assert_eq!(p2["decision"], "deny", "deny 也要发提醒");
+    }
+
+    /// ⑬ CLI 文件缺失时，状态查询**如实报不可用**。
+    #[test]
+    fn CLI文件缺失时状态查询如实报不可用() {
+        let root = tmp_dir("ncli"); // 空的包根（没有 bin\orbcat-perm.exe）
+        let state = tmp_dir("ncli-state");
+        let st = status_at(&root, &state);
+        assert!(!st.cli_present, "没有 CLI 文件 ⇒ cli_present 必须为 false");
+        assert!(!st.available, "CLI 缺失 ⇒ 必须如实报不可用");
+        assert!(
+            st.cli_path.ends_with("orbcat-perm.exe"),
+            "路径要指向预期位置：{}",
+            st.cli_path
+        );
+        assert!(!st.token_valid, "没签发 token ⇒ token 必然无效");
+
+        // 反过来：文件在 ⇒ cli_present = true
+        let (root2, _bin) = app_with_cli("ncli-ok");
+        let st2 = status_at(&root2, &state);
+        assert!(st2.cli_present, "文件在就该报在");
+        // available = 「文件在」且「通道起」⇒ 不变式
+        assert_eq!(st2.available, st2.cli_present && st2.channel_up);
+    }
+
+    /// ⑭ 代批决定**照旧进审计链**（hash 链完整）。
+    #[test]
+    fn 代批决定照旧进审计链_hash链完整() {
+        let dir = tmp_dir("audit2");
+        let hub = std::sync::Arc::new(crate::perm_request::PermHub::new());
+
+        let (id1, _h1) = spawn_pending(&hub, "第一条");
+        let t1 = issue_token(&dir, crate::permission::now_ms()).unwrap();
+        handle_op(&dir, &dir, &hub, &t1, "approve", &id1, "orbcat-perm/7").unwrap();
+
+        let (id2, _h2) = spawn_pending(&hub, "第二条");
+        let t2 = issue_token(&dir, crate::permission::now_ms()).unwrap();
+        handle_op(&dir, &dir, &hub, &t2, "deny", &id2, "orbcat-perm/7").unwrap();
+
+        let audit =
+            std::fs::read_to_string(crate::command_policy::audit_path(&dir)).unwrap_or_default();
+        assert!(audit.contains("perm-cli-approve"), "代批必须进审计链：{audit}");
+        assert!(audit.contains("perm-cli-deny"), "拒绝也要进审计链：{audit}");
+
+        let recs: Vec<crate::command_policy::AuditRecord> = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert!(recs.len() >= 2, "至少两条：{audit}");
+        assert!(
+            recs.iter().all(|r| !r.hash.is_empty()),
+            "每条都要有 hash：{audit}"
+        );
+        // hash 链：后一条的 prev_hash 指向上一条的 hash
+        for w in recs.windows(2) {
+            assert_eq!(w[1].prev_hash, w[0].hash, "hash 链必须连上：{audit}");
+        }
     }
 }

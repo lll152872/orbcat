@@ -19,11 +19,19 @@
 //!
 //! # 凭证
 //!
-//! - **token 在环境变量** `ORBCAT_PERM_TOKEN` 里 —— **只存在于本进程的环境**；
-//! - orbcat 侧短时效（5 分钟）+ **用一次即轮换**；
+//! - **token 默认从状态目录的文件读**（`<状态目录>\perm-token`，宿主启动时自动签发、
+//!   每次成功调用轮换）⇒ 外部 AI 直接跑 `orbcat-perm list` 就行，
+//!   **不用用户手动设置环境变量**；
+//! - `ORBCAT_PERM_TOKEN` 仍可覆盖（显式给一枚用；测试/便携场景）；
 //! - 端点地址在 `<状态目录>\perm-port`：
 //!   - Windows：`%LOCALAPPDATA%\orbcat`
 //!   - 可用 `ORBCAT_PERM_STATE_DIR` 覆盖（测试/便携场景）。
+//!
+//! # 链式续期
+//!
+//! 宿主的凭证是**用一次即轮换**的 ⇒ 每次**成功**响应里都带**新 token**
+//! （旧的立刻作废）。CLI 每次调用都**重读文件** ⇒ 永远拿到当前那一枚，
+//! 链不会断；响应里的新 token 也一并打印，方便调用方自己管 token。
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -80,8 +88,28 @@ fn main() {
         }
     };
 
-    let token = std::env::var("ORBCAT_PERM_TOKEN")
-        .unwrap_or_else(|_| die("缺少环境变量 ORBCAT_PERM_TOKEN（凭证只应出现在本进程环境里）"));
+    // ⚠️ 凭证来源：**优先环境变量**（显式给一枚），否则读状态目录里的 token 文件
+    //    （宿主启动时自动签发 + 每次成功调用轮换 ⇒ 外部 AI 不用配置任何环境变量）。
+    let token = match std::env::var("ORBCAT_PERM_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => {
+            let p = state_dir().join("perm-token");
+            let raw = std::fs::read_to_string(&p).unwrap_or_else(|e| {
+                die(&format!(
+                    "读 token 文件失败（{}）：{e}\n\
+                     （宿主没起来？先启动 orbcat；或用 ORBCAT_PERM_TOKEN 显式给一枚）",
+                    p.display()
+                ))
+            });
+            raw.lines().next().unwrap_or("").trim().to_string()
+        }
+    };
+    if token.is_empty() {
+        die("token 是空的（宿主可能还没签发；先启动 orbcat）");
+    }
+
+    // CLI 实例标识（**仅用于提醒里显示「谁批的」，不是安全边界** —— 客户端可自称）。
+    let client = format!("orbcat-perm/{}", std::process::id());
 
     let port_file = state_dir().join("perm-port");
     let port: u16 = std::fs::read_to_string(&port_file)
@@ -94,12 +122,13 @@ fn main() {
         .unwrap_or_else(|e| die(&format!("连 orbcat 外部通道失败（127.0.0.1:{port}）：{e}")));
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
 
-    // 手写最小 JSON（只三个字符串字段，避免给 bin 拖 serde 依赖）
+    // 手写最小 JSON（只四个字符串字段，避免给 bin 拖 serde 依赖）
     let req = format!(
-        "{{\"token\":{},\"op\":{},\"arg\":{}}}",
+        "{{\"token\":{},\"op\":{},\"arg\":{},\"client\":{}}}",
         json_str(&token),
         json_str(op),
-        json_str(arg)
+        json_str(arg),
+        json_str(&client)
     );
     stream
         .write_all(format!("{req}\n").as_bytes())

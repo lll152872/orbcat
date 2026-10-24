@@ -256,7 +256,7 @@ bash tools/build-release.sh --fast   # 快速档，给人真机测试用
 
 代价：**`orbcat.exe` 必须和 `dist/` 同目录分发**，不能只拷一个 exe 走。
 
-### 发布 zip 是**四件套**，不是两个文件
+### 发布 zip 是**五件套**，不是两个文件
 
 ```
 发布目录/
@@ -269,6 +269,8 @@ bash tools/build-release.sh --fast   # 快速档，给人真机测试用
 ├── runtime/                 ← 内置运行时（缺了 pi 内核静默失效）
 │   ├── node/                ← node v22.22.2（PTC run_code + pi 都要它）
 │   └── pi/                  ← pi 内核 bundle
+├── bin/                     ← 外部代批 CLI（**不想要就删掉整个文件**）
+│   └── orbcat-perm.exe      ← 给用户侧外部 AI（Codex / Claude Code）代批权限申请
 ├── agent-data/              ← 空骨架，解压即有内置技能与记忆模板
 │   ├── manifest.json
 │   ├── memory/MEMORY.md
@@ -316,12 +318,43 @@ bash tools/build-release.sh --fast   # 快速档，给人真机测试用
 > 两者在代码侧都是 `Option`（`pi::bundled_git()` / `bundled_bash()` / `bundled_python()`），
 > 缺席就是回落系统那份，**不会导致启动失败**。
 
+### 外部代批 CLI（`bin\orbcat-perm.exe`）—— 可随时删掉
+
+**它是什么**：给**用户自己 shell 里的外部 AI**（Codex / Claude Code 等）用的命令行工具，
+让外部 AI 能**代用户**处理 orbcat 的权限申请（批准 / 拒绝 / 查看待办）：
+
+```bash
+bin\orbcat-perm.exe list                 # 列出当前待批的申请
+bin\orbcat-perm.exe approve <id>         # 代批一次（**一次性**，不写任何永久授权）
+bin\orbcat-perm.exe deny <id>            # 拒绝
+```
+
+- **orbcat 内部的 AI（pi 内核 / 自研内核）碰它一律硬阻断** ——
+  两层边界：① 路径阻断（命令/工具参数里出现 CLI 的名字或路径 ⇒ 拒绝、不执行、不弹卡）
+  ② 通道鉴权（独立本地端点 + 短时效凭证 + **只允许一次性决定**）。
+- **凭证**：宿主启动时**自动签发**（明文 + 过期戳，5 分钟有效、用一次即轮换），
+  落 `%LOCALAPPDATA%\orbcat\perm-token`；端口落同目录 `perm-port`
+  ⇒ **不在 `agent-data/` 里**。外部 AI 直接跑 CLI 就行，不用配置环境变量。
+- **界面会提醒**：每次代批（**批和拒都算**）都会在 orbcat 界面弹一条提示 ——
+  谁批的、批了哪条、批还是拒（事件 `perm-cli-decision`）。
+
+> ✅ **不信任就删**：把 `bin\orbcat-perm.exe` 删掉，这个能力**立刻消失**
+> （设置页的状态查询会如实报「不可用」）。这是**兜底手段**，不是唯一的防线。
+
+> ⚠️ **残余风险（说清楚，别当没有）**：
+> 内部 AI 与外部 AI **同用户、同完整性级别 ⇒ 共享同一安全主体** ⇒ 内部 AI
+> **理论上**也能读到 token 文件并自己直调端点（路径阻断只挡「直接调用 CLI」）。
+> ⇒ 本版按用户 2026-10-24 拍板**不做内核级隔离**，
+> 用「**每次代批都有界面提醒 + CLI 可随时删除**」兜底。
+> ⇒ 要彻底封死，需下一版做匿名 Job Object / 命名管道那一层。
+
 ### 装配由一个脚本统一，CI 不自带复制逻辑
 
 ```bash
 # 装配 + 自检（dist 是子目录，不是平铺）
 node tools/package.mjs --exe src-tauri/target/release/orbcat.exe \
-                       --dist dist --out pkg --skeleton src-tauri/skeleton
+                       --dist dist --out pkg --skeleton src-tauri/skeleton \
+                       --cli-exe src-tauri/target/release/orbcat-perm.exe
 
 # 只校验已有产物（CI 解压回验用的就是这条）
 node tools/package.mjs --verify pkg --exe-name orbcat.exe
@@ -329,6 +362,11 @@ node tools/package.mjs --verify pkg --exe-name orbcat.exe
 
 `--skeleton` **只能指向 `src-tauri/skeleton`** —— 那是编译期固定的空骨架。
 铺真实的 `agent-data/` 会被 `verifyNoUserData()` 拦下（那等于把 API key 打进发布包）。
+
+> ⚠️ **CLI 的文件名必须精确是 `orbcat-perm.exe`（带连字符）** ——
+> 层 1 的路径阻断按**文件名**匹配 ⇒ 叫 `orbcat_perm.exe` 就挡不住。
+> `src-tauri/Cargo.toml` 里是**显式** `[[bin]] name = "orbcat-perm"`（自动发现会叫成下划线版）。
+> `--cli-exe` **缺了或名字不对 ⇒ 当场报错**，不许发出一个「没有 CLI」的包。
 
 > ⚠️ **runtime 是必带的**（2026-10-23 起，审计 F1/F2）：
 > `package.mjs` 找不到 `runtime/` 会**当场报错**，不再只 warn 就放过

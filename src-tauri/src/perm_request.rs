@@ -587,6 +587,18 @@ impl PermHub {
         }
     }
 
+    /// 发一个**任意**事件（给不归本模块管的能力用）。
+    ///
+    /// ⚠️ 用途：外部代批 CLI 的「代批提醒」（`perm_cli` 模块）——
+    ///    那是**别的模块**产生的事件，但要走同一条发射通道
+    ///    （否则就得再往 `PermHub` 里塞一个回调，通道会分叉）。
+    ///
+    /// ⚠️ 注入的回调没接时**静默丢弃**（与 `emit_request` 同口径）：
+    ///    单测 / 无界面场景下没有前端可通知。
+    pub fn emit_event(&self, event: &str, payload: serde_json::Value) {
+        self.emit(event, payload);
+    }
+
     pub fn grants(&self) -> &Mutex<GrantStore> {
         &self.grants
     }

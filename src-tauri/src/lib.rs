@@ -4527,6 +4527,18 @@ fn perm_requests_list(state: State<'_, AppState>) -> Vec<perm_request::PendingVi
     state.perm.pending_views()
 }
 
+/// **外部代批 CLI** 的状态（前端设置页用）。
+///
+/// ⚠️ 用户把 `bin\orbcat-perm.exe` 删掉之后，这里会**如实报不可用**
+///    （`cliPresent=false` / `available=false`）—— 不许假装还能用。
+///
+/// ⚠️ `available` = 「CLI 文件在」**且**「通道起着」——
+///    只看文件不看通道，会把「文件在但宿主没起」误报成可用。
+#[tauri::command]
+fn perm_cli_status() -> perm_cli::PermCliStatus {
+    perm_cli::status_current()
+}
+
 /// 当前生效的临时授权（设置页展示 + 手动撤销用）
 #[tauri::command]
 fn perm_grants_list(state: State<'_, AppState>) -> Result<Vec<permission::Grant>, String> {
@@ -5487,6 +5499,30 @@ pub fn run() {
                 }
             }
 
+            // ── 外部代批通道（**宿主进程**起，**不是** pi 运行时）──
+            //
+            // ⚠️ 必须在宿主起：pi 运行时那条是**工具桥**（内部 AI 够得着），
+            //    而「代批权限」这个能力绝不能挂在那条路上。
+            //
+            // ⚠️ **已知弱点（写清楚，别当没有）**：token / 端口文件**同用户可读**
+            //    ⇒ 内部 AI 理论上能读到 token 并自己直调端点
+            //    （层 1 的路径阻断只挡「直接调用 CLI」）。
+            //    ⇒ 按用户 2026-10-24 拍板，本版**不做内核级隔离**，
+            //    用「① 每次代批都有界面提醒（perm-cli-decision 事件）
+            //      ② CLI 可随时删掉（删了状态查询就报不可用）」兜底。
+            {
+                let perm_for_cli = perm.clone();
+                let dd_for_cli = data_dir.clone();
+                let state_dir = perm_cli::cli_state_dir();
+                match perm_cli::serve(&state_dir, &dd_for_cli, perm_for_cli) {
+                    Ok(port) => eprintln!(
+                        "[orbcat] 外部代批通道已启动：127.0.0.1:{port}（状态目录 {}）",
+                        state_dir.display()
+                    ),
+                    Err(e) => eprintln!("[orbcat] ⚠️ 外部代批通道启动失败: {e}"),
+                }
+            }
+
             // ── pi 内核运行时 ──
             //
             // 只有**内置 runtime 存在**时才建（`runtime/node/node.exe` + `runtime/pi/`）。
@@ -5749,6 +5785,7 @@ pub fn run() {
             perm_cmd_audit_tail,
             perm_request_decide,
             perm_requests_list,
+            perm_cli_status,
             perm_grants_list,
             perm_grant_revoke,
             list_models,
