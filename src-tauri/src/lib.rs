@@ -557,12 +557,27 @@ const ORB_SAVE_DEBOUNCE_MS: u64 = 600;
 /// 拖动时 `WindowEvent::Moved` 每帧都来（可达 60+/s），而 `on_window_event`
 /// 跑在**主线程**上 —— 每次同步写 `settings.json` 会在事件循环里制造 IO 抖动，
 /// 表现为"拖的时候发卡"。所以改成"只留最新值 + 安静期后由后台线程写一次"。
-static ORB_SAVE_PENDING: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+///
+/// ## 为什么槽里要**连目录一起存**（2026-10-24 修）
+///
+/// 原来这里只存坐标，落盘目标取的是「**谁先 spawn 的那个 worker** 捕获的目录」。
+/// 于是槽里的值和落盘目录可能**对不上** —— 值属于后来的目录，却写进先来那个
+/// worker 的目录。
+///
+/// 生产上只有一个数据目录，所以平时看不出来；但一进测试（多个用例各用各的临时
+/// 目录）就会**偶发红**：上一个用例留下的 worker 醒来后 `take()` 走了下一个用例
+/// 正等着写的值，却把它写进**自己那个目录** ⇒ 被偷的目录永远等不到那个值。
+///
+/// 修法：**值连目录一起走**，落盘目标跟着值走 ⇒ 谁拿走都写对地方。
+static ORB_SAVE_PENDING: Mutex<Option<(PathBuf, i32, i32)>> = Mutex::new(None);
 
 /// 安排一次球位置落盘（自带防抖）。
 ///
 /// 已有 worker 在等就只更新值；没有才起一个。worker 醒来后 `take()` 走最新的
 /// 那个值 —— 所以拖一整串事件，最终只写**最后那一个**位置。
+///
+/// ⚠️ 落盘目标**跟着值走**，不跟着 worker 走：worker 醒来 `take()` 到什么，
+/// 就写到那个值**自带的目录**去（见 [`ORB_SAVE_PENDING`] 的说明）。
 ///
 /// worker 醒来与 `Moved` 撞上的次序也安全：
 /// - `take()` 之前来了新值 → worker 直接拿到新的；
@@ -571,7 +586,8 @@ fn schedule_orb_pos_save(data_dir: &Path, pos: (i32, i32)) {
     let spawn = match ORB_SAVE_PENDING.lock() {
         Ok(mut g) => {
             let spawn = g.is_none();
-            *g = Some(pos);
+            // ⚠️ 值和目录**一起**存 —— 少了目录就会"落盘写到别处去"（见 static 的说明）
+            *g = Some((data_dir.to_path_buf(), pos.0, pos.1));
             spawn
         }
         Err(e) => {
@@ -582,15 +598,15 @@ fn schedule_orb_pos_save(data_dir: &Path, pos: (i32, i32)) {
     if !spawn {
         return;
     }
-    let dir = data_dir.to_path_buf();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(ORB_SAVE_DEBOUNCE_MS));
         let latest = match ORB_SAVE_PENDING.lock() {
             Ok(mut g) => g.take(),
             Err(_) => None,
         };
-        if let Some(p) = latest {
-            save_orb_pos(&dir, p);
+        // 落盘目标 = 值自带的目录（不是这个 worker 捕获的那个）
+        if let Some((dir, x, y)) = latest {
+            save_orb_pos(&dir, (x, y));
         }
     });
 }
@@ -599,13 +615,16 @@ fn schedule_orb_pos_save(data_dir: &Path, pos: (i32, i32)) {
 ///
 /// 不做这一步的话："拖完球 → 直接杀进程 / 关机"这一条路径上，防抖窗口里的
 /// 那个值就丢了，下次启动球回到更早一次的位置。
-fn flush_orb_pos_save(data_dir: &Path) {
+///
+/// ⚠️ 同样**按值自带的目录**写 —— 传进来一个目录再拿它写 pending 的值，
+/// 就会重犯"值与目录错位"的老毛病（所以这里刻意**不收**目录参数）。
+fn flush_orb_pos_save() {
     let pending = match ORB_SAVE_PENDING.lock() {
         Ok(mut g) => g.take(),
         Err(_) => None,
     };
-    if let Some(p) = pending {
-        save_orb_pos(data_dir, p);
+    if let Some((dir, x, y)) = pending {
+        save_orb_pos(&dir, (x, y));
     }
 }
 
@@ -2378,8 +2397,8 @@ pub(crate) fn web_search_ready_for(data_dir: &std::path::Path) -> bool {
 fn app_quit(app: tauri::AppHandle) {
     eprintln!("[orbcat] 用户要求退出");
     // 退出前把还排在防抖窗口里的球位置写掉 —— 否则「刚拖完就退出」会丢
-    let dir = app.state::<AppState>().data_dir.clone();
-    flush_orb_pos_save(&dir);
+    // （落盘目标跟着待写值**自带的目录**走，所以这里不用传目录）
+    flush_orb_pos_save();
     app.exit(0);
 }
 
