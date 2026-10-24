@@ -20,8 +20,11 @@
 //!   同构。老备份没有 id 就从文件名反解（`legacy` 标记），**不假装知道**它的原路径。
 //! - **还**：`restore_backup` 把备份复制回原路径（**先给现状再备份一次**，
 //!   所以"还原"本身也可撤销）；`restore_trash` 把归档 move 回原路径。
-//! - **清**：`prune` 按天数 + 条数上限清理，**默认保守**（90 天 / 各 500 条），
-//!   且只在用户显式调用时执行 —— 不做后台自动删除。
+//! - **清**：**两层语义各管各的**（设计稿 §7 硬约束 + R-011 / R-038）：
+//!   ① **自动**：`retain_head_tail` 按**原路径分组**，同一个文件只留**最新 + 最旧两份**，
+//!     中间的版本自动清掉；触发时机 = **每次新增备份后**（`backup_file` 里）。
+//!   ② **手动**：`prune` 按天数 + 条数上限批量腾空间（**默认保守**：90 天 / 各 500 条），
+//!     只在用户显式点按钮时执行 —— 它是用户唯一的「批量腾空间」入口，不能被自动逻辑吞掉。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -165,7 +168,31 @@ fn parse_legacy_name(name: &str) -> (u64, String) {
 /// 1. 写 `backups.jsonl` 记录**原路径**，还原才有依据；
 /// 2. 返回记录本身（调用方拿去拼提示文本）；
 /// 3. 文件不存在时返回 `None`，不建空备份。
+///
+/// ## ⚠️ 这里会**自动**跑保留策略（设计稿 §7 / R-011 验收②）
+///
+/// 新增备份之后立刻执行 [`retain_head_tail`]：同一个原路径只留**最新 + 最旧两份**，
+/// 中间的版本从盘上真正删掉。**不引入定时任务/后台线程** ——
+/// 「刚发生一次修改」这个时机本身就是最省事、也最不打扰用户的清理点。
+///
+/// 保留策略失败**不会**让备份失败（副本已经在盘上了）。
 pub fn backup_file(data_dir: &Path, path: &Path) -> Result<Option<BackupRec>, String> {
+    let rec = backup_file_inner(data_dir, path)?;
+    if rec.is_some() {
+        if let Err(e) = retain_head_tail_except(data_dir, rec.as_ref().map(|r| r.id.as_str())) {
+            eprintln!("[orbcat] ⚠️ 自动保留（只留首尾两份）执行失败: {e}");
+        }
+    }
+    Ok(rec)
+}
+
+/// 建备份副本 + 写清单（**不触发**自动保留策略）。
+///
+/// 为什么单独拆一层：还原流程（[`copy_over`]）会先给目标文件「现状」再备份一份，
+/// 而**还原的源文件本身也可能在这次保留策略里被删掉** ——
+/// 若在 `backup_file` 里就触发，源文件可能在复制之前就没了 ⇒ 还原直接失败。
+/// 所以：还原流程用这一层（无副作用），复制**完成之后**再统一跑一次保留策略。
+fn backup_file_inner(data_dir: &Path, path: &Path) -> Result<Option<BackupRec>, String> {
     if !path.is_file() {
         return Ok(None);
     }
@@ -362,7 +389,10 @@ pub fn restore_backup(
 /// 复制覆盖 + 目标现状先备份。
 fn copy_over(data_dir: &Path, src: &Path, dst: &Path) -> Result<String, String> {
     let safety = if dst.exists() {
-        match backup_file(data_dir, dst)? {
+        // ⚠️ 用 `backup_file_inner`（**不**触发保留策略）：还原的源文件 `src`
+        //    可能就在这次保留策略的删除名单上 —— 先触发会把源文件删掉，
+        //    复制就失败了。保留策略挪到复制**之后**统一跑（见本函数末尾）。
+        match backup_file_inner(data_dir, dst)? {
             Some(r) => format!("\n（{} 的**现状**也已备份：{}）", dst.display(), r.id),
             None => String::new(),
         }
@@ -373,6 +403,11 @@ fn copy_over(data_dir: &Path, src: &Path, dst: &Path) -> Result<String, String> 
         std::fs::create_dir_all(parent).map_err(|e| format!("建目录失败: {e}"))?;
     }
     std::fs::copy(src, dst).map_err(|e| format!("还原失败: {e}"))?;
+    // 还原本身也算一次「新增备份」⇒ 保留策略在**复制完成之后**跑一次。
+    // 此刻源文件已经安全落到目标位置，被清掉的中间版本不影响这次还原。
+    if let Err(e) = retain_head_tail(data_dir) {
+        eprintln!("[orbcat] ⚠️ 自动保留（只留首尾两份）执行失败: {e}");
+    }
     Ok(format!(
         "已还原 {} ← {}（{} 字节）{safety}",
         dst.display(),
@@ -510,6 +545,138 @@ pub fn prune(data_dir: &Path, keep: Retention) -> Result<PruneOutcome, String> {
     rewrite_trash_manifest(data_dir)?;
 
     Ok(out)
+}
+
+/// **同一个原路径只留首尾两份** —— 设计稿 §7 硬约束（`docs/09-FRONTEND-HANDOVER.md` §一）。
+///
+/// ## 为什么是「首尾两份」而不是「最新一份」
+///
+/// 备份区的意义是**后悔药**：用户改坏了文件想退回去。
+/// - 只留**最新一份** ⇒ 只能退到"上一版"，**最初写的那版没了**；
+/// - 留**首尾两份** ⇒ 既能退到最近一版，也能退到最初一版。
+///
+/// 设计稿原话：「备份与回收站必须能删：不只还原；且**只保留首尾两份**
+/// （每次都存没意义）」—— 落成本模块的**自动**保留策略（R-011）。
+///
+/// ## 触发时机
+///
+/// **每次新增备份后自动跑一次**（在 [`backup_file`] 里）⇒ R-011 验收标准②
+/// 「清理**自动发生**，不靠用户点按钮」。
+/// **不引入定时任务/后台线程**：新增备份这个时机 = "刚刚发生了一次修改"，
+/// 此刻把中间版本清掉最省事，也不用常驻一个线程扫盘。
+///
+/// ## 分组口径
+///
+/// 按 `BackupRec.original`（**原路径**）分组 —— 同一个原路径 = 同一个文件的连续版本。
+/// `original` 为空的（加清单之前的老备份、手工丢进目录的副本）**原路径无从得知**
+/// ⇒ 一律归进「未知原路径」这一组，按时间只留首末两份（同一口径），
+/// **不瞎猜**它们是不是同一个文件。
+///
+/// ## 回收站（trash）为什么不一起处理 —— **结论：维持现状，不动**
+///
+/// 设计稿 §7 那句「只保留首尾两份」针对的是**同一文件的连续修改版本**：
+/// 备份区里 `a.txt` 的第 1/3/5 版是**同一个文件的不同版本**，
+/// 留首尾两份还能找回"最初的样子"和"最近的样子"，中间的确实没价值。
+///
+/// 而回收站里躺着的是**被删掉的不同东西**（用户删了 A、B、C 三个文件），
+/// 它们之间**没有任何版本关系** —— 按时间只留两份 = 随手替用户删掉他刚删的文件。
+/// 那不是"版本保留"，那是"偷偷清空回收站"，与设计稿 §7「必须能删」的语义正相反。
+///
+/// ⇒ trash 的清理由**用户显式操作**负责（每行「删除」/「清空回收站」，已实现）。
+///
+/// ## 与手动 [`prune`] 的分工
+///
+/// 两者**并存**，语义不同：自动管「同一文件的首尾两份」（版本保留），
+/// 手动管「按天数/条数批量腾空间」（容量治理）。
+pub fn retain_head_tail(data_dir: &Path) -> Result<PruneOutcome, String> {
+    retain_head_tail_except(data_dir, None)
+}
+
+/// [`retain_head_tail`] 的内部实现：`keep_id` 指定的备份**本轮不删**。
+///
+/// 为什么需要这个豁免：刚建好的那份备份**必须**留着（哪怕时钟回拨导致
+/// 清单里有比它更新的记录）。豁免只是推迟 —— 下一轮保留策略照样会处理它。
+fn retain_head_tail_except(data_dir: &Path, keep_id: Option<&str>) -> Result<PruneOutcome, String> {
+    let mut out = PruneOutcome::default();
+    let recs = list_backups(data_dir); // 新→旧
+
+    // ---- 按原路径分组 ----
+    // ⚠️ `original` 为空 ⇒ 「未知原路径」组（key = 空串），**不瞎分组**。
+    let mut groups: Vec<(String, Vec<BackupRec>)> = Vec::new();
+    for r in recs {
+        let key = if r.original.trim().is_empty() {
+            String::new()
+        } else {
+            r.original.clone()
+        };
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, g)) => g.push(r),
+            None => groups.push((key, vec![r])),
+        }
+    }
+
+    for (_key, mut g) in groups {
+        if g.len() <= RETAIN_HEAD_TAIL_KEEP {
+            continue; // 1 份 / 2 份：全留
+        }
+        // g 来自 `list_backups`（新→旧）；这里**稳定**排序成时间升序 ⇒ [最旧 … 最新]。
+        // ⚠️ 同一毫秒多份时：稳定排序保持清单写入顺序 ⇒ 最早写入的那份仍排在最后
+        //    ⇒ 天然被当成"最旧"，语义正确。
+        g.sort_by_key(|r| r.at);
+        let last = g.len() - 1;
+        for r in &g[1..last] {
+            // 刚建好的那份必须留着
+            if Some(r.id.as_str()) == keep_id {
+                continue;
+            }
+            if let Some(size) = remove_backup_copy(data_dir, r) {
+                out.backups_removed += 1;
+                out.bytes_freed += size;
+            }
+        }
+    }
+
+    // 删了东西就得重写清单，否则清单里全是已不存在的条目
+    if out.backups_removed > 0 {
+        rewrite_backups_manifest(data_dir)?;
+    }
+    Ok(out)
+}
+
+/// 每个原路径保留几份（最新 + 最旧）。
+const RETAIN_HEAD_TAIL_KEEP: usize = 2;
+
+/// 删掉一份备份**副本**，返回释放的字节数（副本不在盘上则返回 `None`）。
+///
+/// ⚠️ **只删 `backups/` 目录里面**的副本 —— 绝不可能碰到用户当前的文件：
+///    优先用「目录里的同名文件」（`id` 就是文件名 ⇒ 一定在 `backups/` 内）；
+///    退而求其次用清单里的 `backup` 路径时，也必须**字面**落在 `backups/` 下才敢删
+///    （清单被改坏时，宁可留着也不误删用户文件）。
+fn remove_backup_copy(data_dir: &Path, rec: &BackupRec) -> Option<u64> {
+    let dir = backups_dir(data_dir);
+    let by_id = dir.join(&rec.id);
+    let path = if by_id.is_file() {
+        by_id
+    } else {
+        let p = PathBuf::from(&rec.backup);
+        if !p.starts_with(&dir) {
+            return None;
+        }
+        p
+    };
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    std::fs::remove_file(&path).ok().map(|_| size)
+}
+
+/// 备份清单重写（保留策略用）：只留**副本还在盘上**的条目。
+fn rewrite_backups_manifest(data_dir: &Path) -> Result<(), String> {
+    let dir = backups_dir(data_dir);
+    let recs = read_jsonl::<BackupRec>(&backups_manifest(data_dir));
+    let alive: Vec<BackupRec> = recs
+        .into_iter()
+        .filter(|r| dir.join(&r.id).exists() || Path::new(&r.backup).exists())
+        .collect();
+    write_manifest(&backups_manifest(data_dir), &alive)
 }
 
 /// 备份清单重写：只留磁盘上还存在的条目（清理后必须重写，否则清单越滚越大）。
@@ -1032,6 +1199,207 @@ mod tests {
         assert!(text.contains("## 目录体积"));
         let path = write_diagnostic(&d).unwrap();
         assert!(path.exists(), "应把诊断包落盘");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // -----------------------------------------------------------------
+    // 自动保留：同一原路径只留首尾两份（设计稿 §7 / R-011）
+    // -----------------------------------------------------------------
+
+    /// 测试用临时 agent-data 目录（名字带**纳秒** ⇒ 并行跑不互删）。
+    ///
+    /// 照抄 `agent.rs` 里 `meme_tmp()` 的写法：只带 pid 的目录名在
+    /// 同一进程内两次调用会撞车（后一次把前一次删了）。
+    fn recovery_tmp(tag: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir().join(format!("orbcat_recovery_{tag}_{stamp}"));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 🔴 **自动保留的核心验收**：同一原路径备份 5 份 ⇒ 只剩**首尾两份**，
+    /// 且中间 3 份**确实从盘上消失**（断言磁盘状态，不只是返回值）
+    #[test]
+    fn retain_head_tail_keeps_only_oldest_and_newest() {
+        let d = recovery_tmp("retain5");
+        let f = d.join("doc.md");
+        let mut ids: Vec<(String, String)> = Vec::new();
+        for i in 0..5 {
+            std::fs::write(&f, format!("v{i}")).unwrap();
+            let rec = backup_file(&d, &f).unwrap().expect("应产生备份");
+            ids.push((rec.id.clone(), rec.backup.clone()));
+        }
+
+        // 只剩 2 份（最新 + 最旧）
+        let left = list_backups(&d);
+        assert_eq!(left.len(), 2, "同一原路径只该留首尾两份：{left:?}");
+
+        // 磁盘状态：最旧那份还在、最新那份还在
+        let (oldest_id, oldest_path) = &ids[0];
+        let (newest_id, newest_path) = &ids[4];
+        assert!(Path::new(oldest_path).exists(), "最旧那份必须留着");
+        assert!(Path::new(newest_path).exists(), "最新那份必须留着");
+
+        // 中间 3 份**确实不在盘上了**
+        for (id, path) in &ids[1..4] {
+            assert!(!Path::new(path).exists(), "中间那份 {id} 必须从盘上删掉");
+        }
+
+        // 留下的正好是首与尾
+        let left_ids: Vec<String> = left.iter().map(|r| r.id.clone()).collect();
+        assert!(left_ids.contains(oldest_id), "留下的应包含最旧那份");
+        assert!(left_ids.contains(newest_id), "留下的应包含最新那份");
+
+        // 用户的当前文件**不受影响**（只删备份副本）
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "v4");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 组内 **1 份 ⇒ 不删**；组内 **2 份 ⇒ 都留**
+    #[test]
+    fn retain_head_tail_keeps_single_and_pair() {
+        let d = recovery_tmp("retain12");
+
+        // 组 A：1 份
+        let a = d.join("a.txt");
+        std::fs::write(&a, "a").unwrap();
+        let ra = backup_file(&d, &a).unwrap().unwrap();
+
+        // 组 B：2 份
+        let b = d.join("b.txt");
+        std::fs::write(&b, "b1").unwrap();
+        let rb1 = backup_file(&d, &b).unwrap().unwrap();
+        std::fs::write(&b, "b2").unwrap();
+        let rb2 = backup_file(&d, &b).unwrap().unwrap();
+
+        let out = retain_head_tail(&d).unwrap();
+        assert_eq!(out.backups_removed, 0, "1 份和 2 份的组都不该删");
+        assert_eq!(list_backups(&d).len(), 3);
+        assert!(Path::new(&ra.backup).exists());
+        assert!(Path::new(&rb1.backup).exists());
+        assert!(Path::new(&rb2.backup).exists());
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `original` 为空的一组（老备份 / 手工丢进目录的副本）⇒ **也只留首末 2 份**
+    #[test]
+    fn retain_head_tail_unknown_original_keeps_two() {
+        let d = recovery_tmp("retain_unknown");
+        let dir = backups_dir(&d);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 3 份老备份：没有清单 ⇒ 原路径未知
+        let ids = [
+            "1700000000000__old1.txt",
+            "1700000000001__old2.txt",
+            "1700000000002__old3.txt",
+        ];
+        for id in ids {
+            std::fs::write(dir.join(id), "旧").unwrap();
+        }
+
+        let listed = list_backups(&d);
+        assert_eq!(listed.len(), 3);
+        assert!(
+            listed.iter().all(|r| r.original.is_empty()),
+            "老备份不该知道原路径"
+        );
+
+        let out = retain_head_tail(&d).unwrap();
+        assert_eq!(out.backups_removed, 1, "3 份未知原路径的只该删中间的 1 份");
+        let left = list_backups(&d);
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().any(|r| r.id == ids[0]), "最旧那份留着");
+        assert!(left.iter().any(|r| r.id == ids[2]), "最新那份留着");
+        assert!(!dir.join(ids[1]).exists(), "中间那份必须从盘上删掉");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ⚠️ **「可手动删」不回归**：自动保留照样在跑，用户点「删除」也必须能删指定备份
+    #[test]
+    fn manual_delete_still_works_alongside_auto_retention() {
+        let d = recovery_tmp("manual_delete");
+        let f = d.join("doc.md");
+        std::fs::write(&f, "v0").unwrap();
+        let rec = backup_file(&d, &f).unwrap().unwrap();
+
+        let msg = delete_backup(&d, &rec.id).unwrap();
+        assert!(msg.contains("已永久删除"), "{msg}");
+        assert!(!Path::new(&rec.backup).exists(), "手动删的备份必须真的不在盘上");
+        assert!(list_backups(&d).is_empty());
+        // 用户的当前文件不受影响
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "v0");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 🔴 **不硬删用户当前文件**：保留策略只动 `backups/` 里的副本
+    #[test]
+    fn retention_never_deletes_the_users_current_file() {
+        let d = recovery_tmp("no_hard_delete");
+        let f = d.join("doc.md");
+        let mut copies: Vec<String> = Vec::new();
+        for i in 0..4 {
+            std::fs::write(&f, format!("v{i}")).unwrap();
+            let rec = backup_file(&d, &f).unwrap().unwrap();
+            copies.push(rec.backup.clone());
+        }
+        assert!(
+            !copies.iter().any(|p| p == &f.display().to_string()),
+            "备份副本路径不能等于原文件路径"
+        );
+        assert!(f.exists(), "用户的当前文件必须还在");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "v3");
+        // 只剩 2 份副本
+        assert_eq!(list_backups(&d).len(), 2);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 回收站**不参与**「只留首尾两份」：trash 里是用户删掉的**不同东西**，
+    /// 按时间只留两份 = 偷偷替用户清空回收站 ⇒ 维持现状不动
+    #[test]
+    fn retention_does_not_touch_trash() {
+        let d = recovery_tmp("trash_untouched");
+        let trash = trash_dir(&d);
+        std::fs::create_dir_all(&trash).unwrap();
+        for i in 0..3u64 {
+            let p = trash.join(format!("170000000000{i}__gone{i}.txt"));
+            std::fs::write(&p, "删掉的东西").unwrap();
+            append_jsonl(
+                &trash_manifest(&d),
+                &TrashRec {
+                    at: 1_700_000_000_000 + i,
+                    original: d.join(format!("gone{i}.txt")).display().to_string(),
+                    trashed: p.display().to_string(),
+                    kind: "file".into(),
+                    count: 1,
+                    present: false,
+                    size: 0,
+                },
+            )
+            .unwrap();
+        }
+        // 顺便造 3 份同一原路径的备份，触发保留策略
+        let f = d.join("doc.md");
+        for i in 0..3 {
+            std::fs::write(&f, format!("v{i}")).unwrap();
+            backup_file(&d, &f).unwrap().unwrap();
+        }
+
+        retain_head_tail(&d).unwrap();
+
+        let trashed = list_trash(&d);
+        assert_eq!(trashed.len(), 3, "回收站一项都不该被自动保留策略动");
+        for r in &trashed {
+            assert!(Path::new(&r.trashed).exists(), "归档物必须还在盘上");
+        }
+
         let _ = std::fs::remove_dir_all(&d);
     }
 }
