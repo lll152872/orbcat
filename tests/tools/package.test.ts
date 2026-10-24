@@ -18,6 +18,7 @@
 // ============================================================================
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
   existsSync,
@@ -832,5 +833,38 @@ describe("外部代批 CLI 不随包分发契约", () => {
     const src = readFileSync(path.join(REPO_ROOT, "tools", "package.mjs"), "utf8");
     expect(src).not.toMatch(/args\["cli-exe"\]/);
     expect(src).toMatch(/forbidCli/);
+  });
+
+  // -------------------------------------------------------------------
+  // ★ 真跑一次脚本，验「传了 --cli-exe 必须当场红」
+  // -------------------------------------------------------------------
+
+  /**
+   * 为什么要**真跑**而不是断言源码文本：
+   *
+   * `parseArgs` **不拒未知 flag**（任意 `--k v` 都收）⇒ 如果 `main()` 只是
+   * 静默忽略 `--cli-exe`，那就是「看起来通过、实际什么也没发生」——
+   * 构建链里最阴的**假绿陷阱**：谁想给包里加 CLI 时不会报错，
+   * 只会得到一个**没有 CLI** 的包。
+   *
+   * ⇒ 这条用例断言的是**真实退出码 + 真实文案**，
+   *    源码文本断言做不到这一点（源码里写了 `exit 2` 也不代表真会 exit 2）。
+   */
+  it("★ 传了 --cli-exe 必须当场 exit 2（不许静默 no-op）", () => {
+    const script = path.join(REPO_ROOT, "tools", "package.mjs");
+
+    // ① 空格写法：--cli-exe <路径>
+    for (const argv of [["--cli-exe", "xxx.exe"], ["--cli-exe=xxx.exe"]]) {
+      const r = spawnSync(process.execPath, [script, ...argv], { encoding: "utf8" });
+      expect(r.status, `argv=${argv.join(" ")} 应当 exit 2`).toBe(2);
+      expect(r.stderr, "错误文案要说清是 --cli-exe 这个参数被移除").toMatch(/--cli-exe/);
+      expect(r.stderr, "错误文案要说清是「该参数已移除」").toMatch(/已移除/);
+      expect(r.stderr, "错误文案要说清为什么不随包分发").toMatch(/不随包分发/);
+    }
+
+    // ② 不带 --cli-exe ⇒ **不许**触发这道闸（只拦这一个 flag）
+    const r2 = spawnSync(process.execPath, [script], { encoding: "utf8" });
+    expect(r2.status).toBe(2); // 缺必填参数 ⇒ 走用法提示，退出码也是 2
+    expect(r2.stderr, "没有 --cli-exe 时不该出现这道闸的文案").not.toMatch(/已移除/);
   });
 });
