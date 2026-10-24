@@ -3647,6 +3647,19 @@ mod tests {
     ///
     /// ⇒ 判据：**提示词与工具描述的输出里不得出现任何图片扩展名**
     /// （文件名只有工具知道；出现扩展名即说明有真名漏进来了）。
+    ///
+    /// ## 覆盖范围（五处，缺一不可）
+    ///
+    /// | 位置 | 在提示词里的位置 |
+    /// |---|---|
+    /// | `memes::prompt_section` | 「表情包库」段（标签表） |
+    /// | `agent::meme_policy_prompt(true/false)` | 「表情包」段（**最终口径**，排最后） |
+    /// | `agent::image_replies_prompt` | 「发图」段（stable 段**靠前**） |
+    /// | `tools::send_meme_spec` | **工具描述**（模型决策点，最贴近） |
+    ///
+    /// ⚠️ `send_meme_spec` 在 `tools.rs`（私有）⇒ 这里只能查 `meme_policy_prompt`
+    /// 与 `image_replies_prompt`；`tools.rs` 那侧有一条同判据的守卫
+    /// （`send_meme_spec_says_only_tool_and_no_path`）。
     #[test]
     fn 表情包提示词里不得出现任何图片文件名() {
         let policy = super::meme_policy_prompt(true);
@@ -3657,15 +3670,28 @@ mod tests {
         let replies = super::image_replies_prompt(&mode);
         let lib = super::meme_policy_prompt(false);
 
+        // 「表情包库」段要**真库**才非空 ⇒ 造一个小库
+        let tmp = meme_tmp("leakcheck");
+        put_meme(&tmp, "开心", "a.png");
+        let lib_section = crate::memes::prompt_section(&tmp);
+
         for (name, p) in [
             ("meme_policy_prompt(true)", policy.as_str()),
             ("meme_policy_prompt(false)", lib.as_str()),
             ("image_replies_prompt", replies.as_str()),
+            ("memes::prompt_section", lib_section.as_str()),
         ] {
             for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"] {
                 assert!(
                     !p.to_lowercase().contains(ext),
                     "{name} 里不能出现图片文件名（{ext}）—— 那等于把编造路径的原料喂给模型:\n{p}"
+                );
+            }
+            // 也不许出现**路径形态**（盘符 / 库目录 / 相对目录层）
+            for bad in [":\\", "agent-data", "dafeiyu", "memes\\", "memes/"] {
+                assert!(
+                    !p.contains(bad),
+                    "{name} 里出现路径形态「{bad}」⇒ 泄漏了位置信息:\n{p}"
                 );
             }
         }
@@ -3679,6 +3705,13 @@ mod tests {
             policy.contains("加个序号"),
             "要说明「改序号」这类加工动作（但不写真名）:\n{policy}"
         );
+        // 「表情包库」段也必须点明「标签≠文件名」（否则模型照标签编文件名）
+        assert!(
+            lib_section.contains("不是文件名"),
+            "「表情包库」段必须点明标签**不是文件名**:\n{lib_section}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     use super::*;
