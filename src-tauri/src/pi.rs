@@ -243,11 +243,36 @@ fn system_git() -> Option<PathBuf> {
 /// `runtime 候选 + crate::pi::system_bash_candidates()`，
 /// 不要自己再列一遍路径。
 ///
-/// 顺序有意义：**优先 `bin`**（MSYS2 的 launcher，PATH 处理比 `usr\bin` 那份稳），
-/// 其次 `usr\bin`（有 coreutils，但 PATH 映射要自己配）。
+/// ## ⚠️ 顺序：**Git for Windows 固定位置在前，PATH 搜索在后**
+///
+/// （2026-10-24 实测修的真 bug）原来把 PATH 搜索排在前面 ⇒
+/// `C:\Windows\System32\bash.exe`（**WSL 的启动器**，`system32` 在 PATH 里靠前）
+/// 被第一个选中 ⇒ 用户选「本机 Git Bash」，实际跑起来的是 **Ubuntu**：
+/// `$0`=/bin/bash、`uname`=Linux WSL2、路径是 `/mnt/d/...`、**没有 `/c`**。
+/// ⇒ 现在固定位置优先，且 PATH 里的 WSL 启动器被**直接剔除**（见 [`is_wsl_bash`]）。
 pub fn system_bash_candidates() -> Vec<PathBuf> {
+    let fixed = git_for_windows_bash_candidates();
+    let from_path = path_bash_candidates();
+    ordered_bash_candidates(fixed, from_path)
+}
+
+/// Git for Windows 的常见安装位置（**优先 `bin`** —— 那是 MSYS2 的 launcher，
+/// PATH 处理比 `usr\bin` 那份稳）。
+fn git_for_windows_bash_candidates() -> Vec<PathBuf> {
+    [
+        r"C:\Program Files\Git\bin",
+        r"C:\Program Files\Git\usr\bin",
+        r"C:\Program Files (x86)\Git\bin",
+        r"C:\Program Files (x86)\Git\usr\bin",
+    ]
+    .iter()
+    .map(|base| Path::new(base).join("bash.exe"))
+    .collect()
+}
+
+/// PATH 搜索到的 `bash.exe`（用户把 bash 装在别处也能找到）。
+fn path_bash_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    // PATH 搜索（用户自装的、装在别处的）
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
             for name in ["bash.exe", "bash"] {
@@ -258,16 +283,43 @@ pub fn system_bash_candidates() -> Vec<PathBuf> {
             }
         }
     }
-    // Git for Windows 常见位置：**优先 bin**
-    for base in [
-        r"C:\Program Files\Git\bin",
-        r"C:\Program Files\Git\usr\bin",
-        r"C:\Program Files (x86)\Git\bin",
-        r"C:\Program Files (x86)\Git\usr\bin",
-    ] {
-        out.push(Path::new(base).join("bash.exe"));
-    }
     out
+}
+
+/// 候选排序 + 过滤（**纯函数** ⇒ 可测）。
+///
+/// - 固定位置（Git for Windows）在前，PATH 搜索在后；
+/// - **WSL 的 `bash.exe` 一律剔除**（它不是 Git Bash）。
+pub fn ordered_bash_candidates(fixed: Vec<PathBuf>, from_path: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    out.extend(fixed.into_iter().filter(|p| !is_wsl_bash(p)));
+    out.extend(from_path.into_iter().filter(|p| !is_wsl_bash(p)));
+    out
+}
+
+/// 这个 `bash.exe` 是 **WSL 的启动器**（`%SystemRoot%\System32\bash.exe`）吗？
+///
+/// **它不是 Git Bash**：起的是 WSL 里的发行版（Ubuntu 等）——
+/// `$0` = `/bin/bash`、`uname` = Linux、路径走 `/mnt/c` `/mnt/d`、**没有 `/c`**。
+/// 用户选「本机 Git Bash」却跑成 WSL ⇒ 命令语法/路径全不对
+/// （`/c/...` 不存在、`/mnt/d/...` 才是），而系统提示里还写着「Git Bash」⇒ 双重误导。
+///
+/// ⇒ **一律不算 Git Bash 候选**。
+pub fn is_wsl_bash(p: &Path) -> bool {
+    let s = p.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+    // 精确匹配当前系统的 system32 / sysnative
+    if let Ok(root) = std::env::var("SystemRoot") {
+        let root = root.trim_end_matches('\\').to_ascii_lowercase().replace('/', "\\");
+        for sub in ["system32", "sysnative", "syswow64"] {
+            if s == format!("{root}\\{sub}\\bash.exe") {
+                return true;
+            }
+        }
+    }
+    // 兜底：Windows 目录下的 bash.exe 一律当 WSL 启动器
+    s.contains("\\windows\\system32\\bash.exe")
+        || s.contains("\\windows\\sysnative\\bash.exe")
+        || s.contains("\\windows\\syswow64\\bash.exe")
 }
 
 /// 找**系统装**的 `bash.exe`（Git for Windows 自带）。
@@ -1931,4 +1983,47 @@ mod tests {
         let c = ui_reply_json("x", PiHostReply::Input("hi".into()));
         assert_eq!(c["value"], "hi");
     }
+
+    // ---- Git Bash 候选：WSL 的 bash.exe 绝不能被选中（2026-10-24 真机 bug）----
+    //
+    // 真机症状：选「本机 Git Bash」⇒ 实际起的是 `C:\Windows\system32\bash.exe`
+    // （WSL 的启动器）⇒ `$0`=/bin/bash、uname=Linux WSL2、路径是 `/mnt/d/...`、
+    // **没有 `/c`** ⇒ 模型按提示写 `cd /c/...` 必然跑不通。
+
+    #[test]
+    fn wsl_launcher_is_recognized_as_not_git_bash() {
+        assert!(
+            crate::pi::is_wsl_bash(Path::new(r"C:\Windows\System32\bash.exe")),
+            "WSL 启动器必须被认出来"
+        );
+        assert!(crate::pi::is_wsl_bash(Path::new(
+            r"C:\Windows\Sysnative\bash.exe"
+        )));
+        assert!(
+            !crate::pi::is_wsl_bash(Path::new(r"C:\Program Files\Git\bin\bash.exe")),
+            "Git for Windows 的 bash 不是 WSL"
+        );
+        assert!(!crate::pi::is_wsl_bash(Path::new(
+            r"C:\msys64\usr\bin\bash.exe"
+        )));
+    }
+
+    #[test]
+    fn candidates_put_git_for_windows_first_and_drop_wsl() {
+        let fixed = vec![PathBuf::from(r"C:\Program Files\Git\bin\bash.exe")];
+        let from_path = vec![
+            PathBuf::from(r"C:\Windows\System32\bash.exe"), // WSL：必须被剔除
+            PathBuf::from(r"D:\tools\msys\bin\bash.exe"),
+        ];
+        let out = crate::pi::ordered_bash_candidates(fixed, from_path);
+        assert_eq!(
+            out,
+            vec![
+                PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+                PathBuf::from(r"D:\tools\msys\bin\bash.exe"),
+            ],
+            "固定位置在前、WSL 被剔除（PATH 顺序不得决定用哪个 bash）"
+        );
+    }
+
 }

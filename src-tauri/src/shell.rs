@@ -141,12 +141,22 @@ pub fn git_bash_candidates(runtime_root: Option<&Path>) -> Vec<PathBuf> {
     }
     // ② 系统装的 —— 单一来源在 `pi.rs`（含 PATH 搜索：用户把 bash 装在别处也能找到）
     v.extend(crate::pi::system_bash_candidates());
+    // ③ **剔除 WSL 的 bash.exe**（`%SystemRoot%\System32\bash.exe`）
+    //    —— 它不是 Git Bash，起的是 WSL 发行版（`/bin/bash`、`/mnt/d/...`、无 `/c`）。
+    //    2026-10-24 用户真机实测：选「本机 Git Bash」实际跑成了 Ubuntu ⇒ 就是它。
+    v.retain(|p| !crate::pi::is_wsl_bash(p));
     v
 }
 
 /// 在候选里挑第一个**真实存在**的 `bash.exe`。
+///
+/// ⚠️ **WSL 的 `bash.exe` 不算**（[`crate::pi::is_wsl_bash`]）——
+/// 选到它 = 用户以为在 Git Bash 里跑、其实跑的是 WSL 发行版。
 pub fn pick_git_bash(candidates: &[PathBuf]) -> Option<PathBuf> {
-    candidates.iter().find(|p| p.is_file()).cloned()
+    candidates
+        .iter()
+        .find(|p| p.is_file() && !crate::pi::is_wsl_bash(p))
+        .cloned()
 }
 
 /// 解析 Git Bash 的可执行文件路径。
@@ -1331,4 +1341,86 @@ mod tests {
             );
         }
     }
+
+    // ---- 选 Git Bash 时绝不能选到 WSL 的 bash.exe（2026-10-24 真机 bug）----
+
+    #[test]
+    fn pick_git_bash_never_returns_the_wsl_launcher() {
+        // 候选里只有 WSL 启动器 ⇒ 必须选不出来（fail-closed，不回落）
+        assert!(
+            pick_git_bash(&[PathBuf::from(r"C:\Windows\System32\bash.exe")]).is_none(),
+            "WSL 的 bash.exe 不算 Git Bash"
+        );
+        let err = resolve_git_bash_from(&[PathBuf::from(r"C:\Windows\System32\bash.exe")])
+            .expect_err("只有 WSL 启动器时必须报错");
+        assert!(err.contains("Git Bash"), "错误要说清是 Git Bash 找不到: {err}");
+    }
+
+    #[test]
+    fn git_bash_candidates_never_include_wsl() {
+        let cands = git_bash_candidates(None);
+        for c in &cands {
+            assert!(
+                !crate::pi::is_wsl_bash(c),
+                "候选里不该有 WSL 启动器: {}",
+                c.display()
+            );
+        }
+    }
+
+    /// 真机口径：这台机器上解析出来的 Git Bash **绝不能**是 WSL 的那个。
+    #[cfg(windows)]
+    #[test]
+    fn resolved_git_bash_is_not_wsl_on_this_machine() {
+        if let Ok(p) = resolve_git_bash() {
+            assert!(
+                !crate::pi::is_wsl_bash(&p),
+                "解析结果不能是 WSL 启动器: {}",
+                p.display()
+            );
+        }
+    }
+
+
+    /// 真机口径：**起的就是 Git Bash（MSYS2），不是 WSL**。
+    ///
+    /// 2026-10-24 用户真机实测的反面：选「本机 Git Bash」实际起的是
+    /// `C:\Windows\system32\bash.exe`（WSL 启动器）⇒ `uname` 是 Linux、
+    /// 路径是 `/mnt/d/...`、**没有 `/c`** ⇒ 模型按提示写的 `cd /c/...` 必然跑不通。
+    ///
+    /// 这条用例在**装了 WSL 的机器上**能直接抓住那个 bug（旧码必红）。
+    #[tokio::test]
+    async fn real_git_bash_is_msys_not_wsl() {
+        let dir = std::env::temp_dir();
+        let out = match run_gitbash_tick("echo $0; uname -s; pwd", &dir, 30, None, None).await {
+            Ok(o) => o,
+            Err(e) => {
+                // 没装 Git for Windows ⇒ 跳过（**这是预期行为**，不是失败）
+                eprintln!("[test] 跳过（起不了 Git Bash）：{e}");
+                return;
+            }
+        };
+        let low = out.stdout.to_ascii_lowercase();
+        assert!(
+            !low.contains("linux"),
+            "uname 不该是 Linux（那是 WSL）：{:?}",
+            out.stdout
+        );
+        assert!(
+            !low.contains("/mnt/"),
+            "工作目录不该是 WSL 的 /mnt/... 形态：{:?}",
+            out.stdout
+        );
+        assert!(
+            low.contains("mingw") || low.contains("msys"),
+            "uname 应是 MINGW/MSYS_NT（Git Bash）：{:?}",
+            out.stdout
+        );
+        assert!(
+            !crate::pi::is_wsl_bash(std::path::Path::new(&out.interpreter)),
+            "解释器不该是 WSL 的 system32\\bash.exe：{}",
+            out.interpreter
+        );
+    }
+
 }
