@@ -3435,7 +3435,20 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// ⚠️ 「后台桌面 vs 本机」与「用哪种 shell」是**两个正交维度**：
 /// 前者决定**在哪儿跑**，后者决定**用哪种解释器**。
 fn exec_location_note(data_dir: &Path) -> String {
-    exec_location_note_for_target(data_dir, crate::win32desk::is_enabled())
+    // ⚠️ 「后台桌面」是 **Windows 独占**能力（`CreateDesktopW` 是 Win32 API）
+    //    ⇒ 非 Windows 平台上它**永远是关的**，这里必须按平台分岔。
+    //
+    // ⚠️ 为什么必须分岔（2026-10-25 CI macOS job 实测）：
+    //    `lib.rs` 里是 `#[cfg(windows)] mod win32desk;` ⇒ macOS/Linux 上
+    //    **压根没有 `win32desk` 这个模块** ⇒ 直接引用会编译期报
+    //    `error[E0433]: cannot find `win32desk` in the crate root`
+    //    ⇒ master 的 macOS job 必红（`Rust check (lib)` 步骤 exit 101）。
+    //    同一个判断在 `tools.rs` 里已经有一份 ⇒ 同一件事别写两套。
+    #[cfg(windows)]
+    let bg_desk = crate::win32desk::is_enabled();
+    #[cfg(not(windows))]
+    let bg_desk = false;
+    exec_location_note_for_target(data_dir, bg_desk)
 }
 
 /// 按「执行目标」现算提示（**可测版本**：后台桌面开关是进程级的，测不了 ⇒ 传进来）。
