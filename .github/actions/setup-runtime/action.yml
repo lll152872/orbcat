@@ -23,12 +23,44 @@ runs:
     - name: Fetch runtime assets (node + pi)
       shell: pwsh
       run: |
+        # ⚠️ **失败要当场炸**：默认的 ErrorActionPreference=Continue 会让
+        #   「下载失败 / 解压失败」只是**打印一行错误然后继续往下跑**
+        #   ⇒ 真正的失败点被推到后面，报错信息还误导
+        #   （只说「路径不存在」，不说「东西根本没下下来」）。
+        $ErrorActionPreference = 'Stop'
         New-Item -ItemType Directory -Force -Path tools/.cache | Out-Null
         # node.exe —— pi 要求 >= 22.19.0
         $nodeVer = "22.23.4"
-        Invoke-WebRequest -Uri "https://nodejs.org/dist/v$nodeVer/node-v$nodeVer-win-x64.zip" -OutFile node.zip
-        Expand-Archive -Force node.zip
-        Copy-Item "node-v$nodeVer-win-x64/node.exe" tools/.cache/node.exe
+        # ⚠️ **架构必须跟着 runner 走**：release matrix 里有 `windows-11-arm`
+        #   （写死 -win-x64 ⇒ 会把 **x64 的 node.exe 打进 arm64 包**，
+        #     那个包在 arm64 机器上直接跑不起来 —— 绿着的假包）。
+        $nodeArch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
+        $zipName = "node-v$nodeVer-win-$nodeArch.zip"
+        # ⚠️ **必须给 -DestinationPath**：不给的话 pwsh 7 会把内容解到
+        #   **以压缩包文件名命名的目录**下（node.zip → `node\`），
+        #   实际落点是 `<cwd>\node\node-v$nodeVer-win-$nodeArch\node.exe`，
+        #   而下面按 `<cwd>\node-v$nodeVer-win-$nodeArch\node.exe` 找 → **必然找不到**。
+        #   （2026-10-25 CI 的 Windows job 就是死在这；
+        #     本机 pwsh 7 全新空目录已复现：不给 DestinationPath 就多套一层。）
+        $stage = Join-Path $env:RUNNER_TEMP 'node-dist'
+        $out = Join-Path $stage 'out'
+        Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path $stage | Out-Null
+        New-Item -ItemType Directory -Force -Path $out | Out-Null
+        $zipPath = Join-Path $stage $zipName
+        Invoke-WebRequest -Uri "https://nodejs.org/dist/v$nodeVer/$zipName" -OutFile $zipPath
+        Expand-Archive -Force $zipPath -DestinationPath $out
+        # ⚠️ **别写死内层目录名**：直接找那个 node.exe（取路径最短的 = 根目录那个）
+        $nodeExe = Get-ChildItem -Path $out -Recurse -Filter node.exe |
+          Sort-Object { $_.FullName.Length } | Select-Object -First 1
+        if (-not $nodeExe) { throw "node.exe 没在 $out 里找到（zip 结构变了？）" }
+        Copy-Item $nodeExe.FullName tools/.cache/node.exe
+        # pi 的硬要求是 >= 22.19.0 —— 与其相信一个写死的 URL，不如**当场断言**
+        $gotVer = (& tools/.cache/node.exe --version).TrimStart('v')
+        if ([version]$gotVer -lt [version]'22.19.0') {
+          throw "node $gotVer < pi 要求的 22.19.0"
+        }
+        Write-Output "node: $gotVer ($nodeArch) <- $zipName"
         # pi 内核 —— 公开 npm 包
         npm pack @earendil-works/pi-coding-agent@1.4.0 --pack-destination tools/.cache
         tar -xzf "tools/.cache/earendil-works-pi-coding-agent-1.4.0.tgz" -C tools/.cache
