@@ -999,6 +999,12 @@ mod tests {
     }
 
     /// 候选必须**多路径**：内置 runtime + PATH + Git for Windows 常见位置。
+    #[cfg(windows)]
+    // 这条断言的是**候选路径的 Windows 形状**：`Path::join` 在 Windows 上用 `\`，
+    // 在 Unix 上用 `/` ⇒ macOS 上候选长成 `C:\Program Files\Git\bin/bash.exe`，
+    // 与断言里的 `C:\Program Files\Git\bin\bash.exe` 不匹配。
+    // 产品只在 Windows 上跑，Windows 侧这条用例是真跑真过的（CI Windows job 绿）。
+    // 由 CI 的 macos runner 抓出。
     #[test]
     fn git_bash_candidates_cover_runtime_and_program_files() {
         let runtime = PathBuf::from(r"D:\somewhere\runtime");
@@ -1089,6 +1095,12 @@ mod tests {
     /// `bash.exe -lc "ls --version"` 仍跑出 `ls (GNU coreutils) 8.32`。
     ///
     /// 这条用例把那个约束**锁住** —— 哪天有人把 `-l` 去掉，它会立刻红。
+    #[cfg(windows)]
+    // 这条锁的是 **Git for Windows（MSYS2）** 的 login shell 行为（GNU coreutils）。
+    // macOS runner 上没有 Git for Windows，`resolve_git_bash` 会从 PATH 挑中系统
+    // `/bin/bash` ⇒ `ls` 是 BSD 版（`--version` 非法）、PATH 里也没有 MSYS 的
+    // `/usr/bin` ⇒ 断言必然失败 —— 不是产品 bug。
+    // 由 CI 的 macos runner 抓出。
     #[tokio::test]
     async fn git_bash_login_shell_provides_unix_tools() {
         let dir = std::env::temp_dir();
@@ -1389,6 +1401,11 @@ mod tests {
     /// 路径是 `/mnt/d/...`、**没有 `/c`** ⇒ 模型按提示写的 `cd /c/...` 必然跑不通。
     ///
     /// 这条用例在**装了 WSL 的机器上**能直接抓住那个 bug（旧码必红）。
+    #[cfg(windows)]
+    // 真机口径断言的是 **MSYS2 的 `uname -s`（MINGW/MSYS_NT）**。
+    // macOS runner 上起的是系统 `/bin/bash` ⇒ `uname -s` = `Darwin`，
+    // 断言必然失败 —— 不是产品 bug。
+    // 由 CI 的 macos runner 抓出。
     #[tokio::test]
     async fn real_git_bash_is_msys_not_wsl() {
         let dir = std::env::temp_dir();
