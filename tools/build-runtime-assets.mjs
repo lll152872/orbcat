@@ -65,7 +65,22 @@ import { execFileSync } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
-const CACHE = path.join(__dirname, ".cache");
+
+/**
+ * 运行时**源**缓存目录（`node.exe` / `pi-pkg/` / `photon-pkg/`）。
+ *
+ * ⚠️ **为什么允许指到 worktree 之外**（2026-10-24 实测事故后加）：
+ * 这份源约 120 MB，每个 worktree 各存一份就是 N 倍；
+ * 而 worktree 里的 `tools/.cache` 若是**指向共享目录的 junction**，
+ * `git worktree remove --force` 会**跟着 junction 把共享目录内容删掉**
+ * —— 本次实际踩到：主仓库的 `node_modules` 与 `tools/.cache` 被清空
+ * ⇒ runtime 三个源全丢、`runtime/` 变成悬空链接。
+ * ⇒ 口径：**共享源放所有 worktree 之外**（本机用 `D:\workplace\orbcat-cache`），
+ * 用 `--cache <dir>` 或环境变量 `ORBCAT_CACHE_DIR` 指进来；
+ * 默认仍是 `tools/.cache`（兼容旧用法）。
+ */
+const CACHE_ARG = argValue("--cache") || process.env.ORBCAT_CACHE_DIR;
+const CACHE = CACHE_ARG ? path.resolve(CACHE_ARG) : path.join(__dirname, ".cache");
 
 const VERIFY_ONLY = process.argv.includes("--verify");
 
