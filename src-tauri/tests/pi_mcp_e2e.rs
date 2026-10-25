@@ -671,9 +671,23 @@ async fn 宿主执行失败时_pip侧如实透出错误不当成成功() {
 
     // 假模型必须**真的调一次工具** —— 否则宿主那边压根不会执行，失败语义也就不会出现。
     // ⚠️ 用 `start_raw`（不加 `orb_` 前缀）⇒ 名字就写全 `orb_run_command`。
+    //
+    // ⚠️⚠️ **命令为什么是 `git log --definitely-not-a-flag`**（2026-10-25 修确定性挂死）：
+    //
+    // 1. 原来用「一条不存在的命令」⇒ `command_policy::evaluate` 对**未知命令**判
+    //    **`CmdVerdict::Ask`** ⇒ 进 `perm.ask_cmd(...)` 等用户裁决；
+    // 2. 而**桥那条路**（`tools.rs` 的 `execute_bridge`）硬编码 `PermHub::new()`
+    //    = **空 hub** ⇒ 没人应答 ⇒ 一直等到 3 分钟（`REQUEST_TIMEOUT_MS`）
+    //    ⇒ 用例 90 秒超时 ⇒ **确定性挂死**（并行挂、串行也挂 —— 不是竞态）；
+    // 3. 现在换成**白名单内但必失败**的命令：
+    //    - `default_allow()`（`command_policy.rs:599`）含 **`git log *`** ⇒ 命中白名单
+    //      ⇒ **不问权限**（`CmdVerdict::Allow`）⇒ 不进 perm 等待；
+    //    - 非法参数 ⇒ git 立刻报 `unknown option` ⇒ **退出码 129（非 0）**；
+    //    - `git log` 是只读命令 ⇒ **绝对无害**（参数非法时什么都不做）。
+    // ⇒ 快速失败 ⇒ **秒级**；下面「退出码非 0 + 不许出现执行成功」两条断言原样继续成立。
     let fake = fake_model::FakeModel::start_raw(
         "orb_run_command",
-        json!({ "command": "orbcat-perm-nonexistent-probe-xyz" }),
+        json!({ "command": "git log --definitely-not-a-flag" }),
         "（假装执行完了）",
     )
     .expect("假模型应能起");
