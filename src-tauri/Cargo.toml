@@ -83,6 +83,24 @@ indexmap = { version = "1.9.3", features = ["std"] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
+# 全局快捷键（唤醒 orbcat）。
+#
+# 为什么用官方插件而不是自己写 `RegisterHotKey`：
+#   Tauri 2 接管了窗口消息循环，裸 `RegisterHotKey` 需要的 WM_HOTKEY
+#   得自己挂 WndProc 钩子 → 与 Tauri 的事件循环打架。
+#   插件内部用独立的 message-only 窗口 + 自己的消息泵，Windows 上
+#   底层仍是 `RegisterHotKey`（系统级独占），但线程模型干净。
+#
+# ⚠️ 加依赖时**只能手动加这一行**，别用 `cargo add` ——
+#    `cargo add` 会连带把整棵 tauri 栈升到最新（实测 wry 0.55→0.57、
+#    tauri-runtime 2.11→2.12），那是与本需求无关的大范围变更。
+#
+# ⚠️ 版本必须钉在 **2.3.0**：它是最后一个要求 `tauri-plugin ^2.3` 的版本，
+#    与本项目 lock 里已有的 tauri-plugin 2.6.3 兼容。
+#    2.3.1 起要求 `tauri ^2.8.2` / 2.4.0 起要求 `tauri ^2.12` ——
+#    用它们会把 tauri / tauri-runtime / wry / tray-icon 整串顶上去。
+#    （实测：2.4.1 会把 wry 0.55→0.57、tray-icon 0.24→0.25、window-vibrancy 0.6→0.8。）
+tauri-plugin-global-shortcut = "=2.3.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -225,6 +225,7 @@ use serde::Serialize;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 // ---------------------------------------------------------------------------
 // 窗口布局常量（逻辑像素）
@@ -5042,12 +5043,19 @@ fn apply_tray_visual(app: &tauri::AppHandle, sleeping: bool) {
         return;
     };
 
-    let tip = if sleeping {
+    let base_tip = if sleeping {
         "orbcat（睡眠中）— 左键单击唤醒"
     } else {
         "orbcat"
     };
-    if let Err(e) = tray.set_tooltip(Some(tip)) {
+    // 快捷键注册失败时把原因**粘在** tooltip 上（见 SHORTCUT_ERROR 的说明）：
+    // 托盘是球睡着之后用户唯一能看见的常驻入口，失败原因必须挂在那儿，
+    // 否则用户只会觉得"按了没反应"，根本不知道是快捷键没注册上。
+    let tip = match shortcut_error() {
+        Some(e) => format!("{base_tip} — ⚠️ {e}"),
+        None => base_tip.to_string(),
+    };
+    if let Err(e) = tray.set_tooltip(Some(&tip)) {
         eprintln!("[orbcat] 更新托盘提示失败: {e}");
     }
 
@@ -5287,6 +5295,155 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// 全局快捷键（唤醒）
+// ---------------------------------------------------------------------------
+
+/// 唤醒 orbcat 的全局快捷键：`Ctrl + Shift + S`。
+///
+/// ## 为什么是这组键（2026-10-25 本机实测，不是拍脑袋）
+///
+/// 选键的唯一硬判据是「**别的程序有没有用 `RegisterHotKey` 占了它**」——
+/// 那才是系统级独占、会让注册直接失败的东西
+/// （`ERROR_HOTKEY_ALREADY_REGISTERED` = 1409）。
+/// IDE / 浏览器 / 编辑器里的键位是**应用内**的，不注册全局热键，
+/// 它们不挡注册，只是被抢走后那个软件里按不到了。
+///
+/// 实测结论（探针脚本 `tmp/hotkey_probe*.ps1`，可复跑）：
+///
+/// | 检查项 | `Ctrl+Shift+S` |
+/// |---|---|
+/// | IDEA 默认键位（Windows `$default`） | **没绑**（有 a/b/c/d/e/f/h/i/j/l/m/n/p/r/t/u/w/z） |
+/// | IDEA 用户自定义 keymap | 只绑了 `ctrl+y` / `shift+alt+back_space` / `shift+ctrl+z` → 不碰 S |
+/// | VS Code 默认键位 | 宽松匹配 0 次 → 没绑 |
+/// | Windows 全局注册 | `RegisterHotKey` 实测成功（无 1409） |
+///
+/// ⇒ **零兼容成本**：不需要改任何一个软件的键位设置。
+///
+/// ## 手感
+///
+/// 纯左手：小指 Ctrl、无名指 Shift、中指 S —— 鼠标不用离开右手。
+/// 语义：S = Summon（召唤）。
+///
+/// ⚠️ 改键前先跑探针确认没被占：微信/QQ 这类**真注册全局热键**的程序
+///    占的是 `Ctrl+Alt+{A,C,F,L,M,O,S,T,X,Z}` 与 `Ctrl+Shift+{O,Y}`。
+///
+/// ⚠️ 键位是**用户肌肉记忆**的一部分 —— 改它会静默破坏上面那些性质
+///    （纯左手 / 不撞任何软件），所以有单测钉住（见 `wake_shortcut_tests`）。
+
+/// 快捷键注册失败的原因（`None` = 正常）。
+///
+/// **存下来是为了让提示"粘住"**：`apply_tray_visual` 每次睡眠/唤醒都会重写
+/// 托盘 tooltip —— 只在失败那一刻写一次的话，下一次睡眠就被抹掉了，
+/// 用户反而以为"根本没这回事"。
+static SHORTCUT_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// 唤醒用的快捷键 —— **键位的唯一事实来源**。
+///
+/// 显示用的标签由 [`shortcut_label`] 从它推导，不另写一份字符串
+/// （两处各写一份迟早会对不上，而对不上的后果是"托盘提示在骗人"）。
+fn wake_shortcut() -> Shortcut {
+    Shortcut::new(
+        Some(Modifiers::CONTROL | Modifiers::SHIFT),
+        Code::KeyS,
+    )
+}
+
+/// 把快捷键格式化成人类可读的标签（`Ctrl+Shift+S`）—— 用于日志与托盘提示。
+fn shortcut_label(sc: &Shortcut) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if sc.mods.contains(Modifiers::CONTROL) {
+        parts.push("Ctrl".into());
+    }
+    if sc.mods.contains(Modifiers::SHIFT) {
+        parts.push("Shift".into());
+    }
+    if sc.mods.contains(Modifiers::ALT) {
+        parts.push("Alt".into());
+    }
+    if sc.mods.contains(Modifiers::SUPER) {
+        parts.push("Win".into());
+    }
+    let key = match sc.key {
+        Code::KeyA => "A",
+        Code::KeyQ => "Q",
+        Code::KeyS => "S",
+        Code::KeyX => "X",
+        Code::Space => "Space",
+        other => return format!("{:?}", other),
+    };
+    parts.push(key.into());
+    parts.join("+")
+}
+
+/// 唤醒键的可读标签。
+fn wake_shortcut_label() -> String {
+    shortcut_label(&wake_shortcut())
+}
+
+/// 注册全局快捷键。
+///
+/// 失败**不静默**：错误写 stderr + 托盘 tooltip（见 [`SHORTCUT_ERROR`]）。
+/// 静默失败的代价是：用户按了没反应，却完全不知道为什么
+/// （最常见的原因就是快捷键被别的程序注册了）。
+fn setup_global_shortcut(app: &tauri::App) -> Result<(), String> {
+    let sc = wake_shortcut();
+    app.global_shortcut()
+        .register(sc)
+        .map_err(|e| format!("注册全局快捷键 {} 失败: {e}", wake_shortcut_label()))
+}
+
+/// 全局快捷键被按下时的处理。
+///
+/// ## 为什么必须回主线程
+///
+/// 插件的事件来自它**自己的线程**（Windows 上是插件内部 message-only 窗口的
+/// 消息泵），不是 Tauri 主线程 ⇒ 窗口操作必须回主线程执行。
+/// 与「第二实例唤醒」那条路径同套路（见 `setup` 里的 `run_on_main_thread`）。
+fn on_wake_shortcut(app: &tauri::AppHandle) {
+    eprintln!(
+        "[orbcat] 收到全局快捷键 {} → 展开面板",
+        wake_shortcut_label()
+    );
+    // 兜底标记：前端可能还没就绪，那时 emit 会丢（见标记的文档）
+    OPEN_PANEL_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        wake_and_open_panel(&handle);
+    });
+}
+
+/// 读出快捷键注册失败的原因（`None` = 正常）。
+fn shortcut_error() -> Option<String> {
+    SHORTCUT_ERROR.lock().ok().and_then(|g| g.clone())
+}
+
+#[cfg(test)]
+mod wake_shortcut_tests {
+    use super::*;
+
+    /// 唤醒键必须**恰好**是 `Ctrl+Shift+S`。
+    ///
+    /// 为什么钉死：键位是**用户肌肉记忆**的一部分（2026-10-25 实测选它，
+    /// 因为 IDEA / VS Code 都不占这组键、且纯左手可按）。被人随手改成别的会
+    /// **静默**破坏这两条性质 —— 用户不会注意到，只会觉得"这 agent 不好使了"。
+    #[test]
+    fn wake_shortcut_is_exactly_ctrl_shift_s() {
+        let sc = wake_shortcut();
+        assert_eq!(sc.mods, Modifiers::CONTROL | Modifiers::SHIFT);
+        assert_eq!(sc.key, Code::KeyS);
+    }
+
+    /// 标签必须与实际注册的键**一致**。
+    ///
+    /// 标签会出现在托盘 tooltip 和日志里 —— 它要是与真实键位对不上，
+    /// 用户照着提示去按就会按不到（"托盘提示在骗人"）。
+    #[test]
+    fn label_matches_registered_shortcut() {
+        assert_eq!(wake_shortcut_label(), "Ctrl+Shift+S");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
 
@@ -5386,6 +5543,23 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // 全局快捷键插件。
+        //
+        // handler 里只做一件事：把「唤醒」交给 `on_wake_shortcut`。
+        // ⚠️ 插件必须排在 `.setup()` **之前**注册 —— setup 里要调
+        //    `app.global_shortcut().register(...)`，插件还没初始化就调会失败。
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    // 只认「按下」这一次事件：Windows 上按住不放会持续报
+                    // Pressed 之外的重复事件，忽略掉才不会一次长按触发多次。
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    on_wake_shortcut(app);
+                })
+                .build(),
+        )
         .setup(|app| {
             // --- 初始化权限网关 ---
             let data_dir = resolve_data_dir(app.handle());
@@ -5741,6 +5915,29 @@ pub fn run() {
             // 托盘是用户能正常关掉它的入口。打开面板仍靠悬浮球。
             if let Err(e) = setup_tray(app) {
                 eprintln!("[orbcat] 托盘初始化失败: {e}");
+            }
+
+            // --- 全局快捷键（唤醒）---
+            //
+            // 放在托盘**之后**：失败时要往托盘 tooltip 上挂提示，
+            // 托盘得先存在。
+            if let Err(e) = setup_global_shortcut(app) {
+                eprintln!("[orbcat] ⚠️ {e}");
+                let label = wake_shortcut_label();
+                if let Ok(mut g) = SHORTCUT_ERROR.lock() {
+                    *g = Some(format!("快捷键 {label} 不可用"));
+                }
+                // 托盘是球睡着之后用户唯一能看见的常驻入口 ⇒ 失败原因挂那儿
+                if let Some(tray) = app.handle().tray_by_id("orbcat-tray") {
+                    let _ = tray.set_tooltip(Some(&format!(
+                        "orbcat — ⚠️ 快捷键 {label} 不可用（请用托盘菜单）"
+                    )));
+                }
+            } else {
+                eprintln!(
+                    "[orbcat] 全局快捷键已注册：{}（唤醒）",
+                    wake_shortcut_label()
+                );
             }
 
             // --- 唤醒监听（单实例锁的另一半）---
