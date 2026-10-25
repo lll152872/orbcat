@@ -48,6 +48,10 @@ import sys
 DEFAULT_CONFIG = r"D:\workplace\.cargo\config.toml"
 HOST_TARGET = "x86_64-pc-windows-msvc"
 
+# 镜像注释块的标记串 —— **写入与剥离共用同一个**（单一事实源）
+# ⚠️ 换标记串 = 老配置里的旧注释块再也剥不掉 ⇒ 又会开始堆叠 ⇒ 别随便改。
+MIRROR_MARKER = "【crates.io 镜像】"
+
 # 稀疏索引镜像（checksum 与 crates.io 一致：原样镜像）
 INDEXES = {
     "rsproxy": ("rsproxy-sparse", "sparse+https://rsproxy.cn/index/"),
@@ -82,19 +86,47 @@ def strip_source_sections(text):
             skip = s.startswith("[source.")
         if not skip:
             out.append(line)
-    # 去掉由此产生的连续空行（最多留一个）
+    return out
+
+
+def strip_mirror_comment_blocks(lines):
+    """去掉所有**镜像注释块**（以 `# 【crates.io 镜像】` 开头的连续注释行）。
+
+    ⚠️ **为什么必须单独剥**（2026-10-25 实测踩到）：
+    注释块**不在 `[source.*]` 段里** ⇒ `strip_source_sections` 剥不掉它
+    ⇒ 每次 apply 都「旧的留下 + 新的又追加」⇒ 同一段注释越堆越多
+    （实测 apply 三次 ⇒ 注释出现三遍；TOML 本身仍有效，所以不报错、只是脏）。
+
+    ⇒ 标记串是**单一事实源**：写入用它（`build_mirror_block`）、剥离也用它。
+    """
+    out, skipping = [], False
+    for line in lines:
+        s = line.strip()
+        if skipping:
+            if s.startswith("#"):
+                continue          # 注释块的续行
+            skipping = False     # 遇到非注释行 ⇒ 块结束
+        if s.startswith("#") and MIRROR_MARKER in s:
+            skipping = True
+            continue
+        out.append(line)
+    return out
+
+
+def tidy_blank_lines(lines):
+    """去掉由此产生的连续空行（最多留一个）。"""
     cleaned = []
-    for ln in out:
+    for ln in lines:
         if not ln.strip() and cleaned and not cleaned[-1].strip():
             continue
         cleaned.append(ln)
-    return "\n".join(cleaned).rstrip() + "\n"
+    return cleaned
 
 
 def build_mirror_block(index_name):
     alias, url = INDEXES[index_name]
     return (
-        "\n# 【crates.io 镜像】2026-10-25 守门加：直连 crates.io 太慢，cargo 校验 Cargo.lock\n"
+        f"\n# {MIRROR_MARKER}2026-10-25 守门加：直连 crates.io 太慢，cargo 校验 Cargo.lock\n"
         "# 完整性时会去下载**当前平台用不到**的 crate（objc2-app-kit 等 macOS-only）⇒ 超时 ⇒ 退出码 101。\n"
         "# 镜像与 crates.io **checksum 完全一致**（原样镜像）⇒ Cargo.lock 不用改。\n"
         "# ⚠️ 换 source id ⇒ 本地 registry 缓存里已下载的 crate 全部失效 ⇒ 首次会全量重下。\n"
@@ -105,14 +137,25 @@ def build_mirror_block(index_name):
     )
 
 
+def count_mirror_blocks(text):
+    """配置里镜像注释块有几份（>1 就是重复堆叠了）。"""
+    return sum(1 for l in text.splitlines()
+               if l.strip().startswith("#") and MIRROR_MARKER in l)
+
+
 def apply_mirror(config_path, index_name, dry_run=False):
     alias, url = INDEXES[index_name]
     text = read_config(config_path)
     has = re.search(r"^\s*\[source\.crates-io\]", text, re.M) is not None
-    kept = strip_source_sections(text)
+    old_blocks = count_mirror_blocks(text)
+    # ⚠️ 顺序很重要：先剥 [source.*] 段，再剥**镜像注释块**（它不在段里）
+    kept_lines = strip_mirror_comment_blocks(strip_source_sections(text))
+    kept = "\n".join(tidy_blank_lines(kept_lines)).rstrip() + "\n"
     new_text = kept + build_mirror_block(index_name)
     print("=== 目标配置：%s ===" % config_path)
     print("已存在 [source.crates-io]：%s" % ("是（将被替换为 %s）" % alias if has else "否（将新增）"))
+    print("原有镜像注释块：%d 份%s" % (
+        old_blocks, "（将被归并成 1 份）" if old_blocks > 1 else ""))
     print("--- 将写入的尾部内容 ---")
     print(new_text[len(kept):].rstrip())
     if dry_run:
@@ -122,6 +165,16 @@ def apply_mirror(config_path, index_name, dry_run=False):
     with open(config_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(new_text)
     print("✓ 已写入：%s" % config_path)
+    # ⚠️ **幂等自检**：写完再读，注释块与 [source.*] 段都必须各只有一份 ——
+    #   否则「apply 两次 = 文件变两次」这种脏问题又会悄悄回来。
+    written = read_config(config_path)
+    n_comment = count_mirror_blocks(written)
+    n_src = len(re.findall(r"^\s*\[source\.", written, re.M))
+    ok = (n_comment == 1 and n_src == 2)
+    print("   幂等自检：镜像注释块 %d 份（应 1）· [source.*] 段 %d 个（应 2：crates-io + 镜像别名）%s"
+          % (n_comment, n_src, " ✓" if ok else " ❌"))
+    if not ok:
+        return 1
     print("⚠️ 首次 cargo 会**全量重下**依赖（source id 变了 ⇒ 旧缓存失效）")
     return 0
 
@@ -135,6 +188,9 @@ def show_status(config_path):
         s = line.strip()
         if s.startswith("[") or s.startswith("replace-with") or s.startswith("registry") or s.startswith("target-dir"):
             print("  " + s)
+    # ⚠️ 顺手报一下**漂移**：镜像注释块 > 1 份 = 老版本 apply 留下的重复堆叠
+    n = count_mirror_blocks(text)
+    print("  镜像注释块：%d 份%s" % (n, " ✓" if n <= 1 else " ⚠️ 重复堆叠（跑一次 apply 即可归并）"))
     return 0
 
 
@@ -150,7 +206,7 @@ def fetch_current_platform(config_path, target=HOST_TARGET):
 
 
 def bootstrap_worktree(wt, main_wt, target=HOST_TARGET, do_mirror=True, index_name="rsproxy"):
-    """新 worktree 引导：**这才是「cargo 跑不完」的真正根因所在**
+    r"""新 worktree 引导：**这才是「cargo 跑不完」的真正根因所在**
 
     ⚠️ 症状（伪装成 cargo 网络问题）：
     ```
