@@ -2,7 +2,7 @@
 
 > 悬浮球形态的私人 agent —— 一个记得住你的桌面助手。
 >
-> **v1.1.0** · Windows（x64 / arm64）+ macOS（Apple Silicon）
+> **v2.0.0** · Windows（x64 / arm64）+ macOS（Apple Silicon）
 >
 > 下载见 [Releases](https://github.com/lll152872/orbcat/releases)。zip 是**四件套**
 > （`orbcat.exe` + `dist/` + `runtime/` + `agent-data/`），**解压即用，但首次启动要点一次

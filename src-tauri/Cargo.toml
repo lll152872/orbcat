@@ -5,7 +5,7 @@ name = "orbcat"
 #    CI 的 Release 触发与产物版本取自 tag，不读它，但「tag 叫 v1.1.0、
 #    Cargo.toml 写 1.0.0」这种自相矛盾迟早坑到人（`cargo package` 的文件名、
 #    崩溃报告里的版本号都取这里）。
-version = "1.1.0"
+version = "2.0.0"
 description = "悬浮球形态的私人 agent（Windows 桌面）"
 authors = ["lll152"]
 edition = "2021"
